@@ -49,6 +49,15 @@ swiftc \
 "$TEST_TMP_DIR/tacua-credential-store-tests"
 
 swiftc \
+  -module-cache-path "$TEST_TMP_DIR/module-cache" \
+  ios/TacuaCanonicalJSON.swift \
+  ios/TacuaBackendConfiguration.swift \
+  tests/BackendConfigurationTests.swift \
+  -o "$TEST_TMP_DIR/tacua-backend-configuration-tests"
+
+"$TEST_TMP_DIR/tacua-backend-configuration-tests"
+
+swiftc \
   -D TACUA_CAPTURE_FAULT_INJECTION \
   -module-cache-path "$TEST_TMP_DIR/module-cache" \
   ios/CaptureFaultInjection.swift \
