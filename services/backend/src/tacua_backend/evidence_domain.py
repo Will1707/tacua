@@ -33,6 +33,8 @@ ITEM_VERSION = "tacua.candidate-evidence-item@1.0.0"
 MAX_MANIFEST_BYTES = 1_048_576
 MAX_PREVIEW_BYTES = 2_097_152
 PREVIEW_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"})
+_JOURNAL_DISCARD_PREVIEW = "discard_uncommitted_preview"
+_JOURNAL_DELETE_PREVIEW = "delete_committed_preview"
 
 _ID = re.compile(r"^[a-z][a-z0-9_-]{2,63}$")
 _DIGEST = re.compile(r"^sha256:[a-f0-9]{64}$")
@@ -544,6 +546,31 @@ def _savepoint(connection: sqlite3.Connection) -> Iterator[None]:
         connection.execute(f"RELEASE SAVEPOINT {name}")
 
 
+@contextmanager
+def _durable_transaction(connection: sqlite3.Connection) -> Iterator[None]:
+    """Own one SQLite commit boundary for a filesystem-coordinated phase.
+
+    A caller transaction cannot be safely composed with a filesystem mutation:
+    rolling it back after a file was created or removed would resurrect the
+    opposite half of the operation. Filesystem methods therefore use explicit,
+    top-level phases and reject nesting.
+    """
+
+    _require(
+        not connection.in_transaction,
+        "EVIDENCE_TRANSACTION_ACTIVE",
+        "$",
+        "filesystem evidence operations require a standalone database boundary",
+    )
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+
+
 def initialize_schema(connection: sqlite3.Connection) -> None:
     """Create evidence tables on a caller-owned SQLite connection."""
 
@@ -635,6 +662,27 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
         )
         """,
         """
+        CREATE TABLE IF NOT EXISTS tacua_evidence_file_journal (
+            journal_row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation_id TEXT NOT NULL,
+            disposition TEXT NOT NULL CHECK (
+                disposition IN (
+                    'discard_uncommitted_preview',
+                    'delete_committed_preview'
+                )
+            ),
+            relative_path TEXT NOT NULL UNIQUE,
+            staging_relative_path TEXT,
+            content_type TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL CHECK (
+                size_bytes >= 1 AND size_bytes <= 2097152
+            ),
+            content_digest TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            UNIQUE (operation_id, relative_path)
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS tacua_evidence_audit (
             audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
             occurred_at TEXT NOT NULL,
@@ -654,6 +702,7 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
         """,
         "CREATE INDEX IF NOT EXISTS tacua_evidence_bindings_session_idx ON tacua_candidate_evidence_bindings (organization_id, project_id, session_id)",
         "CREATE INDEX IF NOT EXISTS tacua_evidence_previews_item_idx ON tacua_evidence_preview_revisions (manifest_row_id, item_row_id, preview_row_id)",
+        "CREATE INDEX IF NOT EXISTS tacua_evidence_file_journal_operation_idx ON tacua_evidence_file_journal (operation_id, journal_row_id)",
     )
     with _savepoint(connection):
         for statement in statements:
@@ -1301,15 +1350,47 @@ class EvidenceStore:
             ) from error
         return target
 
-    def _write(self, relative_path: Path, body: bytes) -> Path:
+    @staticmethod
+    def _fsync_directory(directory: Path) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(
+            os, "O_NOFOLLOW", 0
+        )
+        try:
+            descriptor = os.open(directory, flags)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        except OSError as error:
+            raise EvidenceDomainError(
+                "PREVIEW_DIRECTORY_SYNC_FAILED",
+                "$.relative_path",
+                "preview directory state could not be made durable",
+            ) from error
+
+    def _write(
+        self, relative_path: Path, staging_relative_path: Path, body: bytes
+    ) -> Path:
         target = self._path(relative_path, create_parents=True)
+        temporary = self._path(staging_relative_path, create_parents=True)
         _require(
             not target.exists() and not target.is_symlink(),
             "PREVIEW_PATH_COLLISION",
             "$.relative_path",
             "preview path already exists",
         )
-        temporary = target.parent / (".tacua-preview-" + uuid.uuid4().hex)
+        _require(
+            temporary.parent == target.parent,
+            "PREVIEW_PATH_ESCAPE",
+            "$.staging_relative_path",
+            "preview staging path must share the committed file directory",
+        )
+        _require(
+            not temporary.exists() and not temporary.is_symlink(),
+            "PREVIEW_PATH_COLLISION",
+            "$.staging_relative_path",
+            "preview staging path already exists",
+        )
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
         descriptor: int | None = None
         try:
@@ -1323,11 +1404,7 @@ class EvidenceStore:
             descriptor = None
             os.link(temporary, target, follow_symlinks=False)
             temporary.unlink()
-            directory_descriptor = os.open(target.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_descriptor)
-            finally:
-                os.close(directory_descriptor)
+            self._fsync_directory(target.parent)
         except FileExistsError as error:
             raise EvidenceDomainError(
                 "PREVIEW_PATH_COLLISION",
@@ -1348,6 +1425,198 @@ class EvidenceStore:
             except OSError:
                 pass
         return target
+
+    def _journal_file(
+        self,
+        *,
+        operation_id: str,
+        disposition: str,
+        relative_path: str | Path,
+        staging_relative_path: str | Path | None,
+        content_type: str,
+        size_bytes: int,
+        content_digest: str,
+    ) -> None:
+        _identifier(operation_id, "$.operation_id")
+        _require(
+            disposition in {_JOURNAL_DISCARD_PREVIEW, _JOURNAL_DELETE_PREVIEW},
+            "FILE_JOURNAL_INVALID",
+            "$.disposition",
+            "unknown evidence file disposition",
+        )
+        relative = Path(relative_path).as_posix()
+        self._path(relative, create_parents=True)
+        staging = (
+            None
+            if staging_relative_path is None
+            else Path(staging_relative_path).as_posix()
+        )
+        if staging is not None:
+            self._path(staging, create_parents=False)
+        _require(
+            content_type in PREVIEW_MIME_TYPES,
+            "FILE_JOURNAL_INVALID",
+            "$.content_type",
+            "journal MIME type is invalid",
+        )
+        _integer(size_bytes, "$.size_bytes", 1, MAX_PREVIEW_BYTES)
+        _digest(content_digest, "$.content_digest")
+        try:
+            self.connection.execute(
+                """
+                INSERT INTO tacua_evidence_file_journal (
+                    operation_id, disposition, relative_path,
+                    staging_relative_path, content_type, size_bytes,
+                    content_digest, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    operation_id,
+                    disposition,
+                    relative,
+                    staging,
+                    content_type,
+                    size_bytes,
+                    content_digest,
+                    _now(),
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise EvidenceDomainError(
+                "EVIDENCE_FILE_OPERATION_CONFLICT",
+                "$.relative_path",
+                "another durable file operation already owns this preview path",
+            ) from error
+
+    def _clear_journal_row(self, journal_row_id: int) -> None:
+        with _durable_transaction(self.connection):
+            self.connection.execute(
+                "DELETE FROM tacua_evidence_file_journal WHERE journal_row_id = ?",
+                (journal_row_id,),
+            )
+
+    def _drain_file_journal(self, operation_id: str | None = None) -> dict[str, int]:
+        parameters: tuple[Any, ...] = ()
+        where = ""
+        if operation_id is not None:
+            _identifier(operation_id, "$.operation_id")
+            where = " WHERE operation_id = ?"
+            parameters = (operation_id,)
+        rows = self.connection.execute(
+            """
+            SELECT journal_row_id, disposition, relative_path,
+                   staging_relative_path, content_type, size_bytes,
+                   content_digest
+              FROM tacua_evidence_file_journal
+            """
+            + where
+            + " ORDER BY journal_row_id",
+            parameters,
+        ).fetchall()
+        report = {
+            "journal_entries": len(rows),
+            "preview_files_removed": 0,
+            "staging_files_removed": 0,
+            "committed_previews_preserved": 0,
+        }
+        for row in rows:
+            (
+                journal_row_id,
+                disposition,
+                relative_path,
+                staging_relative_path,
+                content_type,
+                size_bytes,
+                content_digest,
+            ) = tuple(row)
+            if disposition == _JOURNAL_DISCARD_PREVIEW:
+                committed = self.connection.execute(
+                    """
+                    SELECT availability, content_type, size_bytes, content_digest
+                      FROM tacua_evidence_preview_revisions
+                     WHERE relative_path = ?
+                    """,
+                    (relative_path,),
+                ).fetchall()
+                if committed:
+                    _require(
+                        len(committed) == 1
+                        and tuple(committed[0])
+                        == ("available", content_type, size_bytes, content_digest),
+                        "STORED_PREVIEW_TAMPERED",
+                        "$.relative_path",
+                        "journal path is bound to conflicting preview metadata",
+                    )
+                    self._read(
+                        relative_path, content_type, size_bytes, content_digest
+                    )
+                    report["committed_previews_preserved"] += 1
+                elif self._unlink(relative_path):
+                    report["preview_files_removed"] += 1
+            elif disposition == _JOURNAL_DELETE_PREVIEW:
+                referenced = self.connection.execute(
+                    """
+                    SELECT p.availability, p.content_type, p.size_bytes,
+                           p.content_digest,
+                           (
+                               SELECT latest.availability
+                                 FROM tacua_evidence_preview_revisions AS latest
+                                WHERE latest.manifest_row_id = p.manifest_row_id
+                                  AND latest.item_row_id = p.item_row_id
+                                ORDER BY latest.preview_row_id DESC LIMIT 1
+                           ) AS latest_availability
+                      FROM tacua_evidence_preview_revisions AS p
+                     WHERE p.relative_path = ?
+                    """,
+                    (relative_path,),
+                ).fetchall()
+                _require(
+                    all(
+                        tuple(item)
+                        == (
+                            "available",
+                            content_type,
+                            size_bytes,
+                            content_digest,
+                            "unavailable",
+                        )
+                        for item in referenced
+                    ),
+                    "FILE_JOURNAL_INVALID",
+                    "$.relative_path",
+                    "cleanup journal cannot delete an active preview revision",
+                )
+                if self._unlink(relative_path):
+                    report["preview_files_removed"] += 1
+            else:  # The table check is defense in depth against a disabled schema.
+                raise EvidenceDomainError(
+                    "FILE_JOURNAL_INVALID",
+                    "$.disposition",
+                    "stored evidence file disposition is invalid",
+                )
+            if staging_relative_path is not None and self._unlink(
+                staging_relative_path
+            ):
+                report["staging_files_removed"] += 1
+            self._clear_journal_row(int(journal_row_id))
+        return report
+
+    def recover_file_journal(self) -> dict[str, int]:
+        """Reconcile durable filesystem phases before accepting evidence writes.
+
+        Call this once during process startup, before concurrent request handling.
+        Uncommitted preview bytes are discarded; deletion intents are completed;
+        an already committed, byte-verified preview is preserved.
+        """
+
+        self._schema()
+        _require(
+            not self.connection.in_transaction,
+            "EVIDENCE_TRANSACTION_ACTIVE",
+            "$",
+            "file recovery requires a standalone database boundary",
+        )
+        return self._drain_file_journal()
 
     def _read(
         self,
@@ -1487,9 +1756,17 @@ class EvidenceStore:
         )
         _signature(content_type, body)
 
-        created_path: Path | None = None
+        _require(
+            not self.connection.in_transaction,
+            "EVIDENCE_TRANSACTION_ACTIVE",
+            "$",
+            "preview writes require a standalone database boundary",
+        )
+        operation_id = "preview_put_" + uuid.uuid4().hex
+        relative_path: Path | None = None
+        staging_relative_path: Path | None = None
         try:
-            with _savepoint(self.connection):
+            with _durable_transaction(self.connection):
                 manifest_row_id, manifest = self._resolve(**binding)
                 item_row_id, item = self._item(
                     manifest_row_id, manifest, evidence_id
@@ -1543,7 +1820,49 @@ class EvidenceStore:
                     preview_revision_id,
                     content_type,
                 )
-                created_path = self._write(relative_path, body)
+                staging_relative_path = relative_path.parent / (
+                    ".tacua-preview-" + operation_id
+                )
+                self._journal_file(
+                    operation_id=operation_id,
+                    disposition=_JOURNAL_DISCARD_PREVIEW,
+                    relative_path=relative_path,
+                    staging_relative_path=staging_relative_path,
+                    content_type=content_type,
+                    size_bytes=size_bytes,
+                    content_digest=content_digest,
+                )
+
+            assert relative_path is not None and staging_relative_path is not None
+            self._write(relative_path, staging_relative_path, body)
+            self._read(
+                relative_path.as_posix(), content_type, size_bytes, content_digest
+            )
+            with _durable_transaction(self.connection):
+                journal = self.connection.execute(
+                    """
+                    SELECT disposition, relative_path, staging_relative_path,
+                           content_type, size_bytes, content_digest
+                      FROM tacua_evidence_file_journal
+                     WHERE operation_id = ?
+                    """,
+                    (operation_id,),
+                ).fetchone()
+                _require(
+                    journal is not None
+                    and tuple(journal)
+                    == (
+                        _JOURNAL_DISCARD_PREVIEW,
+                        relative_path.as_posix(),
+                        staging_relative_path.as_posix(),
+                        content_type,
+                        size_bytes,
+                        content_digest,
+                    ),
+                    "FILE_JOURNAL_INVALID",
+                    "$.operation_id",
+                    "durable preview intent changed before commit",
+                )
                 self.connection.execute(
                     """
                     INSERT INTO tacua_evidence_preview_revisions (
@@ -1577,12 +1896,18 @@ class EvidenceStore:
                     item_digest=item["evidence_item_digest"],
                     preview_digest=content_digest,
                 )
-        except BaseException:
-            if created_path is not None:
-                try:
-                    created_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                self.connection.execute(
+                    "DELETE FROM tacua_evidence_file_journal WHERE operation_id = ?",
+                    (operation_id,),
+                )
+        except Exception:
+            # Ordinary failures are cleaned synchronously. A process death or
+            # BaseException leaves the durable row for startup recovery.
+            try:
+                if not self.connection.in_transaction:
+                    self._drain_file_journal(operation_id)
+            except Exception:
+                pass
             raise
         return {
             "evidence_id": evidence_id,
@@ -1641,6 +1966,82 @@ class EvidenceStore:
             "size_bytes": row[3],
             "content_digest": row[4],
             "body": body,
+            "authorized_for_handoff": False,
+        }
+
+    def get_verified_keyframes_for_approval(
+        self, *, evidence_ids: list[str], **binding: Any
+    ) -> dict[str, Any]:
+        """Return exact verified keyframe bytes to an approval integration.
+
+        This method deliberately grants no handoff authority. The approval
+        layer must consume these returned bytes (not a later path lookup), bind
+        their digests into its separately sealed authorization artifact, and
+        fail if any requested keyframe is absent, unavailable, or changed. It
+        should call this inside the same SQLite ``BEGIN IMMEDIATE`` transaction
+        that persists approval so retirement/deletion cannot commit between
+        verification and authorization.
+        """
+
+        self._schema()
+        _require(
+            isinstance(evidence_ids, list) and 1 <= len(evidence_ids) <= 256,
+            "APPROVAL_KEYFRAMES_INVALID",
+            "$.evidence_ids",
+            "approval must request from 1 through 256 keyframe evidence IDs",
+        )
+        for index, evidence_id in enumerate(evidence_ids):
+            _identifier(evidence_id, f"$.evidence_ids[{index}]")
+        _require(
+            len(set(evidence_ids)) == len(evidence_ids),
+            "APPROVAL_KEYFRAMES_INVALID",
+            "$.evidence_ids",
+            "approval keyframe evidence IDs must be unique",
+        )
+        manifest_row_id, manifest = self._resolve(**binding)
+        verified: list[dict[str, Any]] = []
+        for index, evidence_id in enumerate(evidence_ids):
+            item_row_id, item = self._item(
+                manifest_row_id, manifest, evidence_id
+            )
+            _require(
+                item["evidence_type"] == "media.keyframe"
+                and item["availability"] == "available",
+                "APPROVAL_KEYFRAME_INVALID",
+                f"$.evidence_ids[{index}]",
+                "approval references must name available media.keyframe evidence",
+            )
+            row = self._latest_preview(manifest_row_id, item_row_id)
+            _require(
+                row is not None,
+                "PREVIEW_NOT_FOUND",
+                f"$.evidence_ids[{index}]",
+                "approval keyframe has no derived preview",
+            )
+            if row[1] == "unavailable":
+                raise EvidenceDomainError(
+                    "PREVIEW_UNAVAILABLE",
+                    f"$.evidence_ids[{index}]",
+                    f"approval keyframe preview is unavailable: {row[6]}",
+                )
+            body = self._read(row[5], row[2], row[3], row[4])
+            verified.append(
+                {
+                    "evidence_id": evidence_id,
+                    "evidence_item_digest": item["evidence_item_digest"],
+                    "preview_revision_id": row[0],
+                    "content_type": row[2],
+                    "size_bytes": row[3],
+                    "content_digest": row[4],
+                    "body": body,
+                }
+            )
+        return {
+            "candidate_id": binding["candidate_id"],
+            "candidate_version": binding["candidate_version"],
+            "candidate_digest": binding["candidate_digest"],
+            "evidence_manifest_digest": binding["manifest_digest"],
+            "verified_keyframes": verified,
             "authorized_for_handoff": False,
         }
 
@@ -1724,6 +2125,7 @@ class EvidenceStore:
         try:
             metadata = target.lstat()
         except FileNotFoundError:
+            self._fsync_directory(target.parent)
             return False
         _require(
             stat.S_ISREG(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode),
@@ -1731,7 +2133,15 @@ class EvidenceStore:
             "$.relative_path",
             "refusing to remove a non-regular preview path",
         )
-        target.unlink()
+        try:
+            target.unlink()
+        except OSError as error:
+            raise EvidenceDomainError(
+                "PREVIEW_DELETE_FAILED",
+                "$.relative_path",
+                "preview file could not be removed",
+            ) from error
+        self._fsync_directory(target.parent)
         return True
 
     def mark_preview_unavailable(
@@ -1754,7 +2164,14 @@ class EvidenceStore:
             "unknown preview unavailability reason",
         )
         _text(detail, "$.detail", 1, 512)
-        with _savepoint(self.connection):
+        _require(
+            not self.connection.in_transaction,
+            "EVIDENCE_TRANSACTION_ACTIVE",
+            "$",
+            "preview retirement requires a standalone database boundary",
+        )
+        operation_id = "preview_retire_" + uuid.uuid4().hex
+        with _durable_transaction(self.connection):
             manifest_row_id, manifest = self._resolve(**binding)
             item_row_id, item = self._item(
                 manifest_row_id, manifest, evidence_id
@@ -1814,11 +2231,11 @@ class EvidenceStore:
                     "$.preview_revision_id",
                     "immutable preview revision has different availability",
                 )
-            paths = {
-                row[0]
+            preview_files = {
+                tuple(row)
                 for row in self.connection.execute(
                     """
-                    SELECT relative_path
+                    SELECT relative_path, content_type, size_bytes, content_digest
                       FROM tacua_evidence_preview_revisions
                      WHERE manifest_row_id = ? AND item_row_id = ?
                        AND availability = 'available'
@@ -1826,14 +2243,24 @@ class EvidenceStore:
                     (manifest_row_id, item_row_id),
                 ).fetchall()
             }
-            removed = sum(1 for path in paths if self._unlink(path))
+            for path, stored_type, stored_size, stored_digest in preview_files:
+                self._journal_file(
+                    operation_id=operation_id,
+                    disposition=_JOURNAL_DELETE_PREVIEW,
+                    relative_path=path,
+                    staging_relative_path=None,
+                    content_type=stored_type,
+                    size_bytes=stored_size,
+                    content_digest=stored_digest,
+                )
+        report = self._drain_file_journal(operation_id)
         return {
             "evidence_id": evidence_id,
             "preview_revision_id": preview_revision_id,
             "availability": "unavailable",
             "reason": reason,
             "created": created,
-            "removed_preview_files": removed,
+            "removed_preview_files": report["preview_files_removed"],
             "authorized_for_handoff": False,
         }
 
@@ -1846,7 +2273,14 @@ class EvidenceStore:
         _identifier(organization_id, "$.organization_id")
         _identifier(project_id, "$.project_id")
         _identifier(session_id, "$.session_id")
-        with _savepoint(self.connection):
+        _require(
+            not self.connection.in_transaction,
+            "EVIDENCE_TRANSACTION_ACTIVE",
+            "$",
+            "session evidence deletion requires a standalone database boundary",
+        )
+        operation_id = "session_delete_" + uuid.uuid4().hex
+        with _durable_transaction(self.connection):
             manifests = [
                 int(row[0])
                 for row in self.connection.execute(
@@ -1870,7 +2304,8 @@ class EvidenceStore:
             if manifests:
                 marks = ",".join("?" for _ in manifests)
                 preview_rows = self.connection.execute(
-                    f"SELECT relative_path FROM tacua_evidence_preview_revisions "
+                    f"SELECT relative_path, content_type, size_bytes, content_digest "
+                    f"FROM tacua_evidence_preview_revisions "
                     f"WHERE manifest_row_id IN ({marks})",
                     manifests,
                 ).fetchall()
@@ -1889,11 +2324,21 @@ class EvidenceStore:
                 """,
                 (organization_id, project_id, session_id),
             ).fetchone()[0]
-            removed_files = sum(
-                1
-                for path in {row[0] for row in preview_rows if row[0] is not None}
-                if self._unlink(path)
-            )
+            preview_files = {
+                tuple(row)
+                for row in preview_rows
+                if row[0] is not None
+            }
+            for path, stored_type, stored_size, stored_digest in preview_files:
+                self._journal_file(
+                    operation_id=operation_id,
+                    disposition=_JOURNAL_DELETE_PREVIEW,
+                    relative_path=path,
+                    staging_relative_path=None,
+                    content_type=stored_type,
+                    size_bytes=stored_size,
+                    content_digest=stored_digest,
+                )
             if manifests:
                 marks = ",".join("?" for _ in manifests)
                 self.connection.execute(
@@ -1935,11 +2380,12 @@ class EvidenceStore:
                     session_id=session_id,
                     reason_code="session_deletion",
                 )
+        report = self._drain_file_journal(operation_id)
         return {
             "candidate_bindings": int(binding_count),
             "manifests": len(manifests),
             "manifest_items": int(membership_count),
             "items": len(items),
             "preview_revisions": len(preview_rows),
-            "preview_files": int(removed_files),
+            "preview_files": int(report["preview_files_removed"]),
         }

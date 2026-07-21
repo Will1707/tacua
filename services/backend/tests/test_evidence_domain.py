@@ -43,6 +43,10 @@ PNG = base64.b64decode(
 )
 
 
+class SimulatedProcessCrash(BaseException):
+    pass
+
+
 def available_item(
     evidence_id: str,
     evidence_type: str,
@@ -457,6 +461,199 @@ class EvidenceDomainTests(unittest.TestCase):
             ),
         )
 
+    def test_preview_write_crash_is_recovered_without_an_orphan(self) -> None:
+        self.put_manifest()
+        original_write = self.store._write
+
+        def crash_after_write(relative_path, staging_relative_path, body):
+            original_write(relative_path, staging_relative_path, body)
+            raise SimulatedProcessCrash()
+
+        self.store._write = crash_after_write
+        with self.assertRaises(SimulatedProcessCrash):
+            self.put_preview()
+        self.assertEqual(
+            1,
+            self.connection.execute(
+                "SELECT COUNT(*) FROM tacua_evidence_file_journal"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.connection.execute(
+                "SELECT COUNT(*) FROM tacua_evidence_preview_revisions"
+            ).fetchone()[0],
+        )
+        self.assertEqual(1, len([path for path in self.root.rglob("*") if path.is_file()]))
+
+        recovered = EvidenceStore(self.connection, self.root)
+        report = recovered.recover_file_journal()
+        self.assertEqual(1, report["journal_entries"])
+        self.assertEqual(1, report["preview_files_removed"])
+        self.assertEqual([], [path for path in self.root.rglob("*") if path.is_file()])
+        self.store = recovered
+        self.assertTrue(self.put_preview()["created"])
+
+    def test_file_journal_survives_database_connection_restart(self) -> None:
+        database = Path(self.temporary.name) / "evidence.sqlite3"
+        root = Path(self.temporary.name) / "restart-derived"
+        connection = sqlite3.connect(database)
+        initialize_schema(connection)
+        store = EvidenceStore(connection, root)
+        values = dict(self.binding)
+        values.pop("manifest_digest")
+        store.put_manifest(manifest=self.manifest, **values)
+        original_write = store._write
+
+        def crash_after_write(relative_path, staging_relative_path, body):
+            original_write(relative_path, staging_relative_path, body)
+            raise SimulatedProcessCrash()
+
+        store._write = crash_after_write
+        with self.assertRaises(SimulatedProcessCrash):
+            store.put_preview(
+                evidence_id="evidence_keyframe",
+                preview_revision_id="preview_restart",
+                content_type="image/png",
+                size_bytes=len(PNG),
+                content_digest=sha256_digest(PNG),
+                body=PNG,
+                **self.binding,
+            )
+        connection.close()
+
+        recovered_connection = sqlite3.connect(database)
+        try:
+            recovered = EvidenceStore(recovered_connection, root)
+            report = recovered.recover_file_journal()
+            self.assertEqual(1, report["journal_entries"])
+            self.assertEqual(1, report["preview_files_removed"])
+            self.assertEqual(
+                0,
+                recovered_connection.execute(
+                    "SELECT COUNT(*) FROM tacua_evidence_file_journal"
+                ).fetchone()[0],
+            )
+            self.assertEqual([], [path for path in root.rglob("*") if path.is_file()])
+        finally:
+            recovered_connection.close()
+
+    def test_recovery_preserves_a_committed_verified_preview(self) -> None:
+        self.put_manifest()
+        self.put_preview()
+        row = self.connection.execute(
+            """
+            SELECT relative_path, content_type, size_bytes, content_digest
+              FROM tacua_evidence_preview_revisions
+            """
+        ).fetchone()
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO tacua_evidence_file_journal (
+                    operation_id, disposition, relative_path,
+                    staging_relative_path, content_type, size_bytes,
+                    content_digest, recorded_at
+                ) VALUES (?, 'discard_uncommitted_preview', ?, NULL, ?, ?, ?, ?)
+                """,
+                (
+                    "preview_recover_ambiguous",
+                    row[0],
+                    row[1],
+                    row[2],
+                    row[3],
+                    "2026-07-21T10:00:03Z",
+                ),
+            )
+        report = self.store.recover_file_journal()
+        self.assertEqual(1, report["committed_previews_preserved"])
+        self.assertEqual(PNG, self.store.get_preview(
+            evidence_id="evidence_keyframe", **self.binding
+        )["body"])
+
+    def test_recovery_refuses_a_forged_cleanup_for_an_active_preview(self) -> None:
+        self.put_manifest()
+        self.put_preview()
+        row = self.connection.execute(
+            """
+            SELECT relative_path, content_type, size_bytes, content_digest
+              FROM tacua_evidence_preview_revisions
+            """
+        ).fetchone()
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO tacua_evidence_file_journal (
+                    operation_id, disposition, relative_path,
+                    staging_relative_path, content_type, size_bytes,
+                    content_digest, recorded_at
+                ) VALUES (?, 'delete_committed_preview', ?, NULL, ?, ?, ?, ?)
+                """,
+                (
+                    "preview_forged_cleanup",
+                    row[0],
+                    row[1],
+                    row[2],
+                    row[3],
+                    "2026-07-21T10:00:03Z",
+                ),
+            )
+        self.assert_error(
+            "FILE_JOURNAL_INVALID", self.store.recover_file_journal
+        )
+        self.assertEqual(
+            PNG,
+            self.store.get_preview(
+                evidence_id="evidence_keyframe", **self.binding
+            )["body"],
+        )
+
+    def test_approval_keyframes_are_reverified_without_changing_reviewer_view(self) -> None:
+        self.put_manifest()
+        self.put_preview()
+        verified = self.store.get_verified_keyframes_for_approval(
+            evidence_ids=["evidence_keyframe"], **self.binding
+        )
+        self.assertEqual(PNG, verified["verified_keyframes"][0]["body"])
+        self.assertEqual(
+            sha256_digest(PNG),
+            verified["verified_keyframes"][0]["content_digest"],
+        )
+        self.assertFalse(verified["authorized_for_handoff"])
+
+        relative_path = self.connection.execute(
+            "SELECT relative_path FROM tacua_evidence_preview_revisions"
+        ).fetchone()[0]
+        (self.root / relative_path).write_bytes(PNG + b"tampered")
+        view = self.store.get_candidate_evidence_view(
+            diagnostic_events=[], **self.binding
+        )
+        keyframe = next(
+            item
+            for item in view["items"]
+            if item["evidence_id"] == "evidence_keyframe"
+        )
+        self.assertEqual("available", keyframe["preview"]["status"])
+        self.assert_error(
+            "STORED_PREVIEW_TAMPERED",
+            lambda: self.store.get_verified_keyframes_for_approval(
+                evidence_ids=["evidence_keyframe"], **self.binding
+            ),
+        )
+        self.assert_error(
+            "APPROVAL_KEYFRAME_INVALID",
+            lambda: self.store.get_verified_keyframes_for_approval(
+                evidence_ids=["evidence_route"], **self.binding
+            ),
+        )
+        self.assert_error(
+            "APPROVAL_KEYFRAMES_INVALID",
+            lambda: self.store.get_verified_keyframes_for_approval(
+                evidence_ids=["evidence_keyframe", "evidence_keyframe"],
+                **self.binding,
+            ),
+        )
+
     def test_retention_expiry_preserves_manifest_metadata(self) -> None:
         self.put_manifest()
         self.put_preview()
@@ -495,6 +692,54 @@ class EvidenceDomainTests(unittest.TestCase):
         )
         self.assertFalse(retry["created"])
         self.assertEqual(0, retry["removed_preview_files"])
+
+    def test_retirement_crash_cannot_leave_an_available_view_with_missing_bytes(self) -> None:
+        self.put_manifest()
+        self.put_preview()
+        original_clear = self.store._clear_journal_row
+
+        def crash_before_journal_clear(journal_row_id):
+            raise SimulatedProcessCrash()
+
+        self.store._clear_journal_row = crash_before_journal_clear
+        with self.assertRaises(SimulatedProcessCrash):
+            self.store.mark_preview_unavailable(
+                evidence_id="evidence_keyframe",
+                preview_revision_id="preview_expired",
+                reason="outside_retention",
+                detail="Derived preview passed the configured retention deadline.",
+                **self.binding,
+            )
+        row = self.connection.execute(
+            """
+            SELECT availability FROM tacua_evidence_preview_revisions
+             ORDER BY preview_row_id DESC LIMIT 1
+            """
+        ).fetchone()
+        self.assertEqual(("unavailable",), tuple(row))
+        self.assertEqual(
+            1,
+            self.connection.execute(
+                "SELECT COUNT(*) FROM tacua_evidence_file_journal"
+            ).fetchone()[0],
+        )
+        self.assert_error(
+            "PREVIEW_UNAVAILABLE",
+            lambda: self.store.get_preview(
+                evidence_id="evidence_keyframe", **self.binding
+            ),
+        )
+
+        self.store._clear_journal_row = original_clear
+        report = self.store.recover_file_journal()
+        self.assertEqual(1, report["journal_entries"])
+        self.assertEqual(0, report["preview_files_removed"])
+        self.assertEqual(
+            0,
+            self.connection.execute(
+                "SELECT COUNT(*) FROM tacua_evidence_file_journal"
+            ).fetchone()[0],
+        )
 
     def test_session_deletion_removes_rows_and_files_idempotently(self) -> None:
         self.put_manifest()
@@ -545,6 +790,70 @@ class EvidenceDomainTests(unittest.TestCase):
             self.store.delete_session(
                 organization_id=ORG, project_id=PROJECT, session_id=SESSION
             ),
+        )
+
+    def test_session_deletion_crash_is_recoverable_after_metadata_commit(self) -> None:
+        self.put_manifest()
+        self.put_preview()
+        original_drain = self.store._drain_file_journal
+
+        def crash_before_file_cleanup(operation_id=None):
+            raise SimulatedProcessCrash()
+
+        self.store._drain_file_journal = crash_before_file_cleanup
+        with self.assertRaises(SimulatedProcessCrash):
+            self.store.delete_session(
+                organization_id=ORG, project_id=PROJECT, session_id=SESSION
+            )
+        self.assertEqual(
+            0,
+            self.connection.execute(
+                "SELECT COUNT(*) FROM tacua_candidate_evidence_bindings"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            self.connection.execute(
+                "SELECT COUNT(*) FROM tacua_evidence_file_journal"
+            ).fetchone()[0],
+        )
+        self.assertEqual(1, len([path for path in self.root.rglob("*") if path.is_file()]))
+
+        self.store._drain_file_journal = original_drain
+        report = self.store.recover_file_journal()
+        self.assertEqual(1, report["preview_files_removed"])
+        self.assertEqual([], [path for path in self.root.rglob("*") if path.is_file()])
+
+    def test_filesystem_operations_reject_caller_rollback_boundaries(self) -> None:
+        self.put_manifest()
+        self.put_preview()
+        self.connection.execute("BEGIN")
+        try:
+            self.assert_error(
+                "EVIDENCE_TRANSACTION_ACTIVE",
+                lambda: self.store.mark_preview_unavailable(
+                    evidence_id="evidence_keyframe",
+                    preview_revision_id="preview_expired",
+                    reason="outside_retention",
+                    detail="Retention expired.",
+                    **self.binding,
+                ),
+            )
+            self.assert_error(
+                "EVIDENCE_TRANSACTION_ACTIVE",
+                lambda: self.store.delete_session(
+                    organization_id=ORG,
+                    project_id=PROJECT,
+                    session_id=SESSION,
+                ),
+            )
+        finally:
+            self.connection.rollback()
+        self.assertEqual(
+            PNG,
+            self.store.get_preview(
+                evidence_id="evidence_keyframe", **self.binding
+            )["body"],
         )
 
     def test_audit_schema_and_rows_are_content_free(self) -> None:
