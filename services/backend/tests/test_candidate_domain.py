@@ -142,6 +142,22 @@ class CandidateDomainTests(unittest.TestCase):
         self.assertIsNone(result["rejection"])
         TICKET_CONTRACT.validate_chain([*stored, result])
 
+    def test_draft_can_answer_its_first_blocking_clarification(self) -> None:
+        stored = chain(1)
+        parent = stored[-1]
+
+        result = apply_transition(
+            stored,
+            REVIEWER,
+            transition_body(parent, "resolve_clarification"),
+            at("2026-07-21T10:01:00Z"),
+        )
+
+        self.assertEqual("draft", result["transition"]["from_state"])
+        self.assertEqual("ready_for_review", result["state"])
+        self.assertEqual("clarification_answered", result["lineage"]["operation"])
+        TICKET_CONTRACT.validate_chain([*stored, result])
+
     def test_resolution_remains_needs_clarification_while_blocker_remains(self) -> None:
         stored = chain(2)
         parent = stored[-1]

@@ -229,10 +229,10 @@ def _resolve_clarification(
     body: dict[str, Any],
 ) -> str:
     _require(
-        candidate["state"] == "needs_clarification",
+        candidate["state"] in {"draft", "needs_clarification"},
         "ILLEGAL_TRANSITION_ACTION",
         "$.action",
-        "clarification resolution requires a needs_clarification parent",
+        "clarification resolution requires a draft or needs_clarification parent",
     )
     clarification = next(
         (
