@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { useLocalSearchParams } from "expo-router";
-import { useCallback, useEffect, useState } from "react";
+import type { File } from "expo-file-system";
+import * as Sharing from "expo-sharing";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Alert, Pressable, ScrollView, Text, TextInput, View } from "react-native";
 
 import { TacuaApiError } from "@/api/client";
 import type { CandidateEvidenceView, TicketCandidate } from "@/api/types";
+import { cleanupApprovedHandoffShareCache, createApprovedHandoffShareFile } from "@/approved-handoff/share-cache";
 import { ActionButton } from "@/components/action-button";
 import { CandidateEvidencePanel } from "@/components/candidate-evidence-panel";
 import { MessageState } from "@/components/message-state";
@@ -13,6 +16,19 @@ import { SectionCard } from "@/components/section-card";
 import { StatusPill } from "@/components/status-pill";
 import { useBackend } from "@/hooks/use-backend";
 import { colors } from "@/theme/colors";
+
+const handoffShareTypes = {
+  markdown: {
+    extension: "md",
+    mimeType: "text/markdown",
+    UTI: "net.daringfireball.markdown",
+  },
+  json: {
+    extension: "json",
+    mimeType: "application/vnd.tacua.approved-handoff+json;version=1.1.0",
+    UTI: "public.json",
+  },
+} as const;
 
 export default function CandidateRoute() {
   const { "candidate-id": candidateId } = useLocalSearchParams<{ "candidate-id": string }>();
@@ -24,12 +40,29 @@ export default function CandidateRoute() {
   const [evidenceInspectionReady, setEvidenceInspectionReady] = useState(false);
   const [loading, setLoading] = useState(true);
   const [action, setAction] = useState<string | null>(null);
+  const [handoffAction, setHandoffAction] = useState<"json" | "markdown" | null>(null);
+  const [handoffVerification, setHandoffVerification] = useState<{
+    readonly format: "json" | "markdown";
+    readonly handoffDigest: string;
+    readonly bodyDigest: string;
+  } | null>(null);
+  const [handoffError, setHandoffError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [clarificationDraft, setClarificationDraft] = useState<{
     readonly clarificationId: string;
     readonly choiceId: string;
     readonly note: string;
   } | null>(null);
+  const mountedRef = useRef(false);
+  const handoffRequestSequence = useRef(0);
+  const handoffRequestRef = useRef<{
+    readonly requestId: number;
+    readonly candidateBinding: string;
+    readonly controller: AbortController;
+  } | null>(null);
+  const candidateBinding = candidate
+    ? `${candidateId ?? "missing-route"}:${candidate.candidate_id}:${candidate.candidate_version}:${candidate.candidate_digest}`
+    : null;
 
   const load = useCallback(async () => {
     if (!client || !candidateId) return;
@@ -41,6 +74,28 @@ export default function CandidateRoute() {
   }, [candidateId, client]);
 
   useEffect(() => { void load(); }, [load]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    try {
+      cleanupApprovedHandoffShareCache();
+    } catch {
+      // A later share will retry cleanup and fail closed if the bound cannot be enforced.
+    }
+    return () => {
+      mountedRef.current = false;
+      handoffRequestRef.current?.controller.abort();
+      handoffRequestRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    handoffRequestRef.current?.controller.abort();
+    handoffRequestRef.current = null;
+    setHandoffAction(null);
+    setHandoffVerification(null);
+    setHandoffError(null);
+  }, [candidateBinding, client]);
 
   useEffect(() => {
     let active = true;
@@ -110,6 +165,60 @@ export default function CandidateRoute() {
     } catch (caught) {
       await handleTransitionError("Clarification was not saved", caught);
     } finally { setAction(null); }
+  }
+
+  async function shareHandoff(format: "json" | "markdown") {
+    if (!client || !candidate || candidate.state !== "approved" || candidate.candidate_id !== candidateId) return;
+    const candidateSnapshot = candidate;
+    const requestBinding = `${candidateId}:${candidate.candidate_id}:${candidate.candidate_version}:${candidate.candidate_digest}`;
+    const requestId = handoffRequestSequence.current + 1;
+    handoffRequestSequence.current = requestId;
+    handoffRequestRef.current?.controller.abort();
+    const controller = new AbortController();
+    handoffRequestRef.current = { requestId, candidateBinding: requestBinding, controller };
+    const isCurrentRequest = () => (
+      mountedRef.current
+      && !controller.signal.aborted
+      && handoffRequestRef.current?.requestId === requestId
+      && handoffRequestRef.current.candidateBinding === requestBinding
+    );
+    setHandoffAction(format);
+    setHandoffError(null);
+    try {
+      if (!await Sharing.isAvailableAsync()) {
+        throw new Error("File sharing is unavailable on this device.");
+      }
+      const artifact = await client.getCandidateHandoff(candidateSnapshot, format, controller.signal);
+      if (!isCurrentRequest()) return;
+      setHandoffVerification({
+        format,
+        handoffDigest: artifact.handoffDigest,
+        bodyDigest: artifact.bodyDigest,
+      });
+      const shareType = handoffShareTypes[format];
+      const sharedFile: File = createApprovedHandoffShareFile({
+        candidateId: candidateSnapshot.candidate_id,
+        candidateVersion: candidateSnapshot.candidate_version,
+        extension: shareType.extension,
+        bytes: artifact.bytes,
+      });
+      if (!isCurrentRequest()) return;
+      await Sharing.shareAsync(sharedFile.uri, {
+        dialogTitle: `${candidateSnapshot.content.title} · Tacua handoff`,
+        mimeType: shareType.mimeType,
+        UTI: shareType.UTI,
+      });
+    } catch (caught) {
+      if (!isCurrentRequest()) return;
+      const message = caught instanceof Error ? caught.message : "Tacua could not share the approved handoff.";
+      setHandoffError(message);
+      Alert.alert("Handoff unavailable", message);
+    } finally {
+      if (handoffRequestRef.current?.requestId === requestId) {
+        handoffRequestRef.current = null;
+        if (mountedRef.current) setHandoffAction(null);
+      }
+    }
   }
 
   if (loading && !candidate) return <View style={{ flex: 1, justifyContent: "center" }}><ActivityIndicator /></View>;
@@ -285,9 +394,41 @@ export default function CandidateRoute() {
         </SectionCard>
       ) : null}
 
+      {candidate.state === "approved" ? (
+        <SectionCard title="Agent handoff">
+          <Text selectable style={{ color: colors.label, lineHeight: 21 }}>
+            This exact approved version has immutable Markdown and JSON handoffs ready to pass to an implementation agent.
+          </Text>
+          <Text selectable style={{ color: colors.secondaryLabel, fontSize: 13, lineHeight: 18 }}>
+            The files are structural artifacts. An agent must still validate execution authority against a separately trusted registry before changing code.
+          </Text>
+          {handoffVerification ? (
+            <View style={{ gap: 4 }}>
+              <Text selectable style={{ color: colors.tertiaryLabel, fontSize: 12 }}>Handoff: {handoffVerification.handoffDigest}</Text>
+              <Text selectable style={{ color: colors.tertiaryLabel, fontSize: 12 }}>
+                {handoffVerification.format === "markdown" ? "Markdown" : "JSON"} file: {handoffVerification.bodyDigest}
+              </Text>
+            </View>
+          ) : null}
+          {handoffError ? <Text selectable style={{ color: colors.red, fontSize: 13 }}>{handoffError}</Text> : null}
+          <ActionButton
+            label="Share Markdown handoff"
+            loading={handoffAction === "markdown"}
+            disabled={handoffAction !== null}
+            onPress={() => void shareHandoff("markdown")}
+          />
+          <ActionButton
+            label="Share JSON handoff"
+            loading={handoffAction === "json"}
+            disabled={handoffAction !== null}
+            onPress={() => void shareHandoff("json")}
+          />
+        </SectionCard>
+      ) : null}
+
       <View style={{ gap: 10, paddingTop: 4 }}>
         {candidate.state === "draft" || candidate.state === "needs_clarification" ? <ActionButton label="Mark ready for review" disabled={unresolved.some((item) => item.impact === "blocking")} loading={action === "mark_ready"} onPress={() => void transition("mark_ready", "Reviewer completed candidate preparation.")} /> : null}
-        {candidate.state === "ready_for_review" ? <ActionButton label="Approve exact version" disabled={!evidenceInspectionReady || evidenceLoading || evidenceError !== null} loading={action === "approve"} onPress={() => Alert.alert("Approve this ticket?", "Approval binds this exact candidate digest. It does not authorize a coding agent until an approved handoff is exported.", [{ text: "Cancel", style: "cancel" }, { text: "Approve", onPress: () => void transition("approve", "Reviewer approved the exact candidate version.") }])} /> : null}
+        {candidate.state === "ready_for_review" ? <ActionButton label="Approve exact version" disabled={!evidenceInspectionReady || evidenceLoading || evidenceError !== null} loading={action === "approve"} onPress={() => Alert.alert("Approve this ticket?", "Approval binds this exact candidate and evidence and atomically creates its immutable handoff. The handoff is not authenticated execution trust by itself.", [{ text: "Cancel", style: "cancel" }, { text: "Approve", onPress: () => void transition("approve", "Reviewer approved the exact candidate version.") }])} /> : null}
         {candidate.state === "needs_clarification" || candidate.state === "ready_for_review" ? <ActionButton destructive label="Reject candidate" loading={action === "reject"} onPress={() => Alert.alert("Reject this candidate?", undefined, [{ text: "Cancel", style: "cancel" }, { text: "Reject", style: "destructive", onPress: () => void transition("reject", "Reviewer rejected the candidate.") }])} /> : null}
       </View>
     </ScrollView>

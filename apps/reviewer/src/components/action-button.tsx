@@ -17,6 +17,7 @@ export function ActionButton({ label, onPress, disabled = false, loading = false
   const foreground = destructive ? colors.systemBackground : colors.onPrimary;
   return (
     <Pressable
+      accessibilityLabel={label}
       accessibilityRole="button"
       accessibilityState={{ disabled: disabled || loading, busy: loading }}
       disabled={disabled || loading}

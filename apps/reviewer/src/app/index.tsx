@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, AppState, Pressable, RefreshControl, ScrollView, Text, View } from "react-native";
 
 import type { CaptureSession } from "@/api/types";
+import { ActionButton } from "@/components/action-button";
 import { LaunchReviewCard } from "@/components/launch-review-card";
 import { MessageState } from "@/components/message-state";
 import { StatusPill } from "@/components/status-pill";
@@ -15,21 +16,69 @@ import { formatDate } from "@/utils/format";
 export default function ReviewsRoute() {
   const { client, config, loading: configLoading } = useBackend();
   const [sessions, setSessions] = useState<readonly CaptureSession[]>([]);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [pageError, setPageError] = useState<string | null>(null);
+  const refreshGeneration = useRef(0);
+  const pageRequestGeneration = useRef(0);
+  const loadingMoreRef = useRef(false);
 
   const refresh = useCallback(async () => {
     if (!client) return;
+    const generation = ++refreshGeneration.current;
+    ++pageRequestGeneration.current;
+    loadingMoreRef.current = false;
     setLoading(true);
+    setLoadingMore(false);
     setError(null);
+    setPageError(null);
     try {
-      setSessions(await client.listSessions());
+      const page = await client.listSessions();
+      if (generation !== refreshGeneration.current) return;
+      setSessions(page.sessions);
+      setNextCursor(page.next_cursor);
     } catch (caught) {
+      if (generation !== refreshGeneration.current) return;
       setError(caught instanceof Error ? caught.message : "Tacua could not load review sessions.");
     } finally {
-      setLoading(false);
+      if (generation === refreshGeneration.current) setLoading(false);
     }
   }, [client]);
+
+  const loadMore = useCallback(async () => {
+    if (!client || !nextCursor || loading || loadingMoreRef.current) return;
+    const refreshAtStart = refreshGeneration.current;
+    const requestGeneration = ++pageRequestGeneration.current;
+    loadingMoreRef.current = true;
+    setLoadingMore(true);
+    setPageError(null);
+    try {
+      const page = await client.listSessions(nextCursor);
+      if (
+        refreshAtStart !== refreshGeneration.current
+        || requestGeneration !== pageRequestGeneration.current
+      ) return;
+      setSessions((current) => {
+        const known = new Set(current.map((session) => session.session_id));
+        return [...current, ...page.sessions.filter((session) => !known.has(session.session_id))];
+      });
+      setNextCursor(page.next_cursor);
+    } catch (caught) {
+      if (
+        refreshAtStart === refreshGeneration.current
+        && requestGeneration === pageRequestGeneration.current
+      ) {
+        setPageError(caught instanceof Error ? caught.message : "Tacua could not load more review sessions.");
+      }
+    } finally {
+      if (requestGeneration === pageRequestGeneration.current) {
+        loadingMoreRef.current = false;
+        setLoadingMore(false);
+      }
+    }
+  }, [client, loading, nextCursor]);
 
   useEffect(() => {
     void refresh();
@@ -85,6 +134,8 @@ export default function ReviewsRoute() {
           <Link.Preview />
         </Link>
       ))}
+      {pageError ? <MessageState title="Could not load more sessions" detail={pageError} /> : null}
+      {nextCursor ? <ActionButton label="Load 50 more sessions" onPress={() => void loadMore()} loading={loadingMore} disabled={loading} /> : null}
     </ScrollView>
   );
 }

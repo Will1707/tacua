@@ -9,9 +9,15 @@ The current scaffold can connect to the pilot backend's session/job endpoints.
 Its ticket UI is typed against the standalone `tacua.ticket-candidate@1.0.0`
 contract and shows grounded behavior, reproduction, scope, uncertainty, visual
 clarification choices, and the exact candidate/evidence digests being approved.
-Candidate endpoints and launch-code orchestration remain blocked until the
-backend transition API is implemented. A failed candidate request is
-intentionally not treated as an empty approval.
+An approved version exposes its immutable `tacua.approved-handoff@1.1.0`
+Markdown and JSON files through the native share sheet. Before sharing, the app
+hashes the exact bounded response bytes, validates canonical JSON and the
+embedded exact source candidate, then writes a uniquely named file in a
+dedicated share cache. The cache keeps at most ten files, removes entries older
+than one hour on route mount and before sharing, and retains a just-shared file
+long enough for the receiving app to consume it. These are structural exports;
+execution trust remains a separate authenticated registry decision. A failed
+candidate or handoff request is intentionally not treated as an empty approval.
 
 ## Local development
 

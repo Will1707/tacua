@@ -3,7 +3,8 @@
 export type RetentionSummary = {
   readonly policy_version: string;
   readonly raw_media_expires_at: string;
-  readonly deletion_status: "active" | "deletion_requested" | "deleted";
+  readonly derived_data_expires_at: string;
+  readonly deletion_status: "active" | "deleting" | "deleted";
 };
 
 export type UploadReceipt = {
@@ -41,13 +42,37 @@ export type CaptureSession = {
   readonly build_id: string;
   readonly consent_contract: string;
   readonly state: string;
+  readonly scope_digest: string;
+  readonly build_identity_digest: string;
   readonly created_at: string;
   readonly completed_at: string | null;
+  readonly completion_id: string | null;
   readonly retention: RetentionSummary;
   readonly manifest_digest: string | null;
   readonly segments?: readonly UploadReceipt[];
   readonly diagnostics?: readonly DiagnosticSummary[];
   readonly jobs?: readonly ProcessingJob[];
+};
+
+export type SessionPage = {
+  readonly sessions: readonly CaptureSession[];
+  readonly next_cursor: string | null;
+};
+
+export type TicketCandidateSummary = {
+  readonly candidate_id: string;
+  readonly candidate_version: number;
+  readonly candidate_digest: string;
+  readonly state: CandidateState;
+  readonly priority: "P0" | "P1" | "P2" | "P3";
+  readonly title: string;
+  readonly summary: string;
+  readonly version_created_at: string;
+};
+
+export type CandidatePage = {
+  readonly candidates: readonly TicketCandidateSummary[];
+  readonly next_cursor: string | null;
 };
 
 export type RegisteredBuild = {
@@ -358,4 +383,13 @@ export type EvidencePreview = {
   readonly contentType: "image/png" | "image/jpeg" | "image/webp";
   readonly sizeBytes: number;
   readonly contentDigest: string;
+};
+
+export type ApprovedHandoffArtifact = {
+  readonly format: "json" | "markdown";
+  readonly bytes: Uint8Array;
+  readonly bodyDigest: string;
+  readonly handoffDigest: string;
+  readonly candidateDigest: string;
+  readonly candidateVersion: number;
 };

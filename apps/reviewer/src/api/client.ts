@@ -2,15 +2,27 @@
 
 import type { BackendConfig } from "@/config/backend-config";
 import type {
+  ApprovedHandoffArtifact,
+  CandidatePage,
   CandidateEvidenceView,
   CaptureSession,
   EvidencePreview,
   LaunchGrant,
   ProcessingJob,
   RegisteredBuild,
+  SessionPage,
   TicketCandidate,
 } from "@/api/types";
+import * as Crypto from "expo-crypto";
 import { fetch, type FetchRequestInit } from "expo/fetch";
+
+import {
+  ApprovedHandoffValidationError,
+  approvedHandoffMediaType,
+  maximumJsonHandoffBytes,
+  maximumMarkdownHandoffBytes,
+  validateApprovedHandoffArtifact,
+} from "@/approved-handoff/contract";
 
 const maximumResponseCharacters = 2_000_000;
 const maximumEvidencePreviewBytes = 2 * 1_024 * 1_024;
@@ -63,12 +75,81 @@ function isDigest(value: unknown): value is string {
 }
 
 function isTimestamp(value: unknown): value is string {
-  if (typeof value !== "string" || !/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/.test(value)) {
+  if (
+    typeof value !== "string"
+    || value.startsWith("0000-")
+    || !/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/.test(value)
+  ) {
     return false;
   }
   const parsed = new Date(value);
   return !Number.isNaN(parsed.valueOf())
     && parsed.toISOString() === `${value.slice(0, -1)}.000Z`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function validatePageCursor(value: unknown): value is string | null {
+  return value === null || (
+    typeof value === "string"
+    && value.length >= 1
+    && value.length <= 512
+    && value.length % 4 !== 1
+    && /^[A-Za-z0-9_-]+$/.test(value)
+  );
+}
+
+function pageHeaders(cursor?: string): HeadersInit | undefined {
+  if (cursor === undefined) return undefined;
+  if (!validatePageCursor(cursor) || cursor === null) {
+    throw new TacuaApiError(0, "INVALID_PAGE_CURSOR", "The Tacua page cursor is invalid.");
+  }
+  return { "Tacua-Page-Cursor": cursor };
+}
+
+function isSessionSummary(value: unknown): value is CaptureSession {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    "session_id", "organization_id", "project_id", "application_id", "build_id", "consent_contract", "state",
+    "scope_digest", "build_identity_digest", "created_at", "completed_at", "completion_id", "manifest_digest", "retention",
+  ])) return false;
+  if (!isRecord(value.retention) || !hasExactKeys(value.retention, ["policy_version", "raw_media_expires_at", "derived_data_expires_at", "deletion_status"])) return false;
+  const baseIsValid = isIdentifier(value.session_id)
+    && isIdentifier(value.organization_id)
+    && isIdentifier(value.project_id)
+    && isIdentifier(value.application_id)
+    && isIdentifier(value.build_id)
+    && typeof value.consent_contract === "string"
+    && value.consent_contract.length >= 1
+    && value.consent_contract.length <= 128
+    && ["receiving", "completed"].includes(value.state as string)
+    && isDigest(value.scope_digest)
+    && isDigest(value.build_identity_digest)
+    && isTimestamp(value.created_at)
+    && (value.completed_at === null || isTimestamp(value.completed_at))
+    && (value.completion_id === null || isIdentifier(value.completion_id))
+    && (value.manifest_digest === null || isDigest(value.manifest_digest))
+    && typeof value.retention.policy_version === "string"
+    && value.retention.policy_version.length >= 1
+    && value.retention.policy_version.length <= 128
+    && isTimestamp(value.retention.raw_media_expires_at)
+    && isTimestamp(value.retention.derived_data_expires_at)
+    && value.retention.deletion_status === "active";
+  if (!baseIsValid) return false;
+  const completionIsAbsent = value.completed_at === null && value.completion_id === null && value.manifest_digest === null;
+  const completionIsPresent = value.completed_at !== null && value.completion_id !== null && value.manifest_digest !== null;
+  const createdAt = Date.parse(value.created_at as string);
+  const rawExpiresAt = Date.parse(value.retention.raw_media_expires_at as string);
+  const derivedExpiresAt = Date.parse(value.retention.derived_data_expires_at as string);
+  const retentionIsOrdered = createdAt <= rawExpiresAt && rawExpiresAt <= derivedExpiresAt;
+  return retentionIsOrdered && ((value.state === "receiving" && completionIsAbsent)
+    || (
+      value.state === "completed"
+      && completionIsPresent
+      && createdAt <= Date.parse(value.completed_at as string)
+      && Date.parse(value.completed_at as string) <= rawExpiresAt
+    ));
 }
 
 function bytesToBase64(bytes: Uint8Array): string {
@@ -93,13 +174,16 @@ function bytesToBase64(bytes: Uint8Array): string {
   return chunks.join("");
 }
 
+async function sha256Digest(bytes: Uint8Array): Promise<string> {
+  const digestInput = new Uint8Array(new ArrayBuffer(bytes.byteLength));
+  digestInput.set(bytes);
+  const digest = new Uint8Array(await Crypto.digest(Crypto.CryptoDigestAlgorithm.SHA256, digestInput));
+  return `sha256:${Array.from(digest, (value) => value.toString(16).padStart(2, "0")).join("")}`;
+}
+
 async function readBoundedBytes(response: Response, maximum: number): Promise<Uint8Array> {
   if (!response.body) {
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.byteLength > maximum) {
-      throw new TacuaApiError(502, "RESPONSE_TOO_LARGE", "The evidence preview exceeded the reviewer limit.");
-    }
-    return bytes;
+    throw new TacuaApiError(502, "RESPONSE_STREAM_REQUIRED", "The backend response could not be read within the reviewer limit.");
   }
 
   const reader = response.body.getReader();
@@ -112,7 +196,7 @@ async function readBoundedBytes(response: Response, maximum: number): Promise<Ui
       length += result.value.byteLength;
       if (length > maximum) {
         await reader.cancel();
-        throw new TacuaApiError(502, "RESPONSE_TOO_LARGE", "The evidence preview exceeded the reviewer limit.");
+        throw new TacuaApiError(502, "RESPONSE_TOO_LARGE", "The backend response exceeded the reviewer limit.");
       }
       chunks.push(result.value);
     }
@@ -203,9 +287,21 @@ export class TacuaApiClient {
     }
   }
 
-  async listSessions(): Promise<readonly CaptureSession[]> {
-    const response = await this.request<{ readonly sessions: readonly CaptureSession[] }>("/v1/admin/sessions");
-    return response.sessions;
+  async listSessions(cursor?: string): Promise<SessionPage> {
+    const response = await this.request<SessionPage>("/v1/admin/sessions", { headers: pageHeaders(cursor) });
+    if (
+      !isRecord(response)
+      || !hasExactKeys(response, ["sessions", "next_cursor"])
+      || !Array.isArray(response.sessions)
+      || response.sessions.length > 50
+      || response.sessions.some((session) => !isSessionSummary(session))
+      || new Set(response.sessions.map((session) => session.session_id)).size !== response.sessions.length
+      || (response.next_cursor !== null && response.sessions.length !== 50)
+      || !validatePageCursor(response.next_cursor)
+    ) {
+      throw new TacuaApiError(502, "INVALID_SESSION_PAGE", "The backend returned an invalid session page.");
+    }
+    return response;
   }
 
   async listBuilds(): Promise<readonly RegisteredBuild[]> {
@@ -292,11 +388,41 @@ export class TacuaApiClient {
     return response.jobs;
   }
 
-  async listCandidates(sessionId: string): Promise<readonly TicketCandidate[]> {
-    const response = await this.request<{ readonly candidates: readonly TicketCandidate[] }>(
+  async listCandidates(sessionId: string, cursor?: string): Promise<CandidatePage> {
+    if (!isIdentifier(sessionId)) throw new TacuaApiError(0, "INVALID_SESSION_ID", "The session identifier is invalid.");
+    const response = await this.request<CandidatePage>(
       `/v1/admin/sessions/${encodeURIComponent(sessionId)}/candidates`,
+      { headers: pageHeaders(cursor) },
     );
-    return response.candidates;
+    if (
+      !isRecord(response)
+      || !hasExactKeys(response, ["candidates", "next_cursor"])
+      || !Array.isArray(response.candidates)
+      || response.candidates.length > 50
+      || !validatePageCursor(response.next_cursor)
+      || (response.next_cursor !== null && response.candidates.length !== 50)
+      || response.candidates.some((candidate) => (
+        !isRecord(candidate)
+        || !hasExactKeys(candidate, ["candidate_id", "candidate_version", "candidate_digest", "state", "priority", "title", "summary", "version_created_at"])
+        || !isIdentifier(candidate.candidate_id)
+        || !Number.isSafeInteger(candidate.candidate_version)
+        || (candidate.candidate_version as number) < 1
+        || !isDigest(candidate.candidate_digest)
+        || !["draft", "needs_clarification", "ready_for_review", "rejected", "approved"].includes(candidate.state as string)
+        || !["P0", "P1", "P2", "P3"].includes(candidate.priority as string)
+        || typeof candidate.title !== "string"
+        || Array.from(candidate.title).length < 1
+        || Array.from(candidate.title).length > 256
+        || typeof candidate.summary !== "string"
+        || Array.from(candidate.summary).length < 1
+        || Array.from(candidate.summary).length > 4096
+        || !isTimestamp(candidate.version_created_at)
+      ))
+      || new Set(response.candidates.map((candidate) => candidate.candidate_id)).size !== response.candidates.length
+    ) {
+      throw new TacuaApiError(502, "INVALID_CANDIDATE_PAGE", "The backend returned an invalid candidate page.");
+    }
+    return response;
   }
 
   getCandidate(candidateId: string): Promise<TicketCandidate> {
@@ -434,6 +560,152 @@ export class TacuaApiClient {
       throw new TacuaApiError(0, "NETWORK_ERROR", "Tacua could not load the evidence preview.");
     } finally {
       clearTimeout(timeout);
+    }
+  }
+
+  async getCandidateHandoff(
+    candidate: TicketCandidate,
+    format: "json" | "markdown",
+    externalSignal?: AbortSignal,
+  ): Promise<ApprovedHandoffArtifact> {
+    if (candidate.state !== "approved") {
+      throw new TacuaApiError(0, "HANDOFF_NOT_APPROVED", "Only an approved ticket has an agent handoff.");
+    }
+    if (
+      !isIdentifier(candidate.organization_id)
+      || !isIdentifier(candidate.project_id)
+      || !isIdentifier(candidate.candidate_id)
+      || !Number.isSafeInteger(candidate.candidate_version)
+      || candidate.candidate_version < 1
+      || !isDigest(candidate.candidate_digest)
+      || !isDigest(candidate.candidate_content_digest)
+    ) {
+      throw new TacuaApiError(0, "HANDOFF_CANDIDATE_INVALID", "The approved ticket binding was invalid.");
+    }
+    const extension = format === "markdown" ? "md" : "json";
+    const path = `/v1/admin/candidates/${encodeURIComponent(candidate.candidate_id)}/versions/${candidate.candidate_version}/handoff.${extension}`;
+    const endpoint = new URL(path, `${this.config.baseUrl}/`);
+    if (!path.startsWith("/") || path.startsWith("//") || endpoint.origin !== this.config.baseUrl) {
+      throw new TacuaApiError(0, "INVALID_REQUEST_ORIGIN", "The Tacua handoff request escaped the configured backend.");
+    }
+
+    const expectedContentType = format === "markdown"
+      ? "text/markdown; charset=utf-8"
+      : approvedHandoffMediaType;
+    const maximumBytes = format === "markdown"
+      ? maximumMarkdownHandoffBytes
+      : maximumJsonHandoffBytes;
+    const controller = new AbortController();
+    let timedOut = false;
+    const abortFromCaller = () => controller.abort();
+    if (externalSignal?.aborted) controller.abort();
+    else externalSignal?.addEventListener("abort", abortFromCaller, { once: true });
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, 15_000);
+    const throwIfCancelled = () => {
+      if (!controller.signal.aborted) return;
+      if (timedOut && !externalSignal?.aborted) {
+        throw new TacuaApiError(408, "REQUEST_TIMEOUT", "The approved handoff did not respond in time.");
+      }
+      throw new TacuaApiError(499, "HANDOFF_REQUEST_CANCELLED", "The approved handoff request was cancelled.");
+    };
+    try {
+      const response = await fetch(endpoint, {
+        method: "GET",
+        credentials: "omit",
+        redirect: "error",
+        headers: {
+          Accept: expectedContentType,
+          Authorization: `Bearer ${this.config.adminToken}`,
+          "Cache-Control": "no-store",
+        },
+        signal: controller.signal,
+      });
+      if (new URL(response.url).origin !== this.config.baseUrl || response.redirected) {
+        throw new TacuaApiError(502, "UNEXPECTED_RESPONSE_ORIGIN", "The handoff response came from another origin.");
+      }
+      const declaredLength = response.headers.get("Content-Length");
+      if (
+        declaredLength === null
+        || !/^\d+$/.test(declaredLength)
+        || Number(declaredLength) < 1
+        || Number(declaredLength) > maximumBytes
+      ) {
+        throw new TacuaApiError(502, "INVALID_HANDOFF_SIZE", "The backend returned an invalid handoff size.");
+      }
+      if (!response.ok) {
+        throw new TacuaApiError(response.status, "HANDOFF_DOWNLOAD_FAILED", "The approved handoff could not be downloaded.");
+      }
+      if (response.headers.get("Content-Type")?.toLowerCase() !== expectedContentType) {
+        throw new TacuaApiError(502, "INVALID_HANDOFF_TYPE", "The backend returned an unexpected handoff representation.");
+      }
+
+      const bodyDigest = response.headers.get("Tacua-Body-Digest");
+      const handoffDigest = response.headers.get("Tacua-Handoff-Digest");
+      const candidateDigest = response.headers.get("Tacua-Candidate-Digest");
+      const candidateVersion = response.headers.get("Tacua-Candidate-Version");
+      if (
+        !isDigest(bodyDigest)
+        || !isDigest(handoffDigest)
+        || candidateDigest !== candidate.candidate_digest
+        || candidateVersion !== String(candidate.candidate_version)
+        || response.headers.get("ETag") !== quotedEntityTag(bodyDigest)
+      ) {
+        throw new TacuaApiError(502, "HANDOFF_BINDING_MISMATCH", "The handoff was not bound to this exact approved ticket.");
+      }
+
+      const bytes = await readBoundedBytes(response, maximumBytes);
+      if (bytes.byteLength !== Number(declaredLength)) {
+        throw new TacuaApiError(502, "HANDOFF_LENGTH_MISMATCH", "The handoff length did not match its declaration.");
+      }
+      const computedBodyDigest = await sha256Digest(bytes);
+      throwIfCancelled();
+      if (computedBodyDigest !== bodyDigest) {
+        throw new TacuaApiError(502, "HANDOFF_BODY_DIGEST_MISMATCH", "The handoff bytes did not match their declared digest.");
+      }
+      let body: string;
+      try {
+        body = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      } catch {
+        throw new TacuaApiError(502, "INVALID_HANDOFF_ENCODING", "The handoff was not valid UTF-8.");
+      }
+      try {
+        await validateApprovedHandoffArtifact({
+          format,
+          text: body,
+          displayedCandidate: candidate,
+          expectedHandoffDigest: handoffDigest,
+          digest: sha256Digest,
+        });
+      } catch (error) {
+        if (error instanceof ApprovedHandoffValidationError) {
+          throw new TacuaApiError(502, error.code, `The approved handoff failed validation (${error.path}).`);
+        }
+        throw error;
+      }
+      throwIfCancelled();
+      return {
+        format,
+        bytes,
+        bodyDigest,
+        handoffDigest,
+        candidateDigest,
+        candidateVersion: candidate.candidate_version,
+      };
+    } catch (error) {
+      if (error instanceof TacuaApiError) throw error;
+      if (controller.signal.aborted && externalSignal?.aborted) {
+        throw new TacuaApiError(499, "HANDOFF_REQUEST_CANCELLED", "The approved handoff request was cancelled.");
+      }
+      if (controller.signal.aborted && timedOut) {
+        throw new TacuaApiError(408, "REQUEST_TIMEOUT", "The approved handoff did not respond in time.");
+      }
+      throw new TacuaApiError(0, "NETWORK_ERROR", "Tacua could not load the approved handoff.");
+    } finally {
+      clearTimeout(timeout);
+      externalSignal?.removeEventListener("abort", abortFromCaller);
     }
   }
 
