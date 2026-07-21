@@ -971,11 +971,13 @@ class BackendProtocolTests(BackendHarness):
         self.assertIn("scope_policy_digest", grant)
         self.assertNotIn("scope_digest", grant)
         scope = copy.deepcopy(self.scope)
-        scope["consent"]["granted_at"] = "2026-07-21T09:57:00Z"
+        consent_at = self.clock().strftime("%Y-%m-%dT%H:%M:%SZ")
+        scope["consent"]["granted_at"] = consent_at
         scope = seal(scope)
         request = fixture("launch-exchange-request")
         request["launch_code"] = grant["launch_code"]
         request["scope"] = scope
+        request["requested_at"] = consent_at
         request = seal(request)
         response = self.backend.exchange_launch_code(request)
         self.assertEqual(201, response.status)

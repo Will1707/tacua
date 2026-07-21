@@ -22,6 +22,8 @@ COPY --chown=root:root contracts/sdk-backend-protocol/src/ /app/contracts/sdk-ba
 COPY --chown=root:root contracts/sdk-backend-protocol/schemas/ /app/contracts/sdk-backend-protocol/schemas/
 COPY --chown=root:root contracts/runtime/src/ /app/contracts/runtime/src/
 COPY --chown=root:root contracts/runtime/schemas/ /app/contracts/runtime/schemas/
+COPY --chown=root:root contracts/ticket-candidate/src/ /app/contracts/ticket-candidate/src/
+COPY --chown=root:root contracts/ticket-candidate/schemas/ /app/contracts/ticket-candidate/schemas/
 
 USER 10001:10001
 VOLUME ["/var/lib/tacua"]

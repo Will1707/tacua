@@ -14,3 +14,8 @@
 !contracts/sdk-backend-protocol/src/**
 !contracts/sdk-backend-protocol/schemas/
 !contracts/sdk-backend-protocol/schemas/**
+!contracts/ticket-candidate/
+!contracts/ticket-candidate/src/
+!contracts/ticket-candidate/src/**
+!contracts/ticket-candidate/schemas/
+!contracts/ticket-candidate/schemas/**

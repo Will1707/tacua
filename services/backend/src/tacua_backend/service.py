@@ -64,6 +64,7 @@ SCHEMA_VERSION = 2
 INTERNAL_DELETION_RESOURCE = "tacua.internal-deletion-job@1.0.0"
 SCOPE_POLICY_CONTRACT = "tacua.capture-scope-policy@1.0.0"
 RETENTION_POLICY_VERSION = "tacua.retention-v1"
+MANIFEST_RETENTION_POLICY_VERSION = "tacua.retention@1.0.0"
 
 
 class ClosingConnection(sqlite3.Connection):
@@ -242,6 +243,10 @@ class PilotBackend:
             )
         ):
             raise ValueError("retention periods must be from 1 through 30 days")
+        if config.raw_retention_days != config.derived_retention_days:
+            raise ValueError(
+                "V1 raw and derived retention periods must use one session boundary"
+            )
         if not 300 <= config.credential_ttl_seconds <= 2_592_000:
             raise ValueError("credential_ttl_seconds is outside the V1 bound")
         if not 30 <= config.retention_sweep_interval_seconds <= 3600:
@@ -267,6 +272,8 @@ class PilotBackend:
         self.derived_evidence_dir = self.state_dir / "derived-evidence"
         self.db_path = self.state_dir / "tacua.sqlite3"
         self._lock = threading.RLock()
+        self._authoritative_time_lock = threading.Lock()
+        self._authoritative_time_floor: datetime | None = None
         self._retention_worker_lock = threading.Lock()
         self._retention_stop = threading.Event()
         self._retention_thread: threading.Thread | None = None
@@ -285,7 +292,19 @@ class PilotBackend:
             if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
                 raise ValueError(f"backend state path is not a real directory: {directory}")
             directory.chmod(0o700)
+        try:
+            database_metadata = self.db_path.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISREG(database_metadata.st_mode) or stat.S_ISLNK(
+                database_metadata.st_mode
+            ):
+                raise ValueError(
+                    f"backend database path is not a regular file: {self.db_path}"
+                )
         self._initialize_database()
+        self._restore_authoritative_time_floor()
         self._initialize_review_storage()
         self._recover_pending_deletions()
         self._reconcile_storage()
@@ -298,7 +317,43 @@ class PilotBackend:
         value = self._clock()
         if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("clock must return a timezone-aware datetime")
-        return value.astimezone(timezone.utc).replace(microsecond=0)
+        normalized = value.astimezone(timezone.utc).replace(microsecond=0)
+        with self._authoritative_time_lock:
+            if (
+                self._authoritative_time_floor is not None
+                and normalized < self._authoritative_time_floor
+            ):
+                return self._authoritative_time_floor
+        return normalized
+
+    def _advance_authoritative_time_floor(self, value: datetime) -> None:
+        normalized = value.astimezone(timezone.utc).replace(microsecond=0)
+        with self._authoritative_time_lock:
+            if (
+                self._authoritative_time_floor is None
+                or self._authoritative_time_floor < normalized
+            ):
+                self._authoritative_time_floor = normalized
+
+    def _restore_authoritative_time_floor(self) -> None:
+        """Keep protocol timestamps monotonic after a same-second rotation or restart."""
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT MAX(event_at) AS event_at FROM (
+                       SELECT created_at AS event_at FROM sessions
+                       UNION ALL SELECT issued_at FROM credentials
+                       UNION ALL SELECT created_at FROM launch_grants
+                       UNION ALL SELECT accepted_at FROM segments
+                       UNION ALL SELECT accepted_at FROM diagnostics
+                       UNION ALL SELECT accepted_at FROM completions
+                       UNION ALL SELECT accepted_at FROM pending_deletions
+                       UNION ALL SELECT deleted_at FROM tombstones
+                       UNION ALL SELECT occurred_at FROM audit_events
+                   )"""
+            ).fetchone()
+        if row is not None and row["event_at"] is not None:
+            self._advance_authoritative_time_floor(_parse_timestamp(row["event_at"]))
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10, factory=ClosingConnection)
@@ -775,6 +830,12 @@ class PilotBackend:
             if set(body) != {"exchange_kind", "session_id"}:
                 raise ApiError(400, "INVALID_LAUNCH_GRANT", "resume grant fields are invalid")
             session_id = _require_id(body["session_id"], "session_id")
+            if self._expire_session_if_due(session_id, self._now()):
+                raise ApiError(
+                    410,
+                    "SESSION_RETENTION_EXPIRED",
+                    "session retention has expired",
+                )
             with self._connect() as conn:
                 session = conn.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
                 if session is None:
@@ -873,6 +934,20 @@ class PilotBackend:
                 ) != canonical_json(scope_authorization)
             if grant_mismatch:
                 raise ApiError(403, "LAUNCH_GRANT_MISMATCH", "launch request differs from its authorization")
+            if request["exchange_kind"] == "start_session":
+                consent_granted_at = _parse_timestamp(
+                    request["scope"]["consent"]["granted_at"]
+                )
+                if not (
+                    _parse_timestamp(grant["created_at"])
+                    <= consent_granted_at
+                    <= received
+                ):
+                    raise ApiError(
+                        422,
+                        "INVALID_CHRONOLOGY",
+                        "consent chronology is outside the authorized launch exchange",
+                    )
             if grant["consumed_at"] is not None:
                 if (
                     grant["exchange_id"] == request["exchange_id"]
@@ -930,6 +1005,12 @@ class PilotBackend:
                     raise ApiError(404, "SESSION_NOT_FOUND", "session was not found")
                 if session["state"] == "deleting":
                     raise ApiError(410, "SESSION_DELETED", "session deletion is in progress")
+                if _parse_timestamp(session["raw_media_expires_at"]) <= received:
+                    raise ApiError(
+                        410,
+                        "SESSION_RETENTION_EXPIRED",
+                        "session retention has expired",
+                    )
                 current = conn.execute(
                     "SELECT * FROM credentials WHERE session_id = ? AND revoked_at IS NULL",
                     (session_id,),
@@ -946,6 +1027,22 @@ class PilotBackend:
                     or grant["pinned_previous_credential_id"] != current["credential_id"]
                 ):
                     raise ApiError(409, "RESUME_STATE_CONFLICT", "session changed after resume authorization")
+                last_authorized = _parse_timestamp(current["issued_at"])
+                for table in ("segments", "diagnostics", "completions"):
+                    accepted = conn.execute(
+                        f"""SELECT MAX(accepted_at) FROM {table}
+                            WHERE session_id = ? AND source_credential_id = ?""",
+                        (session_id, current["credential_id"]),
+                    ).fetchone()[0]
+                    if accepted is not None:
+                        last_authorized = max(
+                            last_authorized,
+                            _parse_timestamp(accepted),
+                        )
+                if received <= last_authorized:
+                    received = last_authorized + timedelta(seconds=1)
+                    now_text = timestamp(received)
+                    self._advance_authoritative_time_floor(received)
                 conn.execute(
                     "UPDATE credentials SET revoked_at = ?, current_state = 'revoked' WHERE credential_id = ?",
                     (now_text, current["credential_id"]),
@@ -1049,6 +1146,12 @@ class PilotBackend:
             raise ApiError(404, "SESSION_NOT_FOUND", "session was not found")
         if session["state"] == "deleting":
             raise ApiError(410, "SESSION_DELETED", "session deletion is in progress")
+        if _parse_timestamp(session["raw_media_expires_at"]) <= authenticated_at:
+            raise ApiError(
+                410,
+                "SESSION_RETENTION_EXPIRED",
+                "session retention has expired",
+            )
         current = conn.execute(
             "SELECT * FROM credentials WHERE session_id = ? AND revoked_at IS NULL", (session_id,)
         ).fetchone()
@@ -1064,11 +1167,37 @@ class PilotBackend:
             raise ApiError(401, "SDK_CREDENTIAL_EXPIRED", "SDK credential is not currently valid")
         return session, current
 
+    def _expire_session_if_due(self, session_id: str, boundary: datetime) -> bool:
+        """Synchronously attempt policy erasure without entering from a DB transaction."""
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT raw_media_expires_at FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None or _parse_timestamp(row["raw_media_expires_at"]) > boundary:
+            return False
+        self.sweep_expired_sessions(now=boundary)
+        return True
+
     def preauthorize_sdk_route(self, session_id: str, bearer_secret: str | None) -> str:
         """Authenticate a route before the HTTP adapter reads a request body."""
 
+        _require_id(session_id, "session_id")
+        authenticated_at = self._now()
+        if self._expire_session_if_due(session_id, authenticated_at):
+            raise ApiError(
+                410,
+                "SESSION_RETENTION_EXPIRED",
+                "session retention has expired",
+            )
         with self._connect() as conn:
-            _session, credential = self._authenticate_current(conn, session_id, bearer_secret, self._now())
+            _session, credential = self._authenticate_current(
+                conn,
+                session_id,
+                bearer_secret,
+                authenticated_at,
+            )
             return credential["credential_id"]
 
     @staticmethod
@@ -1174,9 +1303,37 @@ class PilotBackend:
             path.unlink(missing_ok=True)
             raise
 
+    def _ensure_object_parent(self, final: Path) -> None:
+        root = self.objects_dir.resolve()
+        try:
+            relative_parent = final.parent.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("persisted object parent escaped backend storage") from exc
+        current = root
+        for part in relative_parent.parts:
+            child = current / part
+            created = False
+            try:
+                metadata = child.lstat()
+            except FileNotFoundError:
+                try:
+                    child.mkdir(mode=0o700)
+                    created = True
+                except FileExistsError:
+                    metadata = child.lstat()
+                else:
+                    metadata = child.lstat()
+            if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                raise ValueError(f"backend object path is not a real directory: {child}")
+            child.chmod(0o700)
+            if created:
+                self._fsync_directory(child)
+                self._fsync_directory(current)
+            current = child
+
     def _publish(self, temporary: Path, relative_path: str) -> Path:
         final = self._object_path(relative_path)
-        final.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._ensure_object_parent(final)
         os.replace(temporary, final)
         self._fsync_directory(final.parent)
         self._fsync_directory(self.objects_dir)
@@ -1660,6 +1817,20 @@ class PilotBackend:
                 for field in ("organization_id", "project_id", "build_id", "build_identity_digest"):
                     if manifest[field] != scope[field]:
                         raise ApiError(403, "ROUTE_SCOPE_MISMATCH", "capture manifest escaped immutable scope")
+                expected_retention = {
+                    "policy_version": MANIFEST_RETENTION_POLICY_VERSION,
+                    "raw_media_expires_at": session["raw_media_expires_at"],
+                    "derived_data_expires_at": session["derived_data_expires_at"],
+                    "deletion_status": "active",
+                }
+                if canonical_json(manifest["retention"]) != canonical_json(
+                    expected_retention
+                ):
+                    raise ApiError(
+                        422,
+                        "RETENTION_BINDING_MISMATCH",
+                        "capture manifest retention differs from the persisted session policy",
+                    )
                 job_id = _new_id("job")
                 job = self._queued_job_snapshot(
                     job_id,
@@ -2380,9 +2551,22 @@ class PilotBackend:
             raise ApiError(404, "SESSION_NOT_FOUND", "session was not found")
         if row["state"] == "deleting":
             raise ApiError(410, "SESSION_DELETED", "session deletion is in progress")
+        if _parse_timestamp(row["raw_media_expires_at"]) <= self._now():
+            raise ApiError(
+                410,
+                "SESSION_RETENTION_EXPIRED",
+                "session retention has expired",
+            )
         if require_completed and row["state"] != "completed":
             raise ApiError(409, "SESSION_NOT_COMPLETED", "session is not ready for processing")
         return row
+
+    def _sweep_before_review_access(self) -> datetime:
+        """Erase due sessions before an admin/reviewer read and fail closed on errors."""
+
+        boundary = self._now()
+        self.sweep_expired_sessions(now=boundary)
+        return boundary
 
     @staticmethod
     def _candidate_binding(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -2410,6 +2594,7 @@ class PilotBackend:
         but can never expose a candidate whose required screenshot is missing.
         """
 
+        self._sweep_before_review_access()
         try:
             TICKET_CONTRACT.validate_chain([candidate])
         except CandidateContractError as error:
@@ -2502,6 +2687,7 @@ class PilotBackend:
 
     def list_candidates(self, session_id: str) -> list[dict[str, Any]]:
         _require_id(session_id, "session_id")
+        self._sweep_before_review_access()
         with self._connect() as connection:
             self._require_review_session(connection, session_id)
         try:
@@ -2510,6 +2696,7 @@ class PilotBackend:
             self._raise_candidate_error(error)
 
     def get_candidate(self, candidate_id: str, version: int | None = None) -> dict[str, Any]:
+        self._sweep_before_review_access()
         try:
             candidate = self._candidate_store().get(candidate_id, version)
         except CandidateStoreError as error:
@@ -2697,8 +2884,14 @@ class PilotBackend:
         }
 
     def list_sessions(self) -> list[dict[str, Any]]:
+        boundary = self._sweep_before_review_access()
         with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM sessions ORDER BY created_at DESC").fetchall()
+            rows = conn.execute(
+                """SELECT * FROM sessions
+                   WHERE state != 'deleting' AND raw_media_expires_at > ?
+                   ORDER BY created_at DESC""",
+                (timestamp(boundary),),
+            ).fetchall()
             completions = {
                 item["session_id"]: item["request_json"]
                 for item in conn.execute("SELECT session_id,request_json FROM completions")
@@ -2710,6 +2903,7 @@ class PilotBackend:
 
     def get_session(self, session_id: str) -> dict[str, Any]:
         _require_id(session_id, "session_id")
+        self._sweep_before_review_access()
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
             if row is None:
@@ -2723,6 +2917,7 @@ class PilotBackend:
                     "state": "deleted",
                     "tombstone": self._decode_protocol_object(bytes(tombstone["response_bytes"])),
                 }
+            self._require_review_session(conn, session_id)
             completion = conn.execute(
                 "SELECT request_json,response_bytes FROM completions WHERE session_id = ?",
                 (session_id,),
@@ -2799,33 +2994,70 @@ class PilotBackend:
             return result
 
     def list_jobs(self) -> list[dict[str, Any]]:
+        boundary = self._sweep_before_review_access()
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT job_json FROM jobs WHERE organization_id = ? AND project_id = ? ORDER BY requested_at DESC",
-                (self.config.organization_id, self.config.project_id),
+                """SELECT jobs.job_json FROM jobs
+                   JOIN sessions ON sessions.session_id = jobs.session_id
+                   WHERE jobs.organization_id = ? AND jobs.project_id = ?
+                     AND sessions.state != 'deleting'
+                     AND sessions.raw_media_expires_at > ?
+                   ORDER BY jobs.requested_at DESC""",
+                (
+                    self.config.organization_id,
+                    self.config.project_id,
+                    timestamp(boundary),
+                ),
             ).fetchall()
         return [self._decode_protocol_object(row["job_json"]) for row in rows]
 
     def get_job(self, job_id: str) -> dict[str, Any]:
         _require_id(job_id, "job_id")
+        boundary = self._sweep_before_review_access()
         with self._connect() as conn:
             row = conn.execute(
-                """SELECT job_json FROM jobs WHERE job_id = ?
-                   AND organization_id = ? AND project_id = ?""",
-                (job_id, self.config.organization_id, self.config.project_id),
+                """SELECT jobs.job_json FROM jobs
+                   JOIN sessions ON sessions.session_id = jobs.session_id
+                   WHERE jobs.job_id = ? AND jobs.organization_id = ?
+                     AND jobs.project_id = ? AND sessions.state != 'deleting'
+                     AND sessions.raw_media_expires_at > ?""",
+                (
+                    job_id,
+                    self.config.organization_id,
+                    self.config.project_id,
+                    timestamp(boundary),
+                ),
             ).fetchone()
         if row is None:
             raise ApiError(404, "JOB_NOT_FOUND", "job was not found")
         return self._decode_protocol_object(row["job_json"])
 
     def list_audit_events(self) -> list[dict[str, Any]]:
+        boundary = self._sweep_before_review_access()
         with self._connect() as conn:
             rows = conn.execute(
-                """SELECT event_id,event_type,actor_kind,organization_id,project_id,
-                          session_id,outcome,occurred_at
-                   FROM audit_events WHERE organization_id = ? AND project_id = ?
-                   ORDER BY occurred_at,event_id""",
-                (self.config.organization_id, self.config.project_id),
+                """SELECT audit_events.event_id,audit_events.event_type,
+                          audit_events.actor_kind,audit_events.organization_id,
+                          audit_events.project_id,audit_events.session_id,
+                          audit_events.outcome,audit_events.occurred_at
+                   FROM audit_events
+                   LEFT JOIN sessions ON sessions.session_id = audit_events.session_id
+                   WHERE audit_events.organization_id = ?
+                     AND audit_events.project_id = ?
+                     AND (
+                         audit_events.session_id IS NULL
+                         OR (
+                             sessions.session_id IS NOT NULL
+                             AND sessions.state != 'deleting'
+                             AND sessions.raw_media_expires_at > ?
+                         )
+                     )
+                   ORDER BY audit_events.occurred_at,audit_events.event_id""",
+                (
+                    self.config.organization_id,
+                    self.config.project_id,
+                    timestamp(boundary),
+                ),
             ).fetchall()
         return [dict(row) for row in rows]
 

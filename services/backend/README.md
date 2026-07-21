@@ -27,12 +27,15 @@ exchange must never be redirected.
   start grant pins that registered artifact plus a static capture-scope policy
   (organization, project, application, build, required consent contract, and
   retention). The SDK supplies `consent.granted_at` and the resulting sealed
-  `scope_digest` only after consent inside the tested app.
+  `scope_digest` only after consent inside the tested app. Exchange proves the
+  consent instant is at or after grant creation and no later than server receipt.
 - Ordered credential history is server-owned. Resume revokes A and issues B in
   one SQLite transaction. An authenticated current credential may recover an
   exact historical receipt, but a missing operation must name the current
-  credential. Completed-session credentials can only replay their bound
-  completion or request/replay deletion.
+  credential. If an accepted operation and rotation occupy the same protocol
+  second, rotation advances to the next representable second so strict
+  half-open authorization history remains replayable. Completed-session
+  credentials can only replay their bound completion or request/replay deletion.
 - Segment bytes are authenticated before reading, streamed through SHA-256 to
   a temporary file, verified, atomically published, and committed with the
   canonical intent and exact receipt bytes. The wire contract binds a
@@ -47,6 +50,12 @@ exchange must never be redirected.
   finishes filesystem erasure before success can be reported. The final
   transaction removes session metadata and retains only the exact tombstone
   plus its keyed replay verifier for the configured period (at most 30 days).
+- At the exact raw-media expiry boundary, SDK capability checks and reviewer
+  reads fail closed. HTTP SDK preauthorization and reviewer reads attempt
+  scoped erasure outside their database transaction; the background worker
+  retries at the configured interval (at most 3,600 seconds). A storage failure
+  can delay physical erasure until recovery, but expired/deleting session data
+  remains inaccessible throughout that retry window.
 - Audit events have fixed content-free columns. They cannot contain launch
   codes, bearer secrets, Authorization values, or request bodies.
 
@@ -103,8 +112,10 @@ deployment. Its `transport_configuration_digest` must match `backend_origin`
 and the configured transport policy. To authorize another build, deploy a
 separately pinned instance or explicitly reset/reconfigure an empty instance.
 `raw_retention_days`, `derived_retention_days`, and the capture scope must match
-exactly. The in-process retention worker is single-process; do not run multiple
-backend replicas over one SQLite/state volume.
+exactly. V1 requires the raw and derived periods to be equal because erasure is
+session-scoped; independently expiring those data classes is not represented as
+a capability. The in-process retention worker is single-process; do not run
+multiple backend replicas over one SQLite/state volume.
 
 ## HTTP surface
 
