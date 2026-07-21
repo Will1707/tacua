@@ -4,6 +4,7 @@ import { useLocalSearchParams } from "expo-router";
 import { useCallback, useEffect, useState } from "react";
 import { ActivityIndicator, Alert, Pressable, ScrollView, Text, TextInput, View } from "react-native";
 
+import { TacuaApiError } from "@/api/client";
 import type { CandidateEvidenceView, TicketCandidate } from "@/api/types";
 import { ActionButton } from "@/components/action-button";
 import { CandidateEvidencePanel } from "@/components/candidate-evidence-panel";
@@ -59,6 +60,15 @@ export default function CandidateRoute() {
     return () => { active = false; };
   }, [candidate, client]);
 
+  async function handleTransitionError(title: string, caught: unknown) {
+    if (caught instanceof TacuaApiError && (caught.status === 409 || caught.status === 412)) {
+      await load();
+      Alert.alert("Ticket refreshed", "This ticket changed while you were reviewing it. Tacua loaded the current version; please check it before trying again.");
+      return;
+    }
+    Alert.alert(title, caught instanceof Error ? caught.message : "The backend rejected the transition.");
+  }
+
   async function transition(nextAction: "mark_ready" | "approve" | "reject", reason: string) {
     if (!client || !config || !candidate) return;
     setAction(nextAction);
@@ -73,7 +83,7 @@ export default function CandidateRoute() {
         reason,
       }));
     } catch (caught) {
-      Alert.alert("Candidate was not changed", caught instanceof Error ? caught.message : "The backend rejected the transition.");
+      await handleTransitionError("Candidate was not changed", caught);
     } finally { setAction(null); }
   }
 
@@ -95,7 +105,7 @@ export default function CandidateRoute() {
       }));
       setClarificationDraft(null);
     } catch (caught) {
-      Alert.alert("Clarification was not saved", caught instanceof Error ? caught.message : "The backend rejected the choice.");
+      await handleTransitionError("Clarification was not saved", caught);
     } finally { setAction(null); }
   }
 
