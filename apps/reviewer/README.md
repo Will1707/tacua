@@ -30,4 +30,7 @@ The default bundle identifiers and QA target scheme are development
 placeholders for the repository owner and must remain configurable for other
 self-hosters.
 
+The app uses the adaptive palette and accessibility rules in the
+[visual-direction guide](../../docs/design/visual-direction.md).
+
 This directory is covered by the repository-level Apache-2.0 license.

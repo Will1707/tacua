@@ -15,7 +15,8 @@ Tacua is currently in evidence-driven product and technical de-risking. It is no
 See [the V1 product boundary](docs/PRODUCT.md) for the sanitized workflow,
 privacy boundary, approval model, and explicit non-goals.
 
-No Tacua backend or reviewer app is released yet. The repository currently contains executable risk-reduction work, not a production service.
+The repository now contains a non-production backend pilot and reviewer-app
+scaffold. Neither is a released V1 or safe for Internet-facing production use.
 
 Names under the local `@tacua` package scope are unpublished experiment identifiers, not a claim that any public package-registry scope is owned or available. Schema identifiers use the reserved `.invalid` top-level domain for the same reason.
 
@@ -31,7 +32,9 @@ The first pilot targets an authorized private Expo/React Native iOS app. The V1 
 - [`experiments/docker-topology-probe`](experiments/docker-topology-probe/README.md): a non-production container lifecycle probe. It does not select or implement the backend topology.
 - [`contracts/approved-handoff`](contracts/approved-handoff/README.md): a strict candidate Markdown/JSON agent-handoff contract that separates offline structure from externally authenticated execution trust. [ADR-011](docs/decisions/ADR-011-approved-handoff.md) remains unaccepted until a trusted real-consumer trial passes.
 - [`contracts/runtime`](contracts/runtime/README.md): strict candidate contracts for the capture/upload manifest, sanitized SDK diagnostics, asynchronous processing jobs, and editable ticket lifecycle. Structural validation does not authorize capture, egress, or agent execution.
+- [`contracts/ticket-candidate`](contracts/ticket-candidate/README.md): the standalone production draft/review contract for immutable candidate versions, evidence-manifest binding, visual clarification choices, and exact human approval before approved-handoff export.
 - [`apps/reviewer`](apps/reviewer/README.md): an iOS-first Expo reviewer-app scaffold with secure self-hosted configuration, session/evidence/job views, clarification choices, and exact-version human approval controls. Launch orchestration and candidate APIs are not implemented yet.
+- [`services/backend`](services/backend/README.md): a dependency-free, Docker-packaged upload-boundary pilot with fixed deployment scope, integrity-checked segment and diagnostic persistence, contract-valid processing jobs, and durable deletion. Its documented production blockers remain release work.
 - [`docs/design/visual-direction.md`](docs/design/visual-direction.md): the adaptive, cicada-derived light and dark colour system used by the reviewer app.
 
 ## Local verification
@@ -42,6 +45,7 @@ The contract and synthetic harnesses have no network dependency:
 python3 -B -m unittest discover -s contracts/approved-handoff/tests -v
 python3 -B contracts/runtime/scripts/validate.py bundle contracts/runtime/fixtures/positive
 python3 -B -m unittest discover -s contracts/runtime/tests -v
+PYTHONWARNINGS=error python3 -B -m unittest discover -s services/backend/tests -v
 python3 -B -m unittest discover -s experiments/eval-harness/tests -v
 node --test experiments/security-harness/test/harness.test.mjs
 ```

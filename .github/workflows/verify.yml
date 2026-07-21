@@ -43,6 +43,15 @@ jobs:
           python3 -B scripts/validate.py bundle fixtures/positive
           python3 -B -m unittest discover -s tests -v
 
+      - name: Validate production draft ticket-candidate contract
+        working-directory: contracts/ticket-candidate
+        run: |
+          python3 -B scripts/ticket_candidate.py validate-chain fixtures/positive/version-1-draft.json fixtures/positive/version-2-needs-clarification.json fixtures/positive/version-3-ready.json fixtures/positive/version-4-approved.json
+          python3 -B -m unittest discover -s tests -v
+
+      - name: Validate the pilot backend boundary
+        run: PYTHONWARNINGS=error python3 -B -m unittest discover -s services/backend/tests -v
+
       - name: Validate synthetic evaluation harness
         working-directory: experiments/eval-harness
         run: |
