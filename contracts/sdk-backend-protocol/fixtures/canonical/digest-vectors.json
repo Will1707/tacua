@@ -1,0 +1,61 @@
+{
+  "specification": "tacua.canonical-json@1.0.0",
+  "vectors": [
+    {
+      "canonical_utf8": "{\"a\":true,\"n\":null,\"z\":0}",
+      "canonical_utf8_hex": "7b2261223a747275652c226e223a6e756c6c2c227a223a307d",
+      "name": "scalar-and-key-order",
+      "sha256": "sha256:acb762c2ac69abf0491c77c221fc913fc4acd1ff1c3b105b70d5ee137324562e",
+      "value": {
+        "a": true,
+        "n": null,
+        "z": 0
+      }
+    },
+    {
+      "canonical_utf8": "{\"items\":[3,2,1],\"meta\":{\"a\":\"one\",\"b\":\"two\"}}",
+      "canonical_utf8_hex": "7b226974656d73223a5b332c322c315d2c226d657461223a7b2261223a226f6e65222c2262223a2274776f227d7d",
+      "name": "nested",
+      "sha256": "sha256:36064fe99cef08ae21ff2757ce2fa2432a056e70d2f7931834ac2b97dd84cb35",
+      "value": {
+        "items": [
+          3,
+          2,
+          1
+        ],
+        "meta": {
+          "a": "one",
+          "b": "two"
+        }
+      }
+    },
+    {
+      "canonical_utf8": "{\"label\":\"Café 🐞\"}",
+      "canonical_utf8_hex": "7b226c6162656c223a22436166c3a920f09f909e227d",
+      "name": "unicode-nfc",
+      "sha256": "sha256:965fe4c9273ecbd7d24bb87693cf8bb669ea14d3630e900c7eb6990fa98fb250",
+      "value": {
+        "label": "Café 🐞"
+      }
+    },
+    {
+      "canonical_utf8": "{\"text\":\"quote=\\\" slash=/ backslash=\\\\ newline=\\n\"}",
+      "canonical_utf8_hex": "7b2274657874223a2271756f74653d5c2220736c6173683d2f206261636b736c6173683d5c5c206e65776c696e653d5c6e227d",
+      "name": "string-escaping",
+      "sha256": "sha256:35b2a9eda7cf6807027de083c21a47aa126d7add82a6b0221348478308ed5022",
+      "value": {
+        "text": "quote=\" slash=/ backslash=\\ newline=\n"
+      }
+    },
+    {
+      "canonical_utf8": "{\"max\":9007199254740991,\"min\":-9007199254740991}",
+      "canonical_utf8_hex": "7b226d6178223a393030373139393235343734303939312c226d696e223a2d393030373139393235343734303939317d",
+      "name": "safe-integer-bounds",
+      "sha256": "sha256:63546eb60913dcb1cdd5118f7bf4885beed344af930c8a9d5f38fad243fd4819",
+      "value": {
+        "max": 9007199254740991,
+        "min": -9007199254740991
+      }
+    }
+  ]
+}

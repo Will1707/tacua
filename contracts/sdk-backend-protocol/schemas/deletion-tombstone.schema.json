@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tacua.invalid/schemas/sdk-backend/1.0.0/deletion-tombstone.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "Tacua minimal session-deletion tombstone",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "message_type",
+    "deletion_id",
+    "deletion_request_digest",
+    "session_id",
+    "scope_digest",
+    "revoked_credential_id",
+    "credential_state",
+    "erasure",
+    "deleted_at",
+    "tombstone_expires_at",
+    "tombstone_digest"
+  ],
+  "properties": {
+    "protocol_version": { "$ref": "common.schema.json#/$defs/protocolVersion" },
+    "message_type": { "const": "deletion_tombstone" },
+    "deletion_id": { "$ref": "common.schema.json#/$defs/id" },
+    "deletion_request_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "session_id": { "$ref": "common.schema.json#/$defs/id" },
+    "scope_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "revoked_credential_id": { "$ref": "common.schema.json#/$defs/id" },
+    "credential_state": { "const": "revoked" },
+    "erasure": { "$ref": "#/$defs/erasure" },
+    "deleted_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "tombstone_expires_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "tombstone_digest": { "$ref": "common.schema.json#/$defs/digest" }
+  },
+  "$defs": {
+    "erasure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "raw_media",
+        "diagnostics",
+        "derived_data",
+        "session_metadata",
+        "erased_object_count"
+      ],
+      "properties": {
+        "raw_media": { "const": "deleted" },
+        "diagnostics": { "const": "deleted" },
+        "derived_data": { "const": "deleted" },
+        "session_metadata": { "const": "deleted_except_tombstone" },
+        "erased_object_count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    }
+  }
+}

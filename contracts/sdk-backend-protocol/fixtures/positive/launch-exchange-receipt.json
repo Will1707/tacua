@@ -1,0 +1,40 @@
+{
+  "credential": {
+    "authentication_scheme": "Bearer",
+    "credential_id": "credential_synthetic",
+    "expires_at": "2026-08-20T10:00:00Z",
+    "state": "active"
+  },
+  "exchange_id": "exchange_synthetic",
+  "exchange_kind": "start_session",
+  "exchange_receipt_digest": "sha256:c7ded3c4e527f5d505256f04dd4b9ddd62065071c068a329c58534d047f1162e",
+  "issued_at": "2026-07-21T09:57:01Z",
+  "message_type": "launch_exchange_receipt",
+  "protocol_version": "tacua.sdk-backend@1.0.0",
+  "request_digest": "sha256:06b845473a44c9acfe3c2cd4525e8dfca42a81498b21c8f7b9c45bedd77ea706",
+  "scope": {
+    "application_id": "app_synthetic",
+    "build_id": "build_synthetic",
+    "build_identity_digest": "sha256:6c822c079ee74658215fc90c388cf4a51b8d47cbe2ddea85578b7600815a2e35",
+    "capture_scope": "app_only",
+    "consent": {
+      "diagnostics": "granted",
+      "granted_at": "2026-07-21T09:56:00Z",
+      "microphone": "granted",
+      "policy_version": "tacua.consent-v1",
+      "raw_media_upload": "granted",
+      "screen_recording": "granted"
+    },
+    "message_type": "capture_scope",
+    "organization_id": "org_synthetic",
+    "project_id": "project_synthetic",
+    "protocol_version": "tacua.sdk-backend@1.0.0",
+    "retention": {
+      "derived_data_days": 30,
+      "policy_version": "tacua.retention-v1",
+      "raw_media_days": 30
+    },
+    "scope_digest": "sha256:977c6a39d2770b63551feef13b74d8d6f950b8869fce8bbec7e952628cc9ebcc"
+  },
+  "session_id": "session_synthetic"
+}

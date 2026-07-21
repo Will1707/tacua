@@ -1,0 +1,19 @@
+{
+  "intent_digest": "sha256:9187ff4c35bfbeff6b08360417283d44bec337c1b9a7e597481acbe2bb07ca8c",
+  "message_type": "segment_upload_receipt",
+  "protocol_version": "tacua.sdk-backend@1.0.0",
+  "runtime_receipt": {
+    "content_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+    "object_id": "object_synthetic",
+    "receipt_digest": "sha256:148faa7469515a4846b6b21ba2bba07030d0a640bf6d9440c37fa44b8f0b5989",
+    "received_at": "2026-07-21T10:02:00Z",
+    "segment_id": "segment_synthetic",
+    "size_bytes": 2048
+  },
+  "scope_digest": "sha256:977c6a39d2770b63551feef13b74d8d6f950b8869fce8bbec7e952628cc9ebcc",
+  "segment_receipt_digest": "sha256:fc433bcfb5f8f89e0be5c11f21b60e09b6bf7543d4d5de7f7d53fed41d76b47c",
+  "sequence": 0,
+  "session_id": "session_synthetic",
+  "transport_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+  "upload_id": "upload_segment_synthetic"
+}

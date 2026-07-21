@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tacua.invalid/schemas/sdk-backend/1.0.0/launch-exchange-request.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "Tacua retry-safe launch-code exchange request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "message_type",
+    "exchange_kind",
+    "exchange_id",
+    "launch_code",
+    "expected_session_id",
+    "credential",
+    "build_identity",
+    "scope",
+    "requested_at",
+    "request_digest"
+  ],
+  "properties": {
+    "protocol_version": { "$ref": "common.schema.json#/$defs/protocolVersion" },
+    "message_type": { "const": "launch_exchange_request" },
+    "exchange_kind": { "enum": ["start_session", "resume_session"] },
+    "exchange_id": { "$ref": "common.schema.json#/$defs/id" },
+    "launch_code": { "$ref": "common.schema.json#/$defs/secret" },
+    "expected_session_id": {
+      "oneOf": [
+        { "$ref": "common.schema.json#/$defs/id" },
+        { "type": "null" }
+      ]
+    },
+    "credential": { "$ref": "#/$defs/credential" },
+    "build_identity": { "$ref": "build-identity.schema.json" },
+    "scope": { "$ref": "capture-scope.schema.json" },
+    "requested_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "request_digest": { "$ref": "common.schema.json#/$defs/digest" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "exchange_kind": { "const": "start_session" } } },
+      "then": { "properties": { "expected_session_id": { "type": "null" } } }
+    },
+    {
+      "if": { "properties": { "exchange_kind": { "const": "resume_session" } } },
+      "then": { "properties": { "expected_session_id": { "$ref": "common.schema.json#/$defs/id" } } }
+    }
+  ],
+  "$defs": {
+    "credential": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["credential_id", "secret", "authentication_scheme", "local_storage"],
+      "properties": {
+        "credential_id": { "$ref": "common.schema.json#/$defs/id" },
+        "secret": { "$ref": "common.schema.json#/$defs/secret" },
+        "authentication_scheme": { "const": "Bearer" },
+        "local_storage": { "const": "ios_keychain_when_unlocked_this_device_only" }
+      }
+    }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "diagnostic_receipt_digest": "sha256:1b3ce6065fd9ab7ef07940db6753d2d35fc1a72784b7939e9fd381a8fb64ce4b",
+  "envelope_digest": "sha256:810ff8d3baf1dca5ad4f8d3b3a6c6bcf1fbfde5a02f0f3c6ee1dd82bde41a8dc",
+  "envelope_id": "envelope_synthetic",
+  "message_type": "diagnostic_upload_receipt",
+  "object_id": "object_diagnostic_synthetic",
+  "protocol_version": "tacua.sdk-backend@1.0.0",
+  "receipt_id": "receipt_diagnostic_synthetic",
+  "received_at": "2026-07-21T10:02:03Z",
+  "request_digest": "sha256:acf41bf5d11c99558a4e19eb234e431ba323d48fa42925220cac86088560b076",
+  "scope_digest": "sha256:977c6a39d2770b63551feef13b74d8d6f950b8869fce8bbec7e952628cc9ebcc",
+  "session_id": "session_synthetic",
+  "size_bytes": 3774,
+  "transport_digest": "sha256:981bfb4a6ea45cc813372b74153f520764bc41b679dbf960bac814653ad48a18",
+  "upload_id": "upload_diagnostic_synthetic"
+}

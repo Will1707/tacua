@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tacua.invalid/schemas/sdk-backend/1.0.0/completion-receipt.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "Tacua durable idempotent completion receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "message_type",
+    "completion_id",
+    "request_digest",
+    "session_id",
+    "scope_digest",
+    "accepted_at",
+    "processing_job",
+    "credential",
+    "local_cleanup",
+    "completion_receipt_digest"
+  ],
+  "properties": {
+    "protocol_version": { "$ref": "common.schema.json#/$defs/protocolVersion" },
+    "message_type": { "const": "completion_receipt" },
+    "completion_id": { "$ref": "common.schema.json#/$defs/id" },
+    "request_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "session_id": { "$ref": "common.schema.json#/$defs/id" },
+    "scope_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "accepted_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "processing_job": { "$ref": "../../runtime/schemas/processing-job.schema.json" },
+    "credential": { "$ref": "#/$defs/credential" },
+    "local_cleanup": { "$ref": "#/$defs/localCleanup" },
+    "completion_receipt_digest": { "$ref": "common.schema.json#/$defs/digest" }
+  },
+  "$defs": {
+    "credential": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["credential_id", "state", "replay_completion_id", "expires_at"],
+      "properties": {
+        "credential_id": { "$ref": "common.schema.json#/$defs/id" },
+        "state": { "const": "completion_replay_only" },
+        "replay_completion_id": { "$ref": "common.schema.json#/$defs/id" },
+        "expires_at": { "$ref": "common.schema.json#/$defs/timestamp" }
+      }
+    },
+    "localCleanup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "manifest_digest",
+        "segment_receipt_digests",
+        "diagnostic_receipt_digests"
+      ],
+      "properties": {
+        "state": { "const": "authorized_after_durable_receipt" },
+        "manifest_digest": { "$ref": "common.schema.json#/$defs/digest" },
+        "segment_receipt_digests": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2048,
+          "uniqueItems": true,
+          "items": { "$ref": "common.schema.json#/$defs/digest" }
+        },
+        "diagnostic_receipt_digests": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2048,
+          "uniqueItems": true,
+          "items": { "$ref": "common.schema.json#/$defs/digest" }
+        }
+      }
+    }
+  }
+}

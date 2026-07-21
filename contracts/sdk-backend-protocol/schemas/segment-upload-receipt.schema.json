@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tacua.invalid/schemas/sdk-backend/1.0.0/segment-upload-receipt.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "Tacua durable segment-upload receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "message_type",
+    "upload_id",
+    "intent_digest",
+    "session_id",
+    "scope_digest",
+    "sequence",
+    "runtime_receipt",
+    "transport_digest",
+    "segment_receipt_digest"
+  ],
+  "properties": {
+    "protocol_version": { "$ref": "common.schema.json#/$defs/protocolVersion" },
+    "message_type": { "const": "segment_upload_receipt" },
+    "upload_id": { "$ref": "common.schema.json#/$defs/id" },
+    "intent_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "session_id": { "$ref": "common.schema.json#/$defs/id" },
+    "scope_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "sequence": { "type": "integer", "minimum": 0, "maximum": 2047 },
+    "runtime_receipt": {
+      "$ref": "../../runtime/schemas/capture-upload-manifest.schema.json#/$defs/receipt"
+    },
+    "transport_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "segment_receipt_digest": { "$ref": "common.schema.json#/$defs/digest" }
+  }
+}

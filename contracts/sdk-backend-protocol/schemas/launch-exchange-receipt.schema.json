@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tacua.invalid/schemas/sdk-backend/1.0.0/launch-exchange-receipt.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "Tacua launch-code exchange receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "message_type",
+    "exchange_kind",
+    "exchange_id",
+    "request_digest",
+    "session_id",
+    "scope",
+    "credential",
+    "issued_at",
+    "exchange_receipt_digest"
+  ],
+  "properties": {
+    "protocol_version": { "$ref": "common.schema.json#/$defs/protocolVersion" },
+    "message_type": { "const": "launch_exchange_receipt" },
+    "exchange_kind": { "enum": ["start_session", "resume_session"] },
+    "exchange_id": { "$ref": "common.schema.json#/$defs/id" },
+    "request_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "session_id": { "$ref": "common.schema.json#/$defs/id" },
+    "scope": { "$ref": "capture-scope.schema.json" },
+    "credential": { "$ref": "#/$defs/credential" },
+    "issued_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "exchange_receipt_digest": { "$ref": "common.schema.json#/$defs/digest" }
+  },
+  "$defs": {
+    "credential": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["credential_id", "authentication_scheme", "state", "expires_at"],
+      "properties": {
+        "credential_id": { "$ref": "common.schema.json#/$defs/id" },
+        "authentication_scheme": { "const": "Bearer" },
+        "state": { "const": "active" },
+        "expires_at": { "$ref": "common.schema.json#/$defs/timestamp" }
+      }
+    }
+  }
+}

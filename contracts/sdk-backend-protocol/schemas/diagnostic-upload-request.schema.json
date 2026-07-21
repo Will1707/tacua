@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tacua.invalid/schemas/sdk-backend/1.0.0/diagnostic-upload-request.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "Tacua idempotent diagnostic-envelope upload request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "message_type",
+    "upload_id",
+    "session_id",
+    "scope_digest",
+    "transport",
+    "envelope",
+    "requested_at",
+    "request_digest"
+  ],
+  "properties": {
+    "protocol_version": { "$ref": "common.schema.json#/$defs/protocolVersion" },
+    "message_type": { "const": "diagnostic_upload_request" },
+    "upload_id": { "$ref": "common.schema.json#/$defs/id" },
+    "session_id": { "$ref": "common.schema.json#/$defs/id" },
+    "scope_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "transport": { "$ref": "common.schema.json#/$defs/transport" },
+    "envelope": { "$ref": "../../runtime/schemas/diagnostic-envelope.schema.json" },
+    "requested_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "request_digest": { "$ref": "common.schema.json#/$defs/digest" }
+  }
+}
