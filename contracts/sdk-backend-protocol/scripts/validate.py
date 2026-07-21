@@ -28,8 +28,10 @@ def validate_bundle(root: Path) -> None:
     protocol.validate_bundle(
         load(root, "build-identity.json"),
         load(root, "capture-scope.json"),
-        load(root, "launch-exchange-request.json"),
-        load(root, "launch-exchange-receipt.json"),
+        [
+            (load(root, "launch-exchange-request.json"), load(root, "launch-exchange-receipt.json")),
+            (load(root, "receiving-resume-request.json"), load(root, "receiving-resume-receipt.json")),
+        ],
         [(load(root, "segment-upload-intent.json"), load(root, "segment-upload-receipt.json"))],
         [(load(root, "diagnostic-upload-request.json"), load(root, "diagnostic-upload-receipt.json"))],
         load(root, "completion-request.json"),

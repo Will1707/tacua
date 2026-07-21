@@ -1,7 +1,7 @@
 {
   "build_identity": {
     "build_id": "build_synthetic",
-    "build_identity_digest": "sha256:234578e520242629d531f7a9649e0417dd9e67d8761572530f054f65e7dc4b63",
+    "build_identity_digest": "sha256:59400b3157207cd048dc2dd876eb551c5a39826c21ee7d931a118b5154b7a995",
     "build_variant": "preview",
     "bundle_identifier": "dev.tacua.synthetic",
     "created_at": "2026-07-21T09:55:00Z",
@@ -22,7 +22,7 @@
       "git_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "working_tree_dirty": false
     },
-    "transport_configuration_digest": "sha256:201c7da992e3af7025b47ebc672208012b3b03ab25f41d7985e05c845879f6e4"
+    "transport_configuration_digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999"
   },
   "credential": {
     "authentication_scheme": "Bearer",
@@ -39,7 +39,7 @@
   "message_type": "launch_exchange_request",
   "previous_credential_id": null,
   "protocol_version": "tacua.sdk-backend@1.0.0",
-  "request_digest": "sha256:e142146903a8d73fb073ebef50904eeab1a9daf5ebb895545bf3000725a057df",
+  "request_digest": "sha256:fcbe23f080b5a8f4fe7d410bc37fedffedd7fbcacfba5b5bf6e77a5c7cf8fb1f",
   "requested_at": "2026-07-21T09:57:00Z",
   "scope": {
     "application_id": "app_synthetic",

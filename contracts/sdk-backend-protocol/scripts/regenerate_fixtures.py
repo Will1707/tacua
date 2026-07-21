@@ -51,6 +51,12 @@ build_identity = protocol.seal(
         "build_variant": "preview",
         "distribution": "testflight",
         "react_native_version": "0.81.5",
+        "transport_configuration_digest": protocol.digest(
+            {
+                "backend_origin": "https://qa.tacua.example",
+                "transport_policy_version": "tacua.sdk-transport@1.0.0",
+            }
+        ),
         "expo": {
             "sdk_version": "56.0.0",
             "runtime_version": "1.0.0",
@@ -99,6 +105,9 @@ launch_request = protocol.seal(
         "exchange_id": "exchange_synthetic",
         "launch_code": "L" * 43,
         "expected_session_id": None,
+        "expected_session_state": "receiving",
+        "expected_completion_id": None,
+        "previous_credential_id": None,
         "credential": {
             "credential_id": "credential_synthetic",
             "secret": "S" * 43,
@@ -119,13 +128,17 @@ launch_receipt = protocol.seal(
         "exchange_id": launch_request["exchange_id"],
         "request_digest": launch_request["request_digest"],
         "session_id": "session_synthetic",
+        "session_state": "receiving",
         "scope": scope,
         "credential": {
             "credential_id": launch_request["credential"]["credential_id"],
             "authentication_scheme": "Bearer",
             "state": "active",
+            "replay_completion_id": None,
             "expires_at": "2026-08-20T10:00:00Z",
         },
+        "previous_credential_revocation": None,
+        "received_at": "2026-07-21T09:57:01Z",
         "issued_at": "2026-07-21T09:57:01Z",
     }
 )
@@ -145,6 +158,7 @@ segment_intent = protocol.seal(
         "upload_id": "upload_segment_synthetic",
         "session_id": launch_receipt["session_id"],
         "scope_digest": scope["scope_digest"],
+        "credential_id": launch_receipt["credential"]["credential_id"],
         "sequence": segment["sequence"],
         "segment_id": segment["segment_id"],
         "transport": {
@@ -153,6 +167,7 @@ segment_intent = protocol.seal(
             "content_digest": segment["content"]["content_digest"],
         },
         "sidecar_digest": segment["content"]["sidecar_digest"],
+        "requested_at": "2026-07-21T10:01:59Z",
     }
 )
 
@@ -164,9 +179,63 @@ segment_receipt = protocol.seal(
         "intent_digest": segment_intent["intent_digest"],
         "session_id": launch_receipt["session_id"],
         "scope_digest": scope["scope_digest"],
+        "credential_id": launch_receipt["credential"]["credential_id"],
         "sequence": segment["sequence"],
+        "segment_id": segment["segment_id"],
+        "content_type": segment["content"]["content_type"],
+        "sidecar_digest": segment["content"]["sidecar_digest"],
         "runtime_receipt": runtime_segment_receipt,
         "transport_digest": segment["content"]["content_digest"],
+    }
+)
+
+receiving_resume_request = protocol.seal(
+    {
+        "protocol_version": protocol.PROTOCOL_VERSION,
+        "message_type": "launch_exchange_request",
+        "exchange_kind": "resume_session",
+        "exchange_id": "exchange_receiving_resume",
+        "launch_code": "Q" * 43,
+        "expected_session_id": launch_receipt["session_id"],
+        "expected_session_state": "receiving",
+        "expected_completion_id": None,
+        "previous_credential_id": launch_receipt["credential"]["credential_id"],
+        "credential": {
+            "credential_id": "credential_receiving_resume",
+            "secret": "U" * 43,
+            "authentication_scheme": "Bearer",
+            "local_storage": "ios_keychain_when_unlocked_this_device_only",
+        },
+        "build_identity": build_identity,
+        "scope": scope,
+        "requested_at": "2026-07-21T10:02:01Z",
+    }
+)
+
+receiving_resume_receipt = protocol.seal(
+    {
+        "protocol_version": protocol.PROTOCOL_VERSION,
+        "message_type": "launch_exchange_receipt",
+        "exchange_kind": "resume_session",
+        "exchange_id": receiving_resume_request["exchange_id"],
+        "request_digest": receiving_resume_request["request_digest"],
+        "session_id": launch_receipt["session_id"],
+        "session_state": "receiving",
+        "scope": scope,
+        "credential": {
+            "credential_id": receiving_resume_request["credential"]["credential_id"],
+            "authentication_scheme": "Bearer",
+            "state": "active",
+            "replay_completion_id": None,
+            "expires_at": "2026-08-20T10:00:00Z",
+        },
+        "previous_credential_revocation": {
+            "credential_id": receiving_resume_request["previous_credential_id"],
+            "state": "revoked",
+            "revoked_at": "2026-07-21T10:02:02Z",
+        },
+        "received_at": "2026-07-21T10:02:02Z",
+        "issued_at": "2026-07-21T10:02:02Z",
     }
 )
 
@@ -183,13 +252,14 @@ diagnostic_request = protocol.seal(
         "upload_id": "upload_diagnostic_synthetic",
         "session_id": launch_receipt["session_id"],
         "scope_digest": scope["scope_digest"],
+        "credential_id": receiving_resume_receipt["credential"]["credential_id"],
         "transport": {
             "content_type": "application/vnd.tacua.diagnostic-envelope+json;version=1.0.0",
             "size_bytes": len(diagnostic_bytes),
             "content_digest": protocol.digest(diagnostic_bytes),
         },
         "envelope": diagnostics,
-        "requested_at": "2026-07-21T10:02:02Z",
+        "requested_at": "2026-07-21T10:02:03Z",
     }
 )
 
@@ -202,12 +272,13 @@ diagnostic_receipt = protocol.seal(
         "request_digest": diagnostic_request["request_digest"],
         "session_id": launch_receipt["session_id"],
         "scope_digest": scope["scope_digest"],
+        "credential_id": receiving_resume_receipt["credential"]["credential_id"],
         "object_id": "object_diagnostic_synthetic",
         "size_bytes": diagnostic_request["transport"]["size_bytes"],
         "transport_digest": diagnostic_request["transport"]["content_digest"],
         "envelope_id": diagnostics["envelope_id"],
         "envelope_digest": diagnostics["envelope_digest"],
-        "received_at": "2026-07-21T10:02:03Z",
+        "received_at": "2026-07-21T10:02:04Z",
     }
 )
 
@@ -218,6 +289,7 @@ completion_request = protocol.seal(
         "completion_id": "completion_synthetic",
         "session_id": launch_receipt["session_id"],
         "scope_digest": scope["scope_digest"],
+        "credential_id": receiving_resume_receipt["credential"]["credential_id"],
         "capture_manifest": capture,
         "segment_receipts": [segment_receipt],
         "diagnostic_receipts": [diagnostic_receipt],
@@ -259,8 +331,8 @@ completion_receipt = protocol.seal(
         "accepted_at": "2026-07-21T10:02:06Z",
         "processing_job": job,
         "credential": {
-            "credential_id": launch_request["credential"]["credential_id"],
-            "state": "completion_replay_only",
+            "credential_id": completion_request["credential_id"],
+            "state": "completion_replay_or_delete_only",
             "replay_completion_id": completion_request["completion_id"],
             "expires_at": "2026-08-20T10:00:00Z",
         },
@@ -273,6 +345,56 @@ completion_receipt = protocol.seal(
     }
 )
 
+completed_resume_request = protocol.seal(
+    {
+        "protocol_version": protocol.PROTOCOL_VERSION,
+        "message_type": "launch_exchange_request",
+        "exchange_kind": "resume_session",
+        "exchange_id": "exchange_completed_resume",
+        "launch_code": "R" * 43,
+        "expected_session_id": launch_receipt["session_id"],
+        "expected_session_state": "completed",
+        "expected_completion_id": completion_request["completion_id"],
+        "previous_credential_id": completion_receipt["credential"]["credential_id"],
+        "credential": {
+            "credential_id": "credential_completed_resume",
+            "secret": "T" * 43,
+            "authentication_scheme": "Bearer",
+            "local_storage": "ios_keychain_when_unlocked_this_device_only",
+        },
+        "build_identity": build_identity,
+        "scope": scope,
+        "requested_at": "2026-07-21T10:02:20Z",
+    }
+)
+
+completed_resume_receipt = protocol.seal(
+    {
+        "protocol_version": protocol.PROTOCOL_VERSION,
+        "message_type": "launch_exchange_receipt",
+        "exchange_kind": "resume_session",
+        "exchange_id": completed_resume_request["exchange_id"],
+        "request_digest": completed_resume_request["request_digest"],
+        "session_id": launch_receipt["session_id"],
+        "session_state": "completed",
+        "scope": scope,
+        "credential": {
+            "credential_id": completed_resume_request["credential"]["credential_id"],
+            "authentication_scheme": "Bearer",
+            "state": "completion_replay_or_delete_only",
+            "replay_completion_id": completion_request["completion_id"],
+            "expires_at": "2026-08-20T10:00:00Z",
+        },
+        "previous_credential_revocation": {
+            "credential_id": completed_resume_request["previous_credential_id"],
+            "state": "revoked",
+            "revoked_at": "2026-07-21T10:02:21Z",
+        },
+        "received_at": "2026-07-21T10:02:21Z",
+        "issued_at": "2026-07-21T10:02:21Z",
+    }
+)
+
 deletion_request = protocol.seal(
     {
         "protocol_version": protocol.PROTOCOL_VERSION,
@@ -280,7 +402,7 @@ deletion_request = protocol.seal(
         "deletion_id": "deletion_synthetic",
         "session_id": launch_receipt["session_id"],
         "scope_digest": scope["scope_digest"],
-        "credential_id": launch_request["credential"]["credential_id"],
+        "credential_id": completion_receipt["credential"]["credential_id"],
         "target": "session_all_data",
         "reason": "user_requested",
         "requested_at": "2026-07-21T10:03:00Z",
@@ -295,15 +417,27 @@ deletion_tombstone = protocol.seal(
         "deletion_request_digest": deletion_request["request_digest"],
         "session_id": launch_receipt["session_id"],
         "scope_digest": scope["scope_digest"],
-        "revoked_credential_id": deletion_request["credential_id"],
-        "credential_state": "revoked",
+        "credential": {
+            "credential_id": deletion_request["credential_id"],
+            "state": "deletion_replay_only",
+            "replay_deletion_id": deletion_request["deletion_id"],
+            "verifier_retained_until": "2026-08-19T10:03:05Z",
+        },
+        "session_access": {
+            "evidence": "revoked",
+            "uploads": "revoked",
+            "completion": "revoked",
+            "processing": "revoked",
+        },
         "erasure": {
             "raw_media": "deleted",
             "diagnostics": "deleted",
             "derived_data": "deleted",
-            "session_metadata": "deleted_except_tombstone",
+            "session_metadata": "deleted_except_tombstone_and_replay_verifier",
             "erased_object_count": 4,
         },
+        "local_credential_cleanup": "authorized_after_durable_tombstone",
+        "accepted_at": "2026-07-21T10:03:01Z",
         "deleted_at": "2026-07-21T10:03:05Z",
         "tombstone_expires_at": "2026-08-19T10:03:05Z",
     }
@@ -315,12 +449,16 @@ positive = {
     "capture-scope.json": scope,
     "launch-exchange-request.json": launch_request,
     "launch-exchange-receipt.json": launch_receipt,
+    "receiving-resume-request.json": receiving_resume_request,
+    "receiving-resume-receipt.json": receiving_resume_receipt,
     "segment-upload-intent.json": segment_intent,
     "segment-upload-receipt.json": segment_receipt,
     "diagnostic-upload-request.json": diagnostic_request,
     "diagnostic-upload-receipt.json": diagnostic_receipt,
     "completion-request.json": completion_request,
     "completion-receipt.json": completion_receipt,
+    "completed-resume-request.json": completed_resume_request,
+    "completed-resume-receipt.json": completed_resume_receipt,
     "deletion-request.json": deletion_request,
     "deletion-tombstone.json": deletion_tombstone,
 }
@@ -344,6 +482,11 @@ bad = clone(build_identity)
 bad["native_version"] = "Cafe\u0301"
 invalid("non-nfc-build.json", protocol.seal(bad), "NON_NFC_STRING")
 
+bad = clone(launch_request)
+bad["build_identity"]["transport_configuration_digest"] = "sha256:" + "9" * 64
+bad["build_identity"] = protocol.seal(bad["build_identity"])
+invalid("launch-transport-config-mismatch.json", protocol.seal(bad), "BUILD_SCOPE_MISMATCH")
+
 bad = clone(launch_receipt)
 bad["credential"]["secret"] = "S" * 43
 invalid("launch-secret-echo.json", protocol.seal(bad), "SCHEMA_ADDITIONAL_PROPERTY")
@@ -351,6 +494,20 @@ invalid("launch-secret-echo.json", protocol.seal(bad), "SCHEMA_ADDITIONAL_PROPER
 bad = clone(launch_request)
 bad["exchange_kind"] = "resume_session"
 invalid("resume-without-session.json", protocol.seal(bad), "SCHEMA_TYPE")
+
+bad = clone(completed_resume_receipt)
+bad["session_state"] = "receiving"
+bad["credential"]["state"] = "active"
+bad["credential"]["replay_completion_id"] = None
+invalid("completed-resume-reenabled-upload.json", protocol.seal(bad), "RESUME_SESSION_STATE_MISMATCH", "completed_resume_pair")
+
+bad = clone(completed_resume_receipt)
+bad["session_state"] = "deleted"
+invalid("resume-deleted-session.json", protocol.seal(bad), "SCHEMA_ENUM")
+
+bad = clone(completed_resume_receipt)
+bad["previous_credential_revocation"]["credential_id"] = "credential_other"
+invalid("resume-revoked-wrong-credential.json", protocol.seal(bad), "RESUME_REVOCATION_MISMATCH", "completed_resume_pair")
 
 bad = clone(scope)
 bad["scope_digest"] = "sha256:" + "0" * 64
@@ -362,6 +519,11 @@ bad["runtime_receipt"]["receipt_digest"] = runtime.digest_without(bad["runtime_r
 bad["transport_digest"] = bad["runtime_receipt"]["content_digest"]
 invalid("segment-content-conflict.json", protocol.seal(bad), "SEGMENT_CONTENT_MISMATCH", "segment_pair")
 
+bad = clone(segment_receipt)
+bad["runtime_receipt"]["received_at"] = "2026-07-21T09:00:00Z"
+bad["runtime_receipt"]["receipt_digest"] = runtime.digest_without(bad["runtime_receipt"], "receipt_digest")
+invalid("segment-receipt-before-request.json", protocol.seal(bad), "INVALID_CHRONOLOGY", "segment_pair")
+
 bad = clone(diagnostic_request)
 bad["envelope"]["session_id"] = "session_other"
 bad["envelope"] = runtime.seal(bad["envelope"])
@@ -370,12 +532,39 @@ bad["transport"]["size_bytes"] = len(bad_bytes)
 bad["transport"]["content_digest"] = protocol.digest(bad_bytes)
 invalid("diagnostic-session-mismatch.json", protocol.seal(bad), "ENVELOPE_SCOPE_MISMATCH")
 
+bad = clone(diagnostic_receipt)
+bad["received_at"] = "2026-07-21T09:00:00Z"
+invalid("diagnostic-receipt-before-request.json", protocol.seal(bad), "INVALID_CHRONOLOGY", "diagnostic_pair")
+
 bad = clone(completion_request)
 bad_receipt = clone(segment_receipt)
 bad_receipt["runtime_receipt"]["object_id"] = "object_other"
 bad_receipt["runtime_receipt"]["receipt_digest"] = runtime.digest_without(bad_receipt["runtime_receipt"], "receipt_digest")
 bad["segment_receipts"] = [protocol.seal(bad_receipt)]
 invalid("completion-receipt-set-mismatch.json", protocol.seal(bad), "SEGMENT_RECEIPT_SET_MISMATCH")
+
+bad = clone(completion_request)
+bad_receipt = clone(segment_receipt)
+bad_receipt["sequence"] = 1
+bad["segment_receipts"] = [protocol.seal(bad_receipt)]
+invalid("completion-segment-sequence-mismatch.json", protocol.seal(bad), "SEGMENT_MANIFEST_BINDING_MISMATCH")
+
+bad = clone(completion_request)
+bad_receipt = clone(segment_receipt)
+bad_receipt["sidecar_digest"] = "sha256:" + "f" * 64
+bad["segment_receipts"] = [protocol.seal(bad_receipt)]
+invalid("completion-segment-sidecar-mismatch.json", protocol.seal(bad), "SEGMENT_MANIFEST_BINDING_MISMATCH")
+
+bad = clone(completion_request)
+bad_receipt = clone(segment_receipt)
+bad_receipt["runtime_receipt"]["received_at"] = "2026-07-21T10:02:01Z"
+bad_receipt["runtime_receipt"]["receipt_digest"] = runtime.digest_without(bad_receipt["runtime_receipt"], "receipt_digest")
+bad_receipt = protocol.seal(bad_receipt)
+bad_manifest = clone(bad["capture_manifest"])
+bad_manifest["upload"]["receipts"] = [clone(bad_receipt["runtime_receipt"])]
+bad["capture_manifest"] = runtime.seal(bad_manifest)
+bad["segment_receipts"] = [bad_receipt]
+invalid("completion-upload-before-segment-receipt.json", protocol.seal(bad), "INVALID_CHRONOLOGY")
 
 bad = clone(completion_request)
 bad["capture_manifest"]["capture_state"] = "recoverable"
@@ -395,9 +584,17 @@ bad = clone(completion_receipt)
 bad["local_cleanup"]["segment_receipt_digests"] = ["sha256:" + "8" * 64]
 invalid("completion-cleanup-mismatch.json", protocol.seal(bad), "LOCAL_CLEANUP_BINDING_MISMATCH", "completion_pair")
 
+bad = clone(completion_receipt)
+bad["credential"]["credential_id"] = "credential_other"
+invalid("completion-wrong-credential.json", protocol.seal(bad), "COMPLETION_CREDENTIAL_MISMATCH", "completion_pair")
+
 bad = clone(deletion_tombstone)
-bad["credential_state"] = "active"
+bad["credential"]["state"] = "active"
 invalid("tombstone-active-credential.json", protocol.seal(bad), "SCHEMA_CONST")
+
+bad = clone(deletion_tombstone)
+bad["credential"]["verifier_retained_until"] = "2026-08-18T10:03:05Z"
+invalid("tombstone-verifier-retention-mismatch.json", protocol.seal(bad), "DELETION_REPLAY_RETENTION_MISMATCH")
 
 bad = clone(deletion_tombstone)
 bad["tombstone_expires_at"] = "2026-09-21T10:03:05Z"
@@ -410,6 +607,10 @@ invalid("tombstone-request-mismatch.json", protocol.seal(bad), "DELETION_BINDING
 bad = clone(completion_request)
 bad["requested_at"] = "2026-07-21T10:02:07Z"
 invalid("completion-conflicting-replay.json", protocol.seal(bad), "IDEMPOTENCY_CONFLICT", "completion_replay")
+
+bad = clone(launch_receipt)
+bad["session_id"] = "session_other"
+invalid("launch-replay-response-changed.json", protocol.seal(bad), "IDEMPOTENCY_RESPONSE_MISMATCH", "launch_response_replay")
 
 (NEGATIVE / "duplicate-json-keys.json").write_text(
     '{"protocol_version":"tacua.sdk-backend@1.0.0","message_type":"build_identity","message_type":"capture_scope"}\n',

@@ -12,7 +12,11 @@
     "intent_digest",
     "session_id",
     "scope_digest",
+    "credential_id",
     "sequence",
+    "segment_id",
+    "content_type",
+    "sidecar_digest",
     "runtime_receipt",
     "transport_digest",
     "segment_receipt_digest"
@@ -24,7 +28,11 @@
     "intent_digest": { "$ref": "common.schema.json#/$defs/digest" },
     "session_id": { "$ref": "common.schema.json#/$defs/id" },
     "scope_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "credential_id": { "$ref": "common.schema.json#/$defs/id" },
     "sequence": { "type": "integer", "minimum": 0, "maximum": 2047 },
+    "segment_id": { "$ref": "common.schema.json#/$defs/id" },
+    "content_type": { "enum": ["video/mp4", "video/quicktime"] },
+    "sidecar_digest": { "$ref": "common.schema.json#/$defs/digest" },
     "runtime_receipt": {
       "$ref": "../../runtime/schemas/capture-upload-manifest.schema.json#/$defs/receipt"
     },

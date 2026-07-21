@@ -12,6 +12,9 @@
     "exchange_id",
     "launch_code",
     "expected_session_id",
+    "expected_session_state",
+    "expected_completion_id",
+    "previous_credential_id",
     "credential",
     "build_identity",
     "scope",
@@ -30,6 +33,19 @@
         { "type": "null" }
       ]
     },
+    "expected_session_state": { "enum": ["receiving", "completed"] },
+    "expected_completion_id": {
+      "oneOf": [
+        { "$ref": "common.schema.json#/$defs/id" },
+        { "type": "null" }
+      ]
+    },
+    "previous_credential_id": {
+      "oneOf": [
+        { "$ref": "common.schema.json#/$defs/id" },
+        { "type": "null" }
+      ]
+    },
     "credential": { "$ref": "#/$defs/credential" },
     "build_identity": { "$ref": "build-identity.schema.json" },
     "scope": { "$ref": "capture-scope.schema.json" },
@@ -39,11 +55,36 @@
   "allOf": [
     {
       "if": { "properties": { "exchange_kind": { "const": "start_session" } } },
-      "then": { "properties": { "expected_session_id": { "type": "null" } } }
+      "then": {
+        "properties": {
+          "expected_session_id": { "type": "null" },
+          "expected_session_state": { "const": "receiving" },
+          "expected_completion_id": { "type": "null" },
+          "previous_credential_id": { "type": "null" }
+        }
+      }
     },
     {
       "if": { "properties": { "exchange_kind": { "const": "resume_session" } } },
-      "then": { "properties": { "expected_session_id": { "$ref": "common.schema.json#/$defs/id" } } }
+      "then": {
+        "properties": {
+          "expected_session_id": { "$ref": "common.schema.json#/$defs/id" },
+          "previous_credential_id": { "$ref": "common.schema.json#/$defs/id" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "expected_session_state": { "const": "receiving" } } },
+      "then": { "properties": { "expected_completion_id": { "type": "null" } } }
+    },
+    {
+      "if": { "properties": { "expected_session_state": { "const": "completed" } } },
+      "then": {
+        "properties": {
+          "exchange_kind": { "const": "resume_session" },
+          "expected_completion_id": { "$ref": "common.schema.json#/$defs/id" }
+        }
+      }
     }
   ],
   "$defs": {

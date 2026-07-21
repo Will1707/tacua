@@ -2,73 +2,97 @@
   "artifacts": [
     {
       "digest_field": "build_identity_digest",
-      "expected_digest": "sha256:6c822c079ee74658215fc90c388cf4a51b8d47cbe2ddea85578b7600815a2e35",
+      "expected_digest": "sha256:234578e520242629d531f7a9649e0417dd9e67d8761572530f054f65e7dc4b63",
       "fixture": "../positive/build-identity.json",
       "message_type": "build_identity"
     },
     {
       "digest_field": "scope_digest",
-      "expected_digest": "sha256:977c6a39d2770b63551feef13b74d8d6f950b8869fce8bbec7e952628cc9ebcc",
+      "expected_digest": "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50",
       "fixture": "../positive/capture-scope.json",
       "message_type": "capture_scope"
     },
     {
       "digest_field": "request_digest",
-      "expected_digest": "sha256:06b845473a44c9acfe3c2cd4525e8dfca42a81498b21c8f7b9c45bedd77ea706",
+      "expected_digest": "sha256:e142146903a8d73fb073ebef50904eeab1a9daf5ebb895545bf3000725a057df",
       "fixture": "../positive/launch-exchange-request.json",
       "message_type": "launch_exchange_request"
     },
     {
       "digest_field": "exchange_receipt_digest",
-      "expected_digest": "sha256:c7ded3c4e527f5d505256f04dd4b9ddd62065071c068a329c58534d047f1162e",
+      "expected_digest": "sha256:233effad70bbffdf326b52d547a75d7137066411d48951284c1b8ea9d2aacb89",
       "fixture": "../positive/launch-exchange-receipt.json",
       "message_type": "launch_exchange_receipt"
     },
     {
+      "digest_field": "request_digest",
+      "expected_digest": "sha256:fb229fcb70a04ba483a6451a8650d74282c63c4e7ecf82ad9c8c250e90334f93",
+      "fixture": "../positive/receiving-resume-request.json",
+      "message_type": "launch_exchange_request"
+    },
+    {
+      "digest_field": "exchange_receipt_digest",
+      "expected_digest": "sha256:567ab24503ecf7bfa00a5ad36630461c2c7723d14774d3cff97d8df9f3509c1a",
+      "fixture": "../positive/receiving-resume-receipt.json",
+      "message_type": "launch_exchange_receipt"
+    },
+    {
       "digest_field": "intent_digest",
-      "expected_digest": "sha256:9187ff4c35bfbeff6b08360417283d44bec337c1b9a7e597481acbe2bb07ca8c",
+      "expected_digest": "sha256:1279a5bb8440de4c4e169c93e359eb8abef623d9137a922d2fc95aec5d6cd686",
       "fixture": "../positive/segment-upload-intent.json",
       "message_type": "segment_upload_intent"
     },
     {
       "digest_field": "segment_receipt_digest",
-      "expected_digest": "sha256:9363897939a898960356cfbe9183aa4d19930ea6a98f80a347a35b4880837d2f",
+      "expected_digest": "sha256:00500257fe3fb5315c871a2f5619daca5a1689c00084d98440f1727de16b8d76",
       "fixture": "../positive/segment-upload-receipt.json",
       "message_type": "segment_upload_receipt"
     },
     {
       "digest_field": "request_digest",
-      "expected_digest": "sha256:acf41bf5d11c99558a4e19eb234e431ba323d48fa42925220cac86088560b076",
+      "expected_digest": "sha256:8262c9a2865a735afe517349c57a40bc1b8135e785d0e1db1b3bd9056cc93d68",
       "fixture": "../positive/diagnostic-upload-request.json",
       "message_type": "diagnostic_upload_request"
     },
     {
       "digest_field": "diagnostic_receipt_digest",
-      "expected_digest": "sha256:1b3ce6065fd9ab7ef07940db6753d2d35fc1a72784b7939e9fd381a8fb64ce4b",
+      "expected_digest": "sha256:62d566bef8be86883818cfe2edeb4a07e797ce6c3d56b0f1260adf58f9fef8f5",
       "fixture": "../positive/diagnostic-upload-receipt.json",
       "message_type": "diagnostic_upload_receipt"
     },
     {
       "digest_field": "request_digest",
-      "expected_digest": "sha256:ba007d99c157965f219dbe1df7fadc17fd37a3fb4abcfdd9ac076d4721ebf77d",
+      "expected_digest": "sha256:d5b45fc406ddc15489034b25ac8fcb0cc00f46bb1affed59774c281a844f1a8d",
       "fixture": "../positive/completion-request.json",
       "message_type": "completion_request"
     },
     {
       "digest_field": "completion_receipt_digest",
-      "expected_digest": "sha256:52e8cf95ba629e3d61d99d731eddb06c1df975f52c1f48919c9dfb48d1937639",
+      "expected_digest": "sha256:79bfdfc4a2c6f007b3594446821c789cab31e8507d810add78ed80158d18f8a0",
       "fixture": "../positive/completion-receipt.json",
       "message_type": "completion_receipt"
     },
     {
       "digest_field": "request_digest",
-      "expected_digest": "sha256:35be3dc364bd61deca761616a73c24cb052042648b8ff2ac4fee3c38f6edd0c7",
+      "expected_digest": "sha256:fd0a566dc1066525eecca01e9f461504cdfff7d433eaaf52cefdfea731337b0e",
+      "fixture": "../positive/completed-resume-request.json",
+      "message_type": "launch_exchange_request"
+    },
+    {
+      "digest_field": "exchange_receipt_digest",
+      "expected_digest": "sha256:e63842a54456cdfa88b4a6e7e0b9bfa0275ce5f7e6afd39137f9b584ae2896b6",
+      "fixture": "../positive/completed-resume-receipt.json",
+      "message_type": "launch_exchange_receipt"
+    },
+    {
+      "digest_field": "request_digest",
+      "expected_digest": "sha256:896326b56812e6c1dbd8a776415901a57b47ee43706b89615b4f08c39bdf06a5",
       "fixture": "../positive/deletion-request.json",
       "message_type": "deletion_request"
     },
     {
       "digest_field": "tombstone_digest",
-      "expected_digest": "sha256:a97ad48facb9c41fbcdb5eb7aebe5f2a0c4cbc8020df45364e1ca49ba431b41f",
+      "expected_digest": "sha256:cf07be1c6ffc015823254328d53f052ff6173861c9eb7ba9baaaf6e7df7fa5e9",
       "fixture": "../positive/deletion-tombstone.json",
       "message_type": "deletion_tombstone"
     }

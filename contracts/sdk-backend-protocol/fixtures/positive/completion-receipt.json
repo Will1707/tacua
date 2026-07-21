@@ -1,27 +1,27 @@
 {
   "accepted_at": "2026-07-21T10:02:06Z",
   "completion_id": "completion_synthetic",
-  "completion_receipt_digest": "sha256:52e8cf95ba629e3d61d99d731eddb06c1df975f52c1f48919c9dfb48d1937639",
+  "completion_receipt_digest": "sha256:79bfdfc4a2c6f007b3594446821c789cab31e8507d810add78ed80158d18f8a0",
   "credential": {
-    "credential_id": "credential_synthetic",
+    "credential_id": "credential_receiving_resume",
     "expires_at": "2026-08-20T10:00:00Z",
     "replay_completion_id": "completion_synthetic",
-    "state": "completion_replay_only"
+    "state": "completion_replay_or_delete_only"
   },
   "local_cleanup": {
     "diagnostic_receipt_digests": [
-      "sha256:1b3ce6065fd9ab7ef07940db6753d2d35fc1a72784b7939e9fd381a8fb64ce4b"
+      "sha256:62d566bef8be86883818cfe2edeb4a07e797ce6c3d56b0f1260adf58f9fef8f5"
     ],
-    "manifest_digest": "sha256:c8471a818b66d001b61489b68d7f78da8b3e71b6d5c682f6df98345cf0adeb5a",
+    "manifest_digest": "sha256:6a0816b264fd508f2e870c4989e82348450b42779199e9f63458d0980c55a599",
     "segment_receipt_digests": [
-      "sha256:9363897939a898960356cfbe9183aa4d19930ea6a98f80a347a35b4880837d2f"
+      "sha256:00500257fe3fb5315c871a2f5619daca5a1689c00084d98440f1727de16b8d76"
     ],
     "state": "authorized_after_durable_receipt"
   },
   "message_type": "completion_receipt",
   "processing_job": {
     "build_id": "build_synthetic",
-    "build_identity_digest": "sha256:6c822c079ee74658215fc90c388cf4a51b8d47cbe2ddea85578b7600815a2e35",
+    "build_identity_digest": "sha256:234578e520242629d531f7a9649e0417dd9e67d8761572530f054f65e7dc4b63",
     "completed_at": null,
     "contract_version": "tacua.processing-job@1.0.0",
     "execution": {
@@ -36,7 +36,7 @@
     },
     "failure": null,
     "inputs": {
-      "capture_manifest_digest": "sha256:c8471a818b66d001b61489b68d7f78da8b3e71b6d5c682f6df98345cf0adeb5a",
+      "capture_manifest_digest": "sha256:6a0816b264fd508f2e870c4989e82348450b42779199e9f63458d0980c55a599",
       "context_sources": [
         {
           "access": "read_only",
@@ -59,10 +59,10 @@
         }
       ],
       "diagnostic_envelope_digests": [
-        "sha256:810ff8d3baf1dca5ad4f8d3b3a6c6bcf1fbfde5a02f0f3c6ee1dd82bde41a8dc"
+        "sha256:9842a35e46a1cb1b914c3a3500eeb35bb3020dedf5f6a9f5b10170b7cbd7479d"
       ]
     },
-    "job_digest": "sha256:3b48fafd4866ee9338bcc56eddf32f8739253c78a08c1cbd3e183149201b351e",
+    "job_digest": "sha256:1c660118c0e279b1eb76dd11aee63ea7e455a205971b9d6a287cecf168c8dadb",
     "job_id": "job_synthetic",
     "job_version": 1,
     "media_type": "application/vnd.tacua.processing-job+json;version=1.0.0",
@@ -121,7 +121,7 @@
     "status": "queued"
   },
   "protocol_version": "tacua.sdk-backend@1.0.0",
-  "request_digest": "sha256:ba007d99c157965f219dbe1df7fadc17fd37a3fb4abcfdd9ac076d4721ebf77d",
-  "scope_digest": "sha256:977c6a39d2770b63551feef13b74d8d6f950b8869fce8bbec7e952628cc9ebcc",
+  "request_digest": "sha256:d5b45fc406ddc15489034b25ac8fcb0cc00f46bb1affed59774c281a844f1a8d",
+  "scope_digest": "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50",
   "session_id": "session_synthetic"
 }

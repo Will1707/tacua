@@ -1,7 +1,7 @@
 {
   "build_identity": {
     "build_id": "build_synthetic",
-    "build_identity_digest": "sha256:6c822c079ee74658215fc90c388cf4a51b8d47cbe2ddea85578b7600815a2e35",
+    "build_identity_digest": "sha256:234578e520242629d531f7a9649e0417dd9e67d8761572530f054f65e7dc4b63",
     "build_variant": "preview",
     "bundle_identifier": "dev.tacua.synthetic",
     "created_at": "2026-07-21T09:55:00Z",
@@ -21,7 +21,8 @@
     "source": {
       "git_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "working_tree_dirty": false
-    }
+    },
+    "transport_configuration_digest": "sha256:201c7da992e3af7025b47ebc672208012b3b03ab25f41d7985e05c845879f6e4"
   },
   "credential": {
     "authentication_scheme": "Bearer",
@@ -31,16 +32,19 @@
   },
   "exchange_id": "exchange_synthetic",
   "exchange_kind": "resume_session",
+  "expected_completion_id": null,
   "expected_session_id": null,
+  "expected_session_state": "receiving",
   "launch_code": "LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL",
   "message_type": "launch_exchange_request",
+  "previous_credential_id": null,
   "protocol_version": "tacua.sdk-backend@1.0.0",
-  "request_digest": "sha256:bb54ebfc1a2fd6c07d8bcc0240125345cb7cc750c6d335feefe67bb3ef85f6e2",
+  "request_digest": "sha256:cab34cf5d52e8a7790d1eb6d48627dcbd763c4856d9973eb191d8778101f602b",
   "requested_at": "2026-07-21T09:57:00Z",
   "scope": {
     "application_id": "app_synthetic",
     "build_id": "build_synthetic",
-    "build_identity_digest": "sha256:6c822c079ee74658215fc90c388cf4a51b8d47cbe2ddea85578b7600815a2e35",
+    "build_identity_digest": "sha256:234578e520242629d531f7a9649e0417dd9e67d8761572530f054f65e7dc4b63",
     "capture_scope": "app_only",
     "consent": {
       "diagnostics": "granted",
@@ -59,6 +63,6 @@
       "policy_version": "tacua.retention-v1",
       "raw_media_days": 30
     },
-    "scope_digest": "sha256:977c6a39d2770b63551feef13b74d8d6f950b8869fce8bbec7e952628cc9ebcc"
+    "scope_digest": "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50"
   }
 }

@@ -4,7 +4,7 @@
     "credential_id": "credential_receiving_resume",
     "replay_deletion_id": "deletion_synthetic",
     "state": "deletion_replay_only",
-    "verifier_retained_until": "2026-08-19T10:03:05Z"
+    "verifier_retained_until": "2026-08-18T10:03:05Z"
   },
   "deleted_at": "2026-07-21T10:03:05Z",
   "deletion_id": "deletion_synthetic",
@@ -27,6 +27,6 @@
     "uploads": "revoked"
   },
   "session_id": "session_synthetic",
-  "tombstone_digest": "sha256:cf07be1c6ffc015823254328d53f052ff6173861c9eb7ba9baaaf6e7df7fa5e9",
+  "tombstone_digest": "sha256:0ad270c48407d054bd9b4ce6b922d02c4610d4307b3e6ccaffea15dbdf2e38e9",
   "tombstone_expires_at": "2026-08-19T10:03:05Z"
 }

@@ -16,6 +16,7 @@
     "build_variant",
     "distribution",
     "react_native_version",
+    "transport_configuration_digest",
     "expo",
     "source",
     "created_at",
@@ -37,6 +38,7 @@
     "build_variant": { "enum": ["development", "preview"] },
     "distribution": { "enum": ["local", "internal", "testflight"] },
     "react_native_version": { "$ref": "common.schema.json#/$defs/versionText" },
+    "transport_configuration_digest": { "$ref": "common.schema.json#/$defs/digest" },
     "expo": {
       "oneOf": [
         { "$ref": "#/$defs/expo" },

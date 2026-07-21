@@ -1,7 +1,8 @@
 {
+  "credential_id": "credential_receiving_resume",
   "envelope": {
     "build_id": "build_synthetic",
-    "build_identity_digest": "sha256:6c822c079ee74658215fc90c388cf4a51b8d47cbe2ddea85578b7600815a2e35",
+    "build_identity_digest": "sha256:234578e520242629d531f7a9649e0417dd9e67d8761572530f054f65e7dc4b63",
     "collection_gaps": [
       {
         "detail": "Collection paused while the app was backgrounded.",
@@ -15,7 +16,7 @@
       }
     ],
     "contract_version": "tacua.diagnostic-envelope@1.0.0",
-    "envelope_digest": "sha256:810ff8d3baf1dca5ad4f8d3b3a6c6bcf1fbfde5a02f0f3c6ee1dd82bde41a8dc",
+    "envelope_digest": "sha256:9842a35e46a1cb1b914c3a3500eeb35bb3020dedf5f6a9f5b10170b7cbd7479d",
     "envelope_id": "envelope_synthetic",
     "envelope_version": 1,
     "events": [
@@ -178,12 +179,12 @@
   },
   "message_type": "diagnostic_upload_request",
   "protocol_version": "tacua.sdk-backend@1.0.0",
-  "request_digest": "sha256:acf41bf5d11c99558a4e19eb234e431ba323d48fa42925220cac86088560b076",
-  "requested_at": "2026-07-21T10:02:02Z",
-  "scope_digest": "sha256:977c6a39d2770b63551feef13b74d8d6f950b8869fce8bbec7e952628cc9ebcc",
+  "request_digest": "sha256:8262c9a2865a735afe517349c57a40bc1b8135e785d0e1db1b3bd9056cc93d68",
+  "requested_at": "2026-07-21T10:02:03Z",
+  "scope_digest": "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50",
   "session_id": "session_synthetic",
   "transport": {
-    "content_digest": "sha256:981bfb4a6ea45cc813372b74153f520764bc41b679dbf960bac814653ad48a18",
+    "content_digest": "sha256:6f395bf765e73eac49e90ff444ce8965ce31b452a683f26e03e8554497e4efbf",
     "content_type": "application/vnd.tacua.diagnostic-envelope+json;version=1.0.0",
     "size_bytes": 3774
   },

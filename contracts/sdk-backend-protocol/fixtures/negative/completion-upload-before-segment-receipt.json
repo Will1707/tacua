@@ -22,7 +22,7 @@
         }
       }
     ],
-    "manifest_digest": "sha256:6a0816b264fd508f2e870c4989e82348450b42779199e9f63458d0980c55a599",
+    "manifest_digest": "sha256:143fc8ea96b9f4dc1cc28c0de33e7e9219abce0622e6370fb9e5cfa5dfa2aa37",
     "manifest_version": 2,
     "media_type": "application/vnd.tacua.capture-upload-manifest+json;version=1.0.0",
     "monotonic_duration_ms": 60000,
@@ -70,8 +70,8 @@
         {
           "content_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
           "object_id": "object_synthetic",
-          "receipt_digest": "sha256:4608d212ef2153a29687a9bed66e85854d8871083ba32bcf730d385f2c9db949",
-          "received_at": "2026-07-21T10:02:00Z",
+          "receipt_digest": "sha256:d651e553bf77a76cfb5110527da3a70b929315c63542dc9c27ae9e6f3b3bc08d",
+          "received_at": "2026-07-21T10:02:01Z",
           "segment_id": "segment_synthetic",
           "size_bytes": 2048
         }
@@ -103,7 +103,7 @@
   ],
   "message_type": "completion_request",
   "protocol_version": "tacua.sdk-backend@1.0.0",
-  "request_digest": "sha256:d5b45fc406ddc15489034b25ac8fcb0cc00f46bb1affed59774c281a844f1a8d",
+  "request_digest": "sha256:e54467bc42c01698aaed7639013afa9810b1468eab13c2592422e24c97eda1e5",
   "requested_at": "2026-07-21T10:02:05Z",
   "scope_digest": "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50",
   "segment_receipts": [
@@ -116,14 +116,14 @@
       "runtime_receipt": {
         "content_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
         "object_id": "object_synthetic",
-        "receipt_digest": "sha256:4608d212ef2153a29687a9bed66e85854d8871083ba32bcf730d385f2c9db949",
-        "received_at": "2026-07-21T10:02:00Z",
+        "receipt_digest": "sha256:d651e553bf77a76cfb5110527da3a70b929315c63542dc9c27ae9e6f3b3bc08d",
+        "received_at": "2026-07-21T10:02:01Z",
         "segment_id": "segment_synthetic",
         "size_bytes": 2048
       },
       "scope_digest": "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50",
       "segment_id": "segment_synthetic",
-      "segment_receipt_digest": "sha256:00500257fe3fb5315c871a2f5619daca5a1689c00084d98440f1727de16b8d76",
+      "segment_receipt_digest": "sha256:16a7995055070f892ae225fe9352d039fefbe49912a922f8fbb7bb3a01a70347",
       "sequence": 0,
       "session_id": "session_synthetic",
       "sidecar_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",

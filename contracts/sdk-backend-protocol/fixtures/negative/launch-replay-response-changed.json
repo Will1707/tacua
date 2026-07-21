@@ -8,7 +8,7 @@
   },
   "exchange_id": "exchange_synthetic",
   "exchange_kind": "start_session",
-  "exchange_receipt_digest": "sha256:233effad70bbffdf326b52d547a75d7137066411d48951284c1b8ea9d2aacb89",
+  "exchange_receipt_digest": "sha256:1b2824f4ef22a00ba423deea3594f77b5a1b9c49a4e626e1dd22098063f81dd7",
   "issued_at": "2026-07-21T09:57:01Z",
   "message_type": "launch_exchange_receipt",
   "previous_credential_revocation": null,
@@ -39,6 +39,6 @@
     },
     "scope_digest": "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50"
   },
-  "session_id": "session_synthetic",
+  "session_id": "session_other",
   "session_state": "receiving"
 }

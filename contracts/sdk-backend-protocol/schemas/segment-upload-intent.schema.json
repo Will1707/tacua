@@ -11,10 +11,12 @@
     "upload_id",
     "session_id",
     "scope_digest",
+    "credential_id",
     "sequence",
     "segment_id",
     "transport",
     "sidecar_digest",
+    "requested_at",
     "intent_digest"
   ],
   "properties": {
@@ -23,10 +25,12 @@
     "upload_id": { "$ref": "common.schema.json#/$defs/id" },
     "session_id": { "$ref": "common.schema.json#/$defs/id" },
     "scope_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "credential_id": { "$ref": "common.schema.json#/$defs/id" },
     "sequence": { "type": "integer", "minimum": 0, "maximum": 2047 },
     "segment_id": { "$ref": "common.schema.json#/$defs/id" },
     "transport": { "$ref": "common.schema.json#/$defs/transport" },
     "sidecar_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "requested_at": { "$ref": "common.schema.json#/$defs/timestamp" },
     "intent_digest": { "$ref": "common.schema.json#/$defs/digest" }
   }
 }

@@ -1,12 +1,12 @@
 {
-  "credential_id": "credential_synthetic",
+  "credential_id": "credential_receiving_resume",
   "deletion_id": "deletion_synthetic",
   "message_type": "deletion_request",
   "protocol_version": "tacua.sdk-backend@1.0.0",
   "reason": "user_requested",
-  "request_digest": "sha256:35be3dc364bd61deca761616a73c24cb052042648b8ff2ac4fee3c38f6edd0c7",
+  "request_digest": "sha256:896326b56812e6c1dbd8a776415901a57b47ee43706b89615b4f08c39bdf06a5",
   "requested_at": "2026-07-21T10:03:00Z",
-  "scope_digest": "sha256:977c6a39d2770b63551feef13b74d8d6f950b8869fce8bbec7e952628cc9ebcc",
+  "scope_digest": "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50",
   "session_id": "session_synthetic",
   "target": "session_all_data"
 }

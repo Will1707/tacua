@@ -1,20 +1,24 @@
 {
   "credential": {
     "authentication_scheme": "Bearer",
-    "credential_id": "credential_synthetic",
+    "credential_id": "credential_completed_resume",
     "expires_at": "2026-08-20T10:00:00Z",
-    "replay_completion_id": null,
-    "state": "active"
+    "replay_completion_id": "completion_synthetic",
+    "state": "completion_replay_or_delete_only"
   },
-  "exchange_id": "exchange_synthetic",
-  "exchange_kind": "start_session",
-  "exchange_receipt_digest": "sha256:233effad70bbffdf326b52d547a75d7137066411d48951284c1b8ea9d2aacb89",
-  "issued_at": "2026-07-21T09:57:01Z",
+  "exchange_id": "exchange_completed_resume",
+  "exchange_kind": "resume_session",
+  "exchange_receipt_digest": "sha256:fbcb038109da339a3be7fe47550c6dead2abed29fdcdcea8cef978811f744d99",
+  "issued_at": "2026-07-21T10:02:21Z",
   "message_type": "launch_exchange_receipt",
-  "previous_credential_revocation": null,
+  "previous_credential_revocation": {
+    "credential_id": "credential_receiving_resume",
+    "revoked_at": "2026-07-21T10:02:21Z",
+    "state": "revoked"
+  },
   "protocol_version": "tacua.sdk-backend@1.0.0",
-  "received_at": "2026-07-21T09:57:01Z",
-  "request_digest": "sha256:e142146903a8d73fb073ebef50904eeab1a9daf5ebb895545bf3000725a057df",
+  "received_at": "2026-07-21T10:02:21Z",
+  "request_digest": "sha256:fd0a566dc1066525eecca01e9f461504cdfff7d433eaaf52cefdfea731337b0e",
   "scope": {
     "application_id": "app_synthetic",
     "build_id": "build_synthetic",
@@ -40,5 +44,5 @@
     "scope_digest": "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50"
   },
   "session_id": "session_synthetic",
-  "session_state": "receiving"
+  "session_state": "deleted"
 }

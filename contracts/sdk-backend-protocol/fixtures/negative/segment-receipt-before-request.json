@@ -5,19 +5,19 @@
   "message_type": "segment_upload_receipt",
   "protocol_version": "tacua.sdk-backend@1.0.0",
   "runtime_receipt": {
-    "content_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+    "content_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
     "object_id": "object_synthetic",
-    "receipt_digest": "sha256:148faa7469515a4846b6b21ba2bba07030d0a640bf6d9440c37fa44b8f0b5989",
-    "received_at": "2026-07-21T10:02:00Z",
+    "receipt_digest": "sha256:d5bb5eaae39e8882d3261acf8ef9bf478ce1d80fe5216a71cda230ca545b1be8",
+    "received_at": "2026-07-21T09:00:00Z",
     "segment_id": "segment_synthetic",
     "size_bytes": 2048
   },
   "scope_digest": "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50",
   "segment_id": "segment_synthetic",
-  "segment_receipt_digest": "sha256:c7cbceba15de493d1b042b9352c211b7cd560b302a40e9b4843ed50b2bf1d0f6",
+  "segment_receipt_digest": "sha256:1f2188ff625392918fd73d67f62481a32f98b9464640e7857a07023735d428c8",
   "sequence": 0,
   "session_id": "session_synthetic",
   "sidecar_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
-  "transport_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+  "transport_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
   "upload_id": "upload_segment_synthetic"
 }

@@ -12,8 +12,11 @@
     "exchange_id",
     "request_digest",
     "session_id",
+    "session_state",
     "scope",
     "credential",
+    "previous_credential_revocation",
+    "received_at",
     "issued_at",
     "exchange_receipt_digest"
   ],
@@ -24,21 +27,86 @@
     "exchange_id": { "$ref": "common.schema.json#/$defs/id" },
     "request_digest": { "$ref": "common.schema.json#/$defs/digest" },
     "session_id": { "$ref": "common.schema.json#/$defs/id" },
+    "session_state": { "enum": ["receiving", "completed"] },
     "scope": { "$ref": "capture-scope.schema.json" },
     "credential": { "$ref": "#/$defs/credential" },
+    "previous_credential_revocation": {
+      "oneOf": [
+        { "$ref": "#/$defs/previousCredentialRevocation" },
+        { "type": "null" }
+      ]
+    },
+    "received_at": { "$ref": "common.schema.json#/$defs/timestamp" },
     "issued_at": { "$ref": "common.schema.json#/$defs/timestamp" },
     "exchange_receipt_digest": { "$ref": "common.schema.json#/$defs/digest" }
   },
+  "allOf": [
+    {
+      "if": { "properties": { "exchange_kind": { "const": "start_session" } } },
+      "then": { "properties": { "previous_credential_revocation": { "type": "null" } } }
+    },
+    {
+      "if": { "properties": { "exchange_kind": { "const": "resume_session" } } },
+      "then": {
+        "properties": {
+          "previous_credential_revocation": { "$ref": "#/$defs/previousCredentialRevocation" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "session_state": { "const": "receiving" } } },
+      "then": {
+        "properties": {
+          "credential": {
+            "properties": {
+              "state": { "const": "active" },
+              "replay_completion_id": { "type": "null" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "session_state": { "const": "completed" } } },
+      "then": {
+        "properties": {
+          "exchange_kind": { "const": "resume_session" },
+          "credential": {
+            "properties": {
+              "state": { "const": "completion_replay_or_delete_only" },
+              "replay_completion_id": { "$ref": "common.schema.json#/$defs/id" }
+            }
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "credential": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["credential_id", "authentication_scheme", "state", "expires_at"],
+      "required": ["credential_id", "authentication_scheme", "state", "replay_completion_id", "expires_at"],
       "properties": {
         "credential_id": { "$ref": "common.schema.json#/$defs/id" },
         "authentication_scheme": { "const": "Bearer" },
-        "state": { "const": "active" },
+        "state": { "enum": ["active", "completion_replay_or_delete_only"] },
+        "replay_completion_id": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/id" },
+            { "type": "null" }
+          ]
+        },
         "expires_at": { "$ref": "common.schema.json#/$defs/timestamp" }
+      }
+    },
+    "previousCredentialRevocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["credential_id", "state", "revoked_at"],
+      "properties": {
+        "credential_id": { "$ref": "common.schema.json#/$defs/id" },
+        "state": { "const": "revoked" },
+        "revoked_at": { "$ref": "common.schema.json#/$defs/timestamp" }
       }
     }
   }

@@ -1,6 +1,6 @@
 {
   "build_id": "build_synthetic",
-  "build_identity_digest": "sha256:6c822c079ee74658215fc90c388cf4a51b8d47cbe2ddea85578b7600815a2e35",
+  "build_identity_digest": "sha256:234578e520242629d531f7a9649e0417dd9e67d8761572530f054f65e7dc4b63",
   "build_variant": "preview",
   "bundle_identifier": "dev.tacua.synthetic",
   "created_at": "2026-07-21T09:55:00Z",
@@ -20,5 +20,6 @@
   "source": {
     "git_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "working_tree_dirty": false
-  }
+  },
+  "transport_configuration_digest": "sha256:201c7da992e3af7025b47ebc672208012b3b03ab25f41d7985e05c845879f6e4"
 }

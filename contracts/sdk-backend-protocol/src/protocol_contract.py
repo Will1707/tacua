@@ -206,26 +206,40 @@ def validate_launch_request(value: dict[str, Any]) -> None:
         "$.scope.build_identity_digest",
         "scope does not bind the tested build",
     )
-    requested = parse_time(value["requested_at"], "$.requested_at")
-    require(
-        requested >= parse_time(build["created_at"], "$.build_identity.created_at"),
-        "INVALID_CHRONOLOGY",
-        "$.requested_at",
-        "exchange predates the build",
-    )
-    require(
-        requested >= parse_time(scope["consent"]["granted_at"], "$.scope.consent.granted_at"),
-        "INVALID_CHRONOLOGY",
-        "$.requested_at",
-        "exchange predates consent",
-    )
+    # Start and resume can establish or recover the SDK's backend-time anchor.
+    # Their device timestamp is informational and is not ordered against other
+    # clock domains.
+    parse_time(value["requested_at"], "$.requested_at")
+    if value["exchange_kind"] == "resume_session":
+        require(
+            value["previous_credential_id"] != value["credential"]["credential_id"],
+            "CREDENTIAL_ROTATION_REUSES_ID",
+            "$.previous_credential_id",
+            "resume must replace the previous credential with a new credential ID",
+        )
 
 
 def validate_launch_receipt(value: dict[str, Any]) -> None:
     validate(value["scope"])
+    received = parse_time(value["received_at"], "$.received_at")
     issued = parse_time(value["issued_at"], "$.issued_at")
+    require(issued >= received, "INVALID_CHRONOLOGY", "$.issued_at", "credential issue predates server receipt")
     expires = parse_time(value["credential"]["expires_at"], "$.credential.expires_at")
     require(expires > issued, "INVALID_CREDENTIAL_EXPIRY", "$.credential.expires_at", "credential must expire after issue")
+    revocation = value["previous_credential_revocation"]
+    if revocation is not None:
+        require(
+            revocation["credential_id"] != value["credential"]["credential_id"],
+            "CREDENTIAL_ROTATION_REUSES_ID",
+            "$.previous_credential_revocation.credential_id",
+            "rotation cannot revoke the newly issued credential",
+        )
+        require(
+            parse_time(revocation["revoked_at"], "$.previous_credential_revocation.revoked_at") == issued,
+            "CREDENTIAL_ROTATION_NOT_ATOMIC",
+            "$.previous_credential_revocation.revoked_at",
+            "old credential revocation and durable new receipt must share one commit time",
+        )
 
 
 def validate_launch_pair(request: dict[str, Any], receipt: dict[str, Any]) -> None:
@@ -243,12 +257,34 @@ def validate_launch_pair(request: dict[str, Any], receipt: dict[str, Any]) -> No
     )
     if request["exchange_kind"] == "resume_session":
         require(receipt["session_id"] == request["expected_session_id"], "RESUME_SESSION_MISMATCH", "$.receipt.session_id", "resume code opened another session")
+        revocation = receipt["previous_credential_revocation"]
+        require(
+            revocation is not None and revocation["credential_id"] == request["previous_credential_id"],
+            "RESUME_REVOCATION_MISMATCH",
+            "$.receipt.previous_credential_revocation",
+            "resume receipt does not prove revocation of the credential being replaced",
+        )
+    else:
+        require(
+            receipt["previous_credential_revocation"] is None,
+            "START_SESSION_REVOCATION_FORBIDDEN",
+            "$.receipt.previous_credential_revocation",
+            "a new session has no previous credential to revoke",
+        )
     require(
-        parse_time(receipt["issued_at"], "$.receipt.issued_at") >= parse_time(request["requested_at"], "$.request.requested_at"),
-        "INVALID_CHRONOLOGY",
-        "$.receipt.issued_at",
-        "receipt predates exchange",
+        receipt["session_state"] == request["expected_session_state"],
+        "RESUME_SESSION_STATE_MISMATCH",
+        "$.receipt.session_state",
+        "exchange receipt changed the expected session lifecycle state",
     )
+    require(
+        receipt["credential"]["replay_completion_id"] == request["expected_completion_id"],
+        "RESUME_COMPLETION_BINDING_MISMATCH",
+        "$.receipt.credential.replay_completion_id",
+        "completed-session credential is bound to another completion",
+    )
+    # Launch and resume request times are non-authoritative because either can
+    # be the operation that recovers a missing or invalid monotonic anchor.
 
 
 def validate_segment_intent(value: dict[str, Any]) -> None:
@@ -258,6 +294,7 @@ def validate_segment_intent(value: dict[str, Any]) -> None:
         "$.transport.content_type",
         "segment upload must be video",
     )
+    parse_time(value["requested_at"], "$.requested_at")
 
 
 def validate_segment_receipt(value: dict[str, Any]) -> None:
@@ -274,18 +311,34 @@ def validate_segment_receipt(value: dict[str, Any]) -> None:
         "$.transport_digest",
         "durable bytes differ from runtime receipt",
     )
+    require(
+        value["segment_id"] == receipt["segment_id"],
+        "SEGMENT_CONTENT_MISMATCH",
+        "$.segment_id",
+        "protocol receipt and runtime receipt name different segments",
+    )
+    parse_time(receipt["received_at"], "$.runtime_receipt.received_at")
 
 
 def validate_segment_pair(intent: dict[str, Any], receipt: dict[str, Any]) -> None:
     validate(intent)
     validate(receipt)
-    for field in ("upload_id", "session_id", "scope_digest", "sequence"):
+    for field in ("upload_id", "session_id", "scope_digest", "credential_id", "sequence", "segment_id"):
         require(receipt[field] == intent[field], "SEGMENT_BINDING_MISMATCH", f"$.receipt.{field}", "receipt differs from upload intent")
     require(receipt["intent_digest"] == intent["intent_digest"], "SEGMENT_BINDING_MISMATCH", "$.receipt.intent_digest", "receipt does not bind intent")
     runtime_receipt = receipt["runtime_receipt"]
     require(runtime_receipt["segment_id"] == intent["segment_id"], "SEGMENT_CONTENT_MISMATCH", "$.receipt.runtime_receipt.segment_id", "receipt names another segment")
     require(runtime_receipt["size_bytes"] == intent["transport"]["size_bytes"], "SEGMENT_CONTENT_MISMATCH", "$.receipt.runtime_receipt.size_bytes", "receipt size differs")
     require(runtime_receipt["content_digest"] == intent["transport"]["content_digest"], "SEGMENT_CONTENT_MISMATCH", "$.receipt.runtime_receipt.content_digest", "receipt digest differs")
+    require(receipt["content_type"] == intent["transport"]["content_type"], "SEGMENT_CONTENT_MISMATCH", "$.receipt.content_type", "receipt content type differs")
+    require(receipt["sidecar_digest"] == intent["sidecar_digest"], "SEGMENT_CONTENT_MISMATCH", "$.receipt.sidecar_digest", "receipt sidecar differs")
+    require(
+        parse_time(runtime_receipt["received_at"], "$.receipt.runtime_receipt.received_at")
+        >= parse_time(intent["requested_at"], "$.intent.requested_at"),
+        "INVALID_CHRONOLOGY",
+        "$.receipt.runtime_receipt.received_at",
+        "segment receipt predates upload intent",
+    )
 
 
 def validate_diagnostic_request(value: dict[str, Any]) -> None:
@@ -312,7 +365,7 @@ def validate_diagnostic_receipt(value: dict[str, Any]) -> None:
 def validate_diagnostic_pair(request: dict[str, Any], receipt: dict[str, Any]) -> None:
     validate(request)
     validate(receipt)
-    for field in ("upload_id", "session_id", "scope_digest"):
+    for field in ("upload_id", "session_id", "scope_digest", "credential_id"):
         require(receipt[field] == request[field], "DIAGNOSTIC_BINDING_MISMATCH", f"$.receipt.{field}", "receipt differs from request")
     require(receipt["request_digest"] == request["request_digest"], "DIAGNOSTIC_BINDING_MISMATCH", "$.receipt.request_digest", "receipt does not bind request")
     envelope = request["envelope"]
@@ -320,6 +373,12 @@ def validate_diagnostic_pair(request: dict[str, Any], receipt: dict[str, Any]) -
     require(receipt["envelope_digest"] == envelope["envelope_digest"], "DIAGNOSTIC_BINDING_MISMATCH", "$.receipt.envelope_digest", "receipt does not bind envelope")
     require(receipt["size_bytes"] == request["transport"]["size_bytes"], "DIAGNOSTIC_BINDING_MISMATCH", "$.receipt.size_bytes", "durable size differs")
     require(receipt["transport_digest"] == request["transport"]["content_digest"], "DIAGNOSTIC_BINDING_MISMATCH", "$.receipt.transport_digest", "durable bytes differ")
+    require(
+        parse_time(receipt["received_at"], "$.receipt.received_at") >= parse_time(request["requested_at"], "$.request.requested_at"),
+        "INVALID_CHRONOLOGY",
+        "$.receipt.received_at",
+        "diagnostic receipt predates upload request",
+    )
 
 
 def validate_completion_request(value: dict[str, Any]) -> None:
@@ -335,28 +394,79 @@ def validate_completion_request(value: dict[str, Any]) -> None:
         validate(receipt)
         require(receipt["session_id"] == value["session_id"], "COMPLETION_SCOPE_MISMATCH", "$.receipts.session_id", "receipt names another session")
         require(receipt["scope_digest"] == value["scope_digest"], "COMPLETION_SCOPE_MISMATCH", "$.receipts.scope_digest", "receipt escaped immutable scope")
+    unique([receipt["upload_id"] for receipt in segment_receipts], "$.segment_receipts")
+    unique([receipt["segment_id"] for receipt in segment_receipts], "$.segment_receipts")
+    unique([receipt["sequence"] for receipt in segment_receipts], "$.segment_receipts")
     unique([receipt["segment_receipt_digest"] for receipt in segment_receipts], "$.segment_receipts")
+    unique([receipt["upload_id"] for receipt in diagnostic_receipts], "$.diagnostic_receipts")
+    unique([receipt["receipt_id"] for receipt in diagnostic_receipts], "$.diagnostic_receipts")
+    unique([receipt["object_id"] for receipt in diagnostic_receipts], "$.diagnostic_receipts")
     unique([receipt["diagnostic_receipt_digest"] for receipt in diagnostic_receipts], "$.diagnostic_receipts")
+
+    available_segments = {
+        segment["segment_id"]: segment
+        for segment in manifest["segments"]
+        if segment["availability"] == "available"
+    }
+    protocol_receipts = {receipt["segment_id"]: receipt for receipt in segment_receipts}
     require(
-        [receipt["sequence"] for receipt in segment_receipts] == sorted(receipt["sequence"] for receipt in segment_receipts),
-        "SEGMENT_RECEIPT_ORDER",
-        "$.segment_receipts",
-        "segment receipts must be ordered by sequence",
-    )
-    expected_runtime_receipts = manifest["upload"]["receipts"]
-    actual_runtime_receipts = [receipt["runtime_receipt"] for receipt in segment_receipts]
-    require(
-        [canonical_json(item) for item in actual_runtime_receipts] == [canonical_json(item) for item in expected_runtime_receipts],
+        set(protocol_receipts) == set(available_segments),
         "SEGMENT_RECEIPT_SET_MISMATCH",
         "$.segment_receipts",
-        "protocol receipts must exactly cover manifest upload receipts",
+        "protocol receipts must exactly cover every available manifest segment",
     )
-    requested = parse_time(value["requested_at"], "$.requested_at")
+    expected_runtime_receipts = {receipt["segment_id"]: receipt for receipt in manifest["upload"]["receipts"]}
     require(
-        requested >= parse_time(manifest["upload"]["completed_at"], "$.capture_manifest.upload.completed_at"),
+        set(expected_runtime_receipts) == set(protocol_receipts),
+        "SEGMENT_RECEIPT_SET_MISMATCH",
+        "$.capture_manifest.upload.receipts",
+        "runtime upload receipts and protocol receipts cover different segments",
+    )
+    for segment_id, receipt in protocol_receipts.items():
+        segment = available_segments[segment_id]
+        content = segment["content"]
+        require(receipt["sequence"] == segment["sequence"], "SEGMENT_MANIFEST_BINDING_MISMATCH", "$.segment_receipts.sequence", "protocol sequence differs from manifest")
+        require(receipt["content_type"] == content["content_type"], "SEGMENT_MANIFEST_BINDING_MISMATCH", "$.segment_receipts.content_type", "protocol content type differs from manifest")
+        require(receipt["sidecar_digest"] == content["sidecar_digest"], "SEGMENT_MANIFEST_BINDING_MISMATCH", "$.segment_receipts.sidecar_digest", "protocol sidecar differs from manifest")
+        runtime_receipt = receipt["runtime_receipt"]
+        require(runtime_receipt["size_bytes"] == content["size_bytes"], "SEGMENT_MANIFEST_BINDING_MISMATCH", "$.segment_receipts.runtime_receipt.size_bytes", "protocol size differs from manifest")
+        require(runtime_receipt["content_digest"] == content["content_digest"], "SEGMENT_MANIFEST_BINDING_MISMATCH", "$.segment_receipts.runtime_receipt.content_digest", "protocol content digest differs from manifest")
+        require(
+            canonical_json(runtime_receipt) == canonical_json(expected_runtime_receipts[segment_id]),
+            "SEGMENT_RECEIPT_SET_MISMATCH",
+            "$.segment_receipts.runtime_receipt",
+            "protocol runtime receipt differs from the manifest receipt for its segment",
+        )
+
+    requested = parse_time(value["requested_at"], "$.requested_at")
+    upload_completed = parse_time(manifest["upload"]["completed_at"], "$.capture_manifest.upload.completed_at")
+    latest_segment = max(
+        parse_time(item["runtime_receipt"]["received_at"], "$.segment_receipts[].runtime_receipt.received_at")
+        for item in segment_receipts
+    )
+    require(
+        upload_completed >= latest_segment,
+        "INVALID_CHRONOLOGY",
+        "$.capture_manifest.upload.completed_at",
+        "manifest upload completion predates a segment receipt",
+    )
+    require(
+        upload_completed >= parse_time(manifest["ended_at"], "$.capture_manifest.ended_at"),
+        "INVALID_CHRONOLOGY",
+        "$.capture_manifest.upload.completed_at",
+        "manifest upload completed before capture ended",
+    )
+    require(
+        requested >= upload_completed and requested >= latest_segment,
         "INVALID_CHRONOLOGY",
         "$.requested_at",
         "completion predates media upload",
+    )
+    require(
+        requested >= parse_time(manifest["ended_at"], "$.capture_manifest.ended_at"),
+        "INVALID_CHRONOLOGY",
+        "$.requested_at",
+        "completion predates capture end",
     )
     latest_diagnostic = max(parse_time(item["received_at"], "$.diagnostic_receipts[].received_at") for item in diagnostic_receipts)
     require(requested >= latest_diagnostic, "INVALID_CHRONOLOGY", "$.requested_at", "completion predates diagnostics upload")
@@ -384,6 +494,12 @@ def validate_completion_pair(request: dict[str, Any], receipt: dict[str, Any]) -
     for field in ("completion_id", "session_id", "scope_digest"):
         require(receipt[field] == request[field], "COMPLETION_BINDING_MISMATCH", f"$.receipt.{field}", "completion receipt differs from request")
     require(receipt["request_digest"] == request["request_digest"], "COMPLETION_BINDING_MISMATCH", "$.receipt.request_digest", "receipt does not bind exact request")
+    require(
+        receipt["credential"]["credential_id"] == request["credential_id"],
+        "COMPLETION_CREDENTIAL_MISMATCH",
+        "$.receipt.credential.credential_id",
+        "completion transitioned another credential",
+    )
     accepted = parse_time(receipt["accepted_at"], "$.receipt.accepted_at")
     requested = parse_time(request["requested_at"], "$.request.requested_at")
     require(accepted >= requested, "INVALID_CHRONOLOGY", "$.receipt.accepted_at", "receipt predates completion request")
@@ -427,14 +543,29 @@ def validate_deletion_request(value: dict[str, Any]) -> None:
 
 
 def validate_deletion_tombstone(value: dict[str, Any]) -> None:
+    accepted = parse_time(value["accepted_at"], "$.accepted_at")
     deleted = parse_time(value["deleted_at"], "$.deleted_at")
     expires = parse_time(value["tombstone_expires_at"], "$.tombstone_expires_at")
+    require(deleted >= accepted, "INVALID_CHRONOLOGY", "$.deleted_at", "durable erasure predates deletion acceptance")
     require(expires > deleted, "INVALID_TOMBSTONE_EXPIRY", "$.tombstone_expires_at", "tombstone expiry must follow deletion")
     require(
         expires <= deleted + timedelta(days=30),
         "TOMBSTONE_RETENTION_EXCEEDED",
         "$.tombstone_expires_at",
         "minimal deletion tombstones may not persist beyond 30 days",
+    )
+    credential = value["credential"]
+    require(
+        credential["replay_deletion_id"] == value["deletion_id"],
+        "DELETION_CREDENTIAL_MISMATCH",
+        "$.credential.replay_deletion_id",
+        "deletion replay credential is bound to another deletion",
+    )
+    require(
+        parse_time(credential["verifier_retained_until"], "$.credential.verifier_retained_until") == expires,
+        "DELETION_REPLAY_RETENTION_MISMATCH",
+        "$.credential.verifier_retained_until",
+        "replay verifier and exact tombstone must expire together",
     )
 
 
@@ -445,7 +576,6 @@ def validate_deletion_pair(request: dict[str, Any], tombstone: dict[str, Any]) -
         "deletion_id": "deletion_id",
         "session_id": "session_id",
         "scope_digest": "scope_digest",
-        "credential_id": "revoked_credential_id",
         "request_digest": "deletion_request_digest",
     }
     for request_field, tombstone_field in mappings.items():
@@ -456,15 +586,21 @@ def validate_deletion_pair(request: dict[str, Any], tombstone: dict[str, Any]) -
             "tombstone differs from deletion request",
         )
     require(
-        parse_time(tombstone["deleted_at"], "$.tombstone.deleted_at") >= parse_time(request["requested_at"], "$.request.requested_at"),
+        tombstone["credential"]["credential_id"] == request["credential_id"],
+        "DELETION_BINDING_MISMATCH",
+        "$.tombstone.credential.credential_id",
+        "tombstone retained a verifier for another credential",
+    )
+    require(
+        parse_time(tombstone["accepted_at"], "$.tombstone.accepted_at") >= parse_time(request["requested_at"], "$.request.requested_at"),
         "INVALID_CHRONOLOGY",
-        "$.tombstone.deleted_at",
-        "deletion predates its request",
+        "$.tombstone.accepted_at",
+        "deletion acceptance predates its request",
     )
 
 
-def validate_idempotent_replay(original: dict[str, Any], replay: dict[str, Any]) -> None:
-    """Require an operation-ID replay to be byte-semantically identical."""
+def validate_idempotent_request_replay(original: dict[str, Any], replay: dict[str, Any]) -> None:
+    """Require an operation-ID replay to carry identical canonical request content."""
     validate(original)
     validate(replay)
     message_type = original["message_type"]
@@ -478,27 +614,348 @@ def validate_idempotent_replay(original: dict[str, Any], replay: dict[str, Any])
         f"$.replay.{digest_field}",
         "same operation ID was reused for different canonical content",
     )
+    require(
+        canonical_json(replay) == canonical_json(original),
+        "IDEMPOTENCY_REQUEST_MISMATCH",
+        "$.replay",
+        "same operation ID and digest must replay identical canonical request bytes",
+    )
+
+
+def validate_operation_pair(request: dict[str, Any], response: dict[str, Any]) -> None:
+    """Dispatch one mutating request and its durable response to its pair validator."""
+    validators = {
+        "launch_exchange_request": ("launch_exchange_receipt", validate_launch_pair),
+        "segment_upload_intent": ("segment_upload_receipt", validate_segment_pair),
+        "diagnostic_upload_request": ("diagnostic_upload_receipt", validate_diagnostic_pair),
+        "completion_request": ("completion_receipt", validate_completion_pair),
+        "deletion_request": ("deletion_tombstone", validate_deletion_pair),
+    }
+    message_type = request.get("message_type")
+    require(message_type in validators, "NOT_IDEMPOTENT_REQUEST", "$.request.message_type", str(message_type))
+    response_type, validator = validators[message_type]
+    require(
+        response.get("message_type") == response_type,
+        "OPERATION_RESPONSE_TYPE_MISMATCH",
+        "$.response.message_type",
+        f"{message_type} requires {response_type}",
+    )
+    validator(request, response)
+
+
+def validate_idempotent_replay(
+    original_request: dict[str, Any],
+    original_response: dict[str, Any],
+    replay_request: dict[str, Any],
+    replay_response: dict[str, Any],
+) -> None:
+    """Require exact canonical request and persisted-response bytes across a replay."""
+    validate_idempotent_request_replay(original_request, replay_request)
+    validate_operation_pair(original_request, original_response)
+    validate_operation_pair(replay_request, replay_response)
+    require(
+        replay_response["message_type"] == original_response["message_type"],
+        "IDEMPOTENCY_RESPONSE_TYPE_MISMATCH",
+        "$.replay_response.message_type",
+        "replay returned another response type",
+    )
+    require(
+        canonical_json(replay_response).encode("utf-8") == canonical_json(original_response).encode("utf-8"),
+        "IDEMPOTENCY_RESPONSE_MISMATCH",
+        "$.replay_response",
+        "exact retry must return the byte-identical canonical persisted response",
+    )
+
+
+def validate_launch_chain(
+    build_identity: dict[str, Any],
+    scope: dict[str, Any],
+    launch_pairs: list[tuple[dict[str, Any], dict[str, Any]]],
+) -> tuple[str, dict[str, dict[str, Any]]]:
+    """Validate ordered start/resume exchanges and return durable credential history."""
+    require(bool(launch_pairs), "EMPTY_LAUNCH_CHAIN", "$.launch_pairs", "lifecycle requires a start exchange")
+    history: dict[str, dict[str, Any]] = {}
+    session_id: str | None = None
+    previous_credential_id: str | None = None
+    previous_session_state: str | None = None
+    previous_issued = None
+
+    for index, (request, receipt) in enumerate(launch_pairs):
+        validate_launch_pair(request, receipt)
+        require(request["build_identity"] == build_identity, "BUNDLE_SCOPE_MISMATCH", f"$.launch_pairs[{index}].request.build_identity", "launch request changed build")
+        require(request["scope"] == scope and receipt["scope"] == scope, "BUNDLE_SCOPE_MISMATCH", f"$.launch_pairs[{index}].scope", "launch exchange changed immutable scope")
+        credential_id = receipt["credential"]["credential_id"]
+        require(credential_id not in history, "DUPLICATE_CREDENTIAL_ID", f"$.launch_pairs[{index}].credential_id", "credential ID already exists in this session")
+        issued = parse_time(receipt["issued_at"], f"$.launch_pairs[{index}].receipt.issued_at")
+
+        if index == 0:
+            require(request["exchange_kind"] == "start_session", "LAUNCH_CHAIN_MUST_START_SESSION", "$.launch_pairs[0].request.exchange_kind", "first exchange must create the session")
+            require(receipt["session_state"] == "receiving", "BUNDLE_SESSION_STATE_MISMATCH", "$.launch_pairs[0].receipt.session_state", "new session must begin receiving")
+            session_id = receipt["session_id"]
+        else:
+            require(request["exchange_kind"] == "resume_session", "LAUNCH_CHAIN_RESUME_REQUIRED", f"$.launch_pairs[{index}].request.exchange_kind", "later exchanges must resume the session")
+            require(receipt["session_id"] == session_id, "BUNDLE_SCOPE_MISMATCH", f"$.launch_pairs[{index}].receipt.session_id", "resume escaped the original session")
+            require(request["previous_credential_id"] == previous_credential_id, "CREDENTIAL_CHAIN_MISMATCH", f"$.launch_pairs[{index}].request.previous_credential_id", "resume did not rotate the current credential")
+            revocation = receipt["previous_credential_revocation"]
+            require(revocation["credential_id"] == previous_credential_id, "CREDENTIAL_CHAIN_MISMATCH", f"$.launch_pairs[{index}].receipt.previous_credential_revocation", "resume revoked another credential")
+            require(
+                parse_time(receipt["received_at"], f"$.launch_pairs[{index}].receipt.received_at")
+                >= previous_issued,
+                "INVALID_CHRONOLOGY",
+                f"$.launch_pairs[{index}].receipt.received_at",
+                "server received a resume before the previous credential existed",
+            )
+            require(issued >= previous_issued, "INVALID_CHRONOLOGY", f"$.launch_pairs[{index}].receipt.issued_at", "credential issue time regressed")
+            require(
+                not (previous_session_state == "completed" and receipt["session_state"] != "completed"),
+                "SESSION_STATE_REGRESSION",
+                f"$.launch_pairs[{index}].receipt.session_state",
+                "completed session cannot return to receiving",
+            )
+            history[previous_credential_id]["revoked_at"] = parse_time(
+                revocation["revoked_at"],
+                f"$.launch_pairs[{index}].receipt.previous_credential_revocation.revoked_at",
+            )
+
+        history[credential_id] = {
+            "session_id": session_id,
+            "scope_digest": scope["scope_digest"],
+            "issued_at": issued,
+            "expires_at": parse_time(receipt["credential"]["expires_at"], f"$.launch_pairs[{index}].receipt.credential.expires_at"),
+            "revoked_at": None,
+            "credential_state": receipt["credential"]["state"],
+            "session_state": receipt["session_state"],
+            "replay_completion_id": receipt["credential"]["replay_completion_id"],
+        }
+        previous_credential_id = credential_id
+        previous_session_state = receipt["session_state"]
+        previous_issued = issued
+
+    return session_id, history
+
+
+def validate_credential_use(
+    credential_id: str,
+    authoritative_at: str,
+    history: dict[str, dict[str, Any]],
+    path: str,
+) -> dict[str, Any]:
+    """Resolve a server acceptance time against durable credential history."""
+    require(credential_id in history, "UNRELATED_CREDENTIAL", f"{path}.credential_id", "credential is not in this session's durable rotation chain")
+    credential = history[credential_id]
+    accepted = parse_time(authoritative_at, f"{path}.accepted_at")
+    require(accepted >= credential["issued_at"], "INVALID_CHRONOLOGY", f"{path}.accepted_at", "operation predates credential issue")
+    require(accepted < credential["expires_at"], "EXPIRED_CREDENTIAL", f"{path}.accepted_at", "operation was accepted at or after credential expiry")
+    if credential["revoked_at"] is not None:
+        require(accepted < credential["revoked_at"], "REVOKED_CREDENTIAL", f"{path}.accepted_at", "operation was accepted at or after credential revocation")
+    return credential
+
+
+def current_credential_at(
+    authoritative_at: str,
+    history: dict[str, dict[str, Any]],
+    path: str,
+) -> tuple[str, dict[str, Any]]:
+    """Return the sole credential whose half-open server interval contains a time."""
+    accepted = parse_time(authoritative_at, f"{path}.accepted_at")
+    current = [
+        (credential_id, credential)
+        for credential_id, credential in history.items()
+        if credential["issued_at"] <= accepted
+        and accepted < credential["expires_at"]
+        and (credential["revoked_at"] is None or accepted < credential["revoked_at"])
+    ]
+    require(len(current) == 1, "NO_CURRENT_CREDENTIAL", f"{path}.accepted_at", "server acceptance must resolve to exactly one current credential")
+    return current[0]
+
+
+def validate_new_upload_authentication(
+    request: dict[str, Any],
+    authentication_credential_id: str,
+    server_authenticated_at: str,
+    credential_history: dict[str, dict[str, Any]],
+    session_state: str,
+) -> None:
+    """Authorize a not-yet-durable upload; no rotated-ID exception applies."""
+    current_id, current = current_credential_at(
+        server_authenticated_at,
+        credential_history,
+        "$.authentication",
+    )
+    require(
+        authentication_credential_id == current_id,
+        "CURRENT_CREDENTIAL_MISMATCH",
+        "$.authentication.credential_id",
+        "Authorization did not use the current session credential",
+    )
+    validate(request)
+    require(
+        request["message_type"] in {"segment_upload_intent", "diagnostic_upload_request"},
+        "UNSUPPORTED_AUTHENTICATED_OPERATION",
+        "$.request.message_type",
+        "new-operation helper is limited to SDK uploads",
+    )
+    require(
+        request["session_id"] == current["session_id"]
+        and request["scope_digest"] == current["scope_digest"],
+        "BUNDLE_SCOPE_MISMATCH",
+        "$.request",
+        "authenticated route or body escaped the credential's session scope",
+    )
+    require(
+        request["credential_id"] == authentication_credential_id,
+        "AUTHENTICATION_CREDENTIAL_MISMATCH",
+        "$.request.credential_id",
+        "a new operation must name the same current credential used for Authorization",
+    )
+    validate_credential_use(
+        request["credential_id"],
+        server_authenticated_at,
+        credential_history,
+        "$.request",
+    )
+    require(
+        session_state == "receiving"
+        and current["session_state"] == "receiving"
+        and current["credential_state"] == "active",
+        "CREDENTIAL_CAPABILITY_MISMATCH",
+        "$.authentication.credential_id",
+        "new uploads require the current active credential of a receiving session",
+    )
+
+
+def validate_authenticated_exact_replay(
+    original_request: dict[str, Any],
+    original_response: dict[str, Any],
+    replay_request: dict[str, Any],
+    replay_response: dict[str, Any],
+    authentication_credential_id: str,
+    server_authenticated_at: str,
+    credential_history: dict[str, dict[str, Any]],
+    session_state: str,
+) -> None:
+    """Authorize a durable exact replay without rewriting its original credential ID."""
+    # The caller supplies the credential ID only after verifying its bearer
+    # secret. Authenticate current session scope before any durable lookup, but
+    # deliberately do not require equality with the historical body ID yet.
+    current_id, current = current_credential_at(
+        server_authenticated_at,
+        credential_history,
+        "$.authentication",
+    )
+    require(
+        authentication_credential_id == current_id,
+        "CURRENT_CREDENTIAL_MISMATCH",
+        "$.authentication.credential_id",
+        "exact replay was not authenticated by the current session credential",
+    )
+    require(
+        replay_request.get("session_id") == current["session_id"]
+        and replay_request.get("scope_digest") == current["scope_digest"],
+        "BUNDLE_SCOPE_MISMATCH",
+        "$.replay_request",
+        "authenticated route or request escaped the credential's session scope",
+    )
+
+    # Only an authenticated exact durable hit receives the rotated-body-ID
+    # exception. Conflicts are resolved before operation-specific capability.
+    validate_idempotent_replay(
+        original_request,
+        original_response,
+        replay_request,
+        replay_response,
+    )
+    message_type = original_request["message_type"]
+    require(
+        message_type
+        in {"segment_upload_intent", "diagnostic_upload_request", "completion_request"},
+        "UNSUPPORTED_AUTHENTICATED_OPERATION",
+        "$.request.message_type",
+        "authenticated rotation replay supports uploads and completion",
+    )
+    source_credential_id = original_request["credential_id"]
+    require(
+        source_credential_id in credential_history,
+        "UNRELATED_CREDENTIAL",
+        "$.request.credential_id",
+        "durable operation credential is outside this session's rotation history",
+    )
+
+    if message_type == "segment_upload_intent":
+        original_accepted_at = original_response["runtime_receipt"]["received_at"]
+    elif message_type == "diagnostic_upload_request":
+        original_accepted_at = original_response["received_at"]
+    else:
+        original_accepted_at = original_response["accepted_at"]
+
+    source = validate_credential_use(
+        source_credential_id,
+        original_accepted_at,
+        credential_history,
+        "$.original_request",
+    )
+    require(
+        source["session_state"] == "receiving" and source["credential_state"] == "active",
+        "CREDENTIAL_CAPABILITY_MISMATCH",
+        "$.original_request.credential_id",
+        "the original operation was not accepted under an upload-capable credential",
+    )
+    if message_type == "completion_request":
+        original_current_id, _ = current_credential_at(
+            original_accepted_at,
+            credential_history,
+            "$.original_response",
+        )
+        require(
+            source_credential_id == original_current_id,
+            "CURRENT_CREDENTIAL_MISMATCH",
+            "$.original_request.credential_id",
+            "the original completion did not use the current credential",
+        )
+
+    if message_type in {"segment_upload_intent", "diagnostic_upload_request"}:
+        require(
+            session_state == "receiving"
+            and current["session_state"] == "receiving"
+            and current["credential_state"] == "active",
+            "REPLAY_CAPABILITY_MISMATCH",
+            "$.authentication.credential_id",
+            "only an active receiving-session credential may replay a durable upload",
+        )
+        return
+
+    if current_id == original_response["credential"]["credential_id"]:
+        effective_state = original_response["credential"]["state"]
+        replay_completion_id = original_response["credential"]["replay_completion_id"]
+    else:
+        effective_state = current["credential_state"]
+        replay_completion_id = current["replay_completion_id"]
+    require(
+        session_state == "completed"
+        and effective_state == "completion_replay_or_delete_only"
+        and replay_completion_id == original_request["completion_id"],
+        "REPLAY_CAPABILITY_MISMATCH",
+        "$.authentication.credential_id",
+        "completed credential may replay only its bound durable completion",
+    )
 
 
 def validate_bundle(
     build_identity: dict[str, Any],
     scope: dict[str, Any],
-    launch_request: dict[str, Any],
-    launch_receipt: dict[str, Any],
+    launch_pairs: list[tuple[dict[str, Any], dict[str, Any]]],
     segment_pairs: list[tuple[dict[str, Any], dict[str, Any]]],
     diagnostic_pairs: list[tuple[dict[str, Any], dict[str, Any]]],
     completion_request: dict[str, Any],
     completion_receipt: dict[str, Any],
     deletion_pair: tuple[dict[str, Any], dict[str, Any]] | None = None,
 ) -> None:
-    """Validate one complete capture lifecycle across every protocol boundary."""
+    """Validate one lifecycle against ordered, server-authoritative credential history."""
     validate(build_identity)
     validate(scope)
-    validate_launch_pair(launch_request, launch_receipt)
-    require(launch_request["build_identity"] == build_identity, "BUNDLE_SCOPE_MISMATCH", "$.launch_request.build_identity", "launch request changed build")
-    require(launch_request["scope"] == scope, "BUNDLE_SCOPE_MISMATCH", "$.launch_request.scope", "launch request changed scope")
     require(scope["build_id"] == build_identity["build_id"], "BUNDLE_SCOPE_MISMATCH", "$.scope.build_id", "scope names another build")
     require(scope["build_identity_digest"] == build_identity["build_identity_digest"], "BUNDLE_SCOPE_MISMATCH", "$.scope.build_identity_digest", "scope does not bind build")
+    session_id, credential_history = validate_launch_chain(build_identity, scope, launch_pairs)
 
     for intent, receipt in segment_pairs:
         validate_segment_pair(intent, receipt)
@@ -506,7 +963,6 @@ def validate_bundle(
         validate_diagnostic_pair(request, receipt)
     validate_completion_pair(completion_request, completion_receipt)
 
-    session_id = launch_receipt["session_id"]
     scope_digest = scope["scope_digest"]
     for value in [
         *(item for pair in segment_pairs for item in pair),
@@ -517,42 +973,176 @@ def validate_bundle(
         require(value["session_id"] == session_id, "BUNDLE_SCOPE_MISMATCH", "$.session_id", "message escaped launch session")
         require(value["scope_digest"] == scope_digest, "BUNDLE_SCOPE_MISMATCH", "$.scope_digest", "message escaped immutable scope")
 
-    require(
-        completion_request["segment_receipts"] == [receipt for _, receipt in segment_pairs],
-        "BUNDLE_RECEIPT_MISMATCH",
-        "$.completion_request.segment_receipts",
-        "completion does not use exact media receipts",
+    for index, (intent, receipt) in enumerate(segment_pairs):
+        credential = validate_credential_use(
+            intent["credential_id"],
+            receipt["runtime_receipt"]["received_at"],
+            credential_history,
+            f"$.segment_pairs[{index}]",
+        )
+        require(
+            parse_time(intent["requested_at"], f"$.segment_pairs[{index}].intent.requested_at") >= credential["issued_at"],
+            "INVALID_CHRONOLOGY",
+            f"$.segment_pairs[{index}].intent.requested_at",
+            "client segment request predates credential issue",
+        )
+        require(
+            credential["session_state"] == "receiving" and credential["credential_state"] == "active",
+            "CREDENTIAL_CAPABILITY_MISMATCH",
+            f"$.segment_pairs[{index}].intent.credential_id",
+            "segment upload requires a receiving-session active credential",
+        )
+    for index, (request, receipt) in enumerate(diagnostic_pairs):
+        credential = validate_credential_use(
+            request["credential_id"],
+            receipt["received_at"],
+            credential_history,
+            f"$.diagnostic_pairs[{index}]",
+        )
+        require(
+            parse_time(request["requested_at"], f"$.diagnostic_pairs[{index}].request.requested_at") >= credential["issued_at"],
+            "INVALID_CHRONOLOGY",
+            f"$.diagnostic_pairs[{index}].request.requested_at",
+            "client diagnostic request predates credential issue",
+        )
+        require(
+            credential["session_state"] == "receiving" and credential["credential_state"] == "active",
+            "CREDENTIAL_CAPABILITY_MISMATCH",
+            f"$.diagnostic_pairs[{index}].request.credential_id",
+            "diagnostic upload requires a receiving-session active credential",
+        )
+
+    current_completion_id, _ = current_credential_at(
+        completion_receipt["accepted_at"],
+        credential_history,
+        "$.completion_receipt",
     )
     require(
-        completion_request["diagnostic_receipts"] == [receipt for _, receipt in diagnostic_pairs],
-        "BUNDLE_RECEIPT_MISMATCH",
-        "$.completion_request.diagnostic_receipts",
-        "completion does not use exact diagnostic receipts",
+        completion_request["credential_id"] == current_completion_id,
+        "CURRENT_CREDENTIAL_MISMATCH",
+        "$.completion_request.credential_id",
+        "completion did not use the current credential at server acceptance",
     )
+    completion_credential = validate_credential_use(
+        completion_request["credential_id"],
+        completion_receipt["accepted_at"],
+        credential_history,
+        "$.completion_request",
+    )
+    require(
+        parse_time(completion_request["requested_at"], "$.completion_request.requested_at") >= completion_credential["issued_at"],
+        "INVALID_CHRONOLOGY",
+        "$.completion_request.requested_at",
+        "client completion request predates credential issue",
+    )
+    require(
+        completion_credential["session_state"] == "receiving" and completion_credential["credential_state"] == "active",
+        "CREDENTIAL_CAPABILITY_MISMATCH",
+        "$.completion_request.credential_id",
+        "first completion requires the current receiving-session active credential",
+    )
+    require(
+        completion_receipt["credential"]["credential_id"] == completion_request["credential_id"],
+        "BUNDLE_CREDENTIAL_MISMATCH",
+        "$.completion_receipt.credential.credential_id",
+        "completion transitioned another credential",
+    )
+    launch_expiry = next(
+        receipt["credential"]["expires_at"]
+        for _, receipt in launch_pairs
+        if receipt["credential"]["credential_id"] == completion_request["credential_id"]
+    )
+    require(
+        completion_receipt["credential"]["expires_at"] == launch_expiry,
+        "COMPLETION_CREDENTIAL_EXPIRY_MISMATCH",
+        "$.completion_receipt.credential.expires_at",
+        "completion state transition cannot silently change credential expiry",
+    )
+    accepted = parse_time(completion_receipt["accepted_at"], "$.completion_receipt.accepted_at")
+
+    for index, (_, receipt) in enumerate(launch_pairs):
+        issued = parse_time(receipt["issued_at"], f"$.launch_pairs[{index}].receipt.issued_at")
+        if receipt["session_state"] == "completed":
+            require(issued > accepted, "INVALID_CHRONOLOGY", f"$.launch_pairs[{index}].receipt.issued_at", "completed-session resume did not follow durable completion")
+            require(receipt["credential"]["replay_completion_id"] == completion_request["completion_id"], "RESUME_COMPLETION_BINDING_MISMATCH", f"$.launch_pairs[{index}].receipt.credential.replay_completion_id", "completed-session resume names another completion")
+        else:
+            require(issued <= accepted, "INVALID_CHRONOLOGY", f"$.launch_pairs[{index}].receipt.issued_at", "receiving-session resume followed completion")
+
+    unique([intent["segment_id"] for intent, _ in segment_pairs], "$.segment_pairs")
+    unique([receipt["segment_id"] for _, receipt in segment_pairs], "$.segment_pairs")
+    pair_segment_receipts = {receipt["segment_id"]: canonical_json(receipt) for _, receipt in segment_pairs}
+    completion_segment_receipts = {receipt["segment_id"]: canonical_json(receipt) for receipt in completion_request["segment_receipts"]}
+    require(completion_segment_receipts == pair_segment_receipts, "BUNDLE_RECEIPT_MISMATCH", "$.completion_request.segment_receipts", "completion does not use the exact keyed set of media receipts")
+
+    unique([request["upload_id"] for request, _ in diagnostic_pairs], "$.diagnostic_pairs")
+    unique([receipt["upload_id"] for _, receipt in diagnostic_pairs], "$.diagnostic_pairs")
+    pair_diagnostic_receipts = {receipt["upload_id"]: canonical_json(receipt) for _, receipt in diagnostic_pairs}
+    completion_diagnostic_receipts = {receipt["upload_id"]: canonical_json(receipt) for receipt in completion_request["diagnostic_receipts"]}
+    require(completion_diagnostic_receipts == pair_diagnostic_receipts, "BUNDLE_RECEIPT_MISMATCH", "$.completion_request.diagnostic_receipts", "completion does not use the exact keyed set of diagnostic receipts")
+
     scoped_runtime_values = [completion_request["capture_manifest"], completion_receipt["processing_job"]]
     scoped_runtime_values.extend(request["envelope"] for request, _ in diagnostic_pairs)
     for value in scoped_runtime_values:
         for field in ("organization_id", "project_id", "build_id", "build_identity_digest"):
-            expected = scope[field]
-            require(value[field] == expected, "BUNDLE_SCOPE_MISMATCH", f"$.runtime.{field}", "runtime artifact escaped immutable scope")
+            require(value[field] == scope[field], "BUNDLE_SCOPE_MISMATCH", f"$.runtime.{field}", "runtime artifact escaped immutable scope")
         require(value["session_id"] == session_id, "BUNDLE_SCOPE_MISMATCH", "$.runtime.session_id", "runtime artifact names another session")
+    first_issued = min(item["issued_at"] for item in credential_history.values())
+    require(parse_time(completion_request["capture_manifest"]["started_at"], "$.capture_manifest.started_at") >= first_issued, "INVALID_CHRONOLOGY", "$.capture_manifest.started_at", "capture predates session credential issue")
 
     if deletion_pair is not None:
         request, tombstone = deletion_pair
         validate_deletion_pair(request, tombstone)
         require(request["session_id"] == session_id and request["scope_digest"] == scope_digest, "BUNDLE_SCOPE_MISMATCH", "$.deletion_request", "deletion escaped session scope")
-        require(
-            request["credential_id"] == launch_receipt["credential"]["credential_id"],
-            "BUNDLE_CREDENTIAL_MISMATCH",
-            "$.deletion_request.credential_id",
-            "deletion revokes another credential",
+        current_deletion_id, _ = current_credential_at(
+            tombstone["accepted_at"],
+            credential_history,
+            "$.deletion_tombstone",
         )
         require(
-            parse_time(request["requested_at"], "$.deletion_request.requested_at") >= parse_time(completion_receipt["accepted_at"], "$.completion_receipt.accepted_at"),
+            request["credential_id"] == current_deletion_id,
+            "CURRENT_CREDENTIAL_MISMATCH",
+            "$.deletion_request.credential_id",
+            "deletion did not use the current credential at server acceptance",
+        )
+        deletion_credential = validate_credential_use(
+            request["credential_id"],
+            tombstone["accepted_at"],
+            credential_history,
+            "$.deletion_request",
+        )
+        deletion_requested = parse_time(request["requested_at"], "$.deletion_request.requested_at")
+        require(
+            deletion_requested >= deletion_credential["issued_at"],
             "INVALID_CHRONOLOGY",
             "$.deletion_request.requested_at",
-            "deletion predates completion",
+            "client deletion request predates credential issue",
         )
+        require(deletion_requested >= accepted, "INVALID_CHRONOLOGY", "$.deletion_request.requested_at", "deletion predates completion")
+        effective_state = deletion_credential["credential_state"]
+        if request["credential_id"] == completion_receipt["credential"]["credential_id"]:
+            effective_state = completion_receipt["credential"]["state"]
+            require(
+                parse_time(tombstone["accepted_at"], "$.deletion_tombstone.accepted_at")
+                < parse_time(completion_receipt["credential"]["expires_at"], "$.completion_receipt.credential.expires_at"),
+                "EXPIRED_CREDENTIAL",
+                "$.deletion_tombstone.accepted_at",
+                "first deletion follows completion credential expiry",
+            )
+        require(
+            effective_state == "completion_replay_or_delete_only",
+            "BUNDLE_CREDENTIAL_STATE_MISMATCH",
+            "$.deletion_request.credential_id",
+            "first deletion requires completion replay-or-delete capability",
+        )
+        require(tombstone["credential"]["credential_id"] == request["credential_id"], "BUNDLE_CREDENTIAL_MISMATCH", "$.deletion_tombstone.credential.credential_id", "deletion replay verifier belongs to another credential")
+        for index, (_, receipt) in enumerate(launch_pairs):
+            require(
+                parse_time(receipt["issued_at"], f"$.launch_pairs[{index}].receipt.issued_at")
+                <= parse_time(tombstone["accepted_at"], "$.deletion_tombstone.accepted_at"),
+                "INVALID_CHRONOLOGY",
+                f"$.launch_pairs[{index}].receipt.issued_at",
+                "credential resume followed session deletion request",
+            )
 
 
 def load_json(path: Path) -> dict[str, Any]:
