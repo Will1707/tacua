@@ -1,7 +1,8 @@
 # EXP-001 physical-device results
 
 Status: foreground capture, interruption discovery, verified-partial choice,
-resume, and deletion proven; long-run checks pending
+resume, deletion, and the 30-minute foreground limit proven; background/lock
+and fault-injection checks pending
 
 Date: 2026-07-21
 
@@ -76,7 +77,38 @@ microphone samples, and 6,081 app-audio samples. All checksums matched. `ffprobe
 reported 10.033 seconds of video for every full segment, about 10 seconds on both
 audio tracks, and 1.322 seconds of video in the tail. The manifest recorded 28
 held frames across 15 segments. F2 is closed for foreground static capture; the
-30-minute resource run and background/lock behavior remain separate gates.
+background/lock behavior remains a separate gate.
+
+## 30-minute foreground resource run
+
+An unattended physical-device run reached the persisted monotonic deadline and
+stopped automatically. Tacua restored the host app's prior idle-timer setting
+after the stop; the temporary override prevented auto-lock during capture.
+
+| Measurement | Observed |
+| --- | ---: |
+| Stop reason | `maximum_duration` |
+| Terminal state | `completed` |
+| Finalized segments | 180 |
+| Manifest media duration | 1,799.997 seconds |
+| Start-to-terminal elapsed time | 1,800.409 seconds |
+| Deadline overshoot | 0.409 seconds |
+| Total media bytes | 33,888,910 |
+| Microphone samples | 78,261 |
+| App-audio samples | 77,402 |
+| Held video frames | 359 |
+| Continuity gaps | 0 |
+| Stable errors | 0 |
+| Dropped video samples | 0 |
+| Dropped microphone samples | 0 |
+| Dropped app-audio samples | 121 |
+
+All 180 manifest SHA-256 values matched their media. Representative beginning,
+middle, and final MOV segments each contained full-duration video and both audio
+tracks. The 121 app-audio drops represent about 0.156% of 77,523 append attempts
+and occurred without microphone or video loss. This is acceptable for closing
+the experiment's foreground-duration gate, but production promotion must either
+eliminate boundary reordering drops or define and enforce a measured threshold.
 
 ## Process-interruption recovery run
 
@@ -116,4 +148,4 @@ that states how many verified segments and associated metadata will be removed.
 Raw media was copied to private temporary directories for `ffprobe` and checksum
 inspection, then deleted immediately after aggregate measurements were recorded.
 Remaining synthetic source sessions stay only in the app container until the
-long-run test and final test-data cleanup.
+background/lock checks and final test-data cleanup.

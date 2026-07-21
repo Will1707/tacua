@@ -61,6 +61,8 @@ final class TacuaCaptureSession {
   private var stopWatchdog: DispatchWorkItem?
   private var durationWorkItem: DispatchWorkItem?
   private var microphoneWatchdog: DispatchWorkItem?
+  private var idleTimerOverrideActive = false
+  private var idleTimerWasDisabledBeforeCapture = false
 
   init(
     options: TacuaCaptureStartOptions,
@@ -366,6 +368,7 @@ final class TacuaCaptureSession {
     }
     guard shouldStart else { return }
 
+    activateIdleTimerOverrideOnMain()
     recorder.isMicrophoneEnabled = true
     recorder.startCapture(
       handler: { [weak self] sampleBuffer, sampleType, error in
@@ -438,6 +441,7 @@ final class TacuaCaptureSession {
     appendErrorCode(error.code)
     persistManifestAndReport()
     emitState()
+    restoreIdleTimerOverride()
     completion(.failure(error))
     if recorderStartIssued {
       let recorder = recorder
@@ -874,6 +878,7 @@ final class TacuaCaptureSession {
     removeLifecycleObservers()
     durationWorkItem?.cancel()
     microphoneWatchdog?.cancel()
+    restoreIdleTimerOverride()
     closeBackgroundGap(
       nextMediaPTS: nil,
       closedHostUptimeSeconds: ProcessInfo.processInfo.systemUptime
@@ -903,6 +908,22 @@ final class TacuaCaptureSession {
     stopCompletions.removeAll()
     for completion in completions {
       completion(.success(result))
+    }
+  }
+
+  private func activateIdleTimerOverrideOnMain() {
+    dispatchPrecondition(condition: .onQueue(.main))
+    guard !idleTimerOverrideActive else { return }
+    idleTimerWasDisabledBeforeCapture = UIApplication.shared.isIdleTimerDisabled
+    idleTimerOverrideActive = true
+    UIApplication.shared.isIdleTimerDisabled = true
+  }
+
+  private func restoreIdleTimerOverride() {
+    DispatchQueue.main.async { [self] in
+      guard idleTimerOverrideActive else { return }
+      UIApplication.shared.isIdleTimerDisabled = idleTimerWasDisabledBeforeCapture
+      idleTimerOverrideActive = false
     }
   }
 
