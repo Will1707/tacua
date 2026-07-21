@@ -4,8 +4,9 @@ import { useLocalSearchParams } from "expo-router";
 import { useCallback, useEffect, useState } from "react";
 import { ActivityIndicator, Alert, Pressable, ScrollView, Text, TextInput, View } from "react-native";
 
-import type { TicketCandidate } from "@/api/types";
+import type { CandidateEvidenceView, TicketCandidate } from "@/api/types";
 import { ActionButton } from "@/components/action-button";
+import { CandidateEvidencePanel } from "@/components/candidate-evidence-panel";
 import { MessageState } from "@/components/message-state";
 import { SectionCard } from "@/components/section-card";
 import { StatusPill } from "@/components/status-pill";
@@ -16,6 +17,9 @@ export default function CandidateRoute() {
   const { "candidate-id": candidateId } = useLocalSearchParams<{ "candidate-id": string }>();
   const { client, config } = useBackend();
   const [candidate, setCandidate] = useState<TicketCandidate | null>(null);
+  const [evidence, setEvidence] = useState<CandidateEvidenceView | null>(null);
+  const [evidenceLoading, setEvidenceLoading] = useState(false);
+  const [evidenceError, setEvidenceError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [action, setAction] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -35,6 +39,25 @@ export default function CandidateRoute() {
   }, [candidateId, client]);
 
   useEffect(() => { void load(); }, [load]);
+
+  useEffect(() => {
+    let active = true;
+    if (!client || !candidate) {
+      setEvidence(null);
+      setEvidenceLoading(false);
+      return () => { active = false; };
+    }
+    setEvidence(null);
+    setEvidenceError(null);
+    setEvidenceLoading(true);
+    void client.getCandidateEvidence(candidate)
+      .then((loaded) => { if (active) setEvidence(loaded); })
+      .catch((caught) => {
+        if (active) setEvidenceError(caught instanceof Error ? caught.message : "Tacua could not load the bound evidence.");
+      })
+      .finally(() => { if (active) setEvidenceLoading(false); });
+    return () => { active = false; };
+  }, [candidate, client]);
 
   async function transition(nextAction: "mark_ready" | "approve" | "reject", reason: string) {
     if (!client || !config || !candidate) return;
@@ -77,7 +100,7 @@ export default function CandidateRoute() {
   }
 
   if (loading && !candidate) return <View style={{ flex: 1, justifyContent: "center" }}><ActivityIndicator /></View>;
-  if (!candidate) return <ScrollView contentInsetAdjustmentBehavior="automatic"><MessageState title="Candidate unavailable" detail={error ?? "The candidate was not found."} /></ScrollView>;
+  if (!candidate || !client) return <ScrollView contentInsetAdjustmentBehavior="automatic"><MessageState title="Candidate unavailable" detail={error ?? "The candidate was not found."} /></ScrollView>;
   const unresolved = candidate.content.clarifications.filter((item) => item.status === "unresolved");
 
   return (
@@ -90,6 +113,14 @@ export default function CandidateRoute() {
         <Text selectable style={{ color: colors.secondaryLabel, fontSize: 16, lineHeight: 22 }}>{candidate.content.summary.text}</Text>
         <Text selectable style={{ color: colors.tertiaryLabel }}>Version {candidate.candidate_version} · {candidate.content.priority} · confidence {candidate.content.uncertainty.overall_confidence}</Text>
       </View>
+
+      <CandidateEvidencePanel
+        candidate={candidate}
+        client={client}
+        evidence={evidence}
+        error={evidenceError}
+        loading={evidenceLoading}
+      />
 
       <SectionCard title="Observed">
         <Text selectable style={{ color: colors.label, fontSize: 16, lineHeight: 23 }}>{candidate.content.actual_behavior.text}</Text>

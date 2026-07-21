@@ -211,3 +211,131 @@ export type TicketCandidate = {
     readonly immutable: true;
   };
 };
+
+export type EvidenceTimeRange = {
+  readonly start_ms: number;
+  readonly end_ms: number;
+  readonly clock: "session_monotonic";
+};
+
+export type CandidateEvidenceItem = {
+  readonly evidence_id: string;
+  readonly evidence_type:
+    | "sdk.route_transition"
+    | "sdk.user_interaction"
+    | "sdk.runtime_error"
+    | "sdk.network_metadata"
+    | "sdk.trace_correlation"
+    | "sdk.app_state_provider"
+    | "sdk.capture_gap"
+    | "media.keyframe"
+    | "media.clip"
+    | "media.transcript_excerpt"
+    | "repository.commit_snapshot"
+    | "backend.deployment_snapshot"
+    | "backend.log_snapshot"
+    | "backend.trace_snapshot"
+    | "observability.sentry_snapshot"
+    | "observability.posthog_snapshot";
+  readonly availability: "available" | "unavailable";
+  readonly description: string;
+  readonly time_range: EvidenceTimeRange | null;
+  readonly source: {
+    readonly component: "mobile_sdk" | "backend" | "repository" | "sentry" | "posthog";
+    readonly source_id: string;
+    readonly snapshot_revision: string;
+    readonly captured_at: string;
+  };
+  readonly reference: null | {
+    readonly content_type: string;
+    readonly size_bytes: number;
+    readonly content_digest: string;
+  };
+  readonly unavailable: null | {
+    readonly reason: string;
+    readonly detail: string;
+  };
+  readonly preview: {
+    readonly status: "available" | "unavailable" | "not_applicable";
+    readonly content_type: "image/png" | "image/jpeg" | "image/webp" | null;
+    readonly size_bytes: number | null;
+    readonly content_digest: string | null;
+  };
+};
+
+type DiagnosticEventBase = {
+  readonly event_id: string;
+  readonly sequence: number;
+  readonly elapsed_ms: number;
+  readonly occurred_at: string;
+  readonly source: "mobile_sdk" | "capture_extension";
+  readonly evidence_refs: readonly string[];
+};
+
+export type CandidateDiagnosticEvent = DiagnosticEventBase & (
+  | {
+    readonly event_type: "route_transition";
+    readonly data: { readonly from_route: string | null; readonly to_route: string; readonly trigger: "user" | "system" | "deep_link" | "unknown" };
+  }
+  | {
+    readonly event_type: "user_interaction";
+    readonly data: { readonly action: "tap" | "long_press" | "text_input" | "swipe" | "submit" | "other"; readonly target: string; readonly value_capture: "not_collected" };
+  }
+  | {
+    readonly event_type: "runtime_error";
+    readonly data: { readonly error_class: string; readonly sanitized_message: string; readonly stack_trace_digest: string | null; readonly handled: boolean };
+  }
+  | {
+    readonly event_type: "network_request_completed";
+    readonly data: {
+      readonly request_id: string;
+      readonly method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS";
+      readonly host: string;
+      readonly path_template: string;
+      readonly status_code: number | null;
+      readonly duration_ms: number | null;
+      readonly trace_id: string | null;
+      readonly outcome: "success" | "error" | "cancelled" | "unknown";
+      readonly request_body_capture: "not_collected";
+      readonly response_body_capture: "not_collected";
+    };
+  }
+  | {
+    readonly event_type: "app_state_changed";
+    readonly data: { readonly from_state: "active" | "inactive" | "background" | "unknown"; readonly to_state: "active" | "inactive" | "background" | "unknown" };
+  }
+  | {
+    readonly event_type: "issue_mark";
+    readonly data: { readonly marker_id: string; readonly kind: "spoken" | "manual"; readonly narration_elapsed_ms: number };
+  }
+  | {
+    readonly event_type: "capture_gap";
+    readonly data: { readonly gap_id: string; readonly affected_streams: readonly ("app_video" | "app_audio" | "microphone" | "diagnostics")[] };
+  }
+  | {
+    readonly event_type: "custom_state";
+    readonly data: { readonly provider_id: string; readonly snapshot_digest: string | null; readonly collection_status: "available" | "unavailable" };
+  }
+);
+
+/**
+ * Authenticated reviewer projection. This is deliberately not an approved
+ * handoff evidence manifest: viewing evidence during review does not grant an
+ * implementation agent permission to read or export it.
+ */
+export type CandidateEvidenceView = {
+  readonly contract_version: "tacua.candidate-evidence-view@1.0.0";
+  readonly candidate_id: string;
+  readonly candidate_version: number;
+  readonly candidate_digest: string;
+  readonly evidence_manifest_digest: string;
+  readonly items: readonly CandidateEvidenceItem[];
+  readonly diagnostic_events: readonly CandidateDiagnosticEvent[];
+};
+
+export type EvidencePreview = {
+  readonly uri: string;
+  readonly contentType: "image/png" | "image/jpeg" | "image/webp";
+  readonly sizeBytes: number;
+  readonly contentDigest: string;
+};
