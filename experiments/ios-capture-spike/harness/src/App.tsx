@@ -17,6 +17,16 @@ const BUILD_NUMBER = '1';
 
 type LogEntry = Readonly<{ id: string; message: string }>;
 
+const RESUMABLE_STATES = new Set([
+  'prepared',
+  'recording',
+  'stopping',
+  'recoverable_partial',
+  'partial',
+  'failed_no_verified_segments',
+  'stop_failed_capture_active',
+]);
+
 function safeMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -118,6 +128,34 @@ export default function App(): React.JSX.Element {
       await refreshRecovery();
     } catch (error) {
       log(`Stop failed: ${safeMessage(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const resumeSession = async (sessionId: string) => {
+    setBusy(true);
+    try {
+      const next = await TacuaCapture.resume(options(sessionId));
+      setStatus(next);
+      log(`Resumed ${sessionId}`);
+    } catch (error) {
+      log(`Resume failed: ${safeMessage(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const keepPartial = async (sessionId: string) => {
+    setBusy(true);
+    try {
+      const next = await TacuaCapture.markPartialReadyForUpload(
+        options(sessionId),
+      );
+      log(`Kept verified partial ${sessionId}: ${next.segmentCount} segment(s)`);
+      await refreshRecovery();
+    } catch (error) {
+      log(`Keep partial failed: ${safeMessage(error)}`);
     } finally {
       setBusy(false);
     }
@@ -230,12 +268,30 @@ export default function App(): React.JSX.Element {
                     {session.state} · {session.segmentCount} segment(s)
                   </Text>
                 </View>
-                <Button
-                  title="Delete"
-                  color="#ef4444"
-                  onPress={() => void deleteSession(session.sessionId)}
-                  disabled={busy}
-                />
+                <View style={styles.sessionActions}>
+                  {RESUMABLE_STATES.has(session.state) ? (
+                    <Button
+                      title="Resume"
+                      onPress={() => void resumeSession(session.sessionId)}
+                      disabled={busy}
+                    />
+                  ) : null}
+                  {session.state !== 'completed' &&
+                  session.state !== 'partial_ready_for_upload' &&
+                  session.segmentCount > 0 ? (
+                    <Button
+                      title="Keep partial"
+                      onPress={() => void keepPartial(session.sessionId)}
+                      disabled={busy}
+                    />
+                  ) : null}
+                  <Button
+                    title="Delete"
+                    color="#ef4444"
+                    onPress={() => void deleteSession(session.sessionId)}
+                    disabled={busy}
+                  />
+                </View>
               </View>
             ))
           )}
@@ -308,6 +364,7 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   sessionText: { flex: 1 },
+  sessionActions: { alignItems: 'flex-end', gap: 4 },
   log: {
     color: '#a7f3d0',
     fontSize: 12,

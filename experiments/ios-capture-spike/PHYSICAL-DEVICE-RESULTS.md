@@ -1,6 +1,6 @@
 # EXP-001 physical-device results
 
-Status: in progress
+Status: foreground capture proven; interruption and long-run checks pending
 
 Date: 2026-07-21
 
@@ -49,8 +49,11 @@ The candidate fix now compares the media-clock delta with the host-clock delta.
 A long interval is continuous when both clocks advance together; a regression
 or material delta mismatch remains a gap. Platform-independent regression tests
 cover static-screen continuity, uncorroborated media jumps, and media-clock
-regression. A second physical foreground run is required before this finding is
-closed.
+regression. A second physical foreground run exercised the candidate fix with a
+mostly static screen. It completed with two finalized segments (10.1 and 7.3
+seconds), 758 microphone samples, zero continuity gaps, and no stable errors. F1
+is closed for the foreground proof. Background transitions, process
+interruption, and the 30-minute limit remain separate gates.
 
 ## Finding F2: segment duration follows the last delivered video sample
 
