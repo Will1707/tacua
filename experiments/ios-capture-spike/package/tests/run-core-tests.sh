@@ -18,6 +18,14 @@ swiftc \
 "$TEST_TMP_DIR/tacua-capture-policy-tests"
 
 swiftc \
+  -module-cache-path "$TEST_TMP_DIR/module-cache" \
+  ios/CaptureTransportPolicy.swift \
+  tests/CaptureTransportPolicyTests.swift \
+  -o "$TEST_TMP_DIR/tacua-capture-transport-policy-tests"
+
+"$TEST_TMP_DIR/tacua-capture-transport-policy-tests"
+
+swiftc \
   -D TACUA_CAPTURE_FAULT_INJECTION \
   -module-cache-path "$TEST_TMP_DIR/module-cache" \
   ios/CaptureFaultInjection.swift \
