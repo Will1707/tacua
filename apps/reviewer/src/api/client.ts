@@ -19,6 +19,20 @@ export class TacuaApiError extends Error {
 
 type ErrorResponse = { readonly error?: { readonly code?: unknown; readonly message?: unknown } };
 
+// This fingerprint only keeps distinct human edits from accidentally reusing
+// an idempotency key. The backend's canonical request digest remains the trust
+// boundary, so a collision is a safe conflict rather than a wrong transition.
+function operationFingerprint(value: string): string {
+  const hash = (seed: number) => {
+    let result = seed;
+    for (let index = 0; index < value.length; index += 1) {
+      result = Math.imul(result ^ value.charCodeAt(index), 0x01000193);
+    }
+    return (result >>> 0).toString(16).padStart(8, "0");
+  };
+  return `${hash(0x811c9dc5)}${hash(0x9e3779b1)}`;
+}
+
 export class TacuaApiClient {
   constructor(private readonly config: BackendConfig) {}
 
@@ -133,18 +147,11 @@ export class TacuaApiClient {
       readonly resolution_note?: string;
     },
   ): Promise<TicketCandidate> {
-    const idempotencyKey = [
-      "candidate",
-      candidateId,
-      String(body.candidate_version),
-      body.action,
-      body.clarification_id ?? "none",
-      body.selected_choice_id ?? "none",
-    ].join(":");
+    const idempotencyKey = `candidate:${candidateId}:${body.candidate_version}:${body.action}:${operationFingerprint(JSON.stringify(body))}`;
     return this.request(`/v1/admin/candidates/${encodeURIComponent(candidateId)}/transitions`, {
       method: "POST",
       headers: {
-        "If-Match": body.expected_candidate_digest,
+        "If-Match": `"${body.expected_candidate_digest}"`,
         "Idempotency-Key": idempotencyKey,
       },
       body: JSON.stringify(body),
