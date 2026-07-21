@@ -102,7 +102,9 @@ def _step_action(step: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def _map_ticket(candidate: dict[str, Any]) -> dict[str, Any]:
+def map_candidate_ticket(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Project one validated ticket candidate into the handoff ticket shape."""
+
     content = candidate["content"]
     return {
         "ticket_id": candidate["candidate_id"],
@@ -315,7 +317,7 @@ def export_approved_candidate(
         "media_type": "application/vnd.tacua.approved-handoff+json;version=1.0.0",
         "organization_id": candidate["organization_id"],
         "project_id": candidate["project_id"],
-        "ticket": _map_ticket(candidate),
+        "ticket": map_candidate_ticket(candidate),
         "build_identity": copy.deepcopy(handoff_build_identity),
         "evidence_manifest": _map_evidence(candidate, evidence_manifest),
         "approval": {

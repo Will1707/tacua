@@ -19,3 +19,8 @@
 !contracts/ticket-candidate/src/**
 !contracts/ticket-candidate/schemas/
 !contracts/ticket-candidate/schemas/**
+!contracts/approved-handoff/
+!contracts/approved-handoff/src/
+!contracts/approved-handoff/src/**
+!contracts/approved-handoff/schemas/
+!contracts/approved-handoff/schemas/**
