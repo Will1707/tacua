@@ -10,7 +10,7 @@ It is a candidate implementation, not the production Tacua SDK contract. Its sch
 
 - Captures the host app's ReplayKit video, app-audio, and microphone sample buffers.
 - Requires microphone permission and at least one microphone sample. A video-only session cannot be classified as complete.
-- Writes independently finalized MOV segments. Before each partial-to-final rename, it atomically writes a sidecar containing size, SHA-256, timing, and sample counts.
+- Writes independently finalized MOV segments. Continuous audio timestamps drive rotation even when ReplayKit suppresses unchanged video frames. Tacua retimes the last observed video frame only at a segment boundary or tail, and records `heldVideoSamples` so downstream consumers can distinguish those explicit static-frame holds from observed UI changes. Before each partial-to-final rename, it atomically writes a sidecar containing size, SHA-256, timing, and sample counts.
 - Reconciles a finalized segment, or a sidecar-verified partial segment, after interruption. It never invents a segment from an unverified file.
 - Records host-clock/media-clock calibration, markers, dual-clock continuity gaps, stable public error codes, and truthful nullable status values. A long interval between ReplayKit video samples is not itself a gap when media time and host uptime advance together.
 - Applies bounded start, stop, microphone-startup, and writer-finalization watchdogs. A timed-out stop is retried once. If ReplayKit still reports that it is recording, the session remains installed in the nonterminal `stop_failed_capture_active` state and `stop()` rejects; it is never reported as stopped.
@@ -84,6 +84,6 @@ Run the platform-independent policy tests from this directory:
 npm run test:core
 ```
 
-The tests cover terminal classification, deadline behavior, dual-clock microphone stall detection, crash-window source selection, structural handoff validation, expiry/build-independent deletion authorization, and fail-closed stop-timeout decisions.
+The tests cover terminal classification, deadline behavior, media-clock segment boundaries, dual-clock microphone stall detection, crash-window source selection, structural handoff validation, expiry/build-independent deletion authorization, and fail-closed stop-timeout decisions.
 
 Source type-checking against the target Expo/Xcode toolchain is also required. Before promotion beyond the spike, test a development build on a physical iPhone for ReplayKit consent and callbacks, microphone/app-audio formats and continuity, background/foreground and lock transitions, interruption and process kill, 30-minute resource usage, low storage, writer and stop fault injection, protected-file behavior, and recovery of verified partial segments. Simulator-only results are insufficient.

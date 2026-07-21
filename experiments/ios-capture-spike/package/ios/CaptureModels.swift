@@ -45,6 +45,7 @@ struct CaptureSegment: Codable {
   let lastHostUptimeSeconds: Double
   let durationSeconds: Double
   let videoSamples: Int
+  let heldVideoSamples: Int?
   let appAudioSamples: Int
   let microphoneSamples: Int
   let droppedVideoSamples: Int

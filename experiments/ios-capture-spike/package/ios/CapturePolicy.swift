@@ -55,6 +55,20 @@ enum TacuaCapturePolicy {
     return abs(mediaDelta - hostDelta) > videoClockDiscontinuityToleranceSeconds
   }
 
+  static func segmentRotationBoundary(
+    startedAtPTSSeconds: Double,
+    incomingPTSSeconds: Double,
+    segmentDurationSeconds: Double
+  ) -> Double? {
+    guard startedAtPTSSeconds.isFinite,
+      incomingPTSSeconds.isFinite,
+      segmentDurationSeconds.isFinite,
+      segmentDurationSeconds > 0,
+      incomingPTSSeconds - startedAtPTSSeconds >= segmentDurationSeconds
+    else { return nil }
+    return startedAtPTSSeconds + segmentDurationSeconds
+  }
+
   static func recoverySource(finalExists: Bool, partialExists: Bool) -> RecoverySource? {
     if finalExists { return .finalized }
     if partialExists { return .verifiedPartial }

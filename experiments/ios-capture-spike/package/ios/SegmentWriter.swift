@@ -21,7 +21,10 @@ final class SegmentWriter {
 
   private var lastPTS: CMTime
   private var lastHostUptimeSeconds: Double
+  private var lastVideoPTS: CMTime
+  private var lastVideoSample: CMSampleBuffer?
   private var videoSamples = 0
+  private var heldVideoSamples = 0
   private var appAudioSamples = 0
   private var microphoneSamples = 0
   private var droppedVideoSamples = 0
@@ -52,6 +55,7 @@ final class SegmentWriter {
     self.index = index
     self.startedAtPTS = CMSampleBufferGetPresentationTimeStamp(firstVideoSample)
     self.lastPTS = startedAtPTS
+    self.lastVideoPTS = startedAtPTS
     self.firstHostUptimeSeconds = hostUptimeSeconds
     self.lastHostUptimeSeconds = hostUptimeSeconds
     self.videoDimensions = dimensions
@@ -114,6 +118,62 @@ final class SegmentWriter {
     max(0, CMTimeGetSeconds(CMTimeSubtract(lastPTS, startedAtPTS)))
   }
 
+  var latestPTS: CMTime { lastPTS }
+
+  func makeHeldVideoSample(at presentationTimeStamp: CMTime) throws -> CMSampleBuffer {
+    guard presentationTimeStamp.isValid,
+      CMTimeCompare(presentationTimeStamp, lastVideoPTS) > 0,
+      let lastVideoSample
+    else {
+      throw TacuaCaptureSpikeError.writerFailed(
+        "Segment \(index) could not create a monotonic held video frame."
+      )
+    }
+    var timing = CMSampleTimingInfo(
+      duration: CMTime(value: 1, timescale: 30),
+      presentationTimeStamp: presentationTimeStamp,
+      decodeTimeStamp: .invalid
+    )
+    var copy: CMSampleBuffer?
+    let status = CMSampleBufferCreateCopyWithNewTiming(
+      allocator: kCFAllocatorDefault,
+      sampleBuffer: lastVideoSample,
+      sampleTimingEntryCount: 1,
+      sampleTimingArray: &timing,
+      sampleBufferOut: &copy
+    )
+    guard status == noErr, let copy else {
+      throw TacuaCaptureSpikeError.writerFailed(
+        "Segment \(index) could not retime its last video frame (CoreMedia:\(status))."
+      )
+    }
+    return copy
+  }
+
+  @discardableResult
+  func appendHeldVideoFrame(
+    _ sampleBuffer: CMSampleBuffer,
+    hostUptimeSeconds: Double
+  ) -> Bool {
+    let appended = append(
+      sampleBuffer,
+      type: .video,
+      hostUptimeSeconds: hostUptimeSeconds
+    )
+    if appended { heldVideoSamples += 1 }
+    return appended
+  }
+
+  func extendVideoToLatestPTS(hostUptimeSeconds: Double) throws {
+    guard CMTimeCompare(lastPTS, lastVideoPTS) > 0 else { return }
+    let heldFrame = try makeHeldVideoSample(at: lastPTS)
+    guard appendHeldVideoFrame(heldFrame, hostUptimeSeconds: hostUptimeSeconds) else {
+      throw fatalError ?? TacuaCaptureSpikeError.writerFailed(
+        "Segment \(index) rejected its closing held video frame."
+      )
+    }
+  }
+
   func isCompatible(withVideoSample sampleBuffer: CMSampleBuffer) -> Bool {
     guard let description = CMSampleBufferGetFormatDescription(sampleBuffer) else { return false }
     let candidate = CMVideoFormatDescriptionGetDimensions(description)
@@ -171,7 +231,17 @@ final class SegmentWriter {
       lastHostUptimeSeconds = hostUptimeSeconds
     }
     switch type {
-    case .video: videoSamples += 1
+    case .video:
+      videoSamples += 1
+      lastVideoPTS = pts
+      var copy: CMSampleBuffer?
+      if CMSampleBufferCreateCopy(
+        allocator: kCFAllocatorDefault,
+        sampleBuffer: sampleBuffer,
+        sampleBufferOut: &copy
+      ) == noErr {
+        lastVideoSample = copy
+      }
     case .audioApp: appAudioSamples += 1
     case .audioMic: microphoneSamples += 1
     @unknown default: break
@@ -226,6 +296,7 @@ final class SegmentWriter {
           lastHostUptimeSeconds: lastHostUptimeSeconds,
           durationSeconds: durationSeconds,
           videoSamples: videoSamples,
+          heldVideoSamples: heldVideoSamples,
           appAudioSamples: appAudioSamples,
           microphoneSamples: microphoneSamples,
           droppedVideoSamples: droppedVideoSamples,

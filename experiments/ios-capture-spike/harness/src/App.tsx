@@ -106,7 +106,7 @@ export default function App(): React.JSX.Element {
       }),
       TacuaCapture.subscribe('onSegment', (event) => {
         log(
-          `Segment ${event.index}: ${event.byteLength} bytes, ${event.durationSeconds.toFixed(1)}s`,
+          `Segment ${event.index}: ${event.byteLength} bytes, ${event.durationSeconds.toFixed(1)}s, ${event.heldVideoSamples ?? 0} held frame(s)`,
         );
       }),
       TacuaCapture.subscribe('onGap', (event) => log(`Gap: ${event.reason}`)),

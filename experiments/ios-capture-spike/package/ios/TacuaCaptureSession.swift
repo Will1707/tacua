@@ -639,9 +639,32 @@ final class TacuaCaptureSession {
       return
     }
 
+    let incomingPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+    let incomingPTSSeconds = CMTimeGetSeconds(incomingPTS)
+    if type == .video, let writer, !writer.isCompatible(withVideoSample: sampleBuffer) {
+      finishCurrentSegment()
+    }
+    if let writer,
+      let boundarySeconds = TacuaCapturePolicy.segmentRotationBoundary(
+        startedAtPTSSeconds: CMTimeGetSeconds(writer.startedAtPTS),
+        incomingPTSSeconds: incomingPTSSeconds,
+        segmentDurationSeconds: segmentDurationSeconds
+      )
+    {
+      do {
+        try rotateCurrentSegment(
+          at: CMTime(seconds: boundarySeconds, preferredTimescale: 1_000_000_000),
+          hostUptimeSeconds: hostUptimeSeconds
+        )
+      } catch {
+        failAndStopOnQueue(error: error, gapReason: "segment_rotation_failed")
+        return
+      }
+    }
+
     if type == .video {
-      let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-      let mediaSeconds = CMTimeGetSeconds(pts)
+      let pts = incomingPTS
+      let mediaSeconds = incomingPTSSeconds
       guard pts.isValid, mediaSeconds.isFinite else {
         failAndStopOnQueue(
           error: TacuaCaptureSpikeError.writerCreation("ReplayKit emitted an invalid video timestamp."),
@@ -693,30 +716,12 @@ final class TacuaCaptureSession {
       latestVideoPTS = pts
       latestVideoHostUptimeSeconds = hostUptimeSeconds
 
-      if let writer, !writer.isCompatible(withVideoSample: sampleBuffer) {
-        finishCurrentSegment()
-      }
-      if let writer, writer.durationSeconds >= segmentDurationSeconds {
-        finishCurrentSegment()
-      }
       if writer == nil {
         do {
-          guard Self.hasMinimumFreeStorage(at: directory) else {
-            throw TacuaCaptureSpikeError.insufficientStorage
-          }
-          writer = try SegmentWriter(
-            index: nextSegmentIndex,
-            directory: directory,
+          try startWriter(
             firstVideoSample: sampleBuffer,
-            hostUptimeSeconds: hostUptimeSeconds
-          )
-          nextSegmentIndex += 1
-          manifest.calibrations.append(
-            CaptureCalibration(
-              hostUptimeSeconds: hostUptimeSeconds,
-              mediaPTSSeconds: mediaSeconds,
-              hostMinusMediaSeconds: hostUptimeSeconds - mediaSeconds
-            )
+            hostUptimeSeconds: hostUptimeSeconds,
+            appendFirstVideoAsHeldFrame: false
           )
         } catch {
           failAndStopOnQueue(
@@ -762,8 +767,76 @@ final class TacuaCaptureSession {
     requestStopOnQueue(reason: gapReason)
   }
 
-  private func finishCurrentSegment() {
+  private func startWriter(
+    firstVideoSample: CMSampleBuffer,
+    hostUptimeSeconds: Double,
+    appendFirstVideoAsHeldFrame: Bool
+  ) throws {
+    guard Self.hasMinimumFreeStorage(at: directory) else {
+      throw TacuaCaptureSpikeError.insufficientStorage
+    }
+    let nextWriter = try SegmentWriter(
+      index: nextSegmentIndex,
+      directory: directory,
+      firstVideoSample: firstVideoSample,
+      hostUptimeSeconds: hostUptimeSeconds
+    )
+    writer = nextWriter
+    nextSegmentIndex += 1
+    let mediaSeconds = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(firstVideoSample))
+    manifest.calibrations.append(
+      CaptureCalibration(
+        hostUptimeSeconds: hostUptimeSeconds,
+        mediaPTSSeconds: mediaSeconds,
+        hostMinusMediaSeconds: hostUptimeSeconds - mediaSeconds
+      )
+    )
+    if appendFirstVideoAsHeldFrame,
+      !nextWriter.appendHeldVideoFrame(
+        firstVideoSample,
+        hostUptimeSeconds: hostUptimeSeconds
+      )
+    {
+      throw nextWriter.fatalError ?? TacuaCaptureSpikeError.writerFailed(
+        "The next segment rejected its opening held video frame."
+      )
+    }
+  }
+
+  private func rotateCurrentSegment(
+    at boundaryPTS: CMTime,
+    hostUptimeSeconds: Double
+  ) throws {
+    guard let currentWriter = writer else { return }
+    let closingFrame = try currentWriter.makeHeldVideoSample(at: boundaryPTS)
+    let openingFrame = try currentWriter.makeHeldVideoSample(at: boundaryPTS)
+    guard currentWriter.appendHeldVideoFrame(
+      closingFrame,
+      hostUptimeSeconds: hostUptimeSeconds
+    ) else {
+      throw currentWriter.fatalError ?? TacuaCaptureSpikeError.writerFailed(
+        "The current segment rejected its boundary held video frame."
+      )
+    }
+    finishCurrentSegment(extendVideoToLatestPTS: false)
+    try startWriter(
+      firstVideoSample: openingFrame,
+      hostUptimeSeconds: hostUptimeSeconds,
+      appendFirstVideoAsHeldFrame: true
+    )
+  }
+
+  private func finishCurrentSegment(extendVideoToLatestPTS: Bool = true) {
     guard let writer else { return }
+    if extendVideoToLatestPTS {
+      do {
+        try writer.extendVideoToLatestPTS(
+          hostUptimeSeconds: ProcessInfo.processInfo.systemUptime
+        )
+      } catch {
+        recordError(error.tacuaStableCode, gapReason: "video_tail_extension_failed")
+      }
+    }
     self.writer = nil
     finalizationGroup.enter()
     writer.finish { [self] result in
@@ -780,6 +853,7 @@ final class TacuaCaptureSession {
               "sha256": segment.sha256,
               "byteLength": segment.byteLength,
               "durationSeconds": segment.durationSeconds,
+              "heldVideoSamples": segment.heldVideoSamples ?? 0,
             ]
           )
         case .failure(let error):

@@ -58,17 +58,25 @@ interruption, and the 30-minute limit remain separate gates.
 
 ## Finding F2: segment duration follows the last delivered video sample
 
-The configured design segment was 10 seconds, but a static interval allowed one
+The configured design segment was 10 seconds, but the baseline static interval allowed one
 segment to reach about 20.17 seconds of audio while its delivered video track
 ended near 6.80 seconds. Another segment contained about 10.46 seconds of audio
-and 4.79 seconds of delivered video. Rotation is currently evaluated when a
-video sample arrives, while audio can continue during a static-screen interval.
+and 4.79 seconds of delivered video. Rotation was evaluated only when a video
+sample arrived, while audio could continue during a static-screen interval.
 
-This does not invalidate checksums or narration capture, but it means the
-candidate cannot yet claim bounded segment duration or full-duration video
-coverage under ReplayKit's variable frame cadence. The next implementation
-experiment must evaluate safe last-frame extension and timer-driven rotation
-without inventing user interaction or dropping narration.
+The candidate fix rotates when any continuous media timestamp crosses the
+segment boundary. When ReplayKit has suppressed unchanged video frames, Tacua
+retimes a copy of the last observed frame to close the old segment and open the
+new one. Each sidecar records `heldVideoSamples`, so this duration extension is
+explicit evidence and cannot be mistaken for observed user interaction.
+
+A mostly static 141.3-second physical run finalized fourteen 10.0-second
+segments and one 1.3-second tail with zero gaps, no stable errors, 6,141
+microphone samples, and 6,081 app-audio samples. All checksums matched. `ffprobe`
+reported 10.033 seconds of video for every full segment, about 10 seconds on both
+audio tracks, and 1.322 seconds of video in the tail. The manifest recorded 28
+held frames across 15 segments. F2 is closed for foreground static capture; the
+30-minute resource run and background/lock behavior remain separate gates.
 
 ## Process-interruption recovery run
 

@@ -85,6 +85,7 @@ type CaptureSegmentEvent = {
   readonly sha256: string;
   readonly byteLength: number;
   readonly durationSeconds: number;
+  readonly heldVideoSamples?: number;
 };
 
 type CaptureGapEvent = {

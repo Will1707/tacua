@@ -28,6 +28,7 @@ enum CapturePolicyTests {
     try terminalClassification()
     try deadlineAndMicrophoneContinuity()
     try videoClockContinuity()
+    try segmentRotation()
     try crashWindowRecoverySource()
     try candidateHandoffValidation()
     try deletionAuthorizationAndStopSafety()
@@ -61,6 +62,41 @@ enum CapturePolicyTests {
         currentHostUptimeSeconds: 111
       ),
       "A regressing media clock must create a gap"
+    )
+  }
+
+  private static func segmentRotation() throws {
+    try expect(
+      TacuaCapturePolicy.segmentRotationBoundary(
+        startedAtPTSSeconds: 100,
+        incomingPTSSeconds: 109.999,
+        segmentDurationSeconds: 10
+      ) == nil,
+      "A segment must not rotate before its configured media duration"
+    )
+    try expect(
+      TacuaCapturePolicy.segmentRotationBoundary(
+        startedAtPTSSeconds: 100,
+        incomingPTSSeconds: 110,
+        segmentDurationSeconds: 10
+      ) == 110,
+      "The rotation boundary must be inclusive and anchored to the segment start"
+    )
+    try expect(
+      TacuaCapturePolicy.segmentRotationBoundary(
+        startedAtPTSSeconds: 100,
+        incomingPTSSeconds: 125,
+        segmentDurationSeconds: 10
+      ) == 110,
+      "A late sample must not stretch the previous segment beyond its boundary"
+    )
+    try expect(
+      TacuaCapturePolicy.segmentRotationBoundary(
+        startedAtPTSSeconds: .nan,
+        incomingPTSSeconds: 110,
+        segmentDurationSeconds: 10
+      ) == nil,
+      "Invalid clocks must never create a synthetic boundary"
     )
   }
 
