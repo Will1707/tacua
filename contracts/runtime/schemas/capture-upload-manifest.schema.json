@@ -1,0 +1,291 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tacua.invalid/schemas/runtime/1.0.0/capture-upload-manifest.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "Tacua recoverable capture and resumable upload manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "media_type",
+    "organization_id",
+    "project_id",
+    "build_id",
+    "build_identity_digest",
+    "session_id",
+    "manifest_version",
+    "capture_state",
+    "started_at",
+    "ended_at",
+    "monotonic_duration_ms",
+    "capture_scope",
+    "streams",
+    "segments",
+    "gaps",
+    "upload",
+    "retention",
+    "manifest_digest"
+  ],
+  "properties": {
+    "contract_version": { "const": "tacua.capture-upload-manifest@1.0.0" },
+    "media_type": { "const": "application/vnd.tacua.capture-upload-manifest+json;version=1.0.0" },
+    "organization_id": { "$ref": "common.schema.json#/$defs/id" },
+    "project_id": { "$ref": "common.schema.json#/$defs/id" },
+    "build_id": { "$ref": "common.schema.json#/$defs/id" },
+    "build_identity_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "session_id": { "$ref": "common.schema.json#/$defs/id" },
+    "manifest_version": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "capture_state": { "enum": ["recording", "recoverable", "complete"] },
+    "started_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "ended_at": { "$ref": "common.schema.json#/$defs/nullableTimestamp" },
+    "monotonic_duration_ms": { "type": "integer", "minimum": 0, "maximum": 1800000 },
+    "capture_scope": { "const": "app_only" },
+    "streams": { "$ref": "#/$defs/streams" },
+    "segments": {
+      "type": "array",
+      "maxItems": 2048,
+      "items": { "$ref": "#/$defs/segment" }
+    },
+    "gaps": {
+      "type": "array",
+      "maxItems": 2048,
+      "items": { "$ref": "#/$defs/gap" }
+    },
+    "upload": { "$ref": "#/$defs/upload" },
+    "retention": { "$ref": "#/$defs/retention" },
+    "manifest_digest": { "$ref": "common.schema.json#/$defs/digest" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "capture_state": { "const": "recording" } } },
+      "then": { "properties": { "ended_at": { "type": "null" } } }
+    },
+    {
+      "if": { "properties": { "capture_state": { "enum": ["recoverable", "complete"] } } },
+      "then": { "properties": { "ended_at": { "$ref": "common.schema.json#/$defs/timestamp" } } }
+    }
+  ],
+  "$defs": {
+    "streams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["app_video", "app_audio", "microphone", "diagnostics"],
+      "properties": {
+        "app_video": { "const": "enabled" },
+        "app_audio": { "enum": ["enabled", "disabled", "unavailable"] },
+        "microphone": { "enum": ["enabled", "disabled", "unavailable"] },
+        "diagnostics": { "enum": ["enabled", "disabled", "unavailable"] }
+      }
+    },
+    "content": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["content_type", "size_bytes", "content_digest", "sidecar_digest"],
+      "properties": {
+        "content_type": { "enum": ["video/quicktime", "video/mp4"] },
+        "size_bytes": { "type": "integer", "minimum": 1, "maximum": 1073741824 },
+        "content_digest": { "$ref": "common.schema.json#/$defs/digest" },
+        "sidecar_digest": { "$ref": "common.schema.json#/$defs/digest" }
+      }
+    },
+    "segment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "segment_id",
+        "sequence",
+        "time_range",
+        "finalized",
+        "availability",
+        "content",
+        "unavailable"
+      ],
+      "properties": {
+        "segment_id": { "$ref": "common.schema.json#/$defs/id" },
+        "sequence": { "type": "integer", "minimum": 0, "maximum": 2047 },
+        "time_range": { "$ref": "common.schema.json#/$defs/timeRange" },
+        "finalized": { "const": true },
+        "availability": { "enum": ["available", "unavailable"] },
+        "content": {
+          "oneOf": [
+            { "$ref": "#/$defs/content" },
+            { "type": "null" }
+          ]
+        },
+        "unavailable": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/unavailable" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "availability": { "const": "available" } } },
+          "then": {
+            "properties": {
+              "content": { "$ref": "#/$defs/content" },
+              "unavailable": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "availability": { "const": "unavailable" } } },
+          "then": {
+            "properties": {
+              "content": { "type": "null" },
+              "unavailable": { "$ref": "common.schema.json#/$defs/unavailable" }
+            }
+          }
+        }
+      ]
+    },
+    "gap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gap_id", "time_range", "reason", "affected_streams", "detail"],
+      "properties": {
+        "gap_id": { "$ref": "common.schema.json#/$defs/id" },
+        "time_range": { "$ref": "common.schema.json#/$defs/timeRange" },
+        "reason": {
+          "enum": [
+            "app_backgrounded",
+            "audio_interrupted",
+            "extension_unavailable",
+            "storage_pressure",
+            "permission_revoked",
+            "process_terminated",
+            "clock_discontinuity",
+            "unknown"
+          ]
+        },
+        "affected_streams": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": { "enum": ["app_video", "app_audio", "microphone", "diagnostics"] }
+        },
+        "detail": { "$ref": "common.schema.json#/$defs/shortText" }
+      }
+    },
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "segment_id",
+        "object_id",
+        "size_bytes",
+        "content_digest",
+        "received_at",
+        "receipt_digest"
+      ],
+      "properties": {
+        "segment_id": { "$ref": "common.schema.json#/$defs/id" },
+        "object_id": { "$ref": "common.schema.json#/$defs/id" },
+        "size_bytes": { "type": "integer", "minimum": 1, "maximum": 1073741824 },
+        "content_digest": { "$ref": "common.schema.json#/$defs/digest" },
+        "received_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "receipt_digest": { "$ref": "common.schema.json#/$defs/digest" }
+      }
+    },
+    "uploadError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "retryable", "detail"],
+      "properties": {
+        "code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{2,63}$" },
+        "retryable": { "type": "boolean" },
+        "detail": { "$ref": "common.schema.json#/$defs/shortText" }
+      }
+    },
+    "upload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "protocol",
+        "remote_session_id",
+        "receipts",
+        "last_error",
+        "completed_at"
+      ],
+      "properties": {
+        "state": { "enum": ["not_started", "in_progress", "complete", "failed"] },
+        "protocol": { "const": "segmented-resumable-v1" },
+        "remote_session_id": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/id" },
+            { "type": "null" }
+          ]
+        },
+        "receipts": {
+          "type": "array",
+          "maxItems": 2048,
+          "items": { "$ref": "#/$defs/receipt" }
+        },
+        "last_error": {
+          "oneOf": [
+            { "$ref": "#/$defs/uploadError" },
+            { "type": "null" }
+          ]
+        },
+        "completed_at": { "$ref": "common.schema.json#/$defs/nullableTimestamp" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "state": { "const": "not_started" } } },
+          "then": {
+            "properties": {
+              "remote_session_id": { "type": "null" },
+              "receipts": { "type": "array", "maxItems": 0 },
+              "last_error": { "type": "null" },
+              "completed_at": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "state": { "const": "in_progress" } } },
+          "then": {
+            "properties": {
+              "remote_session_id": { "$ref": "common.schema.json#/$defs/id" },
+              "last_error": { "type": "null" },
+              "completed_at": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "state": { "const": "complete" } } },
+          "then": {
+            "properties": {
+              "remote_session_id": { "$ref": "common.schema.json#/$defs/id" },
+              "last_error": { "type": "null" },
+              "completed_at": { "$ref": "common.schema.json#/$defs/timestamp" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "state": { "const": "failed" } } },
+          "then": {
+            "properties": {
+              "remote_session_id": { "$ref": "common.schema.json#/$defs/id" },
+              "last_error": { "$ref": "#/$defs/uploadError" },
+              "completed_at": { "type": "null" }
+            }
+          }
+        }
+      ]
+    },
+    "retention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_version", "raw_media_expires_at", "derived_data_expires_at", "deletion_status"],
+      "properties": {
+        "policy_version": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "raw_media_expires_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "derived_data_expires_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "deletion_status": { "enum": ["active", "deletion_requested", "deleted"] }
+      }
+    }
+  }
+}

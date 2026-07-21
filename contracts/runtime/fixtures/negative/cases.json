@@ -1,0 +1,8 @@
+[
+  {"name": "tampered_manifest_digest", "expected_error": "DIGEST_MISMATCH"},
+  {"name": "cross_project_bundle", "expected_error": "BUNDLE_SCOPE_MISMATCH"},
+  {"name": "unavailable_evidence_with_reference", "expected_error": "SCHEMA_TYPE"},
+  {"name": "machine_approval", "expected_error": "SCHEMA_CONST"},
+  {"name": "incomplete_complete_upload", "expected_error": "INCOMPLETE_UPLOAD"},
+  {"name": "unresolved_blocking_approval", "expected_error": "UNRESOLVED_BLOCKING_CLARIFICATION"}
+]

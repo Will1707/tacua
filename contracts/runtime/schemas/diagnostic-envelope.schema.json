@@ -1,0 +1,399 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tacua.invalid/schemas/runtime/1.0.0/diagnostic-envelope.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "Tacua sanitized SDK diagnostic and evidence envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "media_type",
+    "organization_id",
+    "project_id",
+    "build_id",
+    "build_identity_digest",
+    "session_id",
+    "envelope_id",
+    "envelope_version",
+    "sequence_range",
+    "events",
+    "evidence",
+    "collection_gaps",
+    "redaction",
+    "envelope_digest"
+  ],
+  "properties": {
+    "contract_version": { "const": "tacua.diagnostic-envelope@1.0.0" },
+    "media_type": { "const": "application/vnd.tacua.diagnostic-envelope+json;version=1.0.0" },
+    "organization_id": { "$ref": "common.schema.json#/$defs/id" },
+    "project_id": { "$ref": "common.schema.json#/$defs/id" },
+    "build_id": { "$ref": "common.schema.json#/$defs/id" },
+    "build_identity_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "session_id": { "$ref": "common.schema.json#/$defs/id" },
+    "envelope_id": { "$ref": "common.schema.json#/$defs/id" },
+    "envelope_version": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "sequence_range": { "$ref": "#/$defs/sequenceRange" },
+    "events": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 10000,
+      "items": { "$ref": "#/$defs/event" }
+    },
+    "evidence": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": { "$ref": "#/$defs/evidence" }
+    },
+    "collection_gaps": {
+      "type": "array",
+      "maxItems": 2048,
+      "items": { "$ref": "#/$defs/collectionGap" }
+    },
+    "redaction": { "$ref": "common.schema.json#/$defs/redaction" },
+    "envelope_digest": { "$ref": "common.schema.json#/$defs/digest" }
+  },
+  "$defs": {
+    "sequenceRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["first", "last"],
+      "properties": {
+        "first": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "last": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    },
+    "nullableShortText": {
+      "oneOf": [
+        { "$ref": "common.schema.json#/$defs/shortText" },
+        { "type": "null" }
+      ]
+    },
+    "nullableInteger": {
+      "oneOf": [
+        { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        { "type": "null" }
+      ]
+    },
+    "routeTransition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from_route", "to_route", "trigger"],
+      "properties": {
+        "from_route": { "$ref": "#/$defs/nullableShortText" },
+        "to_route": { "$ref": "common.schema.json#/$defs/shortText" },
+        "trigger": { "enum": ["user", "system", "deep_link", "unknown"] }
+      }
+    },
+    "userInteraction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action", "target", "value_capture"],
+      "properties": {
+        "action": { "enum": ["tap", "long_press", "text_input", "swipe", "submit", "other"] },
+        "target": { "$ref": "common.schema.json#/$defs/shortText" },
+        "value_capture": { "const": "not_collected" }
+      }
+    },
+    "runtimeError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error_class", "sanitized_message", "stack_trace_digest", "handled"],
+      "properties": {
+        "error_class": { "$ref": "common.schema.json#/$defs/shortText" },
+        "sanitized_message": { "$ref": "common.schema.json#/$defs/boundedText" },
+        "stack_trace_digest": { "$ref": "common.schema.json#/$defs/nullableDigest" },
+        "handled": { "type": "boolean" }
+      }
+    },
+    "networkRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request_id",
+        "method",
+        "host",
+        "path_template",
+        "status_code",
+        "duration_ms",
+        "trace_id",
+        "outcome",
+        "request_body_capture",
+        "response_body_capture"
+      ],
+      "properties": {
+        "request_id": { "$ref": "common.schema.json#/$defs/id" },
+        "method": { "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] },
+        "host": { "type": "string", "pattern": "^[A-Za-z0-9.-]{1,253}$" },
+        "path_template": { "type": "string", "pattern": "^/[^?#]{0,511}$" },
+        "status_code": {
+          "oneOf": [
+            { "type": "integer", "minimum": 100, "maximum": 599 },
+            { "type": "null" }
+          ]
+        },
+        "duration_ms": { "$ref": "#/$defs/nullableInteger" },
+        "trace_id": { "$ref": "#/$defs/nullableShortText" },
+        "outcome": { "enum": ["success", "error", "cancelled", "unknown"] },
+        "request_body_capture": { "const": "not_collected" },
+        "response_body_capture": { "const": "not_collected" }
+      }
+    },
+    "appState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from_state", "to_state"],
+      "properties": {
+        "from_state": { "enum": ["active", "inactive", "background", "unknown"] },
+        "to_state": { "enum": ["active", "inactive", "background", "unknown"] }
+      }
+    },
+    "issueMark": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["marker_id", "kind", "narration_elapsed_ms"],
+      "properties": {
+        "marker_id": { "$ref": "common.schema.json#/$defs/id" },
+        "kind": { "enum": ["spoken", "manual"] },
+        "narration_elapsed_ms": { "type": "integer", "minimum": 0, "maximum": 1800000 }
+      }
+    },
+    "captureGapEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gap_id", "affected_streams"],
+      "properties": {
+        "gap_id": { "$ref": "common.schema.json#/$defs/id" },
+        "affected_streams": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": { "enum": ["app_video", "app_audio", "microphone", "diagnostics"] }
+        }
+      }
+    },
+    "customState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider_id", "snapshot_digest", "collection_status"],
+      "properties": {
+        "provider_id": { "$ref": "common.schema.json#/$defs/id" },
+        "snapshot_digest": { "$ref": "common.schema.json#/$defs/nullableDigest" },
+        "collection_status": { "enum": ["available", "unavailable"] }
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event_id", "sequence", "elapsed_ms", "occurred_at", "source", "event_type", "data", "evidence_refs"],
+      "properties": {
+        "event_id": { "$ref": "common.schema.json#/$defs/id" },
+        "sequence": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "elapsed_ms": { "type": "integer", "minimum": 0, "maximum": 1800000 },
+        "occurred_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "source": { "enum": ["mobile_sdk", "capture_extension"] },
+        "event_type": {
+          "enum": [
+            "route_transition",
+            "user_interaction",
+            "runtime_error",
+            "network_request_completed",
+            "app_state_changed",
+            "issue_mark",
+            "capture_gap",
+            "custom_state"
+          ]
+        },
+        "data": {
+          "oneOf": [
+            { "$ref": "#/$defs/routeTransition" },
+            { "$ref": "#/$defs/userInteraction" },
+            { "$ref": "#/$defs/runtimeError" },
+            { "$ref": "#/$defs/networkRequest" },
+            { "$ref": "#/$defs/appState" },
+            { "$ref": "#/$defs/issueMark" },
+            { "$ref": "#/$defs/captureGapEvent" },
+            { "$ref": "#/$defs/customState" }
+          ]
+        },
+        "evidence_refs": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "common.schema.json#/$defs/id" }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "event_type": { "const": "route_transition" } } },
+          "then": { "properties": { "data": { "$ref": "#/$defs/routeTransition" } } }
+        },
+        {
+          "if": { "properties": { "event_type": { "const": "user_interaction" } } },
+          "then": { "properties": { "data": { "$ref": "#/$defs/userInteraction" } } }
+        },
+        {
+          "if": { "properties": { "event_type": { "const": "runtime_error" } } },
+          "then": { "properties": { "data": { "$ref": "#/$defs/runtimeError" } } }
+        },
+        {
+          "if": { "properties": { "event_type": { "const": "network_request_completed" } } },
+          "then": { "properties": { "data": { "$ref": "#/$defs/networkRequest" } } }
+        },
+        {
+          "if": { "properties": { "event_type": { "const": "app_state_changed" } } },
+          "then": { "properties": { "data": { "$ref": "#/$defs/appState" } } }
+        },
+        {
+          "if": { "properties": { "event_type": { "const": "issue_mark" } } },
+          "then": { "properties": { "data": { "$ref": "#/$defs/issueMark" } } }
+        },
+        {
+          "if": { "properties": { "event_type": { "const": "capture_gap" } } },
+          "then": { "properties": { "data": { "$ref": "#/$defs/captureGapEvent" } } }
+        },
+        {
+          "if": { "properties": { "event_type": { "const": "custom_state" } } },
+          "then": { "properties": { "data": { "$ref": "#/$defs/customState" } } }
+        }
+      ]
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["component", "source_id", "snapshot_revision", "captured_at"],
+      "properties": {
+        "component": { "enum": ["mobile_sdk", "backend", "repository", "sentry", "posthog"] },
+        "source_id": { "$ref": "common.schema.json#/$defs/id" },
+        "snapshot_revision": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "captured_at": { "$ref": "common.schema.json#/$defs/timestamp" }
+      }
+    },
+    "locator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scheme", "organization_id", "project_id", "evidence_id", "revision_id"],
+      "properties": {
+        "scheme": { "const": "tacua-evidence" },
+        "organization_id": { "$ref": "common.schema.json#/$defs/id" },
+        "project_id": { "$ref": "common.schema.json#/$defs/id" },
+        "evidence_id": { "$ref": "common.schema.json#/$defs/id" },
+        "revision_id": { "$ref": "common.schema.json#/$defs/id" }
+      }
+    },
+    "reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["locator", "content_type", "size_bytes", "content_digest"],
+      "properties": {
+        "locator": { "$ref": "#/$defs/locator" },
+        "content_type": {
+          "enum": [
+            "application/json",
+            "text/plain",
+            "image/png",
+            "video/quicktime",
+            "application/vnd.tacua.sdk-event+json",
+            "application/vnd.tacua.connector-snapshot+json"
+          ]
+        },
+        "size_bytes": { "type": "integer", "minimum": 0, "maximum": 104857600 },
+        "content_digest": { "$ref": "common.schema.json#/$defs/digest" }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_id",
+        "evidence_type",
+        "description",
+        "availability",
+        "time_range",
+        "source",
+        "reference",
+        "unavailable",
+        "redaction"
+      ],
+      "properties": {
+        "evidence_id": { "$ref": "common.schema.json#/$defs/id" },
+        "evidence_type": {
+          "enum": [
+            "media_keyframe",
+            "media_clip",
+            "transcript_excerpt",
+            "sdk_event_batch",
+            "repository_snapshot",
+            "backend_log_snapshot",
+            "backend_trace_snapshot",
+            "sentry_event",
+            "posthog_event",
+            "custom_state_snapshot"
+          ]
+        },
+        "description": { "$ref": "common.schema.json#/$defs/boundedText" },
+        "availability": { "enum": ["available", "unavailable"] },
+        "time_range": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/timeRange" },
+            { "type": "null" }
+          ]
+        },
+        "source": { "$ref": "#/$defs/source" },
+        "reference": {
+          "oneOf": [
+            { "$ref": "#/$defs/reference" },
+            { "type": "null" }
+          ]
+        },
+        "unavailable": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/unavailable" },
+            { "type": "null" }
+          ]
+        },
+        "redaction": { "$ref": "common.schema.json#/$defs/redaction" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "availability": { "const": "available" } } },
+          "then": {
+            "properties": {
+              "reference": { "$ref": "#/$defs/reference" },
+              "unavailable": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "availability": { "const": "unavailable" } } },
+          "then": {
+            "properties": {
+              "reference": { "type": "null" },
+              "unavailable": { "$ref": "common.schema.json#/$defs/unavailable" }
+            }
+          }
+        }
+      ]
+    },
+    "collectionGap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gap_id", "time_range", "reason", "detail"],
+      "properties": {
+        "gap_id": { "$ref": "common.schema.json#/$defs/id" },
+        "time_range": { "$ref": "common.schema.json#/$defs/timeRange" },
+        "reason": {
+          "enum": [
+            "diagnostic_collection_paused",
+            "process_terminated",
+            "buffer_overflow",
+            "redacted_by_policy",
+            "clock_discontinuity",
+            "unknown"
+          ]
+        },
+        "detail": { "$ref": "common.schema.json#/$defs/shortText" }
+      }
+    }
+  }
+}
