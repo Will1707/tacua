@@ -81,6 +81,7 @@ enum TransportQueueTests {
       remoteSessionID: "session_remote_001",
       scopeDigest: digestA,
       credentialID: "credential_first",
+      expiresAt: "2026-08-20T10:00:00Z",
       capability: .active,
       issuedAt: "2026-07-21T10:00:00Z",
       clock: TestClock(uptimeMilliseconds: 100_000, bootSessionID: "boot_001")
@@ -221,6 +222,7 @@ enum TransportQueueTests {
       remoteSessionID: "session_remote_001",
       scopeDigest: digestA,
       credentialID: "credential_second",
+      expiresAt: "2026-08-20T10:00:00Z",
       capability: .active,
       issuedAt: "2026-07-21T10:05:00Z",
       clock: TestClock(uptimeMilliseconds: 400_000, bootSessionID: "boot_001")
@@ -238,6 +240,7 @@ enum TransportQueueTests {
       remoteSessionID: "session_remote_001",
       scopeDigest: digestA,
       credentialID: "credential_completed",
+      expiresAt: "2026-08-20T10:00:00Z",
       capability: .completionReplayOrDeleteOnly,
       issuedAt: "2026-07-21T10:05:00Z",
       clock: TestClock(uptimeMilliseconds: 400_000, bootSessionID: "boot_001")
@@ -342,6 +345,7 @@ enum TransportQueueTests {
       remoteSessionID: sessionID,
       scopeDigest: scopeDigest,
       credentialID: credentialID,
+      expiresAt: "2026-08-20T10:00:00Z",
       capability: .active,
       issuedAt: "2026-07-21T10:00:00Z",
       clock: TestClock(uptimeMilliseconds: 100_000, bootSessionID: "boot_fixture")

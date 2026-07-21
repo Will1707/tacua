@@ -163,6 +163,7 @@ struct TacuaTransportQueueV2: Codable, Equatable {
   var remoteSessionID: String?
   var scopeDigest: String?
   var currentCredentialID: String?
+  var currentCredentialExpiresAt: String?
   var credentialCapability: TacuaTransportCredentialCapability
   var timeAnchor: TacuaServerTimeAnchor?
   var operations: [TacuaQueuedOperation]
@@ -183,6 +184,7 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     remoteSessionID = nil
     scopeDigest = nil
     currentCredentialID = nil
+    currentCredentialExpiresAt = nil
     credentialCapability = .requiresExchange
     timeAnchor = nil
     operations = []
@@ -216,6 +218,7 @@ struct TacuaTransportQueueV2: Codable, Equatable {
       queue.remoteSessionID = nil
       queue.scopeDigest = nil
       queue.currentCredentialID = nil
+      queue.currentCredentialExpiresAt = nil
       queue.credentialCapability = .requiresExchange
       queue.timeAnchor = nil
       try queue.validate()
@@ -241,13 +244,17 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     remoteSessionID: String,
     scopeDigest: String,
     credentialID: String,
+    expiresAt: String,
     capability: TacuaTransportCredentialCapability,
     issuedAt: String,
     clock: TacuaMonotonicClock
   ) throws {
     guard Self.validIdentifier(remoteSessionID), Self.validDigest(scopeDigest),
       Self.validIdentifier(credentialID), capability != .requiresExchange,
-      capability != .deletionReplayOnly
+      capability != .deletionReplayOnly,
+      let expiryMilliseconds = TacuaProtocolTimestamp.parseMilliseconds(expiresAt),
+      let issueMilliseconds = TacuaProtocolTimestamp.parseMilliseconds(issuedAt),
+      expiryMilliseconds > issueMilliseconds
     else {
       throw TacuaTransportQueueError.invalidQueue
     }
@@ -260,6 +267,7 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     self.remoteSessionID = remoteSessionID
     self.scopeDigest = scopeDigest
     currentCredentialID = credentialID
+    currentCredentialExpiresAt = expiresAt
     credentialCapability = capability
     timeAnchor = try .establish(issuedAt: issuedAt, clock: clock)
   }
@@ -412,7 +420,8 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     // A caller-created value cannot inject an asserted completion or deletion authority.
     let independentlyValidated = try TacuaSDKBackendProtocol.validateResponse(
       receipt.canonicalResponse,
-      forCanonicalRequest: operation.canonicalRequest
+      forCanonicalRequest: operation.canonicalRequest,
+      expectedCurrentCredentialExpiry: currentCredentialExpiresAt
     )
     guard independentlyValidated == receipt else {
       throw TacuaTransportQueueError.responseConflict
@@ -476,17 +485,20 @@ struct TacuaTransportQueueV2: Codable, Equatable {
       throw TacuaTransportQueueError.invalidQueue
     }
     if credentialCapability == .requiresExchange {
-      guard currentCredentialID == nil, timeAnchor == nil else {
+      guard currentCredentialID == nil, currentCredentialExpiresAt == nil, timeAnchor == nil else {
         throw TacuaTransportQueueError.invalidQueue
       }
     } else if credentialCapability == .deletionReplayOnly,
       credentialCleanupState == .credentialRemoved
     {
-      guard remoteSessionID != nil, scopeDigest != nil, currentCredentialID == nil else {
+      guard remoteSessionID != nil, scopeDigest != nil, currentCredentialID == nil,
+        currentCredentialExpiresAt == nil
+      else {
         throw TacuaTransportQueueError.invalidQueue
       }
     } else {
       guard remoteSessionID != nil, scopeDigest != nil, currentCredentialID != nil,
+        currentCredentialExpiresAt.flatMap(TacuaProtocolTimestamp.parseMilliseconds) != nil,
         timeAnchor != nil || credentialCapability == .deletionReplayOnly
       else {
         throw TacuaTransportQueueError.invalidQueue
@@ -625,6 +637,7 @@ enum TacuaTransportCleanup {
     try credentialStore.remove(credentialID: authority.credentialID)
     queue.credentialCleanupState = .credentialRemoved
     queue.currentCredentialID = nil
+    queue.currentCredentialExpiresAt = nil
     try persistence.persist(queue)
   }
 }

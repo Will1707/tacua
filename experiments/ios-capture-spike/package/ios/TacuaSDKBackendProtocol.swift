@@ -48,11 +48,13 @@ enum TacuaBackendOperationKind: String, Equatable {
 enum TacuaSDKBackendProtocol {
   static let version = "tacua.sdk-backend@1.0.0"
   static let maximumResponseBytes = 2 * 1_024 * 1_024
+  static let maximumUploadBytes: Int64 = 1_073_741_824
 
   static func validateResponse(
     _ responseData: Data,
     forCanonicalRequest requestData: Data,
-    maximumResponseBytes: Int = maximumResponseBytes
+    maximumResponseBytes: Int = maximumResponseBytes,
+    expectedCurrentCredentialExpiry: String? = nil
   ) throws -> TacuaValidatedBackendReceipt {
     let requestValue = try TacuaCanonicalJSON.parse(requestData)
     guard try TacuaCanonicalJSON.data(requestValue) == requestData else {
@@ -75,7 +77,12 @@ enum TacuaSDKBackendProtocol {
     case "diagnostic_upload_request":
       return try validateDiagnostic(request: requestValue, response: responseValue, data: responseData)
     case "completion_request":
-      return try validateCompletion(request: requestValue, response: responseValue, data: responseData)
+      return try validateCompletion(
+        request: requestValue,
+        response: responseValue,
+        data: responseData,
+        expectedCredentialExpiry: expectedCurrentCredentialExpiry
+      )
     case "deletion_request":
       return try validateDeletion(request: requestValue, response: responseValue, data: responseData)
     default:
@@ -252,8 +259,15 @@ enum TacuaSDKBackendProtocol {
     guard ["video/mp4", "video/quicktime"].contains(contentType) else {
       throw TacuaSDKBackendProtocolError.invalidConstant("content_type")
     }
-    let sizeBytes = try positiveInteger(transport, "size_bytes")
+    let sizeBytes = try boundedPositiveInteger(
+      transport, "size_bytes", maximum: maximumUploadBytes
+    )
     let contentDigest = try digest(transport, "content_digest")
+    _ = try digest(request, "sidecar_digest")
+    let intentSequence = try integer(request, "sequence")
+    guard (0...2_047).contains(intentSequence) else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
     let requestedAt = try timestamp(request, "requested_at")
 
     let response = try exactObject(responseValue, keys: [
@@ -268,7 +282,7 @@ enum TacuaSDKBackendProtocol {
       try equalString(response, field, try string(request, field))
     }
     let responseSequence = try integer(response, "sequence")
-    let requestSequence = try integer(request, "sequence")
+    let requestSequence = intentSequence
     guard responseSequence == requestSequence else {
       throw TacuaSDKBackendProtocolError.bindingMismatch("sequence")
     }
@@ -279,9 +293,12 @@ enum TacuaSDKBackendProtocol {
       "object_id", "segment_id", "size_bytes", "content_digest", "received_at", "receipt_digest",
     ])
     try validateArtifactDigest(runtimeReceiptValue, field: "receipt_digest")
+    _ = try identifier(runtimeReceipt, "object_id")
     try equalString(runtimeReceipt, "segment_id", try string(request, "segment_id"))
     try equalString(runtimeReceipt, "content_digest", contentDigest)
-    guard try positiveInteger(runtimeReceipt, "size_bytes") == sizeBytes else {
+    guard try boundedPositiveInteger(
+      runtimeReceipt, "size_bytes", maximum: maximumUploadBytes
+    ) == sizeBytes else {
       throw TacuaSDKBackendProtocolError.bindingMismatch("size_bytes")
     }
     let receivedAt = try timestamp(runtimeReceipt, "received_at")
@@ -324,7 +341,9 @@ enum TacuaSDKBackendProtocol {
     try validateArtifactDigest(try required(request, "envelope"), field: "envelope_digest")
     try equalString(envelope, "session_id", try string(request, "session_id"))
     let envelopeData = try TacuaCanonicalJSON.data(try required(request, "envelope"))
-    let transportSize = try positiveInteger(transport, "size_bytes")
+    let transportSize = try boundedPositiveInteger(
+      transport, "size_bytes", maximum: maximumUploadBytes
+    )
     let transportDigest = try digest(transport, "content_digest")
     guard Int64(envelopeData.count) == transportSize,
       TacuaCanonicalJSON.digest(data: envelopeData) == transportDigest
@@ -339,13 +358,17 @@ enum TacuaSDKBackendProtocol {
     ])
     try responsePreamble(response, message: "diagnostic_upload_receipt")
     try validateArtifactDigest(responseValue, field: "diagnostic_receipt_digest")
+    _ = try identifier(response, "receipt_id")
+    _ = try identifier(response, "object_id")
     for field in ["upload_id", "request_digest", "session_id", "scope_digest", "credential_id"] {
       try equalString(response, field, try string(request, field))
     }
     try equalString(response, "envelope_id", envelopeID)
     try equalString(response, "envelope_digest", envelopeDigest)
     try equalString(response, "transport_digest", try string(transport, "content_digest"))
-    let responseSize = try positiveInteger(response, "size_bytes")
+    let responseSize = try boundedPositiveInteger(
+      response, "size_bytes", maximum: maximumUploadBytes
+    )
     guard responseSize == transportSize else {
       throw TacuaSDKBackendProtocolError.bindingMismatch("size_bytes")
     }
@@ -368,7 +391,8 @@ enum TacuaSDKBackendProtocol {
   private static func validateCompletion(
     request requestValue: TacuaJSONValue,
     response responseValue: TacuaJSONValue,
-    data: Data
+    data: Data,
+    expectedCredentialExpiry: String?
   ) throws -> TacuaValidatedBackendReceipt {
     let request = try exactObject(requestValue, keys: [
       "protocol_version", "message_type", "completion_id", "session_id", "scope_digest",
@@ -379,17 +403,14 @@ enum TacuaSDKBackendProtocol {
     try validateArtifactDigest(requestValue, field: "request_digest")
     let completionID = try identifier(request, "completion_id")
     let requestedAt = try timestamp(request, "requested_at")
-    let manifest = try object(try required(request, "capture_manifest"))
-    try validateArtifactDigest(try required(request, "capture_manifest"), field: "manifest_digest")
-    try equalString(manifest, "session_id", try string(request, "session_id"))
-    try constant(manifest, "capture_state", "complete")
-    let manifestDigest = try digest(manifest, "manifest_digest")
-    let segmentDigests = try receiptDigests(
-      try required(request, "segment_receipts"), field: "segment_receipt_digest"
+    let bindings = try validateCompletionRequestBindings(
+      request,
+      requestedAt: requestedAt
     )
-    let diagnosticDigests = try receiptDigests(
-      try required(request, "diagnostic_receipts"), field: "diagnostic_receipt_digest"
-    )
+    let manifest = bindings.manifest
+    let manifestDigest = bindings.manifestDigest
+    let segmentDigests = bindings.segmentReceiptDigests
+    let diagnosticDigests = bindings.diagnosticReceiptDigests
 
     let response = try exactObject(responseValue, keys: [
       "protocol_version", "message_type", "completion_id", "request_digest", "session_id",
@@ -413,6 +434,9 @@ enum TacuaSDKBackendProtocol {
     guard let expires = parseTimestamp(expiresAt), expires > acceptedAt else {
       throw TacuaSDKBackendProtocolError.invalidCredentialTransition
     }
+    if let expectedCredentialExpiry, expiresAt != expectedCredentialExpiry {
+      throw TacuaSDKBackendProtocolError.invalidCredentialTransition
+    }
     let cleanup = try exactObject(try required(response, "local_cleanup"), keys: [
       "state", "manifest_digest", "segment_receipt_digests", "diagnostic_receipt_digests",
     ])
@@ -423,15 +447,16 @@ enum TacuaSDKBackendProtocol {
     else { throw TacuaSDKBackendProtocolError.invalidCleanupAuthority }
     let jobValue = try required(response, "processing_job")
     let job = try validateQueuedProcessingJob(jobValue)
-    try equalString(job, "session_id", try string(request, "session_id"))
+    for field in [
+      "organization_id", "project_id", "build_id", "build_identity_digest", "session_id",
+    ] {
+      try equalString(job, field, try string(manifest, field))
+    }
     try equalString(job, "requested_at", try string(response, "accepted_at"))
     let jobInputs = try object(try required(job, "inputs"))
     try equalString(jobInputs, "capture_manifest_digest", manifestDigest)
     let jobEnvelopeDigests = try stringArray(jobInputs, "diagnostic_envelope_digests")
-    let requestEnvelopeDigests = try envelopeDigests(
-      try required(request, "diagnostic_receipts")
-    )
-    guard jobEnvelopeDigests == requestEnvelopeDigests
+    guard jobEnvelopeDigests == bindings.diagnosticEnvelopeDigests
     else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
     let responseDigest = try digest(response, "completion_receipt_digest")
     return TacuaValidatedBackendReceipt(
@@ -579,15 +604,326 @@ enum TacuaSDKBackendProtocol {
     try constant(scope, "protocol_version", version)
     try constant(scope, "message_type", "capture_scope")
     try constant(scope, "capture_scope", "app_only")
-    _ = try exactObject(try required(scope, "consent"), keys: [
+    for field in ["organization_id", "project_id", "application_id", "build_id"] {
+      _ = try identifier(scope, field)
+    }
+    _ = try digest(scope, "build_identity_digest")
+    let consent = try exactObject(try required(scope, "consent"), keys: [
       "policy_version", "granted_at", "screen_recording", "microphone", "diagnostics",
       "raw_media_upload",
     ])
-    _ = try exactObject(try required(scope, "retention"), keys: [
+    for field in ["screen_recording", "microphone", "diagnostics", "raw_media_upload"] {
+      try constant(consent, field, "granted")
+    }
+    _ = try timestamp(consent, "granted_at")
+    let retention = try exactObject(try required(scope, "retention"), keys: [
       "policy_version", "raw_media_days", "derived_data_days",
     ])
+    guard (1...30).contains(try integer(retention, "raw_media_days")),
+      (1...365).contains(try integer(retention, "derived_data_days"))
+    else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
     try validateArtifactDigest(value, field: "scope_digest")
     return try digest(scope, "scope_digest")
+  }
+
+  private struct CompletionRequestBindings {
+    let manifest: [String: TacuaJSONValue]
+    let manifestDigest: String
+    let segmentReceiptDigests: [String]
+    let diagnosticReceiptDigests: [String]
+    let diagnosticEnvelopeDigests: [String]
+  }
+
+  private struct CompletionSegmentReceipt {
+    let uploadID: String
+    let segmentID: String
+    let sequence: Int64
+    let contentType: String
+    let sidecarDigest: String
+    let receiptDigest: String
+    let runtimeReceipt: TacuaJSONValue
+    let runtimeReceivedAt: Date
+  }
+
+  private struct CompletionDiagnosticReceipt {
+    let uploadID: String
+    let receiptID: String
+    let objectID: String
+    let receiptDigest: String
+    let envelopeDigest: String
+    let receivedAt: Date
+  }
+
+  private struct AvailableManifestSegment {
+    let sequence: Int64
+    let contentType: String
+    let sidecarDigest: String
+    let sizeBytes: Int64
+    let contentDigest: String
+  }
+
+  private static func validateCompletionRequestBindings(
+    _ request: [String: TacuaJSONValue],
+    requestedAt: Date
+  ) throws -> CompletionRequestBindings {
+    let sessionID = try identifier(request, "session_id")
+    let scopeDigest = try digest(request, "scope_digest")
+    let manifestValue = try required(request, "capture_manifest")
+    let manifest = try exactObject(manifestValue, keys: [
+      "contract_version", "media_type", "manifest_version", "organization_id", "project_id",
+      "build_id", "build_identity_digest", "session_id", "capture_scope", "started_at",
+      "ended_at", "monotonic_duration_ms", "capture_state", "streams", "segments", "gaps",
+      "upload", "retention", "manifest_digest",
+    ])
+    try validateArtifactDigest(manifestValue, field: "manifest_digest")
+    try constant(manifest, "contract_version", "tacua.capture-upload-manifest@1.0.0")
+    try constant(
+      manifest, "media_type", "application/vnd.tacua.capture-upload-manifest+json;version=1.0.0"
+    )
+    try constant(manifest, "capture_scope", "app_only")
+    try constant(manifest, "capture_state", "complete")
+    for field in ["organization_id", "project_id", "build_id", "session_id"] {
+      _ = try identifier(manifest, field)
+    }
+    _ = try digest(manifest, "build_identity_digest")
+    try equalString(manifest, "session_id", sessionID)
+    guard try integer(manifest, "manifest_version") >= 1,
+      try integer(manifest, "monotonic_duration_ms") >= 0
+    else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+    let startedAt = try timestamp(manifest, "started_at")
+    let endedAt = try timestamp(manifest, "ended_at")
+    guard endedAt >= startedAt else { throw TacuaSDKBackendProtocolError.invalidChronology }
+
+    let segmentValues = try array(try required(manifest, "segments"))
+    guard segmentValues.count <= 2_048 else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+    var availableSegments: [String: AvailableManifestSegment] = [:]
+    var manifestSegmentIDs = Set<String>()
+    var manifestSequences = Set<Int64>()
+    for value in segmentValues {
+      let segment = try exactObject(value, keys: [
+        "segment_id", "sequence", "time_range", "finalized", "availability", "content",
+        "unavailable",
+      ])
+      let segmentID = try identifier(segment, "segment_id")
+      let sequence = try integer(segment, "sequence")
+      guard (0...2_047).contains(sequence), manifestSegmentIDs.insert(segmentID).inserted,
+        manifestSequences.insert(sequence).inserted,
+        try bool(segment, "finalized")
+      else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+      switch try string(segment, "availability") {
+      case "available":
+        guard try required(segment, "unavailable") == .null else {
+          throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+        }
+        let content = try exactObject(try required(segment, "content"), keys: [
+          "content_type", "size_bytes", "content_digest", "sidecar_digest",
+        ])
+        let contentType = try string(content, "content_type")
+        guard ["video/mp4", "video/quicktime"].contains(contentType) else {
+          throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+        }
+        availableSegments[segmentID] = AvailableManifestSegment(
+          sequence: sequence,
+          contentType: contentType,
+          sidecarDigest: try digest(content, "sidecar_digest"),
+          sizeBytes: try boundedPositiveInteger(
+            content, "size_bytes", maximum: maximumUploadBytes
+          ),
+          contentDigest: try digest(content, "content_digest")
+        )
+      case "unavailable":
+        guard try required(segment, "content") == .null,
+          try required(segment, "unavailable") != .null
+        else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+      default:
+        throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+      }
+    }
+
+    let segmentReceiptValues = try array(try required(request, "segment_receipts"))
+    guard (1...2_048).contains(segmentReceiptValues.count) else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+    var segmentReceipts: [String: CompletionSegmentReceipt] = [:]
+    var segmentUploadIDs = Set<String>()
+    var segmentSequences = Set<Int64>()
+    var segmentReceiptDigests: [String] = []
+    for value in segmentReceiptValues {
+      let receipt = try validateCompletionSegmentReceipt(
+        value, sessionID: sessionID, scopeDigest: scopeDigest
+      )
+      guard segmentReceipts[receipt.segmentID] == nil,
+        segmentUploadIDs.insert(receipt.uploadID).inserted,
+        segmentSequences.insert(receipt.sequence).inserted,
+        !segmentReceiptDigests.contains(receipt.receiptDigest)
+      else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+      segmentReceipts[receipt.segmentID] = receipt
+      segmentReceiptDigests.append(receipt.receiptDigest)
+    }
+    guard Set(segmentReceipts.keys) == Set(availableSegments.keys) else {
+      throw TacuaSDKBackendProtocolError.invalidCleanupAuthority
+    }
+
+    let upload = try exactObject(try required(manifest, "upload"), keys: [
+      "state", "protocol", "remote_session_id", "receipts", "last_error", "completed_at",
+    ])
+    try constant(upload, "state", "complete")
+    try constant(upload, "protocol", "segmented-resumable-v1")
+    try equalString(upload, "remote_session_id", sessionID)
+    guard try required(upload, "last_error") == .null else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+    let uploadCompletedAt = try timestamp(upload, "completed_at")
+    guard uploadCompletedAt >= endedAt, requestedAt >= uploadCompletedAt else {
+      throw TacuaSDKBackendProtocolError.invalidChronology
+    }
+    let runtimeReceiptValues = try array(try required(upload, "receipts"))
+    var runtimeReceipts: [String: TacuaJSONValue] = [:]
+    for value in runtimeReceiptValues {
+      let receipt = try validateRuntimeReceipt(value)
+      let segmentID = try identifier(receipt, "segment_id")
+      guard runtimeReceipts.updateValue(value, forKey: segmentID) == nil else {
+        throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+      }
+    }
+    guard Set(runtimeReceipts.keys) == Set(segmentReceipts.keys) else {
+      throw TacuaSDKBackendProtocolError.invalidCleanupAuthority
+    }
+    for (segmentID, protocolReceipt) in segmentReceipts {
+      guard let manifestSegment = availableSegments[segmentID],
+        let manifestRuntimeReceipt = runtimeReceipts[segmentID],
+        manifestRuntimeReceipt == protocolReceipt.runtimeReceipt,
+        protocolReceipt.sequence == manifestSegment.sequence,
+        protocolReceipt.contentType == manifestSegment.contentType,
+        protocolReceipt.sidecarDigest == manifestSegment.sidecarDigest
+      else { throw TacuaSDKBackendProtocolError.invalidCleanupAuthority }
+      let runtime = try object(protocolReceipt.runtimeReceipt)
+      guard try boundedPositiveInteger(
+        runtime, "size_bytes", maximum: maximumUploadBytes
+      ) == manifestSegment.sizeBytes,
+        try digest(runtime, "content_digest") == manifestSegment.contentDigest,
+        uploadCompletedAt >= protocolReceipt.runtimeReceivedAt
+      else { throw TacuaSDKBackendProtocolError.invalidCleanupAuthority }
+    }
+
+    let diagnosticReceiptValues = try array(try required(request, "diagnostic_receipts"))
+    guard (1...2_048).contains(diagnosticReceiptValues.count) else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+    var diagnosticUploadIDs = Set<String>()
+    var diagnosticReceiptIDs = Set<String>()
+    var diagnosticObjectIDs = Set<String>()
+    var diagnosticReceiptDigests: [String] = []
+    var diagnosticEnvelopeDigests: [String] = []
+    for value in diagnosticReceiptValues {
+      let receipt = try validateCompletionDiagnosticReceipt(
+        value, sessionID: sessionID, scopeDigest: scopeDigest
+      )
+      guard diagnosticUploadIDs.insert(receipt.uploadID).inserted,
+        diagnosticReceiptIDs.insert(receipt.receiptID).inserted,
+        diagnosticObjectIDs.insert(receipt.objectID).inserted,
+        !diagnosticReceiptDigests.contains(receipt.receiptDigest),
+        requestedAt >= receipt.receivedAt
+      else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+      diagnosticReceiptDigests.append(receipt.receiptDigest)
+      diagnosticEnvelopeDigests.append(receipt.envelopeDigest)
+    }
+    return CompletionRequestBindings(
+      manifest: manifest,
+      manifestDigest: try digest(manifest, "manifest_digest"),
+      segmentReceiptDigests: segmentReceiptDigests,
+      diagnosticReceiptDigests: diagnosticReceiptDigests,
+      diagnosticEnvelopeDigests: diagnosticEnvelopeDigests
+    )
+  }
+
+  private static func validateCompletionSegmentReceipt(
+    _ value: TacuaJSONValue,
+    sessionID: String,
+    scopeDigest: String
+  ) throws -> CompletionSegmentReceipt {
+    let receipt = try exactObject(value, keys: [
+      "protocol_version", "message_type", "upload_id", "intent_digest", "session_id",
+      "scope_digest", "credential_id", "sequence", "segment_id", "content_type",
+      "sidecar_digest", "runtime_receipt", "transport_digest", "segment_receipt_digest",
+    ])
+    try responsePreamble(receipt, message: "segment_upload_receipt")
+    try validateArtifactDigest(value, field: "segment_receipt_digest")
+    try equalString(receipt, "session_id", sessionID)
+    try equalString(receipt, "scope_digest", scopeDigest)
+    let sequence = try integer(receipt, "sequence")
+    guard (0...2_047).contains(sequence) else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+    let contentType = try string(receipt, "content_type")
+    guard ["video/mp4", "video/quicktime"].contains(contentType) else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+    _ = try identifier(receipt, "credential_id")
+    _ = try digest(receipt, "intent_digest")
+    let sidecarDigest = try digest(receipt, "sidecar_digest")
+    let runtimeValue = try required(receipt, "runtime_receipt")
+    let runtime = try validateRuntimeReceipt(runtimeValue)
+    try equalString(runtime, "segment_id", try string(receipt, "segment_id"))
+    try equalString(receipt, "transport_digest", try string(runtime, "content_digest"))
+    return CompletionSegmentReceipt(
+      uploadID: try identifier(receipt, "upload_id"),
+      segmentID: try identifier(receipt, "segment_id"),
+      sequence: sequence,
+      contentType: contentType,
+      sidecarDigest: sidecarDigest,
+      receiptDigest: try digest(receipt, "segment_receipt_digest"),
+      runtimeReceipt: runtimeValue,
+      runtimeReceivedAt: try timestamp(runtime, "received_at")
+    )
+  }
+
+  private static func validateRuntimeReceipt(_ value: TacuaJSONValue) throws
+    -> [String: TacuaJSONValue]
+  {
+    let receipt = try exactObject(value, keys: [
+      "segment_id", "object_id", "size_bytes", "content_digest", "received_at",
+      "receipt_digest",
+    ])
+    try validateArtifactDigest(value, field: "receipt_digest")
+    _ = try identifier(receipt, "segment_id")
+    _ = try identifier(receipt, "object_id")
+    _ = try boundedPositiveInteger(receipt, "size_bytes", maximum: maximumUploadBytes)
+    _ = try digest(receipt, "content_digest")
+    _ = try timestamp(receipt, "received_at")
+    return receipt
+  }
+
+  private static func validateCompletionDiagnosticReceipt(
+    _ value: TacuaJSONValue,
+    sessionID: String,
+    scopeDigest: String
+  ) throws -> CompletionDiagnosticReceipt {
+    let receipt = try exactObject(value, keys: [
+      "protocol_version", "message_type", "receipt_id", "upload_id", "request_digest",
+      "session_id", "scope_digest", "credential_id", "object_id", "size_bytes",
+      "transport_digest", "envelope_id", "envelope_digest", "received_at",
+      "diagnostic_receipt_digest",
+    ])
+    try responsePreamble(receipt, message: "diagnostic_upload_receipt")
+    try validateArtifactDigest(value, field: "diagnostic_receipt_digest")
+    try equalString(receipt, "session_id", sessionID)
+    try equalString(receipt, "scope_digest", scopeDigest)
+    _ = try identifier(receipt, "credential_id")
+    _ = try identifier(receipt, "envelope_id")
+    _ = try digest(receipt, "request_digest")
+    _ = try digest(receipt, "transport_digest")
+    _ = try boundedPositiveInteger(receipt, "size_bytes", maximum: maximumUploadBytes)
+    return CompletionDiagnosticReceipt(
+      uploadID: try identifier(receipt, "upload_id"),
+      receiptID: try identifier(receipt, "receipt_id"),
+      objectID: try identifier(receipt, "object_id"),
+      receiptDigest: try digest(receipt, "diagnostic_receipt_digest"),
+      envelopeDigest: try digest(receipt, "envelope_digest"),
+      receivedAt: try timestamp(receipt, "received_at")
+    )
   }
 
   private static func validateQueuedProcessingJob(_ value: TacuaJSONValue) throws
@@ -600,7 +936,25 @@ enum TacuaSDKBackendProtocol {
       "outputs", "failure", "previous_job_digest", "job_digest",
     ])
     try constant(job, "contract_version", "tacua.processing-job@1.0.0")
+    try constant(
+      job, "media_type", "application/vnd.tacua.processing-job+json;version=1.0.0"
+    )
     try constant(job, "status", "queued")
+    _ = try identifier(job, "job_id")
+    _ = try identifier(job, "organization_id")
+    _ = try identifier(job, "project_id")
+    _ = try identifier(job, "build_id")
+    _ = try identifier(job, "session_id")
+    _ = try digest(job, "build_identity_digest")
+    guard try integer(job, "job_version") >= 1 else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+    _ = try timestamp(job, "requested_at")
+    switch try required(job, "previous_job_digest") {
+    case .null: break
+    case .string: _ = try digest(job, "previous_job_digest")
+    default: throw TacuaJSONError.wrongType
+    }
     for field in ["started_at", "completed_at", "outputs", "failure"] {
       guard try required(job, field) == .null else {
         throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
@@ -711,11 +1065,37 @@ enum TacuaSDKBackendProtocol {
     return value
   }
 
+  private static func bool(
+    _ object: [String: TacuaJSONValue], _ field: String
+  ) throws -> Bool {
+    guard case .bool(let value) = try required(object, field) else {
+      throw TacuaJSONError.wrongType
+    }
+    return value
+  }
+
+  private static func array(_ value: TacuaJSONValue) throws -> [TacuaJSONValue] {
+    guard case .array(let values) = value else { throw TacuaJSONError.wrongType }
+    return values
+  }
+
   private static func positiveInteger(
     _ object: [String: TacuaJSONValue], _ field: String
   ) throws -> Int64 {
     let value = try integer(object, field)
     guard value > 0 else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+    return value
+  }
+
+  private static func boundedPositiveInteger(
+    _ object: [String: TacuaJSONValue],
+    _ field: String,
+    maximum: Int64
+  ) throws -> Int64 {
+    let value = try positiveInteger(object, field)
+    guard value <= maximum else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
     return value
   }
 

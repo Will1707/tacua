@@ -84,6 +84,22 @@ swiftc \
   "$REPO_ROOT/contracts/sdk-backend-protocol/fixtures/positive"
 
 swiftc \
+  -module-cache-path "$TEST_TMP_DIR/module-cache" \
+  ios/TacuaCanonicalJSON.swift \
+  ios/TacuaCredentialStore.swift \
+  ios/TacuaBackendConfiguration.swift \
+  ios/TacuaTransportQueue.swift \
+  ios/TacuaSDKBackendProtocol.swift \
+  ios/TacuaSDKBackendRequests.swift \
+  ios/TacuaSDKBackendClient.swift \
+  tests/SDKBackendClientTests.swift \
+  -framework Security \
+  -o "$TEST_TMP_DIR/tacua-sdk-backend-client-tests"
+
+"$TEST_TMP_DIR/tacua-sdk-backend-client-tests" \
+  "$REPO_ROOT/contracts/sdk-backend-protocol/fixtures/positive"
+
+swiftc \
   -D TACUA_CAPTURE_FAULT_INJECTION \
   -module-cache-path "$TEST_TMP_DIR/module-cache" \
   ios/CaptureFaultInjection.swift \

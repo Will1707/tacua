@@ -27,6 +27,8 @@ enum SDKBackendProtocolTests {
     try rejectsNonCanonicalAndUnboundedResponses(fixtureRoot)
     try rejectsUnknownFieldsAndReboundIdentifiers(fixtureRoot)
     try completionAuthorityComesFromExactReceipt(fixtureRoot)
+    try resealedIncompleteCompletionCannotAuthorizeCleanup(fixtureRoot)
+    try resealedManifestReceiptSetMismatchCannotAuthorizeCleanup(fixtureRoot)
     try deletionAuthorityComesFromExactTombstone(fixtureRoot)
     try exactWholeSecondTimestampsOnly(fixtureRoot)
     print("Tacua SDK/backend protocol tests passed")
@@ -149,6 +151,71 @@ enum SDKBackendProtocolTests {
     try expectFailure {
       _ = try TacuaSDKBackendProtocol.validateResponse(wrongCleanup, forCanonicalRequest: request)
     }
+    try expectFailure {
+      _ = try TacuaSDKBackendProtocol.validateResponse(
+        response,
+        forCanonicalRequest: request,
+        expectedCurrentCredentialExpiry: "2026-08-20T10:00:01Z"
+      )
+    }
+  }
+
+  private static func resealedIncompleteCompletionCannotAuthorizeCleanup(_ root: URL) throws {
+    var request = try rootObject(canonicalFixture(root, "completion-request"))
+    request["segment_receipts"] = .array([])
+    try reseal(&request, field: "request_digest")
+    let requestDigest = request["request_digest"]!.stringValue!
+
+    var response = try rootObject(canonicalFixture(root, "completion-receipt"))
+    response["request_digest"] = .string(requestDigest)
+    guard case .object(var cleanup) = response["local_cleanup"] else {
+      throw ProtocolTestFailure.assertion("Missing cleanup")
+    }
+    cleanup["segment_receipt_digests"] = .array([])
+    response["local_cleanup"] = .object(cleanup)
+    try reseal(&response, field: "completion_receipt_digest")
+    try expectFailure {
+      _ = try TacuaSDKBackendProtocol.validateResponse(
+        try TacuaCanonicalJSON.data(.object(response)),
+        forCanonicalRequest: try TacuaCanonicalJSON.data(.object(request))
+      )
+    }
+  }
+
+  private static func resealedManifestReceiptSetMismatchCannotAuthorizeCleanup(_ root: URL) throws {
+    var request = try rootObject(canonicalFixture(root, "completion-request"))
+    guard case .object(var manifest) = request["capture_manifest"],
+      case .array(var segments) = manifest["segments"],
+      case .object(var segment) = segments.first
+    else { throw ProtocolTestFailure.assertion("Missing manifest segment") }
+    segment["segment_id"] = .string("segment_other")
+    segments[0] = .object(segment)
+    manifest["segments"] = .array(segments)
+    try reseal(&manifest, field: "manifest_digest")
+    request["capture_manifest"] = .object(manifest)
+    try reseal(&request, field: "request_digest")
+    let requestDigest = request["request_digest"]!.stringValue!
+    let manifestDigest = manifest["manifest_digest"]!.stringValue!
+
+    var response = try rootObject(canonicalFixture(root, "completion-receipt"))
+    response["request_digest"] = .string(requestDigest)
+    guard case .object(var cleanup) = response["local_cleanup"],
+      case .object(var job) = response["processing_job"],
+      case .object(var inputs) = job["inputs"]
+    else { throw ProtocolTestFailure.assertion("Missing completion response bindings") }
+    cleanup["manifest_digest"] = .string(manifestDigest)
+    response["local_cleanup"] = .object(cleanup)
+    inputs["capture_manifest_digest"] = .string(manifestDigest)
+    job["inputs"] = .object(inputs)
+    try reseal(&job, field: "job_digest")
+    response["processing_job"] = .object(job)
+    try reseal(&response, field: "completion_receipt_digest")
+    try expectFailure {
+      _ = try TacuaSDKBackendProtocol.validateResponse(
+        try TacuaCanonicalJSON.data(.object(response)),
+        forCanonicalRequest: try TacuaCanonicalJSON.data(.object(request))
+      )
+    }
   }
 
   private static func deletionAuthorityComesFromExactTombstone(_ root: URL) throws {
@@ -184,5 +251,21 @@ enum SDKBackendProtocolTests {
   private static func requireValue<T>(_ value: T?, _ message: String) throws -> T {
     guard let value else { throw ProtocolTestFailure.assertion(message) }
     return value
+  }
+
+  private static func rootObject(_ data: Data) throws -> [String: TacuaJSONValue] {
+    guard case .object(let object) = try TacuaCanonicalJSON.parse(data) else {
+      throw ProtocolTestFailure.assertion("Expected object")
+    }
+    return object
+  }
+
+  private static func reseal(
+    _ object: inout [String: TacuaJSONValue],
+    field: String
+  ) throws {
+    object[field] = .string(try TacuaCanonicalJSON.digest(
+      .object(object), omittingRootField: field
+    ))
   }
 }
