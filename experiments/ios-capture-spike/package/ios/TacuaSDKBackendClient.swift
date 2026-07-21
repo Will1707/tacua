@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import CryptoKit
+import Darwin
 import Foundation
 
 enum TacuaSDKBackendClientError: Error, Equatable {
@@ -11,6 +12,8 @@ enum TacuaSDKBackendClientError: Error, Equatable {
   case unexpectedContentType
   case localPayloadMissing
   case localPayloadMismatch
+  case unsafeLocalPayload
+  case localPayloadTooLarge
   case transportFailure
 }
 
@@ -188,6 +191,10 @@ final class TacuaSDKBackendClient {
   func exchange(_ request: TacuaTransientLaunchRequest) async throws
     -> TacuaValidatedBackendReceipt
   {
+    _ = try TacuaSDKBackendProtocol.validateRequest(
+      request.canonicalData,
+      expectedTransportConfigurationDigest: configuration.configurationDigest
+    )
     var urlRequest = try makeRequest(
       method: "POST",
       route: ["v1", "sdk", "launch-exchanges"],
@@ -205,6 +212,10 @@ final class TacuaSDKBackendClient {
     transportCredentialID: String
   ) async throws -> TacuaValidatedBackendReceipt {
     guard request.kind != .segment else { throw TacuaSDKBackendClientError.invalidRequest }
+    let validatedKind = try TacuaSDKBackendProtocol.validateRequest(request.canonicalData)
+    guard validatedKind.rawValue == request.kind.rawValue else {
+      throw TacuaSDKBackendClientError.invalidRequest
+    }
     let root = try requestObject(request.canonicalData)
     let sessionID = try requiredString(root, "session_id")
     let route: [String]
@@ -231,17 +242,24 @@ final class TacuaSDKBackendClient {
   func uploadSegment(
     _ request: TacuaPreparedBackendRequest,
     fileURL: URL,
+    sessionDirectory: URL,
     transportCredentialID: String
   ) async throws -> TacuaValidatedBackendReceipt {
     guard request.kind == .segment else { throw TacuaSDKBackendClientError.invalidRequest }
+    guard try TacuaSDKBackendProtocol.validateRequest(request.canonicalData) == .segment else {
+      throw TacuaSDKBackendClientError.invalidRequest
+    }
     let intent = try requestObject(request.canonicalData)
     let transportObject = try requiredObject(intent, "transport")
     let expectedSize = try requiredInteger(transportObject, "size_bytes")
     let expectedDigest = try requiredString(transportObject, "content_digest")
-    let actual = try fileMetadata(fileURL)
-    guard actual.sizeBytes == expectedSize, actual.contentDigest == expectedDigest else {
-      throw TacuaSDKBackendClientError.localPayloadMismatch
-    }
+    let uploadSnapshot = try prepareUploadSnapshot(
+      sourceURL: fileURL,
+      sessionDirectory: sessionDirectory,
+      expectedSize: expectedSize,
+      expectedDigest: expectedDigest
+    )
+    defer { try? FileManager.default.removeItem(at: uploadSnapshot) }
     let sessionID = try requiredString(intent, "session_id")
     let segmentID = try requiredString(intent, "segment_id")
     let sequence = try requiredInteger(intent, "sequence")
@@ -267,7 +285,7 @@ final class TacuaSDKBackendClient {
     return try await execute(
       urlRequest,
       requestData: request.canonicalData,
-      uploadFile: fileURL
+      uploadFile: uploadSnapshot
     )
   }
 
@@ -349,22 +367,149 @@ final class TacuaSDKBackendClient {
     return value
   }
 
-  private func fileMetadata(_ url: URL) throws -> (sizeBytes: Int64, contentDigest: String) {
-    guard url.isFileURL,
-      FileManager.default.fileExists(atPath: url.path),
-      let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-      let size = attributes[.size] as? NSNumber
-    else { throw TacuaSDKBackendClientError.localPayloadMissing }
-    let handle = try FileHandle(forReadingFrom: url)
-    defer { try? handle.close() }
-    var hasher = SHA256()
-    while true {
-      let chunk = try handle.read(upToCount: 256 * 1_024) ?? Data()
-      if chunk.isEmpty { break }
-      hasher.update(data: chunk)
+  private func prepareUploadSnapshot(
+    sourceURL: URL,
+    sessionDirectory: URL,
+    expectedSize: Int64,
+    expectedDigest: String
+  ) throws -> URL {
+    guard sourceURL.isFileURL, sessionDirectory.isFileURL,
+      expectedSize > 0, expectedSize <= TacuaSDKBackendProtocol.maximumUploadBytes
+    else { throw TacuaSDKBackendClientError.unsafeLocalPayload }
+    let root = sessionDirectory.standardizedFileURL
+    let source = sourceURL.standardizedFileURL
+    let rootPrefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+    guard source.path.hasPrefix(rootPrefix) else {
+      throw TacuaSDKBackendClientError.unsafeLocalPayload
     }
+    let relative = String(source.path.dropFirst(rootPrefix.count))
+    let components = relative.split(separator: "/", omittingEmptySubsequences: false)
+      .map(String.init)
+    guard !components.isEmpty,
+      components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." })
+    else { throw TacuaSDKBackendClientError.unsafeLocalPayload }
+
+    let rootDescriptor = open(root.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+    guard rootDescriptor >= 0 else { throw TacuaSDKBackendClientError.unsafeLocalPayload }
+    defer { close(rootDescriptor) }
+    var parentDescriptor = rootDescriptor
+    defer { if parentDescriptor != rootDescriptor { close(parentDescriptor) } }
+    for component in components.dropLast() {
+      let child = component.withCString {
+        openat(parentDescriptor, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+      }
+      guard child >= 0 else { throw TacuaSDKBackendClientError.unsafeLocalPayload }
+      if parentDescriptor != rootDescriptor { close(parentDescriptor) }
+      parentDescriptor = child
+    }
+    let sourceDescriptor = components.last!.withCString {
+      openat(parentDescriptor, $0, O_RDONLY | O_NONBLOCK | O_NOFOLLOW)
+    }
+    guard sourceDescriptor >= 0 else {
+      if errno == ENOENT { throw TacuaSDKBackendClientError.localPayloadMissing }
+      throw TacuaSDKBackendClientError.unsafeLocalPayload
+    }
+    defer { close(sourceDescriptor) }
+    var initialStat = stat()
+    guard fstat(sourceDescriptor, &initialStat) == 0,
+      (initialStat.st_mode & S_IFMT) == S_IFREG,
+      initialStat.st_nlink == 1
+    else { throw TacuaSDKBackendClientError.unsafeLocalPayload }
+    guard initialStat.st_size <= TacuaSDKBackendProtocol.maximumUploadBytes else {
+      throw TacuaSDKBackendClientError.localPayloadTooLarge
+    }
+    guard initialStat.st_size == expectedSize else {
+      throw TacuaSDKBackendClientError.localPayloadMismatch
+    }
+
+    let stagingName = ".tacua-upload-staging"
+    let mkdirResult = stagingName.withCString { mkdirat(rootDescriptor, $0, 0o700) }
+    guard mkdirResult == 0 || errno == EEXIST else {
+      throw TacuaSDKBackendClientError.unsafeLocalPayload
+    }
+    let stagingDescriptor = stagingName.withCString {
+      openat(rootDescriptor, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+    }
+    guard stagingDescriptor >= 0 else {
+      throw TacuaSDKBackendClientError.unsafeLocalPayload
+    }
+    defer { close(stagingDescriptor) }
+    guard fchmod(stagingDescriptor, 0o700) == 0 else {
+      throw TacuaSDKBackendClientError.unsafeLocalPayload
+    }
+    let fileName = "upload-\(UUID().uuidString.lowercased()).snapshot"
+    let outputDescriptor = fileName.withCString {
+      openat(stagingDescriptor, $0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+    }
+    guard outputDescriptor >= 0 else {
+      throw TacuaSDKBackendClientError.unsafeLocalPayload
+    }
+    let stagingURL = root.appendingPathComponent(stagingName, isDirectory: true)
+      .appendingPathComponent(fileName)
+    var keepSnapshot = false
+    defer {
+      close(outputDescriptor)
+      if !keepSnapshot { _ = fileName.withCString { unlinkat(stagingDescriptor, $0, 0) } }
+    }
+
+    guard lseek(sourceDescriptor, 0, SEEK_SET) >= 0 else {
+      throw TacuaSDKBackendClientError.localPayloadMismatch
+    }
+    var hasher = SHA256()
+    var total: Int64 = 0
+    var buffer = [UInt8](repeating: 0, count: 256 * 1_024)
+    while total < expectedSize {
+      let limit = min(buffer.count, Int(expectedSize - total))
+      let count = Darwin.read(sourceDescriptor, &buffer, limit)
+      guard count > 0 else { throw TacuaSDKBackendClientError.localPayloadMismatch }
+      total += Int64(count)
+      guard total <= TacuaSDKBackendProtocol.maximumUploadBytes else {
+        throw TacuaSDKBackendClientError.localPayloadTooLarge
+      }
+      hasher.update(data: Data(buffer[0..<count]))
+      try writeAll(descriptor: outputDescriptor, bytes: buffer, count: count)
+    }
+    let extraCount = Darwin.read(sourceDescriptor, &buffer, 1)
+    guard extraCount == 0 else { throw TacuaSDKBackendClientError.localPayloadMismatch }
+    var finalStat = stat()
+    guard fstat(sourceDescriptor, &finalStat) == 0,
+      finalStat.st_dev == initialStat.st_dev,
+      finalStat.st_ino == initialStat.st_ino,
+      finalStat.st_size == initialStat.st_size,
+      finalStat.st_mtimespec.tv_sec == initialStat.st_mtimespec.tv_sec,
+      finalStat.st_mtimespec.tv_nsec == initialStat.st_mtimespec.tv_nsec,
+      finalStat.st_ctimespec.tv_sec == initialStat.st_ctimespec.tv_sec,
+      finalStat.st_ctimespec.tv_nsec == initialStat.st_ctimespec.tv_nsec
+    else { throw TacuaSDKBackendClientError.localPayloadMismatch }
     let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
-    return (size.int64Value, "sha256:\(digest)")
+    guard "sha256:\(digest)" == expectedDigest else {
+      throw TacuaSDKBackendClientError.localPayloadMismatch
+    }
+    guard fsync(outputDescriptor) == 0, fchmod(outputDescriptor, 0o400) == 0,
+      fsync(stagingDescriptor) == 0
+    else { throw TacuaSDKBackendClientError.transportFailure }
+    try FileManager.default.setAttributes(
+      [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+      ofItemAtPath: stagingURL.path
+    )
+    var values = URLResourceValues()
+    values.isExcludedFromBackup = true
+    var stagingDirectoryURL = stagingURL.deletingLastPathComponent()
+    try? stagingDirectoryURL.setResourceValues(values)
+    keepSnapshot = true
+    return stagingURL
+  }
+
+  private func writeAll(descriptor: Int32, bytes: [UInt8], count: Int) throws {
+    var written = 0
+    while written < count {
+      let result = bytes.withUnsafeBytes { rawBuffer -> Int in
+        guard let base = rawBuffer.baseAddress else { return -1 }
+        return Darwin.write(descriptor, base.advanced(by: written), count - written)
+      }
+      guard result > 0 else { throw TacuaSDKBackendClientError.transportFailure }
+      written += result
+    }
   }
 
   private static func isJSON(_ contentType: String?) -> Bool {

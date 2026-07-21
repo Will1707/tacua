@@ -50,12 +50,51 @@ enum TacuaSDKBackendProtocol {
   static let maximumResponseBytes = 2 * 1_024 * 1_024
   static let maximumUploadBytes: Int64 = 1_073_741_824
 
+  @discardableResult
+  static func validateRequest(
+    _ requestData: Data,
+    expectedTransportConfigurationDigest: String? = nil
+  ) throws -> TacuaBackendOperationKind {
+    let requestValue = try TacuaCanonicalJSON.parse(requestData)
+    guard try TacuaCanonicalJSON.data(requestValue) == requestData else {
+      throw TacuaSDKBackendProtocolError.nonCanonicalMessage
+    }
+    let request = try object(requestValue)
+    let messageType = try string(request, "message_type")
+    if messageType != "launch_exchange_request" {
+      try validateNoSensitiveMaterial(requestValue)
+    }
+    switch messageType {
+    case "launch_exchange_request":
+      try validateLaunchRequest(
+        requestValue,
+        expectedTransportConfigurationDigest: expectedTransportConfigurationDigest
+      )
+      return .launch
+    case "segment_upload_intent":
+      try validateSegmentRequest(requestValue)
+      return .segment
+    case "diagnostic_upload_request":
+      try validateDiagnosticRequest(requestValue)
+      return .diagnostic
+    case "completion_request":
+      try validateCompletionRequest(requestValue)
+      return .completion
+    case "deletion_request":
+      try validateDeletionRequest(requestValue)
+      return .deletion
+    default:
+      throw TacuaSDKBackendProtocolError.unsupportedMessage
+    }
+  }
+
   static func validateResponse(
     _ responseData: Data,
     forCanonicalRequest requestData: Data,
     maximumResponseBytes: Int = maximumResponseBytes,
     expectedCurrentCredentialExpiry: String? = nil
   ) throws -> TacuaValidatedBackendReceipt {
+    _ = try validateRequest(requestData)
     let requestValue = try TacuaCanonicalJSON.parse(requestData)
     guard try TacuaCanonicalJSON.data(requestValue) == requestData else {
       throw TacuaSDKBackendProtocolError.nonCanonicalMessage
@@ -88,6 +127,161 @@ enum TacuaSDKBackendProtocol {
     default:
       throw TacuaSDKBackendProtocolError.unsupportedMessage
     }
+  }
+
+  private static func validateLaunchRequest(
+    _ value: TacuaJSONValue,
+    expectedTransportConfigurationDigest: String?
+  ) throws {
+    let request = try exactObject(value, keys: [
+      "protocol_version", "message_type", "exchange_kind", "exchange_id", "launch_code",
+      "expected_session_id", "expected_session_state", "expected_completion_id",
+      "previous_credential_id", "credential", "build_identity", "scope", "requested_at",
+      "request_digest",
+    ])
+    try constant(request, "protocol_version", version)
+    try constant(request, "message_type", "launch_exchange_request")
+    try validateArtifactDigest(value, field: "request_digest")
+    _ = try identifier(request, "exchange_id")
+    _ = try timestamp(request, "requested_at")
+    let launchCode = try string(request, "launch_code")
+    guard launchCode.range(of: "^[A-Za-z0-9_-]{32,512}$", options: .regularExpression) != nil else {
+      throw TacuaSDKBackendProtocolError.invalidIdentifier("launch_code")
+    }
+    let kind = try string(request, "exchange_kind")
+    let expectedState = try string(request, "expected_session_state")
+    let expectedSessionID = try nullableString(request, "expected_session_id")
+    let expectedCompletionID = try nullableString(request, "expected_completion_id")
+    let previousCredentialID = try nullableString(request, "previous_credential_id")
+    if kind == "start_session" {
+      guard expectedState == "receiving", expectedSessionID == nil,
+        expectedCompletionID == nil, previousCredentialID == nil
+      else { throw TacuaSDKBackendProtocolError.bindingMismatch("start_session") }
+    } else if kind == "resume_session" {
+      guard expectedSessionID.map(validIdentifierValue) == true,
+        previousCredentialID.map(validIdentifierValue) == true,
+        ["receiving", "completed"].contains(expectedState),
+        (expectedState == "completed") == (expectedCompletionID != nil),
+        expectedCompletionID.map(validIdentifierValue) ?? true
+      else { throw TacuaSDKBackendProtocolError.bindingMismatch("resume_session") }
+    } else {
+      throw TacuaSDKBackendProtocolError.invalidConstant("exchange_kind")
+    }
+    let credential = try exactObject(try required(request, "credential"), keys: [
+      "credential_id", "secret", "authentication_scheme", "local_storage",
+    ])
+    let credentialID = try identifier(credential, "credential_id")
+    guard previousCredentialID != credentialID else {
+      throw TacuaSDKBackendProtocolError.invalidCredentialTransition
+    }
+    try constant(credential, "authentication_scheme", "Bearer")
+    try constant(
+      credential, "local_storage", "ios_keychain_when_unlocked_this_device_only"
+    )
+    let secret = try string(credential, "secret")
+    guard secret.range(of: "^[A-Za-z0-9_-]{43}$", options: .regularExpression) != nil else {
+      throw TacuaSDKBackendProtocolError.invalidCredentialTransition
+    }
+    let buildValue = try required(request, "build_identity")
+    try validateBuildIdentity(buildValue)
+    let build = try object(buildValue)
+    if let expectedTransportConfigurationDigest {
+      try equalString(
+        build, "transport_configuration_digest", expectedTransportConfigurationDigest
+      )
+    }
+    let scopeValue = try required(request, "scope")
+    _ = try validateScope(scopeValue)
+    let scope = try object(scopeValue)
+    try equalString(scope, "build_id", try string(build, "build_id"))
+    try equalString(
+      scope, "build_identity_digest", try string(build, "build_identity_digest")
+    )
+  }
+
+  private static func validateSegmentRequest(_ value: TacuaJSONValue) throws {
+    let request = try exactObject(value, keys: [
+      "protocol_version", "message_type", "upload_id", "session_id", "scope_digest",
+      "credential_id", "sequence", "segment_id", "transport", "sidecar_digest",
+      "requested_at", "intent_digest",
+    ])
+    try requestPreamble(request, message: "segment_upload_intent")
+    try validateArtifactDigest(value, field: "intent_digest")
+    _ = try identifier(request, "upload_id")
+    _ = try identifier(request, "segment_id")
+    _ = try digest(request, "sidecar_digest")
+    _ = try timestamp(request, "requested_at")
+    guard (0...2_047).contains(try integer(request, "sequence")) else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+    let transport = try exactObject(try required(request, "transport"), keys: [
+      "content_type", "size_bytes", "content_digest",
+    ])
+    guard ["video/mp4", "video/quicktime"].contains(try string(transport, "content_type")) else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+    _ = try boundedPositiveInteger(transport, "size_bytes", maximum: maximumUploadBytes)
+    _ = try digest(transport, "content_digest")
+  }
+
+  private static func validateDiagnosticRequest(_ value: TacuaJSONValue) throws {
+    let request = try exactObject(value, keys: [
+      "protocol_version", "message_type", "upload_id", "session_id", "scope_digest",
+      "credential_id", "transport", "envelope", "requested_at", "request_digest",
+    ])
+    try requestPreamble(request, message: "diagnostic_upload_request")
+    try validateArtifactDigest(value, field: "request_digest")
+    _ = try identifier(request, "upload_id")
+    let requestedAt = try timestamp(request, "requested_at")
+    let envelopeValue = try required(request, "envelope")
+    let latestEvent = try validateDiagnosticEnvelope(
+      envelopeValue,
+      expectedSessionID: try string(request, "session_id")
+    )
+    guard requestedAt >= latestEvent else {
+      throw TacuaSDKBackendProtocolError.invalidChronology
+    }
+    let envelopeData = try TacuaCanonicalJSON.data(envelopeValue)
+    let transport = try exactObject(try required(request, "transport"), keys: [
+      "content_type", "size_bytes", "content_digest",
+    ])
+    try constant(
+      transport, "content_type",
+      "application/vnd.tacua.diagnostic-envelope+json;version=1.0.0"
+    )
+    guard try boundedPositiveInteger(
+      transport, "size_bytes", maximum: maximumUploadBytes
+    ) == Int64(envelopeData.count),
+      try digest(transport, "content_digest") == TacuaCanonicalJSON.digest(data: envelopeData)
+    else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+  }
+
+  private static func validateCompletionRequest(_ value: TacuaJSONValue) throws {
+    let request = try exactObject(value, keys: [
+      "protocol_version", "message_type", "completion_id", "session_id", "scope_digest",
+      "credential_id", "capture_manifest", "segment_receipts", "diagnostic_receipts",
+      "requested_at", "request_digest",
+    ])
+    try requestPreamble(request, message: "completion_request")
+    try validateArtifactDigest(value, field: "request_digest")
+    _ = try identifier(request, "completion_id")
+    let requestedAt = try timestamp(request, "requested_at")
+    _ = try validateCompletionRequestBindings(request, requestedAt: requestedAt)
+  }
+
+  private static func validateDeletionRequest(_ value: TacuaJSONValue) throws {
+    let request = try exactObject(value, keys: [
+      "protocol_version", "message_type", "deletion_id", "session_id", "scope_digest",
+      "credential_id", "target", "reason", "requested_at", "request_digest",
+    ])
+    try requestPreamble(request, message: "deletion_request")
+    try validateArtifactDigest(value, field: "request_digest")
+    _ = try identifier(request, "deletion_id")
+    try constant(request, "target", "session_all_data")
+    guard ["user_requested", "retention_expired", "operator_requested"].contains(
+      try string(request, "reason")
+    ) else { throw TacuaSDKBackendProtocolError.invalidConstant("reason") }
+    _ = try timestamp(request, "requested_at")
   }
 
   private static func validateLaunch(
@@ -580,17 +774,38 @@ enum TacuaSDKBackendProtocol {
     try constant(build, "protocol_version", version)
     try constant(build, "message_type", "build_identity")
     try constant(build, "platform", "ios")
+    _ = try identifier(build, "build_id")
+    guard try string(build, "bundle_identifier").range(
+      of: "^[A-Za-z0-9][A-Za-z0-9-]*(?:\\.[A-Za-z0-9][A-Za-z0-9-]*)+$",
+      options: .regularExpression
+    ) != nil,
+      ["local", "internal", "testflight"].contains(try string(build, "distribution"))
+    else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+    for field in ["native_version", "native_build", "react_native_version"] {
+      try validateText(try string(build, field), maximumBytes: 128)
+    }
     guard ["development", "preview"].contains(try string(build, "build_variant")) else {
       throw TacuaSDKBackendProtocolError.invalidConstant("build_variant")
     }
     _ = try digest(build, "transport_configuration_digest")
     _ = try timestamp(build, "created_at")
-    _ = try exactObject(try required(build, "expo"), keys: [
-      "sdk_version", "runtime_version", "update_id", "update_channel",
-    ])
-    _ = try exactObject(try required(build, "source"), keys: [
+    if try required(build, "expo") != .null {
+      let expo = try exactObject(try required(build, "expo"), keys: [
+        "sdk_version", "runtime_version", "update_id", "update_channel",
+      ])
+      for field in ["sdk_version", "runtime_version"] {
+        try validateText(try string(expo, field), maximumBytes: 128)
+      }
+      try validateNullableText(try required(expo, "update_id"), maximumBytes: 512)
+      try validateNullableText(try required(expo, "update_channel"), maximumBytes: 512)
+    }
+    let source = try exactObject(try required(build, "source"), keys: [
       "git_revision", "working_tree_dirty",
     ])
+    guard try string(source, "git_revision").range(
+      of: "^[a-f0-9]{7,64}$", options: .regularExpression
+    ) != nil else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+    _ = try bool(source, "working_tree_dirty")
     try validateArtifactDigest(value, field: "build_identity_digest")
   }
 
@@ -624,6 +839,273 @@ enum TacuaSDKBackendProtocol {
     else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
     try validateArtifactDigest(value, field: "scope_digest")
     return try digest(scope, "scope_digest")
+  }
+
+  private static func validateDiagnosticEnvelope(
+    _ value: TacuaJSONValue,
+    expectedSessionID: String
+  ) throws -> Date {
+    let envelope = try exactObject(value, keys: [
+      "contract_version", "media_type", "organization_id", "project_id", "build_id",
+      "build_identity_digest", "session_id", "envelope_id", "envelope_version",
+      "sequence_range", "events", "evidence", "collection_gaps", "redaction",
+      "envelope_digest",
+    ])
+    try constant(envelope, "contract_version", "tacua.diagnostic-envelope@1.0.0")
+    try constant(
+      envelope, "media_type", "application/vnd.tacua.diagnostic-envelope+json;version=1.0.0"
+    )
+    for field in ["organization_id", "project_id", "build_id", "session_id", "envelope_id"] {
+      _ = try identifier(envelope, field)
+    }
+    try equalString(envelope, "session_id", expectedSessionID)
+    _ = try digest(envelope, "build_identity_digest")
+    guard try integer(envelope, "envelope_version") >= 1 else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+    try validateArtifactDigest(value, field: "envelope_digest")
+    try validateRedaction(try required(envelope, "redaction"))
+
+    let evidenceValues = try array(try required(envelope, "evidence"))
+    guard evidenceValues.count <= 10_000 else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+    var evidenceIDs = Set<String>()
+    for evidenceValue in evidenceValues {
+      let evidenceID = try validateDiagnosticEvidence(
+        evidenceValue,
+        organizationID: try string(envelope, "organization_id"),
+        projectID: try string(envelope, "project_id")
+      )
+      guard evidenceIDs.insert(evidenceID).inserted else {
+        throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+      }
+    }
+
+    let eventValues = try array(try required(envelope, "events"))
+    guard (1...10_000).contains(eventValues.count) else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+    var eventIDs = Set<String>()
+    var sequences: [Int64] = []
+    var elapsedValues: [Int64] = []
+    var latestEvent: Date?
+    for eventValue in eventValues {
+      let event = try validateDiagnosticEvent(eventValue, evidenceIDs: evidenceIDs)
+      guard eventIDs.insert(event.id).inserted else {
+        throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+      }
+      sequences.append(event.sequence)
+      elapsedValues.append(event.elapsed)
+      latestEvent = max(latestEvent ?? event.occurredAt, event.occurredAt)
+    }
+    guard let firstSequence = sequences.first,
+      sequences.enumerated().allSatisfy({ offset, value in
+        value == firstSequence + Int64(offset)
+      }), elapsedValues == elapsedValues.sorted()
+    else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+    let range = try exactObject(try required(envelope, "sequence_range"), keys: [
+      "first", "last",
+    ])
+    guard try integer(range, "first") == sequences.first,
+      try integer(range, "last") == sequences.last
+    else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+
+    let gapValues = try array(try required(envelope, "collection_gaps"))
+    guard gapValues.count <= 2_048 else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+    var gapIDs = Set<String>()
+    for gapValue in gapValues {
+      let gap = try exactObject(gapValue, keys: ["gap_id", "time_range", "reason", "detail"])
+      guard gapIDs.insert(try identifier(gap, "gap_id")).inserted else {
+        throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+      }
+      _ = try validateTimeRange(try required(gap, "time_range"), maximum: 1_800_000)
+      guard [
+        "diagnostic_collection_paused", "process_terminated", "buffer_overflow",
+        "redacted_by_policy", "clock_discontinuity", "unknown",
+      ].contains(try string(gap, "reason")) else {
+        throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+      }
+      try validateText(try string(gap, "detail"), maximumBytes: 512)
+    }
+    return latestEvent!
+  }
+
+  private static func validateDiagnosticEvent(
+    _ value: TacuaJSONValue,
+    evidenceIDs: Set<String>
+  ) throws -> (id: String, sequence: Int64, elapsed: Int64, occurredAt: Date) {
+    let event = try exactObject(value, keys: [
+      "event_id", "sequence", "elapsed_ms", "occurred_at", "source", "event_type", "data",
+      "evidence_refs",
+    ])
+    let eventID = try identifier(event, "event_id")
+    let sequence = try integer(event, "sequence")
+    let elapsed = try integer(event, "elapsed_ms")
+    guard sequence >= 0, (0...1_800_000).contains(elapsed),
+      ["mobile_sdk", "capture_extension"].contains(try string(event, "source"))
+    else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+    let refs = try stringArray(event, "evidence_refs")
+    guard refs.count <= 32, Set(refs).count == refs.count,
+      refs.allSatisfy({ evidenceIDs.contains($0) && validIdentifierValue($0) })
+    else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+    let data = try required(event, "data")
+    switch try string(event, "event_type") {
+    case "route_transition":
+      let object = try exactObject(data, keys: ["from_route", "to_route", "trigger"])
+      try validateNullableText(try required(object, "from_route"), maximumBytes: 512)
+      try validateText(try string(object, "to_route"), maximumBytes: 512)
+      guard ["user", "system", "deep_link", "unknown"].contains(try string(object, "trigger")) else {
+        throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+      }
+    case "user_interaction":
+      let object = try exactObject(data, keys: ["action", "target", "value_capture"])
+      guard ["tap", "long_press", "text_input", "swipe", "submit", "other"].contains(
+        try string(object, "action")
+      ) else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+      try validateText(try string(object, "target"), maximumBytes: 512)
+      try constant(object, "value_capture", "not_collected")
+    case "runtime_error":
+      let object = try exactObject(data, keys: [
+        "error_class", "sanitized_message", "stack_trace_digest", "handled",
+      ])
+      try validateText(try string(object, "error_class"), maximumBytes: 512)
+      try validateText(try string(object, "sanitized_message"), maximumBytes: 4_096)
+      try validateNullableDigest(try required(object, "stack_trace_digest"))
+      _ = try bool(object, "handled")
+    case "network_request_completed":
+      let object = try exactObject(data, keys: [
+        "request_id", "method", "host", "path_template", "status_code", "duration_ms",
+        "trace_id", "outcome", "request_body_capture", "response_body_capture",
+      ])
+      _ = try identifier(object, "request_id")
+      guard ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"].contains(
+        try string(object, "method")
+      ), try string(object, "host").range(
+        of: "^[A-Za-z0-9.-]{1,253}$", options: .regularExpression
+      ) != nil,
+        try string(object, "path_template").range(
+          of: "^/[^?#]{0,511}$", options: .regularExpression
+        ) != nil,
+        ["success", "error", "cancelled", "unknown"].contains(try string(object, "outcome"))
+      else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+      try validateNullableInteger(try required(object, "status_code"), range: 100...599)
+      try validateNullableInteger(try required(object, "duration_ms"), range: 0...1_800_000)
+      try validateNullableText(try required(object, "trace_id"), maximumBytes: 512)
+      try constant(object, "request_body_capture", "not_collected")
+      try constant(object, "response_body_capture", "not_collected")
+    case "app_state_changed":
+      let object = try exactObject(data, keys: ["from_state", "to_state"])
+      for field in ["from_state", "to_state"] {
+        guard ["active", "inactive", "background", "unknown"].contains(
+          try string(object, field)
+        ) else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+      }
+    case "issue_mark":
+      let object = try exactObject(data, keys: ["marker_id", "kind", "narration_elapsed_ms"])
+      _ = try identifier(object, "marker_id")
+      guard ["spoken", "manual"].contains(try string(object, "kind")),
+        (0...1_800_000).contains(try integer(object, "narration_elapsed_ms"))
+      else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+    case "capture_gap":
+      let object = try exactObject(data, keys: ["gap_id", "affected_streams"])
+      _ = try identifier(object, "gap_id")
+      try validateStreams(try required(object, "affected_streams"), requireNonempty: true)
+    case "custom_state":
+      let object = try exactObject(data, keys: [
+        "provider_id", "snapshot_digest", "collection_status",
+      ])
+      _ = try identifier(object, "provider_id")
+      let collectionStatus = try string(object, "collection_status")
+      let available = collectionStatus == "available"
+      guard available || collectionStatus == "unavailable" else {
+        throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+      }
+      let hasDigest: Bool
+      switch try required(object, "snapshot_digest") {
+      case .null: hasDigest = false
+      case .string: _ = try digest(object, "snapshot_digest"); hasDigest = true
+      default: throw TacuaJSONError.wrongType
+      }
+      guard available == hasDigest else {
+        throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+      }
+    default:
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+    return (eventID, sequence, elapsed, try timestamp(event, "occurred_at"))
+  }
+
+  private static func validateDiagnosticEvidence(
+    _ value: TacuaJSONValue,
+    organizationID: String,
+    projectID: String
+  ) throws -> String {
+    let evidence = try exactObject(value, keys: [
+      "evidence_id", "evidence_type", "description", "availability", "time_range", "source",
+      "reference", "unavailable", "redaction",
+    ])
+    let evidenceID = try identifier(evidence, "evidence_id")
+    guard [
+      "media_keyframe", "media_clip", "transcript_excerpt", "sdk_event_batch",
+      "repository_snapshot", "backend_log_snapshot", "backend_trace_snapshot", "sentry_event",
+      "posthog_event", "custom_state_snapshot",
+    ].contains(try string(evidence, "evidence_type")) else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+    try validateText(try string(evidence, "description"), maximumBytes: 4_096)
+    if try required(evidence, "time_range") != .null {
+      _ = try validateTimeRange(try required(evidence, "time_range"), maximum: 1_800_000)
+    }
+    try validateDiagnosticSource(try required(evidence, "source"))
+    try validateRedaction(try required(evidence, "redaction"))
+    switch try string(evidence, "availability") {
+    case "available":
+      guard try required(evidence, "unavailable") == .null else {
+        throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+      }
+      let reference = try exactObject(try required(evidence, "reference"), keys: [
+        "locator", "content_type", "size_bytes", "content_digest",
+      ])
+      guard [
+        "application/json", "text/plain", "image/png", "video/quicktime",
+        "application/vnd.tacua.sdk-event+json",
+        "application/vnd.tacua.connector-snapshot+json",
+      ].contains(try string(reference, "content_type")),
+        (0...104_857_600).contains(try integer(reference, "size_bytes"))
+      else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+      _ = try digest(reference, "content_digest")
+      let locator = try exactObject(try required(reference, "locator"), keys: [
+        "scheme", "organization_id", "project_id", "evidence_id", "revision_id",
+      ])
+      try constant(locator, "scheme", "tacua-evidence")
+      try equalString(locator, "organization_id", organizationID)
+      try equalString(locator, "project_id", projectID)
+      try equalString(locator, "evidence_id", evidenceID)
+      _ = try identifier(locator, "revision_id")
+    case "unavailable":
+      guard try required(evidence, "reference") == .null else {
+        throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+      }
+      try validateUnavailable(try required(evidence, "unavailable"))
+    default:
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+    return evidenceID
+  }
+
+  private static func validateDiagnosticSource(_ value: TacuaJSONValue) throws {
+    let source = try exactObject(value, keys: [
+      "component", "source_id", "snapshot_revision", "captured_at",
+    ])
+    guard ["mobile_sdk", "backend", "repository", "sentry", "posthog"].contains(
+      try string(source, "component")
+    ) else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+    _ = try identifier(source, "source_id")
+    try validateText(try string(source, "snapshot_revision"), maximumBytes: 128)
+    _ = try timestamp(source, "captured_at")
   }
 
   private struct CompletionRequestBindings {
@@ -687,12 +1169,35 @@ enum TacuaSDKBackendProtocol {
     }
     _ = try digest(manifest, "build_identity_digest")
     try equalString(manifest, "session_id", sessionID)
+    let duration = try integer(manifest, "monotonic_duration_ms")
     guard try integer(manifest, "manifest_version") >= 1,
-      try integer(manifest, "monotonic_duration_ms") >= 0
+      (0...1_800_000).contains(duration)
     else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
     let startedAt = try timestamp(manifest, "started_at")
     let endedAt = try timestamp(manifest, "ended_at")
     guard endedAt >= startedAt else { throw TacuaSDKBackendProtocolError.invalidChronology }
+    let streams = try exactObject(try required(manifest, "streams"), keys: [
+      "app_video", "app_audio", "microphone", "diagnostics",
+    ])
+    try constant(streams, "app_video", "enabled")
+    try constant(streams, "microphone", "enabled")
+    for field in ["app_audio", "diagnostics"] {
+      guard ["enabled", "disabled", "unavailable"].contains(try string(streams, field)) else {
+        throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+      }
+    }
+    let retention = try exactObject(try required(manifest, "retention"), keys: [
+      "policy_version", "raw_media_expires_at", "derived_data_expires_at", "deletion_status",
+    ])
+    try validateText(try string(retention, "policy_version"), maximumBytes: 128)
+    let rawExpiry = try timestamp(retention, "raw_media_expires_at")
+    _ = try timestamp(retention, "derived_data_expires_at")
+    guard rawExpiry > startedAt,
+      rawExpiry.timeIntervalSince(startedAt) <= 30 * 24 * 60 * 60,
+      ["active", "deletion_requested", "deleted"].contains(
+        try string(retention, "deletion_status")
+      )
+    else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
 
     let segmentValues = try array(try required(manifest, "segments"))
     guard segmentValues.count <= 2_048 else {
@@ -701,17 +1206,24 @@ enum TacuaSDKBackendProtocol {
     var availableSegments: [String: AvailableManifestSegment] = [:]
     var manifestSegmentIDs = Set<String>()
     var manifestSequences = Set<Int64>()
-    for value in segmentValues {
+    var previousSegmentEnd: Int64 = 0
+    for (offset, value) in segmentValues.enumerated() {
       let segment = try exactObject(value, keys: [
         "segment_id", "sequence", "time_range", "finalized", "availability", "content",
         "unavailable",
       ])
       let segmentID = try identifier(segment, "segment_id")
       let sequence = try integer(segment, "sequence")
-      guard (0...2_047).contains(sequence), manifestSegmentIDs.insert(segmentID).inserted,
+      let timeRange = try validateTimeRange(
+        try required(segment, "time_range"), maximum: duration
+      )
+      guard sequence == Int64(offset), (0...2_047).contains(sequence),
+        timeRange.start >= previousSegmentEnd,
+        manifestSegmentIDs.insert(segmentID).inserted,
         manifestSequences.insert(sequence).inserted,
         try bool(segment, "finalized")
       else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+      previousSegmentEnd = timeRange.end
       switch try string(segment, "availability") {
       case "available":
         guard try required(segment, "unavailable") == .null else {
@@ -737,9 +1249,32 @@ enum TacuaSDKBackendProtocol {
         guard try required(segment, "content") == .null,
           try required(segment, "unavailable") != .null
         else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+        try validateUnavailable(try required(segment, "unavailable"))
       default:
         throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
       }
+    }
+    guard !availableSegments.isEmpty else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+
+    let gapValues = try array(try required(manifest, "gaps"))
+    guard gapValues.count <= 2_048 else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+    var gapIDs = Set<String>()
+    for value in gapValues {
+      let gap = try exactObject(value, keys: [
+        "gap_id", "time_range", "reason", "affected_streams", "detail",
+      ])
+      guard gapIDs.insert(try identifier(gap, "gap_id")).inserted,
+        ["app_backgrounded", "audio_interrupted", "extension_unavailable",
+          "storage_pressure", "permission_revoked", "process_terminated",
+          "clock_discontinuity", "unknown"].contains(try string(gap, "reason"))
+      else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+      _ = try validateTimeRange(try required(gap, "time_range"), maximum: duration)
+      try validateStreams(try required(gap, "affected_streams"), requireNonempty: true)
+      try validateText(try string(gap, "detail"), maximumBytes: 512)
     }
 
     let segmentReceiptValues = try array(try required(request, "segment_receipts"))
@@ -960,11 +1495,126 @@ enum TacuaSDKBackendProtocol {
         throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
       }
     }
-    _ = try exactObject(try required(job, "inputs"), keys: [
+    let inputs = try exactObject(try required(job, "inputs"), keys: [
       "capture_manifest_digest", "diagnostic_envelope_digests", "context_sources",
     ])
+    _ = try digest(inputs, "capture_manifest_digest")
+    let envelopeDigests = try stringArray(inputs, "diagnostic_envelope_digests")
+    guard (1...2_048).contains(envelopeDigests.count),
+      Set(envelopeDigests).count == envelopeDigests.count,
+      envelopeDigests.allSatisfy(validDigestValue)
+    else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+    let contextSources = try array(try required(inputs, "context_sources"))
+    guard contextSources.count <= 32 else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+    var sourceIDs = Set<String>()
+    for value in contextSources {
+      let source = try exactObject(value, keys: [
+        "source_id", "kind", "access", "availability", "snapshot_digest", "unavailable",
+      ])
+      guard sourceIDs.insert(try identifier(source, "source_id")).inserted,
+        ["mobile_repository", "backend_repository", "sentry", "posthog",
+          "other_observability"].contains(try string(source, "kind"))
+      else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+      try constant(source, "access", "read_only")
+      switch try string(source, "availability") {
+      case "available":
+        _ = try digest(source, "snapshot_digest")
+        guard try required(source, "unavailable") == .null else {
+          throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+        }
+      case "unavailable":
+        guard try required(source, "snapshot_digest") == .null else {
+          throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+        }
+        try validateUnavailable(try required(source, "unavailable"))
+      default:
+        throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+      }
+    }
+
+    let pipeline = try exactObject(try required(job, "pipeline"), keys: [
+      "pipeline_version", "stages",
+    ])
+    try validateText(try string(pipeline, "pipeline_version"), maximumBytes: 128)
+    let stages = try array(try required(pipeline, "stages"))
+    guard stages.count == 5 else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+    let validStages = Set(["transcribe", "align", "correlate", "research", "generate_tickets"])
+    var stageNames = Set<String>()
+    for value in stages {
+      let stage = try exactObject(value, keys: [
+        "name", "state", "attempt_count", "started_at", "completed_at", "detail",
+      ])
+      let name = try string(stage, "name")
+      guard validStages.contains(name), stageNames.insert(name).inserted,
+        ["pending", "running", "waiting_for_clarification", "succeeded", "skipped", "failed"]
+          .contains(try string(stage, "state")),
+        (0...1_000).contains(try integer(stage, "attempt_count"))
+      else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+      let startedAt = try nullableTimestamp(try required(stage, "started_at"))
+      let completedAt = try nullableTimestamp(try required(stage, "completed_at"))
+      if let startedAt, let completedAt, completedAt < startedAt {
+        throw TacuaSDKBackendProtocolError.invalidChronology
+      }
+      try validateNullableText(try required(stage, "detail"), maximumBytes: 4_096)
+    }
+
+    let execution = try exactObject(try required(job, "execution"), keys: [
+      "mode", "max_attempts", "egress",
+    ])
+    try constant(execution, "mode", "async")
+    guard (1...100).contains(try integer(execution, "max_attempts")) else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+    try validateEgress(try required(execution, "egress"))
     try validateArtifactDigest(value, field: "job_digest")
     return job
+  }
+
+  private static func validateEgress(_ value: TacuaJSONValue) throws {
+    let egress = try exactObject(value, keys: [
+      "policy", "authorized", "authorization_decision_id", "destinations",
+    ])
+    try constant(egress, "policy", "default_deny")
+    let authorized = try bool(egress, "authorized")
+    let destinations = try array(try required(egress, "destinations"))
+    guard destinations.count <= 8 else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+    if authorized {
+      _ = try identifier(egress, "authorization_decision_id")
+      guard !destinations.isEmpty else {
+        throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+      }
+    } else {
+      guard try required(egress, "authorization_decision_id") == .null,
+        destinations.isEmpty
+      else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+    }
+    var destinationIDs = Set<String>()
+    let categories = Set([
+      "transcript", "screenshots", "sdk_diagnostics", "repository_context",
+      "observability_context",
+    ])
+    for value in destinations {
+      let destination = try exactObject(value, keys: [
+        "destination_id", "provider_kind", "model_id", "content_categories",
+      ])
+      guard destinationIDs.insert(try identifier(destination, "destination_id")).inserted,
+        ["local", "openai", "anthropic", "other_api"].contains(
+          try string(destination, "provider_kind")
+        )
+      else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+      try validateText(try string(destination, "model_id"), maximumBytes: 128)
+      let contentCategories = try stringArray(destination, "content_categories")
+      guard (1...8).contains(contentCategories.count),
+        Set(contentCategories).count == contentCategories.count,
+        contentCategories.allSatisfy(categories.contains)
+      else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+    }
   }
 
   private static func receiptDigests(_ value: TacuaJSONValue, field: String) throws -> [String] {
@@ -1111,6 +1761,146 @@ enum TacuaSDKBackendProtocol {
     }
   }
 
+  private static func validateTimeRange(
+    _ value: TacuaJSONValue,
+    maximum: Int64
+  ) throws -> (start: Int64, end: Int64) {
+    let range = try exactObject(value, keys: ["start_ms", "end_ms", "clock"])
+    try constant(range, "clock", "session_monotonic")
+    let start = try integer(range, "start_ms")
+    let end = try integer(range, "end_ms")
+    guard start >= 0, end >= start, end <= maximum else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+    return (start, end)
+  }
+
+  private static func validateRedaction(_ value: TacuaJSONValue) throws {
+    let redaction = try exactObject(value, keys: [
+      "policy_version", "applied", "removed_field_count",
+    ])
+    try validateText(try string(redaction, "policy_version"), maximumBytes: 128)
+    let applied = try bool(redaction, "applied")
+    let removed = try integer(redaction, "removed_field_count")
+    guard (0...1_000_000).contains(removed), applied || removed == 0 else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+  }
+
+  private static func validateUnavailable(_ value: TacuaJSONValue) throws {
+    let unavailable = try exactObject(value, keys: ["reason", "detail"])
+    guard [
+      "capture_gap", "collection_disabled", "permission_denied", "provider_unavailable",
+      "connector_revoked", "redacted_by_policy", "not_configured", "outside_retention",
+      "correlation_missing", "upload_failed", "unknown",
+    ].contains(try string(unavailable, "reason")) else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+    try validateText(try string(unavailable, "detail"), maximumBytes: 512)
+  }
+
+  private static func validateStreams(
+    _ value: TacuaJSONValue,
+    requireNonempty: Bool
+  ) throws {
+    let values = try array(value)
+    let allowed = Set(["app_video", "app_audio", "microphone", "diagnostics"])
+    let strings = try values.map { value -> String in
+      guard case .string(let string) = value else { throw TacuaJSONError.wrongType }
+      return string
+    }
+    guard (!requireNonempty || !strings.isEmpty), strings.count <= 4,
+      Set(strings).count == strings.count, strings.allSatisfy(allowed.contains)
+    else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+  }
+
+  private static func validateNullableDigest(_ value: TacuaJSONValue) throws {
+    switch value {
+    case .null: return
+    case .string(let string):
+      guard validDigestValue(string) else {
+        throw TacuaSDKBackendProtocolError.invalidDigest("nullable")
+      }
+    default: throw TacuaJSONError.wrongType
+    }
+  }
+
+  private static func validateNullableText(
+    _ value: TacuaJSONValue,
+    maximumBytes: Int
+  ) throws {
+    switch value {
+    case .null: return
+    case .string(let string): try validateText(string, maximumBytes: maximumBytes)
+    default: throw TacuaJSONError.wrongType
+    }
+  }
+
+  private static func nullableTimestamp(_ value: TacuaJSONValue) throws -> Date? {
+    switch value {
+    case .null:
+      return nil
+    case .string(let value):
+      guard let parsed = parseTimestamp(value) else {
+        throw TacuaSDKBackendProtocolError.invalidTimestamp("nullable")
+      }
+      return parsed
+    default:
+      throw TacuaJSONError.wrongType
+    }
+  }
+
+  private static func validateNullableInteger(
+    _ value: TacuaJSONValue,
+    range: ClosedRange<Int64>
+  ) throws {
+    switch value {
+    case .null: return
+    case .integer(let integer):
+      guard range.contains(integer) else {
+        throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+      }
+    default: throw TacuaJSONError.wrongType
+    }
+  }
+
+  private static func validateText(_ value: String, maximumBytes: Int) throws {
+    guard !value.isEmpty, value.utf8.count <= maximumBytes,
+      value.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) })
+    else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+    let lowered = value.lowercased()
+    let prohibited = [
+      "authorization:", "cookie:", "set-cookie:", "bearer ", "basic ", "password=",
+      "token=", "secret=", "private_key",
+    ]
+    guard !prohibited.contains(where: lowered.contains) else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+  }
+
+  private static func validateNoSensitiveMaterial(_ value: TacuaJSONValue) throws {
+    switch value {
+    case .object(let object):
+      for (key, child) in object {
+        let normalized = key.lowercased().replacingOccurrences(of: "-", with: "_")
+        guard !normalized.contains("secret"),
+          !["authorization", "password", "cookie", "set_cookie", "access_token",
+            "refresh_token", "launch_code"].contains(normalized)
+        else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+        try validateNoSensitiveMaterial(child)
+      }
+    case .array(let values):
+      try values.forEach(validateNoSensitiveMaterial)
+    case .string(let string):
+      let lowered = string.lowercased()
+      guard !["authorization:", "cookie:", "set-cookie:", "bearer ", "basic ",
+        "password=", "token=", "secret="].contains(where: lowered.contains)
+      else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+    case .null, .bool, .integer:
+      break
+    }
+  }
+
   private static func identifier(
     _ object: [String: TacuaJSONValue], _ field: String
   ) throws -> String {
@@ -1119,6 +1909,14 @@ enum TacuaSDKBackendProtocol {
       throw TacuaSDKBackendProtocolError.invalidIdentifier(field)
     }
     return value
+  }
+
+  private static func validIdentifierValue(_ value: String) -> Bool {
+    value.range(of: "^[a-z][a-z0-9_-]{2,63}$", options: .regularExpression) != nil
+  }
+
+  private static func validDigestValue(_ value: String) -> Bool {
+    value.range(of: "^sha256:[a-f0-9]{64}$", options: .regularExpression) != nil
   }
 
   private static func digest(

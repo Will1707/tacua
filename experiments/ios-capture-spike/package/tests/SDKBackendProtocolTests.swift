@@ -31,6 +31,10 @@ enum SDKBackendProtocolTests {
     try resealedManifestReceiptSetMismatchCannotAuthorizeCleanup(fixtureRoot)
     try deletionAuthorityComesFromExactTombstone(fixtureRoot)
     try exactWholeSecondTimestampsOnly(fixtureRoot)
+    try launchRequestRejectsSameIdentifierRotation(fixtureRoot)
+    try resealedDiagnosticUnknownAndUnavailableFieldsAreRejected(fixtureRoot)
+    try resealedManifestStreamsRangesAndRetentionAreRejected(fixtureRoot)
+    try resealedProcessingJobNestedFieldsAreRejected(fixtureRoot)
     print("Tacua SDK/backend protocol tests passed")
   }
 
@@ -245,6 +249,146 @@ enum SDKBackendProtocolTests {
     ) { $0["issued_at"] = .string("2026-07-21T09:57:01.000Z") }
     try expectFailure {
       _ = try TacuaSDKBackendProtocol.validateResponse(fractional, forCanonicalRequest: request)
+    }
+  }
+
+  private static func launchRequestRejectsSameIdentifierRotation(_ root: URL) throws {
+    var request = try rootObject(canonicalFixture(root, "receiving-resume-request"))
+    guard case .object(var credential) = request["credential"] else {
+      throw ProtocolTestFailure.assertion("Missing credential")
+    }
+    credential["credential_id"] = request["previous_credential_id"]
+    request["credential"] = .object(credential)
+    try reseal(&request, field: "request_digest")
+    try expectFailure {
+      _ = try TacuaSDKBackendProtocol.validateRequest(
+        try TacuaCanonicalJSON.data(.object(request))
+      )
+    }
+  }
+
+  private static func resealedDiagnosticUnknownAndUnavailableFieldsAreRejected(
+    _ root: URL
+  ) throws {
+    var eventRequest = try rootObject(canonicalFixture(root, "diagnostic-upload-request"))
+    guard case .object(var envelope) = eventRequest["envelope"],
+      case .array(var events) = envelope["events"],
+      case .object(var firstEvent) = events.first,
+      case .object(var eventData) = firstEvent["data"]
+    else { throw ProtocolTestFailure.assertion("Missing diagnostic event") }
+    eventData["ignored_by_old_validator"] = .bool(true)
+    firstEvent["data"] = .object(eventData)
+    events[0] = .object(firstEvent)
+    envelope["events"] = .array(events)
+    try resealDiagnosticRequest(&eventRequest, envelope: &envelope)
+    try expectFailure {
+      _ = try TacuaSDKBackendProtocol.validateRequest(
+        try TacuaCanonicalJSON.data(.object(eventRequest))
+      )
+    }
+
+    var unavailableRequest = try rootObject(
+      canonicalFixture(root, "diagnostic-upload-request")
+    )
+    guard case .object(var unavailableEnvelope) = unavailableRequest["envelope"],
+      case .array(var evidence) = unavailableEnvelope["evidence"],
+      let unavailableIndex = evidence.firstIndex(where: {
+        $0.objectValue?["availability"]?.stringValue == "unavailable"
+      }),
+      case .object(var unavailableEvidence) = evidence[unavailableIndex],
+      case .object(var unavailable) = unavailableEvidence["unavailable"]
+    else { throw ProtocolTestFailure.assertion("Missing unavailable evidence") }
+    unavailable["ignored"] = .string("must fail")
+    unavailableEvidence["unavailable"] = .object(unavailable)
+    evidence[unavailableIndex] = .object(unavailableEvidence)
+    unavailableEnvelope["evidence"] = .array(evidence)
+    try resealDiagnosticRequest(
+      &unavailableRequest, envelope: &unavailableEnvelope
+    )
+    try expectFailure {
+      _ = try TacuaSDKBackendProtocol.validateRequest(
+        try TacuaCanonicalJSON.data(.object(unavailableRequest))
+      )
+    }
+  }
+
+  private static func resealedManifestStreamsRangesAndRetentionAreRejected(
+    _ root: URL
+  ) throws {
+    for mutation in 0..<3 {
+      var request = try rootObject(canonicalFixture(root, "completion-request"))
+      guard case .object(var manifest) = request["capture_manifest"] else {
+        throw ProtocolTestFailure.assertion("Missing manifest")
+      }
+      switch mutation {
+      case 0:
+        guard case .object(var streams) = manifest["streams"] else {
+          throw ProtocolTestFailure.assertion("Missing streams")
+        }
+        streams["ignored"] = .string("enabled")
+        manifest["streams"] = .object(streams)
+      case 1:
+        guard case .array(var segments) = manifest["segments"],
+          case .object(var segment) = segments[0],
+          case .object(var timeRange) = segment["time_range"]
+        else { throw ProtocolTestFailure.assertion("Missing segment range") }
+        timeRange["end_ms"] = .integer(1_800_001)
+        segment["time_range"] = .object(timeRange)
+        segments[0] = .object(segment)
+        manifest["segments"] = .array(segments)
+      default:
+        guard case .object(var retention) = manifest["retention"] else {
+          throw ProtocolTestFailure.assertion("Missing retention")
+        }
+        retention["raw_media_expires_at"] = .string("2027-07-21T10:00:00Z")
+        manifest["retention"] = .object(retention)
+      }
+      try reseal(&manifest, field: "manifest_digest")
+      request["capture_manifest"] = .object(manifest)
+      try reseal(&request, field: "request_digest")
+      try expectFailure {
+        _ = try TacuaSDKBackendProtocol.validateRequest(
+          try TacuaCanonicalJSON.data(.object(request))
+        )
+      }
+    }
+  }
+
+  private static func resealDiagnosticRequest(
+    _ request: inout [String: TacuaJSONValue],
+    envelope: inout [String: TacuaJSONValue]
+  ) throws {
+    try reseal(&envelope, field: "envelope_digest")
+    let envelopeValue = TacuaJSONValue.object(envelope)
+    let envelopeData = try TacuaCanonicalJSON.data(envelopeValue)
+    guard case .object(var transport) = request["transport"] else {
+      throw ProtocolTestFailure.assertion("Missing diagnostic transport")
+    }
+    transport["size_bytes"] = .integer(Int64(envelopeData.count))
+    transport["content_digest"] = .string(TacuaCanonicalJSON.digest(data: envelopeData))
+    request["transport"] = .object(transport)
+    request["envelope"] = envelopeValue
+    try reseal(&request, field: "request_digest")
+  }
+
+  private static func resealedProcessingJobNestedFieldsAreRejected(_ root: URL) throws {
+    let request = try canonicalFixture(root, "completion-request")
+    var response = try rootObject(canonicalFixture(root, "completion-receipt"))
+    guard case .object(var job) = response["processing_job"],
+      case .object(var execution) = job["execution"],
+      case .object(var egress) = execution["egress"]
+    else { throw ProtocolTestFailure.assertion("Missing processing egress") }
+    egress["ignored"] = .bool(true)
+    execution["egress"] = .object(egress)
+    job["execution"] = .object(execution)
+    try reseal(&job, field: "job_digest")
+    response["processing_job"] = .object(job)
+    try reseal(&response, field: "completion_receipt_digest")
+    try expectFailure {
+      _ = try TacuaSDKBackendProtocol.validateResponse(
+        try TacuaCanonicalJSON.data(.object(response)),
+        forCanonicalRequest: request
+      )
     }
   }
 

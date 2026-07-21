@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import Foundation
+import Darwin
 
 private enum ClientTestFailure: Error { case assertion(String) }
 
@@ -107,6 +108,8 @@ enum SDKBackendClientTests {
     try await completionAndDeletionUseExactRoutes(fixtureRoot)
     try await redirectsAreRejectedWithoutForwardingAuthorization(fixtureRoot)
     try await responseBoundsAndContentTypeFailClosed(fixtureRoot)
+    try await resealedInvalidRequestsNeverReachTransport(fixtureRoot)
+    try await unsafeSegmentSourcesNeverReachTransport(fixtureRoot)
     print("Tacua SDK backend client tests passed")
   }
 
@@ -120,13 +123,26 @@ enum SDKBackendClientTests {
     let scope = try TacuaCanonicalJSON.parse(canonicalFixture(root, "capture-scope"))
     let encodedSecret = String(repeating: "S", count: 43) + "="
     let secret = try requireValue(Data(base64Encoded: encodedSecret), "Invalid fixture secret")
+    let consentGate = TacuaLaunchConsentGate()
+    let pendingLaunch = try consentGate.prepare(
+      rawURL: "configured-target-scheme://tacua/start?launch_code="
+        + String(repeating: "L", count: 43),
+      configuration: try TacuaLaunchLinkConfiguration(
+        buildConfiguredScheme: "configured-target-scheme"
+      )
+    )
+    let approvedLaunchID = try consentGate.confirm(
+      consentRequestID: pendingLaunch.consentRequestID,
+      granted: true
+    )
     let launch = try TacuaSDKBackendRequests.launch(
       preparedCredential: TacuaPreparedCredential(
         exchangeID: "exchange_synthetic",
         credentialID: "credential_synthetic",
         secret: secret
       ),
-      launchCode: String(repeating: "L", count: 43),
+      approvedLaunchID: approvedLaunchID,
+      consentGate: consentGate,
       exchangeKind: "start_session",
       expectedSessionID: nil,
       expectedSessionState: "receiving",
@@ -329,6 +345,7 @@ enum SDKBackendClientTests {
     let receipt = try await client.uploadSegment(
       prepared,
       fileURL: file,
+      sessionDirectory: directory,
       transportCredentialID: "credential_current"
     )
     try require(receipt.operationKind == .segment, "Segment response must validate")
@@ -339,6 +356,10 @@ enum SDKBackendClientTests {
     try require(request.value(forHTTPHeaderField: "Authorization")?.hasPrefix("Bearer QkJC") == true, "Current credential must authenticate upload")
     try require(request.value(forHTTPHeaderField: "Tacua-Content-Digest") == payloadDigest, "Private content digest header must be exact")
     try require(request.value(forHTTPHeaderField: "Tacua-Sidecar-Digest") == sidecarDigest, "Sidecar digest must be transmitted")
+    try require(
+      MockURLProtocol.bodies().first! == payload,
+      "Upload transport must read the immutable private snapshot"
+    )
   }
 
   private static func redirectsAreRejectedWithoutForwardingAuthorization(_ root: URL) async throws {
@@ -453,6 +474,128 @@ enum SDKBackendClientTests {
     }
   }
 
+  private static func resealedInvalidRequestsNeverReachTransport(_ root: URL) async throws {
+    let credentials = TestCredentialStore()
+    credentials.values["credential_current"] = Data(repeating: 0x46, count: 32)
+    var diagnostic = try rootObject(canonicalFixture(root, "diagnostic-upload-request"))
+    diagnostic["client_secret"] = .string("resealed-but-forbidden")
+    try reseal(&diagnostic, field: "request_digest")
+    MockURLProtocol.install { _ in
+      MockResponse(status: 500, headers: ["Content-Type": "application/json"], data: Data())
+    }
+    var client = try makeClient(credentials: credentials)
+    try await expectAsyncFailure {
+      _ = try await client.send(
+        TacuaPreparedBackendRequest(
+          kind: .diagnostic,
+          operationID: "upload_diagnostic_synthetic",
+          credentialID: "credential_receiving_resume",
+          canonicalData: try TacuaCanonicalJSON.data(.object(diagnostic)),
+          requestDigest: diagnostic["request_digest"]!.stringValue!
+        ),
+        transportCredentialID: "credential_current"
+      )
+    }
+    try require(MockURLProtocol.requests().isEmpty, "Forbidden diagnostic must fail locally")
+
+    var completion = try rootObject(canonicalFixture(root, "completion-request"))
+    guard case .object(var manifest) = completion["capture_manifest"],
+      case .object(var streams) = manifest["streams"]
+    else { throw ClientTestFailure.assertion("Missing manifest streams") }
+    streams["ignored"] = .string("enabled")
+    manifest["streams"] = .object(streams)
+    try reseal(&manifest, field: "manifest_digest")
+    completion["capture_manifest"] = .object(manifest)
+    try reseal(&completion, field: "request_digest")
+    MockURLProtocol.install { _ in
+      MockResponse(status: 500, headers: ["Content-Type": "application/json"], data: Data())
+    }
+    client = try makeClient(credentials: credentials)
+    try await expectAsyncFailure {
+      _ = try await client.send(
+        TacuaPreparedBackendRequest(
+          kind: .completion,
+          operationID: "completion_synthetic",
+          credentialID: "credential_receiving_resume",
+          canonicalData: try TacuaCanonicalJSON.data(.object(completion)),
+          requestDigest: completion["request_digest"]!.stringValue!
+        ),
+        transportCredentialID: "credential_current"
+      )
+    }
+    try require(MockURLProtocol.requests().isEmpty, "Invalid manifest must fail locally")
+  }
+
+  private static func unsafeSegmentSourcesNeverReachTransport(_ root: URL) async throws {
+    let payload = Data("safe-segment".utf8)
+    let prepared = try TacuaSDKBackendRequests.segment(
+      uploadID: "upload_local_security",
+      sessionID: "session_synthetic",
+      scopeDigest: "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50",
+      credentialID: "credential_historical",
+      sequence: 8,
+      segmentID: "segment_local_security",
+      metadata: TacuaSegmentTransportMetadata(
+        contentType: "video/quicktime",
+        sizeBytes: Int64(payload.count),
+        contentDigest: TacuaCanonicalJSON.digest(data: payload),
+        sidecarDigest: "sha256:" + String(repeating: "5", count: 64)
+      ),
+      requestedAt: "2026-07-21T10:01:59Z"
+    )
+    let credentials = TestCredentialStore()
+    credentials.values["credential_current"] = Data(repeating: 0x47, count: 32)
+    let directory = FileManager.default.temporaryDirectory
+      .appendingPathComponent("tacua-client-security-\(UUID().uuidString)", isDirectory: true)
+    let outside = FileManager.default.temporaryDirectory
+      .appendingPathComponent("tacua-outside-\(UUID().uuidString).mov")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    try payload.write(to: outside)
+    defer {
+      try? FileManager.default.removeItem(at: directory)
+      try? FileManager.default.removeItem(at: outside)
+    }
+    let symlink = directory.appendingPathComponent("alias.mov")
+    try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: outside)
+    let hardlink = directory.appendingPathComponent("hardlink.mov")
+    try FileManager.default.linkItem(at: outside, to: hardlink)
+    let childDirectory = directory.appendingPathComponent("directory.mov", isDirectory: true)
+    try FileManager.default.createDirectory(at: childDirectory, withIntermediateDirectories: true)
+    let fifo = directory.appendingPathComponent("pipe.mov")
+    guard mkfifo(fifo.path, 0o600) == 0 else {
+      throw ClientTestFailure.assertion("Could not create FIFO fixture")
+    }
+    let sparse = directory.appendingPathComponent("oversize.mov")
+    FileManager.default.createFile(atPath: sparse.path, contents: Data())
+    let sparseHandle = try FileHandle(forWritingTo: sparse)
+    try sparseHandle.truncate(
+      atOffset: UInt64(TacuaSDKBackendProtocol.maximumUploadBytes + 1)
+    )
+    try sparseHandle.close()
+    let grown = directory.appendingPathComponent("grown.mov")
+    try (payload + Data("growth".utf8)).write(to: grown)
+
+    for candidate in [outside, symlink, hardlink, childDirectory, fifo, grown, sparse] {
+      MockURLProtocol.install { _ in
+        MockResponse(status: 500, headers: ["Content-Type": "application/json"], data: Data())
+      }
+      let client = try makeClient(credentials: credentials)
+      try await expectAsyncFailure {
+        _ = try await client.uploadSegment(
+          prepared,
+          fileURL: candidate,
+          sessionDirectory: directory,
+          transportCredentialID: "credential_current"
+        )
+      }
+      try require(
+        MockURLProtocol.requests().isEmpty,
+        "Unsafe local source \(candidate.lastPathComponent) must fail before transport"
+      )
+    }
+    _ = root
+  }
+
   private static func diagnosticPrepared(_ data: Data) -> TacuaPreparedBackendRequest {
     TacuaPreparedBackendRequest(
       kind: .diagnostic,
@@ -505,6 +648,27 @@ enum SDKBackendClientTests {
       throw ClientTestFailure.assertion("Expected object")
     }
     return object
+  }
+
+  private static func reseal(
+    _ object: inout [String: TacuaJSONValue], field: String
+  ) throws {
+    object[field] = .string(try TacuaCanonicalJSON.digest(
+      .object(object), omittingRootField: field
+    ))
+  }
+
+  private static func expectAsyncFailure(
+    _ operation: () async throws -> Void
+  ) async throws {
+    do {
+      try await operation()
+      throw ClientTestFailure.assertion("Expected local failure")
+    } catch is ClientTestFailure {
+      throw ClientTestFailure.assertion("Expected local failure")
+    } catch {
+      return
+    }
   }
 
   private static func objectValue(

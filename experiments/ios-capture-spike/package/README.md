@@ -18,12 +18,14 @@ It is a candidate implementation, not the production Tacua SDK contract. Its sch
 - Temporarily disables the iOS idle timer while capture is active and restores the host app's prior setting on terminal stop or start failure. This prevents an unattended foreground QA run from auto-locking the device without overriding an app that had already disabled auto-lock.
 - Uses iOS complete-unless-open file protection and excludes capture storage from device backup.
 
-`CaptureTransportPolicy.swift` now defines and tests the next SDK boundary for
-scoped upload queues, authenticated receipt matching, idempotent retries,
-bounded backoff, deletion gating, and shape-bound sanitized diagnostic events.
-It deliberately performs no network I/O and persists no bearer credential; the
-backend exchange, secure credential storage, HTTP transport, and capture-session
-integration remain implementation work.
+The package now also contains the native foundation for
+`tacua.sdk-backend@1.0.0`: canonical request builders, exhaustive local request
+and response validation, a build-pinned backend origin, a redirect-rejecting and
+response-bounded `URLSession` client, Keychain-backed credentials, immutable
+request replay, and a crash-safe queue. This foundation can perform network I/O
+when its client is invoked. Automatic capture-to-manifest conversion and the
+lifecycle coordinator that exchanges, uploads, completes, and deletes a stopped
+capture are still implementation work; `stop()` does not upload by itself.
 
 The native design-point limit is 30 minutes. A persisted monotonic deadline and an in-process timer both trigger stop; incoming sample buffers also recheck the deadline. iOS may suspend the host process in the background, so this is not a claim of wall-clock enforcement while suspended. `EXP-001` exercised foreground capture, lock recovery, process interruption, the 30-minute limit, and deterministic storage/writer/stop faults on one physical iPhone using synthetic QA data. Those results close the physical candidate gates for the spike; they do not establish a supported-device matrix or production readiness. See the [physical-device results](../PHYSICAL-DEVICE-RESULTS.md) for the exact scope and measurements.
 
@@ -50,6 +52,64 @@ type CaptureStartOptions = {
 The module validates safe identifier syntax, expiry, the current bundle identifier, the current `CFBundleVersion`, and the supported consent version before creating or resuming local capture data. It persists the identity fields in the manifest and checks them again for recovery. `handoffTokenIdentifier` is an opaque identifier only: never pass or persist a raw bearer token.
 
 This validation is deliberately **structural only**. The candidate module does not authenticate a handoff, verify a signature, contact a backend, perform authorization, upload media, or prove consent. Production must replace this local boundary with a cryptographically authenticated backend-issued handoff.
+
+## Backend launch and transport foundation
+
+The host QA target must pin these values in its built `Info.plist`:
+
+- `TacuaBackendOrigin`: an HTTPS origin with no path, query, fragment, or
+  userinfo. A debug build may explicitly opt into loopback HTTP with
+  `TacuaAllowInsecureLoopback`; a launch link can never override the origin.
+- `TacuaLaunchScheme`: the lowercase URL scheme registered by that target.
+
+The only accepted launch URL is:
+
+```text
+<TacuaLaunchScheme>://tacua/start?launch_code=<percent-encoded opaque code>
+```
+
+`prepareBackendLaunch(url)` rejects duplicate or additional query items,
+userinfo, ports, fragments, and any other authority or path. It keeps the
+decoded launch code only in volatile native memory and returns a consent request
+ID. After the host has presented truthful capture consent,
+`confirmBackendLaunchConsent(id, true)` returns a one-shot approved handle. The
+launch request builder accepts only that handle, so request construction and
+exchange cannot happen before affirmative consent. Decline and cancel discard
+the transient value.
+
+```ts
+const pending = TacuaCapture.prepareBackendLaunch(incomingURL);
+// Present the consent UI named by pending.requiredConsentVersion.
+const approved = TacuaCapture.confirmBackendLaunchConsent(
+  pending.consentRequestId,
+  true,
+);
+// A future native lifecycle coordinator will consume approved.approvedLaunchId once.
+```
+
+Credentials are 32 random bytes stored as
+`kSecAttrAccessibleWhenUnlockedThisDeviceOnly`; secrets, bearer headers, and
+launch codes are prohibited from the durable queue. Rotation records A's
+revocation before removing A from Keychain, and startup recovery idempotently
+drains that journal. Credential validity is the half-open interval ending at
+`expires_at`; an expired credential or a reboot-invalidated monotonic clock
+requires a fresh resume exchange. Exact historical request bytes remain bound to
+their original credential ID while the current credential authenticates replay.
+
+Segment uploads are copied through no-follow file descriptors into a bounded,
+private immutable snapshot before `URLSession` opens them. Completion cleanup
+can remove only local files whose path and digest were bound to the exact set of
+validated segment and diagnostic receipts. A completion receipt is the sole
+payload-cleanup authority; a deletion tombstone is the sole credential-cleanup
+authority.
+
+The capture-to-protocol adapter must derive each manifest segment `time_range`
+from the verified sidecar's first and last host uptime relative to the persisted
+session start. It must never derive ranges from wall-clock timestamps or array
+position. Sidecars, including held/dropped sample counters, remain local until
+completion-authorized cleanup. The frozen wire protocol transmits only
+`sidecar_digest`, not the sidecar bytes, so the backend does not receive that
+richer sidecar evidence in V1.
 
 ## Fixed recovery choices
 
@@ -95,6 +155,15 @@ npm run test:core
 
 The tests cover terminal classification, deadline behavior, media-clock segment boundaries, dual-clock microphone stall detection, crash-window source selection, structural handoff validation, expiry/build-independent deletion authorization, and fail-closed stop-timeout decisions.
 
+They also exercise canonical JSON and the frozen SDK/backend fixtures, strict
+nested diagnostic and completion-manifest validation, launch-link and consent
+gating, Keychain abstraction, build-pinned origin handling, half-open credential
+expiry, rotation recovery, exact replay across multiple credentials, bounded
+HTTP responses, redirect rejection, private upload snapshots, and
+receipt-to-local-file cleanup binding. Adversarial local files include paths
+outside the session, symlinks, directories, FIFOs, digest mismatches, and sparse
+files larger than 1 GiB.
+
 They also cover fail-closed storage thresholds, lifecycle sample admission,
 multi-boundary catch-up, and the exact QA fault-plan parser/matchers. The test
 runner syntax-parses every native source both with and without the dedicated
@@ -129,8 +198,12 @@ SDK. Promotion requires all remaining gates below to close:
 - [ ] Replace structural handoff fields with a cryptographically authenticated,
   backend-issued handoff scoped to the organization, project, build, and current
   consent contract.
-- [ ] Implement resumable, integrity-checked upload and an authenticated backend
-  receipt. This candidate only marks local data `partial_ready_for_upload`.
+- [x] Implement and fixture-test the canonical V1 backend requests, exhaustive
+  receipt validation, Keychain credential abstraction, durable replay queue,
+  bounded HTTP client, and integrity-checked segment upload snapshot.
+- [ ] Connect the capture session to that foundation with the native lifecycle
+  coordinator. This candidate still only marks capture data
+  `partial_ready_for_upload`; `stop()` does not enqueue or upload it.
 - [ ] Verify protected-file behavior in the production integration and provide an
   authenticated, user-visible, scoped local-data reset for an unreadable
   manifest.
@@ -139,5 +212,6 @@ SDK. Promotion requires all remaining gates below to close:
 - [ ] Re-run physical compatibility and resource measurements after the
   production transport and security boundaries replace this spike.
 
-Until those gates close, use this package only for explicitly approved, local
-QA experiments. It performs no external model egress.
+Until those gates close, use this package only for explicitly approved QA
+experiments. The transport client can send evidence only to the build-pinned
+Tacua backend origin; this package performs no direct external-model egress.

@@ -9,6 +9,7 @@ public final class TacuaCaptureSpikeModule: Module {
   private var session: TacuaCaptureSession?
   private var lastTerminalStatus: [String: Any]?
   private let sessionLock = NSLock()
+  private let launchConsentGate = TacuaLaunchConsentGate()
 
   public func definition() -> ModuleDefinition {
     Name("TacuaCaptureSpikeModule")
@@ -40,6 +41,98 @@ public final class TacuaCaptureSpikeModule: Module {
       result["testFaultLeaseConsumed"] = TacuaCaptureFaultRuntime.processLeaseWasClaimed
 #endif
       return result
+    }
+
+    Function("getBackendTransportConfiguration") { () throws -> [String: Any] in
+      let configuration = try TacuaBackendConfiguration.fromBuildConfiguration()
+      let launchConfiguration = try TacuaLaunchLinkConfiguration.fromBuildConfiguration()
+      return [
+        "backendOrigin": configuration.normalizedOrigin,
+        "transportConfigurationDigest": configuration.configurationDigest,
+        "transportPolicyVersion": TacuaBackendConfiguration.policyVersion,
+        "protocolVersion": TacuaSDKBackendProtocol.version,
+        "queueSchemaVersion": TacuaTransportQueueV2.schemaVersion,
+        "credentialStorage": "ios_keychain_when_unlocked_this_device_only",
+        "launchCodePersistence": "transient_only",
+        "redirectPolicy": "reject_all",
+        "launchURLTemplate": "\(launchConfiguration.scheme)://tacua/start?launch_code=<opaque>",
+      ]
+    }
+
+    Function("prepareBackendLaunch") { (launchURL: String) throws -> [String: Any] in
+      // Parsing never accepts an origin: the network origin is independently build-pinned.
+      _ = try TacuaBackendConfiguration.fromBuildConfiguration()
+      let launchConfiguration = try TacuaLaunchLinkConfiguration.fromBuildConfiguration()
+      let pending = try self.launchConsentGate.prepare(
+        rawURL: launchURL,
+        configuration: launchConfiguration
+      )
+      return [
+        "consentRequestId": pending.consentRequestID,
+        "requiredConsentVersion": pending.requiredConsentVersion,
+      ]
+    }
+
+    Function("confirmBackendLaunchConsent") {
+      (consentRequestID: String, granted: Bool) throws -> [String: Any] in
+      let approvedLaunchID = try self.launchConsentGate.confirm(
+        consentRequestID: consentRequestID,
+        granted: granted
+      )
+      return ["approvedLaunchId": approvedLaunchID]
+    }
+
+    Function("cancelBackendLaunch") { (requestID: String) in
+      self.launchConsentGate.cancel(consentRequestID: requestID)
+    }
+
+    AsyncFunction("getBackendQueueStatus") { (localSessionID: String, promise: Promise) in
+      do {
+        let store = try TacuaTransportQueueFileStore.applicationSupportStore()
+        guard let queue = try store.recoverCredentialCleanup(
+          localSessionID: localSessionID,
+          credentialStore: TacuaKeychainCredentialStore()
+        ) else {
+          promise.resolve([
+            "exists": false,
+            "localSessionId": localSessionID,
+          ])
+          return
+        }
+        let clock = TacuaSystemMonotonicClock()
+        let credentialTimeValid = (try? queue.timestampForNewOperation(clock: clock)) != nil
+        let boundPayloadCount = queue.operations.reduce(0) {
+          $0 + ($1.localPayloadBindings?.count ?? 0)
+        }
+        promise.resolve([
+          "exists": true,
+          "localSessionId": queue.localSessionID,
+          "remoteSessionId": queue.remoteSessionID ?? NSNull(),
+          "scopeDigest": queue.scopeDigest ?? NSNull(),
+          "currentCredentialId": queue.currentCredentialID ?? NSNull(),
+          "currentCredentialExpiresAt": queue.currentCredentialExpiresAt ?? NSNull(),
+          "credentialCapability": queue.credentialCapability.rawValue,
+          "credentialTimeValid": credentialTimeValid,
+          "resumeRequired": queue.credentialCapability == .requiresExchange
+            || (queue.currentCredentialID != nil && !credentialTimeValid),
+          "operationCount": queue.operations.count,
+          "queuedOperationCount": queue.operations.filter { $0.state == .queued }.count,
+          "storedResponseCount": queue.operations.filter { $0.state == .responseStored }.count,
+          "boundLocalPayloadCount": boundPayloadCount,
+          "legacyUnboundPayloadCount": queue.localPayloadPaths.count,
+          "pendingRevokedCredentialRemovalCount": queue.pendingRevokedCredentialRemovals.count,
+          "payloadCleanupState": queue.payloadCleanupState.rawValue,
+          "credentialCleanupState": queue.credentialCleanupState.rawValue,
+          "completionCleanupAuthorized": queue.completionCleanupAuthority != nil,
+          "deletionCleanupAuthorized": queue.deletionCleanupAuthority != nil,
+          "schemaVersion": queue.schemaVersion,
+        ])
+      } catch {
+        promise.reject(
+          "ERR_TACUA_BACKEND_QUEUE_STATUS",
+          "Tacua could not read the local backend transport queue."
+        )
+      }
     }
 
     Function("getStatus") { () -> [String: Any] in

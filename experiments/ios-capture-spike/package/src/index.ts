@@ -2,6 +2,10 @@
 
 import {
   TacuaCaptureSpikeModule,
+  type ApprovedBackendLaunch,
+  type BackendLaunchConsentRequest,
+  type BackendQueueStatus,
+  type BackendTransportConfiguration,
   type CaptureCapabilities,
   type CaptureErrorEvent,
   type CaptureEventMap,
@@ -16,6 +20,10 @@ import {
 import { type EventSubscription } from "expo-modules-core";
 
 export type {
+  ApprovedBackendLaunch,
+  BackendLaunchConsentRequest,
+  BackendQueueStatus,
+  BackendTransportConfiguration,
   CaptureCapabilities,
   CaptureErrorEvent,
   CaptureGapEvent,
@@ -29,6 +37,36 @@ export type {
 
 export function getCapabilities(): CaptureCapabilities {
   return TacuaCaptureSpikeModule.getCapabilities();
+}
+
+export function getBackendTransportConfiguration(): BackendTransportConfiguration {
+  return TacuaCaptureSpikeModule.getBackendTransportConfiguration();
+}
+
+export function getBackendQueueStatus(
+  localSessionId: string,
+): Promise<BackendQueueStatus> {
+  return TacuaCaptureSpikeModule.getBackendQueueStatus(localSessionId);
+}
+
+export function prepareBackendLaunch(
+  launchURL: string,
+): BackendLaunchConsentRequest {
+  return TacuaCaptureSpikeModule.prepareBackendLaunch(launchURL);
+}
+
+export function confirmBackendLaunchConsent(
+  consentRequestId: string,
+  granted: boolean,
+): ApprovedBackendLaunch {
+  return TacuaCaptureSpikeModule.confirmBackendLaunchConsent(
+    consentRequestId,
+    granted,
+  );
+}
+
+export function cancelBackendLaunch(requestId: string): void {
+  TacuaCaptureSpikeModule.cancelBackendLaunch(requestId);
 }
 
 export function getStatus(): CaptureStatus {

@@ -104,6 +104,54 @@ type CaptureErrorEvent = {
   readonly reason: string;
 };
 
+type BackendTransportConfiguration = {
+  readonly backendOrigin: string;
+  readonly transportConfigurationDigest: string;
+  readonly transportPolicyVersion: "tacua.sdk-transport@1.0.0";
+  readonly protocolVersion: "tacua.sdk-backend@1.0.0";
+  readonly queueSchemaVersion: 2;
+  readonly credentialStorage: "ios_keychain_when_unlocked_this_device_only";
+  readonly launchCodePersistence: "transient_only";
+  readonly redirectPolicy: "reject_all";
+  readonly launchURLTemplate: string;
+};
+
+type BackendLaunchConsentRequest = {
+  readonly consentRequestId: string;
+  readonly requiredConsentVersion: "tacua-local-capture-consent-v1";
+};
+
+type ApprovedBackendLaunch = {
+  readonly approvedLaunchId: string;
+};
+
+type BackendQueueStatus = {
+  readonly exists: boolean;
+  readonly localSessionId: string;
+  readonly remoteSessionId?: string | null;
+  readonly scopeDigest?: string | null;
+  readonly currentCredentialId?: string | null;
+  readonly currentCredentialExpiresAt?: string | null;
+  readonly credentialCapability?:
+    | "requires_exchange"
+    | "active"
+    | "completion_replay_or_delete_only"
+    | "deletion_replay_only";
+  readonly credentialTimeValid?: boolean;
+  readonly resumeRequired?: boolean;
+  readonly operationCount?: number;
+  readonly queuedOperationCount?: number;
+  readonly storedResponseCount?: number;
+  readonly boundLocalPayloadCount?: number;
+  readonly legacyUnboundPayloadCount?: number;
+  readonly pendingRevokedCredentialRemovalCount?: number;
+  readonly payloadCleanupState?: "none" | "tombstone_written" | "payloads_removed";
+  readonly credentialCleanupState?: "none" | "tombstone_written" | "credential_removed";
+  readonly completionCleanupAuthorized?: boolean;
+  readonly deletionCleanupAuthorized?: boolean;
+  readonly schemaVersion?: 2;
+};
+
 type CaptureEventMap = {
   onState: CaptureStatus;
   onSegment: CaptureSegmentEvent;
@@ -114,6 +162,14 @@ type CaptureEventMap = {
 
 type NativeTacuaCaptureSpikeModule = {
   getCapabilities: () => CaptureCapabilities;
+  getBackendTransportConfiguration: () => BackendTransportConfiguration;
+  getBackendQueueStatus: (localSessionId: string) => Promise<BackendQueueStatus>;
+  prepareBackendLaunch: (launchURL: string) => BackendLaunchConsentRequest;
+  confirmBackendLaunchConsent: (
+    consentRequestId: string,
+    granted: boolean,
+  ) => ApprovedBackendLaunch;
+  cancelBackendLaunch: (requestId: string) => void;
   getStatus: () => CaptureStatus;
   start: (options: CaptureStartOptions) => Promise<CaptureStatus>;
   resume: (options: CaptureStartOptions) => Promise<CaptureStatus>;
@@ -131,6 +187,10 @@ type NativeTacuaCaptureSpikeModule = {
 };
 
 export type {
+  ApprovedBackendLaunch,
+  BackendLaunchConsentRequest,
+  BackendQueueStatus,
+  BackendTransportConfiguration,
   CaptureCapabilities,
   CaptureErrorEvent,
   CaptureEventMap,

@@ -37,6 +37,37 @@ struct TacuaSegmentTransportMetadata: Equatable {
 enum TacuaSDKBackendRequests {
   static func launch(
     preparedCredential: TacuaPreparedCredential,
+    approvedLaunchID: String,
+    consentGate: TacuaLaunchConsentGate,
+    exchangeKind: String,
+    expectedSessionID: String?,
+    expectedSessionState: String,
+    expectedCompletionID: String?,
+    previousCredentialID: String?,
+    buildIdentity: TacuaJSONValue,
+    scope: TacuaJSONValue,
+    requestedAt: String,
+    configuration: TacuaBackendConfiguration
+  ) throws -> TacuaTransientLaunchRequest {
+    try consentGate.withApprovedLaunchCode(approvedLaunchID: approvedLaunchID) { launchCode in
+      try launchAfterConsent(
+        preparedCredential: preparedCredential,
+        launchCode: launchCode,
+        exchangeKind: exchangeKind,
+        expectedSessionID: expectedSessionID,
+        expectedSessionState: expectedSessionState,
+        expectedCompletionID: expectedCompletionID,
+        previousCredentialID: previousCredentialID,
+        buildIdentity: buildIdentity,
+        scope: scope,
+        requestedAt: requestedAt,
+        configuration: configuration
+      )
+    }
+  }
+
+  private static func launchAfterConsent(
+    preparedCredential: TacuaPreparedCredential,
     launchCode: String,
     exchangeKind: String,
     expectedSessionID: String?,
@@ -75,6 +106,7 @@ enum TacuaSDKBackendRequests {
     } else {
       guard expectedSessionID.map(validIdentifier) == true,
         previousCredentialID.map(validIdentifier) == true,
+        previousCredentialID != preparedCredential.credentialID,
         (expectedSessionState == "completed") == (expectedCompletionID != nil),
         expectedCompletionID.map(validIdentifier) ?? true
       else { throw TacuaSDKBackendRequestError.invalidExchangeState }

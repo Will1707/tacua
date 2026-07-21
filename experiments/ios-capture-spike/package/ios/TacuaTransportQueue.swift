@@ -49,10 +49,29 @@ struct TacuaQueuedOperation: Codable, Equatable {
   let requestDigest: String
   /// Exact canonical request bytes for replay. Launch exchanges are never queued.
   let canonicalRequest: Data
+  /// Legacy queue-v2 inventory. It is retained for decoding, but never grants deletion authority.
   let localPayloadPath: String?
+  /// Every removable file is bound to immutable request evidence. Optional preserves decoding of
+  /// queues written before payload binding was introduced; nil is intentionally untrusted.
+  let localPayloadBindings: [TacuaLocalPayloadBinding]?
   var state: TacuaQueuedOperationState
   var canonicalResponse: Data?
   var responseDigest: String?
+  /// Protocol artifact digest (for example segment_receipt_digest), distinct from the hash of the
+  /// complete canonical response bytes above.
+  var responseArtifactDigest: String?
+}
+
+enum TacuaLocalPayloadRole: String, Codable, Equatable, Hashable {
+  case segmentMedia = "segment_media"
+  case segmentSidecar = "segment_sidecar"
+  case diagnosticEnvelope = "diagnostic_envelope"
+}
+
+struct TacuaLocalPayloadBinding: Codable, Equatable, Hashable {
+  let role: TacuaLocalPayloadRole
+  let relativePath: String
+  let contentDigest: String
 }
 
 struct TacuaServerTimeAnchor: Codable, Equatable {
@@ -157,6 +176,7 @@ enum TacuaCredentialCleanupState: String, Codable, Equatable {
 
 struct TacuaTransportQueueV2: Codable, Equatable {
   static let schemaVersion = 2
+  static let maximumEncodedBytes = 32 * 1_024 * 1_024
 
   let schemaVersion: Int
   let localSessionID: String
@@ -164,6 +184,10 @@ struct TacuaTransportQueueV2: Codable, Equatable {
   var scopeDigest: String?
   var currentCredentialID: String?
   var currentCredentialExpiresAt: String?
+  /// Historical expiry is immutable request-validation context. It lets a response for credential
+  /// B be validated after transport authentication has rotated to credential C.
+  var credentialExpiryLedger: [String: String]?
+  var pendingRevokedCredentialRemovals: [String]
   var credentialCapability: TacuaTransportCredentialCapability
   var timeAnchor: TacuaServerTimeAnchor?
   var operations: [TacuaQueuedOperation]
@@ -185,6 +209,8 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     scopeDigest = nil
     currentCredentialID = nil
     currentCredentialExpiresAt = nil
+    credentialExpiryLedger = [:]
+    pendingRevokedCredentialRemovals = []
     credentialCapability = .requiresExchange
     timeAnchor = nil
     operations = []
@@ -199,7 +225,32 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     let probe = try JSONDecoder().decode(TacuaQueueSchemaProbe.self, from: data)
     switch probe.schemaVersion {
     case schemaVersion:
-      let queue = try JSONDecoder().decode(TacuaTransportQueueV2.self, from: data)
+      var queue = try JSONDecoder().decode(TacuaTransportQueueV2.self, from: data)
+      if queue.credentialExpiryLedger == nil {
+        if let credentialID = queue.currentCredentialID,
+          let expiresAt = queue.currentCredentialExpiresAt
+        {
+          queue.credentialExpiryLedger = [credentialID: expiresAt]
+        } else {
+          queue.credentialExpiryLedger = [:]
+        }
+      }
+      for index in queue.operations.indices
+      where queue.operations[index].state == .responseStored
+        && queue.operations[index].responseArtifactDigest == nil
+      {
+        guard let response = queue.operations[index].canonicalResponse,
+          let expiry = queue.credentialExpiryLedger?[
+            queue.operations[index].requestCredentialID
+          ],
+          let receipt = try? TacuaSDKBackendProtocol.validateResponse(
+            response,
+            forCanonicalRequest: queue.operations[index].canonicalRequest,
+            expectedCurrentCredentialExpiry: expiry
+          )
+        else { throw TacuaTransportQueueError.invalidQueue }
+        queue.operations[index].responseArtifactDigest = receipt.responseDigest
+      }
       try queue.validate()
       return queue
     case 1:
@@ -219,6 +270,8 @@ struct TacuaTransportQueueV2: Codable, Equatable {
       queue.scopeDigest = nil
       queue.currentCredentialID = nil
       queue.currentCredentialExpiresAt = nil
+      queue.credentialExpiryLedger = [:]
+      queue.pendingRevokedCredentialRemovals = []
       queue.credentialCapability = .requiresExchange
       queue.timeAnchor = nil
       try queue.validate()
@@ -233,6 +286,9 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys]
     let data = try encoder.encode(self)
+    guard data.count <= Self.maximumEncodedBytes else {
+      throw TacuaTransportQueueError.invalidQueue
+    }
     let parsed = try JSONSerialization.jsonObject(with: data)
     guard !Self.containsProhibitedKey(parsed) else {
       throw TacuaTransportQueueError.prohibitedPersistedMaterial
@@ -245,6 +301,7 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     scopeDigest: String,
     credentialID: String,
     expiresAt: String,
+    previousCredentialID: String? = nil,
     capability: TacuaTransportCredentialCapability,
     issuedAt: String,
     clock: TacuaMonotonicClock
@@ -252,6 +309,8 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     guard Self.validIdentifier(remoteSessionID), Self.validDigest(scopeDigest),
       Self.validIdentifier(credentialID), capability != .requiresExchange,
       capability != .deletionReplayOnly,
+      previousCredentialID.map(Self.validIdentifier) ?? true,
+      previousCredentialID != credentialID,
       let expiryMilliseconds = TacuaProtocolTimestamp.parseMilliseconds(expiresAt),
       let issueMilliseconds = TacuaProtocolTimestamp.parseMilliseconds(issuedAt),
       expiryMilliseconds > issueMilliseconds
@@ -264,12 +323,38 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     if let existingScope = self.scopeDigest, existingScope != scopeDigest {
       throw TacuaTransportQueueError.operationConflict
     }
+    if let existingExpiry = credentialExpiryLedger?[credentialID], existingExpiry != expiresAt {
+      throw TacuaTransportQueueError.operationConflict
+    }
+    guard credentialExpiryLedger?[credentialID] != nil
+      || (credentialExpiryLedger?.count ?? 0) < 4_096
+    else { throw TacuaTransportQueueError.invalidQueue }
+    guard !pendingRevokedCredentialRemovals.contains(credentialID) else {
+      throw TacuaTransportQueueError.credentialMismatch
+    }
+    let newAnchor = try TacuaServerTimeAnchor.establish(issuedAt: issuedAt, clock: clock)
+    var revokedCredentialID: String?
+    if let existingCredentialID = currentCredentialID,
+      existingCredentialID != credentialID
+    {
+      guard previousCredentialID == existingCredentialID else {
+        throw TacuaTransportQueueError.credentialMismatch
+      }
+      revokedCredentialID = existingCredentialID
+    }
+    if let revokedCredentialID,
+      !pendingRevokedCredentialRemovals.contains(revokedCredentialID)
+    {
+      pendingRevokedCredentialRemovals.append(revokedCredentialID)
+    }
     self.remoteSessionID = remoteSessionID
     self.scopeDigest = scopeDigest
     currentCredentialID = credentialID
     currentCredentialExpiresAt = expiresAt
+    if credentialExpiryLedger == nil { credentialExpiryLedger = [:] }
+    credentialExpiryLedger?[credentialID] = expiresAt
     credentialCapability = capability
-    timeAnchor = try .establish(issuedAt: issuedAt, clock: clock)
+    timeAnchor = newAnchor
   }
 
   mutating func advanceTimeAnchor(
@@ -284,10 +369,18 @@ struct TacuaTransportQueueV2: Codable, Equatable {
   }
 
   func timestampForNewOperation(clock: TacuaMonotonicClock) throws -> String {
-    guard credentialCapability != .requiresExchange, let anchor = timeAnchor else {
+    guard credentialCapability != .requiresExchange, let anchor = timeAnchor,
+      let expiresAt = currentCredentialExpiresAt,
+      let expiry = TacuaProtocolTimestamp.parseMilliseconds(expiresAt)
+    else {
       throw TacuaTransportQueueError.resumeRequired
     }
-    return try anchor.timestamp(clock: clock)
+    let timestamp = try anchor.timestamp(clock: clock)
+    guard let now = TacuaProtocolTimestamp.parseMilliseconds(timestamp), now < expiry else {
+      // Credential validity is half-open: [issued_at, expires_at).
+      throw TacuaTransportQueueError.resumeRequired
+    }
+    return timestamp
   }
 
   mutating func enqueueNewOperation(
@@ -297,11 +390,18 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     request: TacuaJSONValue,
     requestDigest: String,
     localPayloadPath: String? = nil,
+    localPayloadBindings: [TacuaLocalPayloadBinding] = [],
     clock: TacuaMonotonicClock
   ) throws {
     guard Self.validIdentifier(operationID), Self.validIdentifier(requestCredentialID),
       Self.validDigest(requestDigest),
-      localPayloadPath.map(Self.validRelativePath) ?? true
+      localPayloadPath.map(Self.validRelativePath) ?? true,
+      localPayloadBindings.allSatisfy({
+        Self.validRelativePath($0.relativePath) && Self.validDigest($0.contentDigest)
+      }),
+      Set(localPayloadBindings.map(\.relativePath)).count == localPayloadBindings.count,
+      Set(localPayloadBindings.map(\.role)).count == localPayloadBindings.count,
+      localPayloadPath == nil || localPayloadBindings.isEmpty
     else {
       throw TacuaTransportQueueError.invalidQueue
     }
@@ -321,6 +421,9 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     else {
       throw TacuaTransportQueueError.invalidDigest
     }
+    if !localPayloadBindings.isEmpty {
+      try Self.validateLocalPayloadBindings(localPayloadBindings, for: kind, request: request)
+    }
     guard !operations.contains(where: { $0.operationID == operationID }) else {
       throw TacuaTransportQueueError.operationConflict
     }
@@ -332,22 +435,25 @@ struct TacuaTransportQueueV2: Codable, Equatable {
         requestDigest: requestDigest,
         canonicalRequest: canonicalRequest,
         localPayloadPath: localPayloadPath,
+        localPayloadBindings: localPayloadBindings.isEmpty ? nil : localPayloadBindings,
         state: .queued,
         canonicalResponse: nil,
-        responseDigest: nil
+        responseDigest: nil,
+        responseArtifactDigest: nil
       )
     )
   }
 
   /// Returns immutable request bytes and the current transport credential. Those IDs may differ
   /// after rotation; only the Authorization credential rotates during an exact durable replay.
-  func attempt(operationID: String) throws -> TacuaOperationAttempt {
+  func attempt(operationID: String, clock: TacuaMonotonicClock) throws -> TacuaOperationAttempt {
     guard let operation = operations.first(where: { $0.operationID == operationID }) else {
       throw TacuaTransportQueueError.operationNotFound
     }
     guard let transportCredentialID = currentCredentialID else {
       throw TacuaTransportQueueError.missingCredential
     }
+    _ = try timestampForNewOperation(clock: clock)
     switch credentialCapability {
     case .requiresExchange:
       throw TacuaTransportQueueError.resumeRequired
@@ -380,8 +486,10 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     responseDigest: String
   ) throws {
     let responseValue = try TacuaCanonicalJSON.parse(canonicalResponse)
+    let persistedResponse = try JSONSerialization.jsonObject(with: canonicalResponse)
     guard try TacuaCanonicalJSON.data(responseValue) == canonicalResponse,
-      TacuaCanonicalJSON.digest(data: canonicalResponse) == responseDigest
+      TacuaCanonicalJSON.digest(data: canonicalResponse) == responseDigest,
+      !Self.containsProhibitedKey(persistedResponse)
     else {
       throw TacuaTransportQueueError.responseConflict
     }
@@ -412,7 +520,8 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     }
     guard receipt.operationKind == expectedKind,
       receipt.remoteSessionID == remoteSessionID,
-      receipt.scopeDigest == scopeDigest
+      receipt.scopeDigest == scopeDigest,
+      let requestCredentialExpiry = credentialExpiryLedger?[operation.requestCredentialID]
     else {
       throw TacuaTransportQueueError.responseConflict
     }
@@ -421,22 +530,34 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     let independentlyValidated = try TacuaSDKBackendProtocol.validateResponse(
       receipt.canonicalResponse,
       forCanonicalRequest: operation.canonicalRequest,
-      expectedCurrentCredentialExpiry: currentCredentialExpiresAt
+      expectedCurrentCredentialExpiry: requestCredentialExpiry
     )
     guard independentlyValidated == receipt else {
       throw TacuaTransportQueueError.responseConflict
     }
-    try storeResponse(
+    var candidate = self
+    try candidate.storeResponse(
       operationID: receipt.operationID,
       canonicalResponse: receipt.canonicalResponse,
       responseDigest: TacuaCanonicalJSON.digest(data: receipt.canonicalResponse)
     )
+    guard let storedIndex = candidate.operations.firstIndex(where: {
+      $0.operationID == receipt.operationID
+    }) else { throw TacuaTransportQueueError.operationNotFound }
+    if let prior = candidate.operations[storedIndex].responseArtifactDigest,
+      prior != receipt.responseDigest
+    {
+      throw TacuaTransportQueueError.responseConflict
+    }
+    candidate.operations[storedIndex].responseArtifactDigest = receipt.responseDigest
     if let authority = receipt.completionCleanupAuthority {
-      try authorizeCompletionCleanup(authority)
+      try candidate.authorizeCompletionCleanup(authority)
     }
     if let authority = receipt.deletionCleanupAuthority {
-      try authorizeDeletionCleanup(authority)
+      try candidate.authorizeDeletionCleanup(authority)
     }
+    try candidate.validate()
+    self = candidate
   }
 
   private mutating func authorizeCompletionCleanup(_ authority: TacuaCompletionCleanupAuthority) throws {
@@ -445,7 +566,9 @@ struct TacuaTransportQueueV2: Codable, Equatable {
       authority.segmentReceiptDigests.allSatisfy(Self.validDigest),
       authority.diagnosticReceiptDigests.allSatisfy(Self.validDigest),
       let operation = operations.first(where: { $0.operationID == authority.completionID }),
-      operation.kind == .completion, operation.state == .responseStored
+      operation.kind == .completion, operation.state == .responseStored,
+      operation.responseArtifactDigest == authority.completionReceiptDigest,
+      try authorizedPayloadBindings(for: authority).isEmpty == false
     else {
       throw TacuaTransportQueueError.cleanupNotAuthorized
     }
@@ -460,7 +583,8 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     guard Self.validIdentifier(authority.deletionID), Self.validDigest(authority.tombstoneDigest),
       Self.validIdentifier(authority.credentialID), authority.credentialID == currentCredentialID,
       let operation = operations.first(where: { $0.operationID == authority.deletionID }),
-      operation.kind == .deletion, operation.state == .responseStored
+      operation.kind == .deletion, operation.state == .responseStored,
+      operation.responseArtifactDigest == authority.tombstoneDigest
     else {
       throw TacuaTransportQueueError.deletionNotAuthorized
     }
@@ -469,6 +593,58 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     }
     deletionCleanupAuthority = authority
     credentialCapability = .deletionReplayOnly
+  }
+
+  func authorizedLocalPayloadBindings() throws -> [TacuaLocalPayloadBinding] {
+    guard let authority = completionCleanupAuthority else {
+      throw TacuaTransportQueueError.cleanupNotAuthorized
+    }
+    return try authorizedPayloadBindings(for: authority)
+  }
+
+  private func authorizedPayloadBindings(
+    for authority: TacuaCompletionCleanupAuthority
+  ) throws -> [TacuaLocalPayloadBinding] {
+    guard Set(authority.segmentReceiptDigests).count
+      == authority.segmentReceiptDigests.count,
+      Set(authority.diagnosticReceiptDigests).count
+        == authority.diagnosticReceiptDigests.count
+    else { throw TacuaTransportQueueError.cleanupNotAuthorized }
+
+    let receivedSegments = operations.filter {
+      $0.kind == .segment && $0.state == .responseStored
+    }
+    let receivedDiagnostics = operations.filter {
+      $0.kind == .diagnostic && $0.state == .responseStored
+    }
+    guard Set(receivedSegments.compactMap(\.responseArtifactDigest))
+      == Set(authority.segmentReceiptDigests),
+      receivedSegments.allSatisfy({ $0.responseArtifactDigest != nil }),
+      Set(receivedSegments.compactMap(\.responseArtifactDigest)).count
+        == receivedSegments.count,
+      Set(receivedDiagnostics.compactMap(\.responseArtifactDigest))
+        == Set(authority.diagnosticReceiptDigests),
+      receivedDiagnostics.allSatisfy({ $0.responseArtifactDigest != nil }),
+      Set(receivedDiagnostics.compactMap(\.responseArtifactDigest)).count
+        == receivedDiagnostics.count
+    else { throw TacuaTransportQueueError.cleanupNotAuthorized }
+
+    var bindings: [TacuaLocalPayloadBinding] = []
+    for operation in receivedSegments + receivedDiagnostics {
+      guard let operationBindings = operation.localPayloadBindings,
+        !operationBindings.isEmpty,
+        operation.localPayloadPath == nil,
+        let request = try? TacuaCanonicalJSON.parse(operation.canonicalRequest)
+      else { throw TacuaTransportQueueError.cleanupNotAuthorized }
+      try Self.validateLocalPayloadBindings(
+        operationBindings, for: operation.kind, request: request
+      )
+      bindings.append(contentsOf: operationBindings)
+    }
+    guard Set(bindings.map(\.relativePath)).count == bindings.count else {
+      throw TacuaTransportQueueError.cleanupNotAuthorized
+    }
+    return bindings
   }
 
   func validate() throws {
@@ -484,8 +660,24 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     else {
       throw TacuaTransportQueueError.invalidQueue
     }
+    guard pendingRevokedCredentialRemovals.allSatisfy(Self.validIdentifier),
+      Set(pendingRevokedCredentialRemovals).count == pendingRevokedCredentialRemovals.count,
+      !pendingRevokedCredentialRemovals.contains(where: { $0 == currentCredentialID })
+    else { throw TacuaTransportQueueError.invalidQueue }
+    guard let credentialExpiryLedger,
+      credentialExpiryLedger.count <= 4_096,
+      credentialExpiryLedger.allSatisfy({
+        Self.validIdentifier($0.key)
+          && TacuaProtocolTimestamp.parseMilliseconds($0.value) != nil
+      })
+    else { throw TacuaTransportQueueError.invalidQueue }
+    guard pendingRevokedCredentialRemovals.allSatisfy({
+      credentialExpiryLedger[$0] != nil
+    }) else { throw TacuaTransportQueueError.invalidQueue }
     if credentialCapability == .requiresExchange {
-      guard currentCredentialID == nil, currentCredentialExpiresAt == nil, timeAnchor == nil else {
+      guard currentCredentialID == nil, currentCredentialExpiresAt == nil, timeAnchor == nil,
+        credentialExpiryLedger.isEmpty
+      else {
         throw TacuaTransportQueueError.invalidQueue
       }
     } else if credentialCapability == .deletionReplayOnly,
@@ -503,34 +695,68 @@ struct TacuaTransportQueueV2: Codable, Equatable {
       else {
         throw TacuaTransportQueueError.invalidQueue
       }
+      guard let currentCredentialID, let currentCredentialExpiresAt,
+        credentialExpiryLedger[currentCredentialID] == currentCredentialExpiresAt
+      else { throw TacuaTransportQueueError.invalidQueue }
     }
     var operationIDs = Set<String>()
+    var boundPayloadPaths = Set<String>()
     for operation in operations {
+      let bindings = operation.localPayloadBindings ?? []
       guard Self.validIdentifier(operation.operationID),
         Self.validIdentifier(operation.requestCredentialID),
         Self.validDigest(operation.requestDigest), operationIDs.insert(operation.operationID).inserted,
         operation.localPayloadPath.map(Self.validRelativePath) ?? true,
+        bindings.allSatisfy({
+          Self.validRelativePath($0.relativePath) && Self.validDigest($0.contentDigest)
+        }),
+        Set(bindings.map(\.role)).count == bindings.count,
+        bindings.allSatisfy({ boundPayloadPaths.insert($0.relativePath).inserted }),
+        operation.localPayloadPath == nil || bindings.isEmpty,
         (try? TacuaCanonicalJSON.parse(operation.canonicalRequest)) != nil
       else {
         throw TacuaTransportQueueError.invalidQueue
       }
+      let request = try TacuaCanonicalJSON.parse(operation.canonicalRequest)
+      let requestObject = try JSONSerialization.jsonObject(with: operation.canonicalRequest)
+      guard try TacuaCanonicalJSON.data(request) == operation.canonicalRequest,
+        try TacuaCanonicalJSON.digest(
+          request, omittingRootField: Self.digestField(for: operation.kind)
+        ) == operation.requestDigest,
+        !Self.containsProhibitedKey(requestObject)
+      else { throw TacuaTransportQueueError.invalidQueue }
       switch operation.state {
       case .queued:
-        guard operation.canonicalResponse == nil, operation.responseDigest == nil else {
+        guard operation.canonicalResponse == nil, operation.responseDigest == nil,
+          operation.responseArtifactDigest == nil
+        else {
           throw TacuaTransportQueueError.invalidQueue
         }
       case .responseStored:
         guard let response = operation.canonicalResponse,
           operation.responseDigest.map(Self.validDigest) == true,
+          operation.responseArtifactDigest.map(Self.validDigest) == true,
           (try? TacuaCanonicalJSON.parse(response)) != nil
         else {
           throw TacuaTransportQueueError.invalidQueue
         }
+        let responseValue = try TacuaCanonicalJSON.parse(response)
+        let responseObject = try JSONSerialization.jsonObject(with: response)
+        guard try TacuaCanonicalJSON.data(responseValue) == response,
+          TacuaCanonicalJSON.digest(data: response) == operation.responseDigest,
+          !Self.containsProhibitedKey(responseObject)
+        else { throw TacuaTransportQueueError.invalidQueue }
+      }
+      if !bindings.isEmpty {
+        try Self.validateLocalPayloadBindings(bindings, for: operation.kind, request: request)
       }
     }
     if payloadCleanupState != .none { guard completionCleanupAuthority != nil else {
       throw TacuaTransportQueueError.invalidQueue
     }}
+    if let completionCleanupAuthority {
+      _ = try authorizedPayloadBindings(for: completionCleanupAuthority)
+    }
     if credentialCleanupState != .none { guard deletionCleanupAuthority != nil else {
       throw TacuaTransportQueueError.invalidQueue
     }}
@@ -556,6 +782,38 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     }
   }
 
+  private static func validateLocalPayloadBindings(
+    _ bindings: [TacuaLocalPayloadBinding],
+    for kind: TacuaQueuedOperationKind,
+    request: TacuaJSONValue
+  ) throws {
+    guard let root = request.objectValue else {
+      throw TacuaTransportQueueError.invalidQueue
+    }
+    let expected: [TacuaLocalPayloadRole: String]
+    switch kind {
+    case .segment:
+      guard let transport = root["transport"]?.objectValue,
+        let contentDigest = transport["content_digest"]?.stringValue,
+        let sidecarDigest = root["sidecar_digest"]?.stringValue
+      else { throw TacuaTransportQueueError.invalidQueue }
+      expected = [
+        .segmentMedia: contentDigest,
+        .segmentSidecar: sidecarDigest,
+      ]
+    case .diagnostic:
+      guard let transport = root["transport"]?.objectValue,
+        let contentDigest = transport["content_digest"]?.stringValue
+      else { throw TacuaTransportQueueError.invalidQueue }
+      expected = [.diagnosticEnvelope: contentDigest]
+    case .completion, .deletion:
+      expected = [:]
+    }
+    guard bindings.count == expected.count,
+      bindings.allSatisfy({ expected[$0.role] == $0.contentDigest })
+    else { throw TacuaTransportQueueError.invalidQueue }
+  }
+
   private static func validIdentifier(_ value: String) -> Bool {
     value.range(of: "^[a-z][a-z0-9_-]{2,63}$", options: .regularExpression) != nil
   }
@@ -565,8 +823,11 @@ struct TacuaTransportQueueV2: Codable, Equatable {
   }
 
   private static func validRelativePath(_ value: String) -> Bool {
-    !value.isEmpty && !value.hasPrefix("/") && !value.contains("..")
-      && !value.contains("\0") && value.utf8.count <= 1_024
+    guard !value.isEmpty, !value.hasPrefix("/"), !value.contains("\0"),
+      !value.contains("\\"), value.utf8.count <= 1_024
+    else { return false }
+    let components = value.split(separator: "/", omittingEmptySubsequences: false)
+    return components.allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." }
   }
 
   private static func containsProhibitedKey(_ value: Any) -> Bool {
@@ -597,24 +858,40 @@ protocol TacuaTransportQueuePersisting {
 }
 
 protocol TacuaLocalPayloadRemoving {
-  func removePayload(atRelativePath path: String) throws
+  func removePayload(_ binding: TacuaLocalPayloadBinding) throws
 }
 
 enum TacuaTransportCleanup {
+  static func removePendingRevokedCredentials(
+    queue: inout TacuaTransportQueueV2,
+    persistence: TacuaTransportQueuePersisting,
+    credentialStore: TacuaCredentialStoring
+  ) throws {
+    guard !queue.pendingRevokedCredentialRemovals.contains(where: {
+      $0 == queue.currentCredentialID
+    }) else { throw TacuaTransportQueueError.credentialMismatch }
+    // Persist the removal journal before touching Keychain. A crash after Keychain removal
+    // is safe because removal is idempotent and the journal is replayed on recovery.
+    try persistence.persist(queue)
+    while let credentialID = queue.pendingRevokedCredentialRemovals.first {
+      try credentialStore.remove(credentialID: credentialID)
+      queue.pendingRevokedCredentialRemovals.removeFirst()
+      try persistence.persist(queue)
+    }
+  }
+
   static func removeAuthorizedPayloads(
     queue: inout TacuaTransportQueueV2,
     persistence: TacuaTransportQueuePersisting,
     remover: TacuaLocalPayloadRemoving
   ) throws {
-    guard queue.completionCleanupAuthority != nil else {
-      throw TacuaTransportQueueError.cleanupNotAuthorized
-    }
+    let bindings = try queue.authorizedLocalPayloadBindings()
     if queue.payloadCleanupState == .none {
       queue.payloadCleanupState = .tombstoneWritten
       try persistence.persist(queue)
     }
     guard queue.payloadCleanupState == .tombstoneWritten else { return }
-    for path in queue.localPayloadPaths { try remover.removePayload(atRelativePath: path) }
+    for binding in bindings { try remover.removePayload(binding) }
     queue.payloadCleanupState = .payloadsRemoved
     try persistence.persist(queue)
   }
@@ -669,13 +946,12 @@ private enum TacuaProtocolTimestamp {
   }
 
   static func format(milliseconds: Int64) -> String {
-    let date = Date(timeIntervalSince1970: TimeInterval(milliseconds) / 1_000)
+    let wholeSecondMilliseconds = milliseconds - (milliseconds % 1_000)
+    let date = Date(
+      timeIntervalSince1970: TimeInterval(wholeSecondMilliseconds) / 1_000
+    )
     let formatter = ISO8601DateFormatter()
-    if milliseconds % 1_000 == 0 {
-      formatter.formatOptions = [.withInternetDateTime]
-    } else {
-      formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    }
+    formatter.formatOptions = [.withInternetDateTime]
     return formatter.string(from: date)
   }
 }

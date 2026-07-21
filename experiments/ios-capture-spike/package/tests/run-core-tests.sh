@@ -59,6 +59,15 @@ swiftc \
 
 swiftc \
   -module-cache-path "$TEST_TMP_DIR/module-cache" \
+  ios/CapturePolicy.swift \
+  ios/TacuaLaunchLink.swift \
+  tests/LaunchLinkTests.swift \
+  -o "$TEST_TMP_DIR/tacua-launch-link-tests"
+
+"$TEST_TMP_DIR/tacua-launch-link-tests"
+
+swiftc \
+  -module-cache-path "$TEST_TMP_DIR/module-cache" \
   ios/TacuaCanonicalJSON.swift \
   ios/TacuaCredentialStore.swift \
   ios/TacuaTransportQueue.swift \
@@ -69,6 +78,19 @@ swiftc \
 
 "$TEST_TMP_DIR/tacua-transport-queue-tests" \
   "$REPO_ROOT/contracts/sdk-backend-protocol/fixtures/positive"
+
+swiftc \
+  -module-cache-path "$TEST_TMP_DIR/module-cache" \
+  ios/TacuaCanonicalJSON.swift \
+  ios/TacuaCredentialStore.swift \
+  ios/TacuaTransportQueue.swift \
+  ios/TacuaSDKBackendProtocol.swift \
+  ios/TacuaTransportQueueFileStore.swift \
+  tests/TransportQueueFileStoreTests.swift \
+  -framework Security \
+  -o "$TEST_TMP_DIR/tacua-transport-queue-file-store-tests"
+
+"$TEST_TMP_DIR/tacua-transport-queue-file-store-tests"
 
 swiftc \
   -module-cache-path "$TEST_TMP_DIR/module-cache" \
@@ -88,6 +110,8 @@ swiftc \
   ios/TacuaCanonicalJSON.swift \
   ios/TacuaCredentialStore.swift \
   ios/TacuaBackendConfiguration.swift \
+  ios/TacuaLaunchLink.swift \
+  ios/CapturePolicy.swift \
   ios/TacuaTransportQueue.swift \
   ios/TacuaSDKBackendProtocol.swift \
   ios/TacuaSDKBackendRequests.swift \
