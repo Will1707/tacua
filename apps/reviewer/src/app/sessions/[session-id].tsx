@@ -89,7 +89,7 @@ export default function SessionRoute() {
                   <Text selectable style={{ color: colors.label, fontWeight: "700", flex: 1 }}>{candidate.content.title}</Text>
                   <StatusPill value={candidate.state} />
                 </View>
-                <Text selectable numberOfLines={2} style={{ color: colors.secondaryLabel }}>{candidate.content.summary}</Text>
+                <Text selectable numberOfLines={2} style={{ color: colors.secondaryLabel }}>{candidate.content.summary.text}</Text>
               </Pressable>
             </Link.Trigger>
             <Link.Preview />

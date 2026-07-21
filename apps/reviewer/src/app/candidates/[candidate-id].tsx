@@ -39,7 +39,7 @@ export default function CandidateRoute() {
         expected_candidate_digest: candidate.candidate_digest,
         candidate_version: candidate.candidate_version,
         candidate_content_digest: candidate.candidate_content_digest,
-        evidence_manifest_digest: candidate.source.evidence_manifest_digest,
+        evidence_manifest_digest: candidate.evidence_manifest.manifest_digest,
         action: nextAction,
         actor_id: config.reviewerId,
         reason,
@@ -57,7 +57,7 @@ export default function CandidateRoute() {
         expected_candidate_digest: candidate.candidate_digest,
         candidate_version: candidate.candidate_version,
         candidate_content_digest: candidate.candidate_content_digest,
-        evidence_manifest_digest: candidate.source.evidence_manifest_digest,
+        evidence_manifest_digest: candidate.evidence_manifest.manifest_digest,
         action: "resolve_clarification",
         actor_id: config.reviewerId,
         reason: "Reviewer selected one bounded clarification choice.",
@@ -80,7 +80,7 @@ export default function CandidateRoute() {
           <Text selectable style={{ color: colors.label, fontSize: 24, lineHeight: 29, fontWeight: "800", flex: 1 }}>{candidate.content.title}</Text>
           <StatusPill value={candidate.state} />
         </View>
-        <Text selectable style={{ color: colors.secondaryLabel, fontSize: 16, lineHeight: 22 }}>{candidate.content.summary}</Text>
+        <Text selectable style={{ color: colors.secondaryLabel, fontSize: 16, lineHeight: 22 }}>{candidate.content.summary.text}</Text>
         <Text selectable style={{ color: colors.tertiaryLabel }}>Version {candidate.candidate_version} · {candidate.content.priority} · confidence {candidate.content.uncertainty.overall_confidence}</Text>
       </View>
 
@@ -93,7 +93,15 @@ export default function CandidateRoute() {
         <Text selectable style={{ color: colors.tertiaryLabel, fontSize: 12 }}>Evidence: {candidate.content.expected_behavior.evidence_refs.join(", ")}</Text>
       </SectionCard>
       <SectionCard title="Reproduction">
-        {candidate.content.reproduction_steps.map((step, index) => (
+        {candidate.content.reproduction.preconditions.length ? (
+          <View style={{ gap: 6 }}>
+            <Text selectable style={{ color: colors.tertiaryLabel, fontSize: 13, fontWeight: "700", textTransform: "uppercase" }}>Before you start</Text>
+            {candidate.content.reproduction.preconditions.map((precondition) => (
+              <Text selectable key={precondition.precondition_id} style={{ color: colors.secondaryLabel }}>• {precondition.text}</Text>
+            ))}
+          </View>
+        ) : null}
+        {candidate.content.reproduction.steps.map((step, index) => (
           <View key={step.step_id} style={{ flexDirection: "row", gap: 12 }}>
             <Text selectable style={{ color: colors.primary, fontWeight: "800", fontVariant: ["tabular-nums"] }}>{index + 1}</Text>
             <View style={{ flex: 1, gap: 4 }}>
@@ -101,6 +109,15 @@ export default function CandidateRoute() {
               {step.actual_result ? <Text selectable style={{ color: colors.secondaryLabel }}>Actual: {step.actual_result}</Text> : null}
               {step.expected_result ? <Text selectable style={{ color: colors.secondaryLabel }}>Expected: {step.expected_result}</Text> : null}
             </View>
+          </View>
+        ))}
+      </SectionCard>
+      <SectionCard title="Grounding">
+        {candidate.content.claims.map((claim) => (
+          <View key={claim.claim_id} style={{ borderTopColor: colors.separator, borderTopWidth: 1, paddingTop: 10, gap: 4 }}>
+            <Text selectable style={{ color: colors.label, lineHeight: 21 }}>{claim.statement}</Text>
+            <Text selectable style={{ color: colors.tertiaryLabel, fontSize: 12, textTransform: "capitalize" }}>{claim.kind} · {claim.support} · {claim.confidence}</Text>
+            <Text selectable style={{ color: colors.tertiaryLabel, fontSize: 12 }}>Evidence: {claim.evidence_refs.join(", ") || "none"}</Text>
           </View>
         ))}
       </SectionCard>
@@ -117,6 +134,10 @@ export default function CandidateRoute() {
           {candidate.content.uncertainty.items.map((item) => <Text selectable key={item.uncertainty_id} style={{ color: item.impact === "blocking" ? colors.orange : colors.secondaryLabel }}>• {item.statement}</Text>)}
         </SectionCard>
       ) : null}
+      <SectionCard title="Scope">
+        {candidate.content.scope.in_scope.map((item) => <Text selectable key={`in:${item}`} style={{ color: colors.label }}>✓ {item}</Text>)}
+        {candidate.content.scope.out_of_scope.map((item) => <Text selectable key={`out:${item}`} style={{ color: colors.secondaryLabel }}>Not included: {item}</Text>)}
+      </SectionCard>
       {unresolved.map((clarification) => (
         <SectionCard key={clarification.clarification_id} title={clarification.impact === "blocking" ? "Decision required" : "Clarification"}>
           <Text selectable style={{ color: colors.label, fontSize: 16 }}>{clarification.question}</Text>
@@ -129,7 +150,9 @@ export default function CandidateRoute() {
               onPress={() => void resolveClarification(clarification.clarification_id, choice.choice_id)}
               style={({ pressed }) => ({ borderColor: colors.separator, borderWidth: 1, borderRadius: 12, borderCurve: "continuous", padding: 12, gap: 4, opacity: action !== null ? 0.5 : pressed ? 0.65 : 1 })}
             >
+              <ChoicePreview choice={choice} />
               <Text selectable style={{ color: colors.label, fontWeight: "700" }}>{choice.label}</Text>
+              <Text selectable style={{ color: colors.secondaryLabel }}>{choice.description}</Text>
               <Text selectable style={{ color: colors.secondaryLabel }}>{choice.consequence}</Text>
             </Pressable>
           ))}
@@ -140,7 +163,8 @@ export default function CandidateRoute() {
         <SectionCard title="Exact version to approve">
           <Text selectable style={{ color: colors.label, fontVariant: ["tabular-nums"] }}>Candidate version {candidate.candidate_version}</Text>
           <Text selectable style={{ color: colors.secondaryLabel, fontSize: 12 }}>{candidate.candidate_content_digest}</Text>
-          <Text selectable style={{ color: colors.secondaryLabel, fontSize: 12 }}>Evidence {candidate.source.evidence_manifest_digest}</Text>
+          <Text selectable style={{ color: colors.secondaryLabel, fontSize: 12 }}>Evidence {candidate.evidence_manifest.manifest_digest}</Text>
+          <Text selectable style={{ color: colors.tertiaryLabel, fontSize: 12 }}>{candidate.evidence_manifest.evidence_ids.length} evidence items are bound to this version.</Text>
         </SectionCard>
       ) : null}
 
@@ -151,4 +175,23 @@ export default function CandidateRoute() {
       </View>
     </ScrollView>
   );
+}
+
+function ChoicePreview({ choice }: { readonly choice: TicketCandidate["content"]["clarifications"][number]["choices"][number] }) {
+  const presentation = choice.presentation;
+  if (presentation.kind === "color_swatch" && presentation.value) {
+    return <View accessibilityLabel={`Colour ${presentation.value}`} style={{ width: 42, height: 42, borderRadius: 10, borderCurve: "continuous", borderColor: colors.separator, borderWidth: 1, backgroundColor: presentation.value }} />;
+  }
+  if (presentation.kind === "evidence_thumbnail" && presentation.evidence_ref) {
+    return (
+      <View style={{ minHeight: 58, borderRadius: 10, borderCurve: "continuous", borderColor: colors.separator, borderWidth: 1, backgroundColor: colors.groupedBackground, padding: 10, justifyContent: "center" }}>
+        <Text selectable style={{ color: colors.primary, fontWeight: "700" }}>Evidence preview</Text>
+        <Text selectable style={{ color: colors.tertiaryLabel, fontSize: 12 }}>{presentation.evidence_ref}</Text>
+      </View>
+    );
+  }
+  if (presentation.value) {
+    return <Text selectable style={{ color: colors.primary, fontSize: presentation.kind === "text" ? 20 : 16, fontWeight: "800" }}>{presentation.value}</Text>;
+  }
+  return null;
 }

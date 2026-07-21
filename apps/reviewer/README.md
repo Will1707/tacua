@@ -6,9 +6,12 @@ launches an authorized QA build, shows uploaded evidence and processing state,
 and requires a human to review an exact candidate version before approval.
 
 The current scaffold can connect to the pilot backend's session/job endpoints.
-Candidate endpoints and launch-code orchestration are typed but remain blocked
-until the SDK/backend protocol and reviewer transition API are implemented. A
-failed candidate request is intentionally not treated as an empty approval.
+Its ticket UI is typed against the standalone `tacua.ticket-candidate@1.0.0`
+contract and shows grounded behavior, reproduction, scope, uncertainty, visual
+clarification choices, and the exact candidate/evidence digests being approved.
+Candidate endpoints and launch-code orchestration remain blocked until the
+backend transition API is implemented. A failed candidate request is
+intentionally not treated as an empty approval.
 
 ## Local development
 

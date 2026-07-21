@@ -97,9 +97,20 @@ export class TacuaApiClient {
       readonly selected_choice_id?: string;
     },
   ): Promise<TicketCandidate> {
+    const idempotencyKey = [
+      "candidate",
+      candidateId,
+      String(body.candidate_version),
+      body.action,
+      body.clarification_id ?? "none",
+      body.selected_choice_id ?? "none",
+    ].join(":");
     return this.request(`/v1/admin/candidates/${encodeURIComponent(candidateId)}/transitions`, {
       method: "POST",
-      headers: { "If-Match": body.expected_candidate_digest },
+      headers: {
+        "If-Match": body.expected_candidate_digest,
+        "Idempotency-Key": idempotencyKey,
+      },
       body: JSON.stringify(body),
     });
   }
