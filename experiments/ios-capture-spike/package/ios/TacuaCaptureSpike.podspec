@@ -18,7 +18,7 @@ Pod::Spec.new do |s|
   s.swift_version = '5.9'
 
   s.dependency 'ExpoModulesCore'
-  s.frameworks = 'AVFAudio', 'AVFoundation', 'CoreMedia', 'ReplayKit'
+  s.frameworks = 'AVFAudio', 'AVFoundation', 'CoreMedia', 'ReplayKit', 'Security'
 
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',
