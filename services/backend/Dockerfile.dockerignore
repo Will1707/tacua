@@ -1,0 +1,11 @@
+**
+!services/
+!services/backend/
+!services/backend/src/
+!services/backend/src/**
+!contracts/
+!contracts/runtime/
+!contracts/runtime/src/
+!contracts/runtime/src/**
+!contracts/runtime/schemas/
+!contracts/runtime/schemas/**

@@ -1,0 +1,17 @@
+{
+  "organization_id": "org_example",
+  "project_id": "project_example",
+  "application_id": "app_example",
+  "bundle_identifier": "com.example.app",
+  "build_id": "build_example",
+  "build_identity_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+  "consent_contract": "tacua-consent-v1",
+  "state_directory": "/var/lib/tacua",
+  "listen_host": "0.0.0.0",
+  "listen_port": 8080,
+  "launch_code_ttl_seconds": 300,
+  "upload_token_ttl_seconds": 3600,
+  "max_segment_bytes": 268435456,
+  "max_diagnostic_bytes": 1048576,
+  "raw_retention_days": 30
+}
