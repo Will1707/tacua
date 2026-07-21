@@ -15,6 +15,7 @@ from typing import Any, Callable
 import unicodedata
 
 from .candidate_domain import ContractError, TICKET_CONTRACT, apply_transition
+from .evidence_domain import EvidenceDomainError
 
 
 _ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{2,63}$")
@@ -52,6 +53,12 @@ class CandidateTransitionResponse:
     candidate_digest: str
 
 
+ApprovalGuard = Callable[[sqlite3.Connection, dict[str, Any]], None]
+VersionAppendGuard = Callable[
+    [sqlite3.Connection, dict[str, Any], dict[str, Any]], None
+]
+
+
 def _canonical_json(value: Any) -> str:
     return json.dumps(
         value,
@@ -87,7 +94,12 @@ class CandidateStore:
 
     Connections are supplied by the owning backend so this module does not
     choose a database location or weaken its filesystem boundary. Every public
-    method obtains and closes its own connection.
+    method obtains and closes its own connection. Optional guards execute on
+    that same connection while its ``BEGIN IMMEDIATE`` transaction is active.
+    Approval verification runs after exact parent/request binding and before
+    transition construction. Version append integration runs after the sealed
+    child is constructed and before any candidate row or head is changed. Any
+    guard failure rolls back its writes and the entire candidate transition.
     """
 
     def __init__(
@@ -98,6 +110,8 @@ class CandidateStore:
         project_id: str,
         reviewer_id: str,
         clock: Callable[[], datetime],
+        approval_guard: ApprovalGuard | None = None,
+        version_append_guard: VersionAppendGuard | None = None,
     ):
         self._connect = connect
         self.organization_id = _require_id(organization_id, "organization_id")
@@ -105,7 +119,13 @@ class CandidateStore:
         self.reviewer_id = _require_id(reviewer_id, "reviewer_id")
         if not callable(clock):
             raise ValueError("clock must be callable")
+        if approval_guard is not None and not callable(approval_guard):
+            raise ValueError("approval_guard must be callable")
+        if version_append_guard is not None and not callable(version_append_guard):
+            raise ValueError("version_append_guard must be callable")
         self._clock = clock
+        self._approval_guard = approval_guard
+        self._version_append_guard = version_append_guard
 
     def initialize_schema(self) -> None:
         schema = """
@@ -305,6 +325,13 @@ class CandidateStore:
             internal = self._domain_body(candidate_id, public_body)
             if internal["expected_candidate_digest"] != if_match:
                 raise CandidateStoreError(412, "CANDIDATE_PRECONDITION_FAILED", "body and If-Match identify different versions")
+            self._require_exact_parent_binding(parent, internal)
+            if public_body["action"] == "approve" and self._approval_guard is not None:
+                self._invoke_guard(
+                    self._approval_guard,
+                    connection,
+                    copy.deepcopy(parent),
+                )
             try:
                 candidate = apply_transition(
                     chain,
@@ -320,6 +347,14 @@ class CandidateStore:
                 else:
                     status = 400
                 raise CandidateStoreError(status, exc.code, exc.detail) from exc
+
+            if self._version_append_guard is not None:
+                self._invoke_guard(
+                    self._version_append_guard,
+                    connection,
+                    copy.deepcopy(parent),
+                    copy.deepcopy(candidate),
+                )
 
             self._insert_version(connection, candidate)
             updated = connection.execute(
@@ -368,21 +403,15 @@ class CandidateStore:
         session_id = _require_id(session_id, "session_id")
         with closing(self._connection()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
-            candidate_ids = [
-                row["candidate_id"]
-                for row in connection.execute(
-                    """SELECT candidate_id FROM candidate_heads
-                       WHERE organization_id = ? AND project_id = ? AND session_id = ?""",
-                    (self.organization_id, self.project_id, session_id),
-                ).fetchall()
-            ]
-            operations = 0
-            if candidate_ids:
-                placeholders = ",".join("?" for _ in candidate_ids)
-                operations = connection.execute(
-                    f"DELETE FROM candidate_operations WHERE candidate_id IN ({placeholders})",
-                    candidate_ids,
-                ).rowcount
+            operations = connection.execute(
+                """DELETE FROM candidate_operations
+                    WHERE candidate_id IN (
+                        SELECT candidate_id FROM candidate_heads
+                         WHERE organization_id = ? AND project_id = ?
+                           AND session_id = ?
+                    )""",
+                (self.organization_id, self.project_id, session_id),
+            ).rowcount
             heads = connection.execute(
                 """DELETE FROM candidate_heads
                    WHERE organization_id = ? AND project_id = ? AND session_id = ?""",
@@ -394,6 +423,50 @@ class CandidateStore:
                 (self.organization_id, self.project_id, session_id),
             ).rowcount
         return {"candidate_heads": heads, "candidate_versions": versions, "candidate_operations": operations}
+
+    @staticmethod
+    def _require_exact_parent_binding(
+        parent: dict[str, Any], body: dict[str, Any]
+    ) -> None:
+        bindings = (
+            (body["expected_candidate_id"], parent["candidate_id"]),
+            (body["expected_candidate_version"], parent["candidate_version"]),
+            (body["expected_candidate_digest"], parent["candidate_digest"]),
+            (
+                body["expected_candidate_content_digest"],
+                parent["candidate_content_digest"],
+            ),
+            (
+                body["expected_evidence_manifest_digest"],
+                parent["evidence_manifest"]["manifest_digest"],
+            ),
+        )
+        if any(
+            type(actual) is not type(expected) or actual != expected
+            for actual, expected in bindings
+        ):
+            raise CandidateStoreError(
+                412,
+                "CANDIDATE_PRECONDITION_FAILED",
+                "transition body does not identify the exact current candidate",
+            )
+
+    @staticmethod
+    def _invoke_guard(callback: Callable[..., None], *arguments: Any) -> None:
+        try:
+            callback(*arguments)
+        except CandidateStoreError:
+            raise
+        except EvidenceDomainError as exc:
+            raise CandidateStoreError(409, exc.code, exc.detail) from exc
+        except ContractError as exc:
+            if exc.code in _EXPECTED_ERRORS:
+                status = 412
+            elif exc.code in _CONFLICT_ERRORS:
+                status = 409
+            else:
+                status = 400
+            raise CandidateStoreError(status, exc.code, exc.detail) from exc
 
     def _connection(self) -> sqlite3.Connection:
         connection = self._connect()
