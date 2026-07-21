@@ -21,6 +21,12 @@ import unicodedata
 from typing import Any, BinaryIO, Callable
 
 from . import PROCESSING_JOB_CONTRACT, __version__
+from .candidate_domain import ContractError as CandidateContractError, TICKET_CONTRACT
+from .candidate_store import (
+    CandidateStore,
+    CandidateStoreError,
+    CandidateTransitionResponse,
+)
 from .config import (
     BUNDLE_ID_PATTERN,
     DIGEST_PATTERN,
@@ -43,6 +49,12 @@ from .contracts import (
     validate_authenticated_exact_replay,
     validate_new_upload_authentication,
     validate_operation_pair,
+)
+from .evidence_domain import (
+    EvidenceDomainError,
+    EvidenceStore,
+    initialize_schema as initialize_evidence_schema,
+    sha256_digest as evidence_sha256_digest,
 )
 
 
@@ -195,7 +207,7 @@ class PilotBackend:
     ):
         if not 32 <= len(admin_secret) <= 4096:
             raise ValueError("admin secret must contain from 32 through 4096 bytes")
-        for name in ("organization_id", "project_id", "application_id"):
+        for name in ("organization_id", "project_id", "application_id", "reviewer_id"):
             if not ID_PATTERN.fullmatch(getattr(config, name)):
                 raise ValueError(f"{name} is invalid")
         if not isinstance(config.build_identity, dict):
@@ -252,6 +264,7 @@ class PilotBackend:
             raise ValueError("state_directory must be an absolute non-root path")
         self.objects_dir = self.state_dir / "objects"
         self.temp_dir = self.state_dir / "tmp"
+        self.derived_evidence_dir = self.state_dir / "derived-evidence"
         self.db_path = self.state_dir / "tacua.sqlite3"
         self._lock = threading.RLock()
         self._retention_worker_lock = threading.Lock()
@@ -261,12 +274,19 @@ class PilotBackend:
         self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.objects_dir.mkdir(exist_ok=True, mode=0o700)
         self.temp_dir.mkdir(exist_ok=True, mode=0o700)
-        for directory in (self.state_dir, self.objects_dir, self.temp_dir):
+        self.derived_evidence_dir.mkdir(exist_ok=True, mode=0o700)
+        for directory in (
+            self.state_dir,
+            self.objects_dir,
+            self.temp_dir,
+            self.derived_evidence_dir,
+        ):
             metadata = directory.lstat()
             if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
                 raise ValueError(f"backend state path is not a real directory: {directory}")
             directory.chmod(0o700)
         self._initialize_database()
+        self._initialize_review_storage()
         self._recover_pending_deletions()
         self._reconcile_storage()
 
@@ -457,6 +477,97 @@ class PilotBackend:
             elif pinned["pin_json"] != pin_json:
                 raise ValueError("configured deployment pin differs from persisted state")
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    def _initialize_review_storage(self) -> None:
+        """Initialize append-only review state before serving concurrent requests."""
+
+        self._candidate_store().initialize_schema()
+        with self._connect() as conn:
+            initialize_evidence_schema(conn)
+            EvidenceStore(conn, self.derived_evidence_dir).recover_file_journal()
+
+    def _candidate_store(self) -> CandidateStore:
+        return CandidateStore(
+            self._connect,
+            organization_id=self.config.organization_id,
+            project_id=self.config.project_id,
+            reviewer_id=self.config.reviewer_id,
+            clock=self._clock,
+            approval_guard=self._verify_candidate_approval_evidence,
+            version_append_guard=self._append_candidate_evidence_version,
+        )
+
+    def _evidence_store(self, connection: sqlite3.Connection) -> EvidenceStore:
+        return EvidenceStore(connection, self.derived_evidence_dir)
+
+    def _verify_candidate_approval_evidence(
+        self,
+        connection: sqlite3.Connection,
+        parent: dict[str, Any],
+    ) -> None:
+        self._require_review_session(connection, parent["session_id"])
+        evidence = self._evidence_store(connection)
+        binding = self._candidate_binding(parent)
+        manifest = evidence.get_manifest(**binding)
+        candidate_ids = set(parent["evidence_manifest"]["evidence_ids"])
+        if candidate_ids != {item["evidence_id"] for item in manifest["items"]}:
+            raise CandidateStoreError(
+                409,
+                "CANDIDATE_EVIDENCE_MISMATCH",
+                "candidate evidence membership changed",
+            )
+        keyframe_ids = [
+            item["evidence_id"]
+            for item in manifest["items"]
+            if item["evidence_id"] in candidate_ids
+            and item["evidence_type"] == "media.keyframe"
+            and item["availability"] == "available"
+        ]
+        if not keyframe_ids:
+            raise CandidateStoreError(
+                409,
+                "CANDIDATE_SCREENSHOT_REQUIRED",
+                "approval requires a bound available screenshot",
+            )
+        verified = evidence.get_verified_keyframes_for_approval(
+            evidence_ids=keyframe_ids,
+            **binding,
+        )
+        if verified["authorized_for_handoff"] is not False:
+            raise CandidateStoreError(
+                500,
+                "CANDIDATE_EVIDENCE_CORRUPT",
+                "review evidence cannot grant handoff authority",
+            )
+        for keyframe in verified["verified_keyframes"]:
+            if evidence_sha256_digest(keyframe["body"]) != keyframe["content_digest"]:
+                raise CandidateStoreError(
+                    500,
+                    "CANDIDATE_EVIDENCE_CORRUPT",
+                    "verified screenshot bytes changed during approval",
+                )
+
+    def _append_candidate_evidence_version(
+        self,
+        connection: sqlite3.Connection,
+        parent: dict[str, Any],
+        candidate: dict[str, Any],
+    ) -> None:
+        self._require_review_session(connection, parent["session_id"])
+        evidence = self._evidence_store(connection)
+        manifest = evidence.get_manifest(**self._candidate_binding(parent))
+        if (
+            candidate["session_id"] != parent["session_id"]
+            or candidate["evidence_manifest"] != parent["evidence_manifest"]
+        ):
+            raise CandidateStoreError(
+                409,
+                "CANDIDATE_EVIDENCE_MISMATCH",
+                "review transition changed immutable evidence binding",
+            )
+        binding = self._candidate_binding(candidate)
+        binding.pop("manifest_digest")
+        evidence.put_manifest(manifest=manifest, **binding)
 
     @staticmethod
     def _fsync_directory(path: Path) -> None:
@@ -1804,8 +1915,22 @@ class PilotBackend:
                        (SELECT COUNT(*) FROM segments WHERE session_id = ?) +
                        (SELECT COUNT(*) FROM diagnostics WHERE session_id = ?) +
                        (SELECT COUNT(*) FROM completions WHERE session_id = ?) +
-                       (SELECT COUNT(*) FROM jobs WHERE session_id = ?)""",
-                    (session_id, session_id, session_id, session_id),
+                       (SELECT COUNT(*) FROM jobs WHERE session_id = ?) +
+                       (SELECT COUNT(*) FROM tacua_evidence_preview_revisions
+                          WHERE manifest_row_id IN (
+                              SELECT manifest_row_id FROM tacua_evidence_manifests
+                               WHERE organization_id = ? AND project_id = ?
+                                 AND session_id = ?
+                          ))""",
+                    (
+                        session_id,
+                        session_id,
+                        session_id,
+                        session_id,
+                        self.config.organization_id,
+                        self.config.project_id,
+                        session_id,
+                    ),
                 ).fetchone()[0]
                 conn.execute("DELETE FROM jobs WHERE session_id = ?", (session_id,))
                 conn.execute(
@@ -1872,6 +1997,31 @@ class PilotBackend:
                         return StoredResponse(200, bytes(tombstone["response_bytes"]))
                     raise ApiError(404, "SESSION_NOT_FOUND", "pending deletion was not found")
                 request = self._decode_protocol_object(pending["request_json"])
+
+            # Review state is erased before the session tombstone can claim
+            # derived-data deletion. Each operation is idempotent, so a crash
+            # between these boundaries is completed on startup recovery.
+            try:
+                self._candidate_store().delete_session(session_id)
+                with self._connect() as conn:
+                    self._evidence_store(conn).delete_session(
+                        organization_id=self.config.organization_id,
+                        project_id=self.config.project_id,
+                        session_id=session_id,
+                    )
+                with self._connect() as conn:
+                    conn.execute(
+                        "DELETE FROM tacua_evidence_audit WHERE session_id = ?",
+                        (session_id,),
+                    )
+            except (CandidateStoreError, EvidenceDomainError, sqlite3.Error) as exc:
+                raise ApiError(
+                    500,
+                    "STORAGE_DELETE_FAILED",
+                    "derived session evidence could not be erased",
+                ) from exc
+
+            with self._connect() as conn:
                 try:
                     self._erase_session_objects(conn, session_id)
                 except OSError as exc:
@@ -2181,38 +2331,382 @@ class PilotBackend:
         ]
 
     @staticmethod
-    def _session_summary(row: sqlite3.Row) -> dict[str, Any]:
+    def _raise_candidate_error(error: CandidateStoreError) -> None:
+        raise ApiError(error.status, error.code, error.message) from error
+
+    @staticmethod
+    def _raise_evidence_error(error: EvidenceDomainError) -> None:
+        if error.code in {
+            "EVIDENCE_BINDING_NOT_FOUND",
+            "EVIDENCE_ITEM_NOT_FOUND",
+            "PREVIEW_NOT_FOUND",
+            "PREVIEW_FILE_MISSING",
+        }:
+            status = 404
+            code = "CANDIDATE_EVIDENCE_NOT_FOUND"
+        elif error.code in {
+            "PREVIEW_UNAVAILABLE",
+            "APPROVAL_KEYFRAME_INVALID",
+            "APPROVAL_KEYFRAMES_INVALID",
+        }:
+            status = 409
+            code = "CANDIDATE_EVIDENCE_UNAVAILABLE"
+        elif "SCOPE" in error.code or "BINDING" in error.code:
+            status = 403
+            code = "CANDIDATE_EVIDENCE_SCOPE_MISMATCH"
+        elif "TAMPER" in error.code or "DIGEST" in error.code:
+            status = 500
+            code = "CANDIDATE_EVIDENCE_CORRUPT"
+        else:
+            status = 409
+            code = "CANDIDATE_EVIDENCE_INVALID"
+        raise ApiError(status, code, "candidate evidence could not be verified") from error
+
+    def _require_review_session(
+        self,
+        connection: sqlite3.Connection,
+        session_id: str,
+        *,
+        require_completed: bool = False,
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        if row is None:
+            if connection.execute(
+                "SELECT 1 FROM tombstones WHERE session_id = ?", (session_id,)
+            ).fetchone():
+                raise ApiError(410, "SESSION_DELETED", "session was deleted")
+            raise ApiError(404, "SESSION_NOT_FOUND", "session was not found")
+        if row["state"] == "deleting":
+            raise ApiError(410, "SESSION_DELETED", "session deletion is in progress")
+        if require_completed and row["state"] != "completed":
+            raise ApiError(409, "SESSION_NOT_COMPLETED", "session is not ready for processing")
+        return row
+
+    @staticmethod
+    def _candidate_binding(candidate: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "organization_id": candidate["organization_id"],
+            "project_id": candidate["project_id"],
+            "session_id": candidate["session_id"],
+            "candidate_id": candidate["candidate_id"],
+            "candidate_version": candidate["candidate_version"],
+            "candidate_digest": candidate["candidate_digest"],
+            "manifest_digest": candidate["evidence_manifest"]["manifest_digest"],
+        }
+
+    def persist_candidate_bundle(
+        self,
+        *,
+        candidate: dict[str, Any],
+        evidence_manifest: dict[str, Any],
+        previews: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Publish one processed draft only after all reviewer evidence is durable.
+
+        This is an internal worker boundary, not an HTTP upload route. A crash
+        before the final candidate insert can leave retention-scoped evidence,
+        but can never expose a candidate whose required screenshot is missing.
+        """
+
+        try:
+            TICKET_CONTRACT.validate_chain([candidate])
+        except CandidateContractError as error:
+            raise ApiError(422, "INVALID_CANDIDATE", "processed candidate is invalid") from error
+        if (
+            candidate["organization_id"] != self.config.organization_id
+            or candidate["project_id"] != self.config.project_id
+        ):
+            raise ApiError(403, "CANDIDATE_SCOPE_MISMATCH", "candidate is outside this deployment")
+        if not isinstance(previews, list) or len(previews) > 100:
+            raise ApiError(422, "INVALID_CANDIDATE_PREVIEWS", "candidate previews are invalid")
+        candidate_ids = candidate["evidence_manifest"]["evidence_ids"]
+        manifest_items = evidence_manifest.get("items") if isinstance(evidence_manifest, dict) else None
+        if not isinstance(manifest_items, list):
+            raise ApiError(422, "INVALID_EVIDENCE_MANIFEST", "candidate evidence manifest is invalid")
+        manifest_ids = [item.get("evidence_id") for item in manifest_items if isinstance(item, dict)]
+        if (
+            len(manifest_ids) != len(manifest_items)
+            or len(set(manifest_ids)) != len(manifest_ids)
+            or sorted(manifest_ids) != sorted(candidate_ids)
+            or evidence_manifest.get("manifest_id") != candidate["evidence_manifest"]["manifest_id"]
+            or evidence_manifest.get("manifest_digest")
+            != candidate["evidence_manifest"]["manifest_digest"]
+        ):
+            raise ApiError(
+                422,
+                "CANDIDATE_EVIDENCE_MISMATCH",
+                "candidate and evidence manifest identify different evidence",
+            )
+
+        required_keyframes = {
+            item["evidence_id"]
+            for item in manifest_items
+            if item.get("evidence_type") == "media.keyframe"
+            and item.get("availability") == "available"
+        }
+        preview_ids = {
+            item.get("evidence_id") for item in previews if isinstance(item, dict)
+        }
+        if not required_keyframes or not required_keyframes <= preview_ids:
+            raise ApiError(
+                422,
+                "CANDIDATE_SCREENSHOT_REQUIRED",
+                "candidate publication requires every available keyframe preview",
+            )
+
+        binding = self._candidate_binding(candidate)
+        binding_without_digest = dict(binding)
+        binding_without_digest.pop("manifest_digest")
+        with self._connect() as connection:
+            session = self._require_review_session(
+                connection, candidate["session_id"], require_completed=True
+            )
+            if (
+                candidate["build_id"] != self.config.build_id
+                or candidate["build_identity_digest"] != session["build_identity_digest"]
+            ):
+                raise ApiError(
+                    403,
+                    "CANDIDATE_BUILD_MISMATCH",
+                    "candidate does not identify the captured build",
+                )
+            evidence = self._evidence_store(connection)
+            try:
+                evidence.put_manifest(
+                    manifest=evidence_manifest,
+                    **binding_without_digest,
+                )
+                for preview in previews:
+                    if not isinstance(preview, dict) or set(preview) != {
+                        "evidence_id",
+                        "preview_revision_id",
+                        "content_type",
+                        "size_bytes",
+                        "content_digest",
+                        "body",
+                    }:
+                        raise ApiError(
+                            422,
+                            "INVALID_CANDIDATE_PREVIEWS",
+                            "candidate preview fields are invalid",
+                        )
+                    evidence.put_preview(**binding, **preview)
+            except EvidenceDomainError as error:
+                self._raise_evidence_error(error)
+        try:
+            return self._candidate_store().insert_generated(candidate)
+        except CandidateStoreError as error:
+            self._raise_candidate_error(error)
+
+    def list_candidates(self, session_id: str) -> list[dict[str, Any]]:
+        _require_id(session_id, "session_id")
+        with self._connect() as connection:
+            self._require_review_session(connection, session_id)
+        try:
+            return self._candidate_store().list_current(session_id)
+        except CandidateStoreError as error:
+            self._raise_candidate_error(error)
+
+    def get_candidate(self, candidate_id: str, version: int | None = None) -> dict[str, Any]:
+        try:
+            candidate = self._candidate_store().get(candidate_id, version)
+        except CandidateStoreError as error:
+            self._raise_candidate_error(error)
+        with self._connect() as connection:
+            self._require_review_session(connection, candidate["session_id"])
+        return candidate
+
+    def _candidate_diagnostic_events(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        session_id: str,
+        manifest: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        allowed = {item["evidence_id"] for item in manifest["items"]}
+        windows = [
+            (item["time_range"]["start_ms"], item["time_range"]["end_ms"])
+            for item in manifest["items"]
+            if item["time_range"] is not None
+        ]
+        selected: dict[str, dict[str, Any]] = {}
+        rows = connection.execute(
+            "SELECT request_json FROM diagnostics WHERE session_id = ? ORDER BY accepted_at, upload_id",
+            (session_id,),
+        ).fetchall()
+        for row in rows:
+            try:
+                request = self._decode_protocol_object(row["request_json"])
+                envelope = request["envelope"]
+                runtime_validate(envelope)
+            except (KeyError, TypeError, ContractError) as error:
+                raise ApiError(
+                    500,
+                    "DIAGNOSTIC_STORAGE_CORRUPT",
+                    "stored diagnostic evidence failed validation",
+                ) from error
+            if (
+                envelope["organization_id"] != self.config.organization_id
+                or envelope["project_id"] != self.config.project_id
+                or envelope["session_id"] != session_id
+            ):
+                raise ApiError(
+                    500,
+                    "DIAGNOSTIC_STORAGE_CORRUPT",
+                    "stored diagnostic evidence escaped its session",
+                )
+            for event in envelope["events"]:
+                refs = set(event["evidence_refs"])
+                if not refs <= allowed:
+                    continue
+                inside_window = any(
+                    start <= event["elapsed_ms"] <= end for start, end in windows
+                )
+                if not refs and not inside_window:
+                    continue
+                prior = selected.get(event["event_id"])
+                if prior is not None and canonical_json(prior) != canonical_json(event):
+                    raise ApiError(
+                        500,
+                        "DIAGNOSTIC_STORAGE_CORRUPT",
+                        "stored diagnostic event identities conflict",
+                    )
+                selected[event["event_id"]] = event
+        return sorted(
+            selected.values(),
+            key=lambda event: (event["elapsed_ms"], event["sequence"], event["event_id"]),
+        )[:512]
+
+    def get_candidate_evidence(
+        self,
+        candidate_id: str,
+        candidate_version: int,
+        *,
+        candidate_digest: str,
+        manifest_digest: str,
+    ) -> dict[str, Any]:
+        candidate = self.get_candidate(candidate_id, candidate_version)
+        if (
+            candidate["candidate_digest"] != candidate_digest
+            or candidate["evidence_manifest"]["manifest_digest"] != manifest_digest
+        ):
+            raise ApiError(
+                412,
+                "CANDIDATE_PRECONDITION_FAILED",
+                "candidate version changed; reload before viewing evidence",
+            )
+        binding = self._candidate_binding(candidate)
+        with self._connect() as connection:
+            evidence = self._evidence_store(connection)
+            try:
+                manifest = evidence.get_manifest(**binding)
+                events = self._candidate_diagnostic_events(
+                    connection,
+                    session_id=candidate["session_id"],
+                    manifest=manifest,
+                )
+                return evidence.get_candidate_evidence_view(
+                    diagnostic_events=events,
+                    **binding,
+                )
+            except EvidenceDomainError as error:
+                self._raise_evidence_error(error)
+
+    def get_candidate_preview(
+        self,
+        candidate_id: str,
+        candidate_version: int,
+        evidence_id: str,
+        *,
+        candidate_digest: str,
+        manifest_digest: str,
+    ) -> dict[str, Any]:
+        candidate = self.get_candidate(candidate_id, candidate_version)
+        if (
+            candidate["candidate_digest"] != candidate_digest
+            or candidate["evidence_manifest"]["manifest_digest"] != manifest_digest
+        ):
+            raise ApiError(
+                412,
+                "CANDIDATE_PRECONDITION_FAILED",
+                "candidate version changed; reload before viewing evidence",
+            )
+        try:
+            with self._connect() as connection:
+                return self._evidence_store(connection).get_preview(
+                    evidence_id=evidence_id,
+                    **self._candidate_binding(candidate),
+                )
+        except EvidenceDomainError as error:
+            self._raise_evidence_error(error)
+
+    def transition_candidate(
+        self,
+        candidate_id: str,
+        *,
+        if_match: str,
+        idempotency_key: str,
+        body: Any,
+    ) -> CandidateTransitionResponse:
+        # Resolve scope before entering the append transaction; the version
+        # hook checks it again under the same SQLite write lock as the append.
+        self.get_candidate(candidate_id)
+        try:
+            return self._candidate_store().transition(
+                candidate_id,
+                if_match=if_match,
+                idempotency_key=idempotency_key,
+                body=body,
+            )
+        except CandidateStoreError as error:
+            self._raise_candidate_error(error)
+
+    def _session_summary(
+        self,
+        row: sqlite3.Row,
+        completion_request_json: str | None = None,
+    ) -> dict[str, Any]:
+        scope = self._decode_protocol_object(row["scope_json"])
+        build = self._decode_protocol_object(row["build_identity_json"])
+        manifest_digest = None
+        if completion_request_json is not None:
+            completion_request = self._decode_protocol_object(completion_request_json)
+            manifest_digest = completion_request["capture_manifest"]["manifest_digest"]
         return {
             "session_id": row["session_id"],
+            "organization_id": scope["organization_id"],
+            "project_id": scope["project_id"],
+            "application_id": scope["application_id"],
+            "build_id": build["build_id"],
+            "consent_contract": scope["consent"]["policy_version"],
             "state": row["state"],
             "scope_digest": row["scope_digest"],
             "build_identity_digest": row["build_identity_digest"],
             "created_at": row["created_at"],
             "completed_at": row["completed_at"],
             "completion_id": row["completion_id"],
+            "manifest_digest": manifest_digest,
             "retention": {
+                "policy_version": scope["retention"]["policy_version"],
                 "raw_media_expires_at": row["raw_media_expires_at"],
                 "derived_data_expires_at": row["derived_data_expires_at"],
+                "deletion_status": "active",
             },
         }
 
     def list_sessions(self) -> list[dict[str, Any]]:
         with self._connect() as conn:
-            active = [
-                self._session_summary(row)
-                for row in conn.execute("SELECT * FROM sessions ORDER BY created_at DESC")
+            rows = conn.execute("SELECT * FROM sessions ORDER BY created_at DESC").fetchall()
+            completions = {
+                item["session_id"]: item["request_json"]
+                for item in conn.execute("SELECT session_id,request_json FROM completions")
+            }
+            return [
+                self._session_summary(row, completions.get(row["session_id"]))
+                for row in rows
             ]
-            deleted = [
-                {
-                    "session_id": row["session_id"],
-                    "state": "deleted",
-                    "scope_digest": row["scope_digest"],
-                    "deleted_at": row["deleted_at"],
-                    "tombstone_expires_at": row["expires_at"],
-                }
-                for row in conn.execute("SELECT * FROM tombstones ORDER BY deleted_at DESC")
-            ]
-        return active + deleted
 
     def get_session(self, session_id: str) -> dict[str, Any]:
         _require_id(session_id, "session_id")
@@ -2229,7 +2723,14 @@ class PilotBackend:
                     "state": "deleted",
                     "tombstone": self._decode_protocol_object(bytes(tombstone["response_bytes"])),
                 }
-            result = self._session_summary(row)
+            completion = conn.execute(
+                "SELECT request_json,response_bytes FROM completions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            result = self._session_summary(
+                row,
+                completion["request_json"] if completion is not None else None,
+            )
             result["build_identity"] = self._decode_protocol_object(row["build_identity_json"])
             result["scope"] = self._decode_protocol_object(row["scope_json"])
             result["credentials"] = [
@@ -2247,31 +2748,53 @@ class PilotBackend:
                     "SELECT * FROM credentials WHERE session_id = ? ORDER BY ordinal", (session_id,)
                 )
             ]
-            result["segment_receipts"] = [
+            protocol_segments = [
                 self._decode_protocol_object(bytes(item["response_bytes"]))
                 for item in conn.execute(
                     "SELECT response_bytes FROM segments WHERE session_id = ? ORDER BY sequence",
                     (session_id,),
                 )
             ]
-            result["diagnostic_receipts"] = [
+            result["segment_receipts"] = protocol_segments
+            result["segments"] = [item["runtime_receipt"] for item in protocol_segments]
+            protocol_diagnostics = [
                 self._decode_protocol_object(bytes(item["response_bytes"]))
                 for item in conn.execute(
                     "SELECT response_bytes FROM diagnostics WHERE session_id = ? ORDER BY upload_id",
                     (session_id,),
                 )
             ]
-            completion = conn.execute(
-                "SELECT response_bytes FROM completions WHERE session_id = ?", (session_id,)
-            ).fetchone()
+            result["diagnostic_receipts"] = protocol_diagnostics
+            result["diagnostics"] = [
+                {
+                    "envelope_id": item["envelope_id"],
+                    "size_bytes": item["size_bytes"],
+                    "content_digest": item["transport_digest"],
+                    "envelope_digest": item["envelope_digest"],
+                    "received_at": item["received_at"],
+                }
+                for item in protocol_diagnostics
+            ]
             result["completion_receipt"] = (
                 self._decode_protocol_object(bytes(completion["response_bytes"])) if completion else None
             )
-            result["jobs"] = [
+            full_jobs = [
                 self._decode_protocol_object(item["job_json"])
                 for item in conn.execute(
                     "SELECT job_json FROM jobs WHERE session_id = ? ORDER BY requested_at", (session_id,)
                 )
+            ]
+            result["jobs"] = [
+                {
+                    "job_id": job["job_id"],
+                    "job_type": "process_session",
+                    "status": job["status"],
+                    "requested_at": job["requested_at"],
+                    "started_at": job["started_at"],
+                    "completed_at": job["completed_at"],
+                    "failure_code": job["failure"]["code"] if job["failure"] else None,
+                }
+                for job in full_jobs
             ]
             return result
 

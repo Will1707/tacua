@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import base64
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from email.message import Message
@@ -30,6 +31,7 @@ from tacua_backend.config import (  # noqa: E402
     load_config,
     normalize_backend_origin,
 )
+from tacua_backend.candidate_domain import TICKET_CONTRACT  # noqa: E402
 from tacua_backend.contracts import (  # noqa: E402
     PROTOCOL_VERSION,
     canonical_json,
@@ -40,6 +42,14 @@ from tacua_backend.contracts import (  # noqa: E402
     validate_operation_pair,
 )
 from tacua_backend.http_api import PilotRequestHandler, create_server  # noqa: E402
+from tacua_backend.evidence_domain import (  # noqa: E402
+    ITEM_VERSION,
+    MANIFEST_MEDIA_TYPE,
+    MANIFEST_VERSION,
+    seal_item,
+    seal_manifest,
+    sha256_digest,
+)
 from tacua_backend.service import (  # noqa: E402
     ApiError,
     InvalidJSONValue,
@@ -381,8 +391,302 @@ class BackendHarness(unittest.TestCase):
             "completion_bytes": completion_bytes,
         }
 
+    @staticmethod
+    def _replace_evidence_ids(value: object, replacements: dict[str, str]) -> object:
+        if isinstance(value, str):
+            return replacements.get(value, value)
+        if isinstance(value, list):
+            return [BackendHarness._replace_evidence_ids(item, replacements) for item in value]
+        if isinstance(value, dict):
+            return {
+                key: BackendHarness._replace_evidence_ids(item, replacements)
+                for key, item in value.items()
+            }
+        return value
+
+    def candidate_bundle(self, session_id: str) -> tuple[dict, dict, list[dict]]:
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+            "YAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+        )
+        identifiers = {
+            "evidence_keyframe_001": "evidence_frame",
+            "evidence_repository_001": "evidence_repository",
+            "evidence_route_001": "evidence_route",
+            "evidence_transcript_001": "evidence_transcript",
+        }
+        ticket_path = (
+            REPOSITORY
+            / "contracts"
+            / "ticket-candidate"
+            / "fixtures"
+            / "positive"
+            / "version-1-draft.json"
+        )
+        candidate = self._replace_evidence_ids(
+            json.loads(ticket_path.read_text(encoding="utf-8")), identifiers
+        )
+        assert isinstance(candidate, dict)
+        candidate.update(
+            {
+                "project_id": self.config.project_id,
+                "session_id": session_id,
+                "build_id": self.config.build_id,
+                "build_identity_digest": self.config.build_identity_digest,
+            }
+        )
+
+        specifications = (
+            ("evidence_frame", "media.keyframe", "mobile_sdk", "image/png", 20_000),
+            (
+                "evidence_repository",
+                "repository.commit_snapshot",
+                "repository",
+                "application/vnd.tacua.connector-snapshot+json",
+                None,
+            ),
+            (
+                "evidence_route",
+                "sdk.route_transition",
+                "mobile_sdk",
+                "application/vnd.tacua.sdk-event+json",
+                1_000,
+            ),
+            (
+                "evidence_transcript",
+                "media.transcript_excerpt",
+                "mobile_sdk",
+                "text/plain",
+                19_000,
+            ),
+        )
+        items = []
+        for evidence_id, evidence_type, component, content_type, elapsed_ms in specifications:
+            content = png if evidence_id == "evidence_frame" else evidence_id.encode("utf-8")
+            item = {
+                "contract_version": ITEM_VERSION,
+                "organization_id": self.config.organization_id,
+                "project_id": self.config.project_id,
+                "session_id": session_id,
+                "evidence_id": evidence_id,
+                "evidence_type": evidence_type,
+                "availability": "available",
+                "description": f"Bound reviewer evidence for {evidence_id}.",
+                "time_range": None
+                if elapsed_ms is None
+                else {
+                    "start_ms": elapsed_ms,
+                    "end_ms": elapsed_ms + 500,
+                    "clock": "session_monotonic",
+                },
+                "source": {
+                    "component": component,
+                    "source_id": "repo_mobile" if component == "repository" else "sdk_session",
+                    "snapshot_revision": f"snapshot_{evidence_id}",
+                    "captured_at": "2026-07-21T10:00:20Z",
+                },
+                "reference": {
+                    "locator": {
+                        "scheme": "tacua-evidence",
+                        "organization_id": self.config.organization_id,
+                        "project_id": self.config.project_id,
+                        "evidence_id": evidence_id,
+                        "revision_id": f"revision_{evidence_id}",
+                    },
+                    "content_type": content_type,
+                    "size_bytes": len(content),
+                    "content_digest": sha256_digest(content),
+                },
+                "unavailable": None,
+                "evidence_item_digest": "sha256:" + "0" * 64,
+            }
+            items.append(seal_item(item))
+        manifest = seal_manifest(
+            {
+                "contract_version": MANIFEST_VERSION,
+                "media_type": MANIFEST_MEDIA_TYPE,
+                "organization_id": self.config.organization_id,
+                "project_id": self.config.project_id,
+                "session_id": session_id,
+                "manifest_id": candidate["evidence_manifest"]["manifest_id"],
+                "items": items,
+                "manifest_digest": "sha256:" + "0" * 64,
+            }
+        )
+        candidate["evidence_manifest"] = {
+            "manifest_id": manifest["manifest_id"],
+            "manifest_digest": manifest["manifest_digest"],
+            "evidence_ids": [item["evidence_id"] for item in manifest["items"]],
+        }
+        candidate = TICKET_CONTRACT.seal(candidate)
+        TICKET_CONTRACT.validate_chain([candidate])
+        previews = [
+            {
+                "evidence_id": "evidence_frame",
+                "preview_revision_id": "preview_primary",
+                "content_type": "image/png",
+                "size_bytes": len(png),
+                "content_digest": sha256_digest(png),
+                "body": png,
+            }
+        ]
+        return candidate, manifest, previews
+
+    def candidate_transition_body(
+        self, parent: dict, action: str, **changes: object
+    ) -> dict:
+        body = {
+            "expected_candidate_digest": parent["candidate_digest"],
+            "candidate_version": parent["candidate_version"],
+            "candidate_content_digest": parent["candidate_content_digest"],
+            "evidence_manifest_digest": parent["evidence_manifest"]["manifest_digest"],
+            "action": action,
+            "actor_id": self.config.reviewer_id,
+            "reason": f"reviewer_{action}",
+        }
+        if action == "resolve_clarification":
+            body.update(
+                {
+                    "clarification_id": "clarification_copy_source",
+                    "selected_choice_id": "choice_use_approved",
+                }
+            )
+        body.update(changes)
+        return body
+
 
 class BackendProtocolTests(BackendHarness):
+
+    def test_candidate_review_is_bound_to_verified_screenshot_bytes(self) -> None:
+        lifecycle = self.full_completed_session()
+        session_id = lifecycle["launch_receipt"]["session_id"]
+        candidate, manifest, previews = self.candidate_bundle(session_id)
+        inserted = self.backend.persist_candidate_bundle(
+            candidate=candidate,
+            evidence_manifest=manifest,
+            previews=previews,
+        )
+        self.assertEqual(candidate, inserted)
+        self.assertEqual([candidate], self.backend.list_candidates(session_id))
+
+        view = self.backend.get_candidate_evidence(
+            candidate["candidate_id"],
+            1,
+            candidate_digest=candidate["candidate_digest"],
+            manifest_digest=manifest["manifest_digest"],
+        )
+        self.assertEqual(
+            set(candidate["evidence_manifest"]["evidence_ids"]),
+            {item["evidence_id"] for item in view["items"]},
+        )
+        self.assertTrue(
+            any(event["event_id"] == "event_issue" for event in view["diagnostic_events"])
+        )
+        self.assertTrue(
+            all(
+                set(event["evidence_refs"])
+                <= set(candidate["evidence_manifest"]["evidence_ids"])
+                for event in view["diagnostic_events"]
+            )
+        )
+        preview = self.backend.get_candidate_preview(
+            candidate["candidate_id"],
+            1,
+            "evidence_frame",
+            candidate_digest=candidate["candidate_digest"],
+            manifest_digest=manifest["manifest_digest"],
+        )
+        self.assertEqual(previews[0]["body"], preview["body"])
+
+        resolved_response = self.backend.transition_candidate(
+            candidate["candidate_id"],
+            if_match=candidate["candidate_digest"],
+            idempotency_key="candidate:resolve:one",
+            body=self.candidate_transition_body(candidate, "resolve_clarification"),
+        )
+        resolved = json.loads(resolved_response.body)
+        self.assertEqual("ready_for_review", resolved["state"])
+        self.backend.get_candidate_evidence(
+            resolved["candidate_id"],
+            resolved["candidate_version"],
+            candidate_digest=resolved["candidate_digest"],
+            manifest_digest=manifest["manifest_digest"],
+        )
+
+        approved_response = self.backend.transition_candidate(
+            resolved["candidate_id"],
+            if_match=resolved["candidate_digest"],
+            idempotency_key="candidate:approve:one",
+            body=self.candidate_transition_body(resolved, "approve"),
+        )
+        approved = json.loads(approved_response.body)
+        self.assertEqual("approved", approved["state"])
+        self.assertEqual(3, approved["candidate_version"])
+        self.assertEqual(
+            candidate["evidence_manifest"]["evidence_ids"],
+            approved["approval"]["authorized_evidence_ids"],
+        )
+        self.backend.get_candidate_evidence(
+            approved["candidate_id"],
+            approved["candidate_version"],
+            candidate_digest=approved["candidate_digest"],
+            manifest_digest=manifest["manifest_digest"],
+        )
+
+    def test_candidate_approval_and_deletion_fail_closed(self) -> None:
+        lifecycle = self.full_completed_session()
+        session_id = lifecycle["launch_receipt"]["session_id"]
+        candidate, manifest, previews = self.candidate_bundle(session_id)
+        self.backend.persist_candidate_bundle(
+            candidate=candidate,
+            evidence_manifest=manifest,
+            previews=previews,
+        )
+        resolved_response = self.backend.transition_candidate(
+            candidate["candidate_id"],
+            if_match=candidate["candidate_digest"],
+            idempotency_key="candidate:resolve:tamper",
+            body=self.candidate_transition_body(candidate, "resolve_clarification"),
+        )
+        resolved = json.loads(resolved_response.body)
+        with self.backend._connect() as connection:
+            relative = connection.execute(
+                "SELECT relative_path FROM tacua_evidence_preview_revisions "
+                "WHERE relative_path IS NOT NULL LIMIT 1"
+            ).fetchone()[0]
+        (self.backend.derived_evidence_dir / relative).write_bytes(b"tampered")
+        self.assert_api_error(
+            409,
+            "STORED_PREVIEW_TAMPERED",
+            lambda: self.backend.transition_candidate(
+                resolved["candidate_id"],
+                if_match=resolved["candidate_digest"],
+                idempotency_key="candidate:approve:tamper",
+                body=self.candidate_transition_body(resolved, "approve"),
+            ),
+        )
+        self.assertEqual(2, self.backend.get_candidate(candidate["candidate_id"])["candidate_version"])
+
+        tombstone = self.backend.delete_session(session_id)
+        self.assertEqual("deleted", tombstone["erasure"]["derived_data"])
+        with self.backend._connect() as connection:
+            for table in (
+                "candidate_heads",
+                "candidate_versions",
+                "candidate_operations",
+                "tacua_candidate_evidence_bindings",
+                "tacua_evidence_manifests",
+                "tacua_evidence_items",
+                "tacua_evidence_preview_revisions",
+                "tacua_evidence_file_journal",
+                "tacua_evidence_audit",
+            ):
+                self.assertEqual(
+                    0,
+                    connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0],
+                    table,
+                )
+        self.assertFalse(any(path.is_file() for path in self.backend.derived_evidence_dir.rglob("*")))
 
     def test_launch_exact_replay_persists_no_plaintext_secrets(self) -> None:
         request, receipt, original, grant = self.start_session()
@@ -920,6 +1224,7 @@ class StrictJSONAndConfigTests(unittest.TestCase):
                 "organization_id": scope["organization_id"],
                 "project_id": scope["project_id"],
                 "application_id": scope["application_id"],
+                "reviewer_id": "reviewer_owner",
                 "build_identity": build,
                 "consent_contract": scope["consent"]["policy_version"],
                 "backend_origin": "https://qa.tacua.example",
@@ -1054,6 +1359,102 @@ class HTTPAdapterTests(BackendHarness):
             },
             sent[0][1],
         )
+
+    def test_candidate_routes_preserve_exact_etag_and_evidence_bindings(self) -> None:
+        lifecycle = self.full_completed_session()
+        session_id = lifecycle["launch_receipt"]["session_id"]
+        candidate, manifest, previews = self.candidate_bundle(session_id)
+        self.backend.persist_candidate_bundle(
+            candidate=candidate,
+            evidence_manifest=manifest,
+            previews=previews,
+        )
+        authorization = "Bearer " + self.admin_secret.decode("ascii")
+
+        listed = self.handler(
+            f"/v1/admin/sessions/{session_id}/candidates",
+            authorization=authorization,
+        )
+        list_responses: list[tuple[int, dict]] = []
+        listed._send_json = lambda status, body: list_responses.append((status, body))
+        listed._dispatch()
+        self.assertEqual([candidate], list_responses[0][1]["candidates"])
+
+        def bound_handler(path: str) -> PilotRequestHandler:
+            handler = self.handler(path, authorization=authorization)
+            handler.headers["If-Match"] = f'"{candidate["candidate_digest"]}"'
+            handler.headers["Tacua-Evidence-Manifest-Digest"] = manifest["manifest_digest"]
+            return handler
+
+        evidence = bound_handler(
+            f"/v1/admin/candidates/{candidate['candidate_id']}/versions/1/evidence"
+        )
+        evidence_responses: list[tuple[int, bytes, str, dict[str, str]]] = []
+        evidence._send_bytes = lambda status, payload, content_type="application/json", headers=None: evidence_responses.append(
+            (status, payload, content_type, headers or {})
+        )
+        evidence._dispatch()
+        evidence_body = json.loads(evidence_responses[0][1])
+        self.assertEqual(candidate["candidate_digest"], evidence_body["candidate_digest"])
+        self.assertEqual(
+            f'"{candidate["candidate_digest"]}"',
+            evidence_responses[0][3]["ETag"],
+        )
+
+        preview = bound_handler(
+            f"/v1/admin/candidates/{candidate['candidate_id']}/versions/1/"
+            "evidence/evidence_frame/preview"
+        )
+        preview_responses: list[tuple[int, bytes, str, dict[str, str]]] = []
+        preview._send_bytes = lambda status, payload, content_type="application/json", headers=None: preview_responses.append(
+            (status, payload, content_type, headers or {})
+        )
+        preview._dispatch()
+        self.assertEqual(previews[0]["body"], preview_responses[0][1])
+        self.assertEqual("image/png", preview_responses[0][2])
+        self.assertEqual(
+            previews[0]["content_digest"],
+            preview_responses[0][3]["Tacua-Content-Digest"],
+        )
+
+        transition_body = self.candidate_transition_body(
+            candidate, "resolve_clarification"
+        )
+        transition_bytes = canonical_json(transition_body).encode("utf-8")
+        transition = self.handler(
+            f"/v1/admin/candidates/{candidate['candidate_id']}/transitions",
+            method="POST",
+            authorization=authorization,
+            body=transition_bytes,
+        )
+        transition.headers["Content-Type"] = "application/json"
+        transition.headers["If-Match"] = f'"{candidate["candidate_digest"]}"'
+        transition.headers["Idempotency-Key"] = "candidate:http:resolve"
+        transition_responses: list[tuple[int, bytes, str, dict[str, str]]] = []
+        transition._send_bytes = lambda status, payload, content_type="application/json", headers=None: transition_responses.append(
+            (status, payload, content_type, headers or {})
+        )
+        transition._dispatch()
+        resolved = json.loads(transition_responses[0][1])
+        self.assertEqual("ready_for_review", resolved["state"])
+        self.assertEqual(
+            f'"{resolved["candidate_digest"]}"',
+            transition_responses[0][3]["ETag"],
+        )
+        self.assertEqual(
+            sha256_digest(transition_responses[0][1]),
+            transition_responses[0][3]["Tacua-Body-Digest"],
+        )
+
+        malformed = self.handler(
+            f"/v1/admin/candidates/{candidate['candidate_id']}/versions/1/evidence",
+            authorization=authorization,
+        )
+        malformed.headers["If-Match"] = candidate["candidate_digest"]
+        malformed.headers["Tacua-Evidence-Manifest-Digest"] = manifest["manifest_digest"]
+        with self.assertRaises(ApiError) as captured:
+            malformed._dispatch()
+        self.assertEqual("CANDIDATE_ETAG_INVALID", captured.exception.code)
 
     def test_segment_route_reconstructs_exact_canonical_intent(self) -> None:
         launch_request, launch_receipt, _, _ = self.start_session()

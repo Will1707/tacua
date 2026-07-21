@@ -78,6 +78,7 @@ class PilotConfig:
     consent_contract: str
     backend_origin: str
     state_directory: Path
+    reviewer_id: str = "reviewer_owner"
     listen_host: str = "127.0.0.1"
     listen_port: int = 8080
     launch_code_ttl_seconds: int = 300
@@ -123,6 +124,7 @@ class PilotConfig:
             "organization_id": self.organization_id,
             "project_id": self.project_id,
             "application_id": self.application_id,
+            "reviewer_id": self.reviewer_id,
             "bundle_identifier": self.bundle_identifier,
             "build_id": self.build_id,
             "build_identity_digest": self.build_identity_digest,
@@ -177,6 +179,7 @@ def load_config(config_file: Path, admin_secret_file: Path) -> tuple[PilotConfig
         "organization_id",
         "project_id",
         "application_id",
+        "reviewer_id",
         "build_identity",
         "consent_contract",
         "backend_origin",
@@ -203,6 +206,9 @@ def load_config(config_file: Path, admin_secret_file: Path) -> tuple[PilotConfig
         if not ID_PATTERN.fullmatch(value):
             raise ConfigError(f"{key} does not match the Tacua identifier format")
         ids[key] = value
+    reviewer_id = _required_text(raw, "reviewer_id", 64)
+    if not ID_PATTERN.fullmatch(reviewer_id):
+        raise ConfigError("reviewer_id does not match the Tacua identifier format")
     build_identity = raw.get("build_identity")
     if not isinstance(build_identity, dict):
         raise ConfigError("build_identity must be the full sealed SDK protocol artifact")
@@ -218,6 +224,7 @@ def load_config(config_file: Path, admin_secret_file: Path) -> tuple[PilotConfig
     derived_days = _bounded_int(raw, "derived_retention_days", 30, 1, 30)
     config = PilotConfig(
         **ids,
+        reviewer_id=reviewer_id,
         build_identity=json.loads(_canonical_json(build_identity)),
         consent_contract=_required_text(raw, "consent_contract", 128),
         backend_origin=normalize_backend_origin(_required_text(raw, "backend_origin", 2048)),

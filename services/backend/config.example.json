@@ -2,6 +2,7 @@
   "organization_id": "org_example",
   "project_id": "project_example",
   "application_id": "app_example",
+  "reviewer_id": "reviewer_owner",
   "build_identity": {
     "build_id": "build_example",
     "build_identity_digest": "sha256:82464072551a9837cd953bcca83d3b3235f81b1058ebc99f8c4374e7ec6513c5",

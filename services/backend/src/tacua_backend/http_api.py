@@ -23,6 +23,7 @@ from .service import (
 
 ID = r"[a-z][a-z0-9_-]{2,63}"
 SEQUENCE = r"(?:0|[1-9][0-9]*)"
+VERSION = r"[1-9][0-9]{0,15}"
 
 
 class PilotHTTPServer(ThreadingHTTPServer):
@@ -113,6 +114,31 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
     def _admin(self) -> None:
         self.backend.authenticate_admin(self._bearer())
 
+    def _entity_tag(self) -> str:
+        value = self._single_header("If-Match", "CANDIDATE_ETAG_REQUIRED", 80)
+        match = re.fullmatch(r'"(sha256:[a-f0-9]{64})"', value)
+        if match is None:
+            raise ApiError(
+                400,
+                "CANDIDATE_ETAG_INVALID",
+                "If-Match must contain one quoted Tacua candidate digest",
+            )
+        return match.group(1)
+
+    def _evidence_manifest_digest(self) -> str:
+        value = self._single_header(
+            "Tacua-Evidence-Manifest-Digest",
+            "EVIDENCE_MANIFEST_DIGEST_REQUIRED",
+            80,
+        )
+        if re.fullmatch(r"sha256:[a-f0-9]{64}", value) is None:
+            raise ApiError(
+                400,
+                "EVIDENCE_MANIFEST_DIGEST_INVALID",
+                "Tacua-Evidence-Manifest-Digest is invalid",
+            )
+        return value
+
     def _content_length(self, maximum: int) -> int:
         if self.headers.get("Transfer-Encoding") is not None:
             raise ApiError(400, "TRANSFER_ENCODING_NOT_ALLOWED", "chunked request bodies are not accepted")
@@ -144,12 +170,29 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
         ) as exc:
             raise ApiError(400, "INVALID_JSON", "request body must be strict canonical-compatible JSON") from exc
 
-    def _send_bytes(self, status: int, payload: bytes, content_type: str = "application/json") -> None:
+    def _send_bytes(
+        self,
+        status: int,
+        payload: bytes,
+        content_type: str = "application/json",
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        for name, value in (headers or {}).items():
+            if (
+                re.fullmatch(r"[A-Za-z0-9-]{1,64}", name) is None
+                or not value
+                or len(value) > 512
+                or "\r" in value
+                or "\n" in value
+            ):
+                raise RuntimeError("unsafe internal response header")
+            self.send_header(name, value)
         if self.close_connection:
             self.send_header("Connection", "close")
         self.end_headers()
@@ -296,6 +339,112 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
             self._admin()
             self._send_json(200, {"sessions": self.backend.list_sessions()})
             return
+        admin_session_candidates = re.fullmatch(
+            rf"/v1/admin/sessions/(?P<session_id>{ID})/candidates", path
+        )
+        if admin_session_candidates and self.command == "GET":
+            self._admin()
+            self._send_json(
+                200,
+                {
+                    "candidates": self.backend.list_candidates(
+                        admin_session_candidates.group("session_id")
+                    )
+                },
+            )
+            return
+
+        candidate_preview = re.fullmatch(
+            rf"/v1/admin/candidates/(?P<candidate_id>{ID})/versions/"
+            rf"(?P<version>{VERSION})/evidence/(?P<evidence_id>{ID})/preview",
+            path,
+        )
+        if candidate_preview and self.command == "GET":
+            self._admin()
+            candidate_digest = self._entity_tag()
+            manifest_digest = self._evidence_manifest_digest()
+            preview = self.backend.get_candidate_preview(
+                candidate_preview.group("candidate_id"),
+                int(candidate_preview.group("version")),
+                candidate_preview.group("evidence_id"),
+                candidate_digest=candidate_digest,
+                manifest_digest=manifest_digest,
+            )
+            self._send_bytes(
+                200,
+                preview["body"],
+                preview["content_type"],
+                headers={
+                    "Tacua-Content-Digest": preview["content_digest"],
+                    "Tacua-Candidate-Digest": candidate_digest,
+                    "Tacua-Evidence-Manifest-Digest": manifest_digest,
+                },
+            )
+            return
+
+        candidate_evidence = re.fullmatch(
+            rf"/v1/admin/candidates/(?P<candidate_id>{ID})/versions/"
+            rf"(?P<version>{VERSION})/evidence",
+            path,
+        )
+        if candidate_evidence and self.command == "GET":
+            self._admin()
+            candidate_digest = self._entity_tag()
+            manifest_digest = self._evidence_manifest_digest()
+            evidence = self.backend.get_candidate_evidence(
+                candidate_evidence.group("candidate_id"),
+                int(candidate_evidence.group("version")),
+                candidate_digest=candidate_digest,
+                manifest_digest=manifest_digest,
+            )
+            self._send_bytes(
+                200,
+                canonical_json(evidence).encode("utf-8"),
+                headers={
+                    "ETag": f'"{candidate_digest}"',
+                    "Tacua-Evidence-Manifest-Digest": manifest_digest,
+                },
+            )
+            return
+
+        candidate_transition = re.fullmatch(
+            rf"/v1/admin/candidates/(?P<candidate_id>{ID})/transitions", path
+        )
+        if candidate_transition and self.command == "POST":
+            self._admin()
+            response = self.backend.transition_candidate(
+                candidate_transition.group("candidate_id"),
+                if_match=self._entity_tag(),
+                idempotency_key=self._single_header(
+                    "Idempotency-Key", "IDEMPOTENCY_KEY_REQUIRED"
+                ),
+                body=self._read_json(16_384),
+            )
+            self._send_bytes(
+                response.status,
+                response.body,
+                headers={
+                    "ETag": f'"{response.candidate_digest}"',
+                    "Tacua-Body-Digest": response.body_digest,
+                },
+            )
+            return
+
+        admin_candidate = re.fullmatch(
+            rf"/v1/admin/candidates/(?P<candidate_id>{ID})", path
+        )
+        if admin_candidate and self.command == "GET":
+            self._admin()
+            candidate = self.backend.get_candidate(
+                admin_candidate.group("candidate_id")
+            )
+            self._send_bytes(
+                200,
+                canonical_json(candidate).encode("utf-8"),
+                headers={"ETag": f'"{candidate["candidate_digest"]}"'},
+            )
+            return
+
         admin_session = re.fullmatch(rf"/v1/admin/sessions/(?P<session_id>{ID})", path)
         if admin_session and self.command == "GET":
             self._admin()
