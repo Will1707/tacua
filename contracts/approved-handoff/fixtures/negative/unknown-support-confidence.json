@@ -1,0 +1,19 @@
+{
+  "spdx_license": "Apache-2.0",
+  "case_id": "negative-unknown-support-confidence",
+  "description": "A claim labelled as unsupported cannot carry asserted confidence.",
+  "mutations": [
+    {
+      "operation": "set",
+      "path": ["ticket", "claims", 3, "support"],
+      "value": "unknown"
+    },
+    {
+      "operation": "set",
+      "path": ["ticket", "claims", 3, "confidence"],
+      "value": "medium"
+    }
+  ],
+  "reseal": true,
+  "expected_error": "UNKNOWN_SUPPORT_CONFIDENCE_MISMATCH"
+}

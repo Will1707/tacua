@@ -1,0 +1,19 @@
+{
+  "spdx_license": "Apache-2.0",
+  "case_id": "negative-cross-project-reference",
+  "description": "An evidence item from a different project must be rejected even with valid digests.",
+  "mutations": [
+    {
+      "operation": "set",
+      "path": ["evidence_manifest", "items", 0, "project_id"],
+      "value": "project-foreign-synthetic"
+    },
+    {
+      "operation": "set",
+      "path": ["evidence_manifest", "items", 0, "reference", "locator", "project_id"],
+      "value": "project-foreign-synthetic"
+    }
+  ],
+  "reseal": true,
+  "expected_error": "SCOPE_MISMATCH"
+}

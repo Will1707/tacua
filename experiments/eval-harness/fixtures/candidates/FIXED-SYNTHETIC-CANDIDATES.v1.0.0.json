@@ -1,0 +1,281 @@
+{
+  "contract_version": "tacua.candidate-run@1.0.0",
+  "run_id": "FIXED-SYNTHETIC-CANDIDATES",
+  "run_version": "1.0.0",
+  "corpus": "EVAL-001@1.0.0",
+  "producer": {"kind": "fixed_fixture", "name": "hand_authored_error_fixture", "version": "1.0.0", "network_used": false},
+  "configuration": {
+    "adapter_version": "none-fixed-fixture",
+    "prompt_id": "none-fixed-fixture",
+    "prompt_digest": null,
+    "model_id": "none",
+    "model_version": "none",
+    "parameters": {},
+    "tool_policy_id": "no-tools-no-network@1.0.0",
+    "external_destination": null,
+    "retention_training_settings": "not_applicable_no_model_or_provider"
+  },
+  "sessions": [
+    {"session_id": "SYN-000", "candidates": [], "clarifications": []},
+    {
+      "session_id": "SYN-001",
+      "candidates": [{
+        "candidate_id": "S001-C1",
+        "title": "Address button uses the wrong label",
+        "actual": "The primary button says Save later.",
+        "expected": "It should say Save address.",
+        "assertions": [
+          {"assertion_id": "S001-C1-A1", "kind": "observation", "text": "The primary address button says Save later.", "evidence_refs": ["S001-E1", "S001-E2"]},
+          {"assertion_id": "S001-C1-A2", "kind": "inference", "text": "Commit synthetic-001 introduced the copy regression in AddressButton.tsx.", "evidence_refs": ["S001-E1"]}
+        ],
+        "acceptance_criteria": ["The primary button reads Save address."],
+        "suggested_verification": ["Open the synthetic address screen and inspect the label."],
+        "uncertainty": ["No source diff supports the suspected introducing commit or file."]
+      }],
+      "clarifications": []
+    },
+    {
+      "session_id": "SYN-002",
+      "candidates": [{
+        "candidate_id": "S002-C1",
+        "title": "Review summary styling and copy are incorrect",
+        "actual": "The heading says Results and the disabled Continue button looks enabled.",
+        "expected": "The heading should say Review and disabled Continue should look disabled.",
+        "assertions": [
+          {"assertion_id": "S002-C1-A1", "kind": "observation", "text": "The heading reads Results.", "evidence_refs": ["S002-E1", "S002-E2"]},
+          {"assertion_id": "S002-C1-A2", "kind": "observation", "text": "Continue rejects taps while using an enabled visual style.", "evidence_refs": ["S002-E3", "S002-E4"]}
+        ],
+        "acceptance_criteria": ["Heading reads Review.", "Disabled Continue has the disabled style."],
+        "suggested_verification": ["Open the summary without a selection."],
+        "uncertainty": []
+      }],
+      "clarifications": []
+    },
+    {
+      "session_id": "SYN-003",
+      "candidates": [{
+        "candidate_id": "S003-C1",
+        "title": "Schedule card ignores saved time preference",
+        "actual": "The first card shows 09:00 after 10:00 was saved.",
+        "expected": "The card should show 10:00.",
+        "assertions": [{"assertion_id": "S003-C1-A1", "kind": "observation", "text": "The first card shows 09:00 and the reporter identifies the saved 10:00 preference.", "evidence_refs": ["S003-E1", "S003-E3"]}],
+        "acceptance_criteria": ["The first card reflects the saved time preference."],
+        "suggested_verification": ["Save a time and return to the first card."],
+        "uncertainty": []
+      }],
+      "clarifications": []
+    },
+    {
+      "session_id": "SYN-004",
+      "candidates": [
+        {
+          "candidate_id": "S004-C1",
+          "title": "Archive is missing from the overflow menu",
+          "actual": "Archive is absent.",
+          "expected": "Archive should be available.",
+          "assertions": [{"assertion_id": "S004-C1-A1", "kind": "observation", "text": "Archive is absent from the overflow menu.", "evidence_refs": ["S004-E1", "S004-E2"]}],
+          "acceptance_criteria": ["Archive appears in the overflow menu."],
+          "suggested_verification": ["Open a note and its overflow menu."],
+          "uncertainty": []
+        },
+        {
+          "candidate_id": "S004-C2",
+          "title": "Delete is missing from the overflow menu",
+          "actual": "Delete is absent.",
+          "expected": "Delete should be available.",
+          "assertions": [{"assertion_id": "S004-C2-A1", "kind": "observation", "text": "Delete is absent from the overflow menu.", "evidence_refs": ["S004-E1", "S004-E2"]}],
+          "acceptance_criteria": ["Delete appears in the overflow menu."],
+          "suggested_verification": ["Open a note and its overflow menu."],
+          "uncertainty": []
+        }
+      ],
+      "clarifications": []
+    },
+    {
+      "session_id": "SYN-005",
+      "candidates": [{
+        "candidate_id": "S005-C1",
+        "title": "Temperature card is too large",
+        "actual": "The card is large.",
+        "expected": "The card should be smaller.",
+        "assertions": [
+          {"assertion_id": "S005-C1-A1", "kind": "observation", "text": "A large blue temperature card is visible.", "evidence_refs": ["S005-E1", "S005-E2"]},
+          {"assertion_id": "S005-C1-A2", "kind": "expected_behavior", "text": "The authorized decision is to make the card smaller rather than less bright.", "evidence_refs": ["S005-E1"]}
+        ],
+        "acceptance_criteria": ["The card is smaller."],
+        "suggested_verification": ["Compare the card dimensions."],
+        "uncertainty": []
+      }],
+      "clarifications": []
+    },
+    {
+      "session_id": "SYN-006",
+      "candidates": [{
+        "candidate_id": "S006-C1",
+        "title": "Balance text is truncated",
+        "actual": "The balance ends in an ellipsis after the decimal separator.",
+        "expected": "The full balance should remain readable.",
+        "assertions": [
+          {"assertion_id": "S006-C1-A1", "kind": "observation", "text": "The visual evidence shows truncation after the decimal separator.", "evidence_refs": ["S006-E2"]},
+          {"assertion_id": "S006-C1-A2", "kind": "observation", "text": "VoiceOver also reads the balance incorrectly.", "evidence_refs": ["S006-E1", "S006-E2"]}
+        ],
+        "acceptance_criteria": ["The full balance is readable at the tested size."],
+        "suggested_verification": ["Inspect the balance visually and run a separate accessibility check."],
+        "uncertainty": ["Transcript wording is low confidence; no VoiceOver evidence exists."]
+      }],
+      "clarifications": []
+    },
+    {
+      "session_id": "SYN-007",
+      "candidates": [{
+        "candidate_id": "S007-C1",
+        "title": "Profile save fails",
+        "actual": "Save shows Unable to save profile.",
+        "expected": "A valid profile should save or show actionable validation.",
+        "assertions": [
+          {"assertion_id": "S007-C1-A1", "kind": "observation", "text": "Save produces an Unable to save profile banner.", "evidence_refs": ["S007-E2", "S007-E3"]},
+          {"assertion_id": "S007-C1-A2", "kind": "inference", "text": "The database rejects a duplicate username.", "evidence_refs": ["S007-E1", "S007-E2"]}
+        ],
+        "acceptance_criteria": ["A valid profile saves or a field-specific error is shown."],
+        "suggested_verification": ["Repeat with an approved synthetic value and inspect bounded backend evidence if authorized."],
+        "uncertainty": []
+      }],
+      "clarifications": []
+    },
+    {"session_id": "SYN-008", "candidates": [], "clarifications": []},
+    {
+      "session_id": "SYN-009",
+      "candidates": [{
+        "candidate_id": "S009-C1",
+        "title": "Login is broken",
+        "actual": "Login fails.",
+        "expected": "Login should work.",
+        "assertions": [{"assertion_id": "S009-C1-A1", "kind": "observation", "text": "The recording demonstrates a broken login flow.", "evidence_refs": ["S009-E1", "S009-E2"]}],
+        "acceptance_criteria": ["Login works."],
+        "suggested_verification": ["Run login."],
+        "uncertainty": []
+      }],
+      "clarifications": []
+    },
+    {
+      "session_id": "SYN-010",
+      "candidates": [{
+        "candidate_id": "S010-C1",
+        "title": "Destructive button has the wrong copy",
+        "actual": "The destructive button says Publish.",
+        "expected": "It should say Delete.",
+        "assertions": [{"assertion_id": "S010-C1-A1", "kind": "observation", "text": "The destructive button reads Publish while the reporter expects Delete.", "evidence_refs": ["S010-E1", "S010-E2"]}],
+        "acceptance_criteria": ["The destructive button reads Delete."],
+        "suggested_verification": ["Open the synthetic admin detail."],
+        "uncertainty": []
+      }],
+      "clarifications": []
+    },
+    {
+      "session_id": "SYN-011",
+      "candidates": [{
+        "candidate_id": "S011-C1",
+        "title": "Retry leaves the offline state unchanged",
+        "actual": "Retry leaves the banner and stale content in place.",
+        "expected": "Retry should refresh or show an actionable failure.",
+        "assertions": [{"assertion_id": "S011-C1-A1", "kind": "observation", "text": "After Retry, the Offline banner and stale content remain.", "evidence_refs": ["S011-E1", "S011-E3"]}],
+        "acceptance_criteria": ["Retry visibly retries and refreshes or presents a failure state."],
+        "suggested_verification": ["Exercise Retry against a controlled synthetic 503."],
+        "uncertainty": ["No second request event is available."]
+      }],
+      "clarifications": []
+    },
+    {
+      "session_id": "SYN-012",
+      "candidates": [{
+        "candidate_id": "S012-C1",
+        "title": "Book details navigates to Home",
+        "actual": "Book details opens Home.",
+        "expected": "It should open the selected book detail.",
+        "assertions": [{"assertion_id": "S012-C1-A1", "kind": "observation", "text": "The tap navigates to Home and the frozen source calls navigate('Home').", "evidence_refs": ["S012-E1", "S012-E2", "S012-E3"]}],
+        "acceptance_criteria": ["Book details opens the selected book detail screen."],
+        "suggested_verification": ["Tap Book details in an isolated test build."],
+        "uncertainty": []
+      }],
+      "clarifications": []
+    },
+    {
+      "session_id": "SYN-013",
+      "candidates": [{
+        "candidate_id": "S013-C1",
+        "title": "Save controls do not work",
+        "actual": "Profile Save stays disabled and Payment Save does nothing.",
+        "expected": "Both Save controls should work.",
+        "assertions": [
+          {"assertion_id": "S013-C1-A1", "kind": "observation", "text": "Profile Save remains disabled after valid input.", "evidence_refs": ["S013-E1", "S013-E2"]},
+          {"assertion_id": "S013-C1-A2", "kind": "observation", "text": "Enabled Payment Save produces no response.", "evidence_refs": ["S013-E3", "S013-E4"]}
+        ],
+        "acceptance_criteria": ["Profile Save enables when valid.", "Payment Save submits or shows a failure."],
+        "suggested_verification": ["Test each form independently."],
+        "uncertainty": []
+      }],
+      "clarifications": []
+    },
+    {
+      "session_id": "SYN-014",
+      "candidates": [
+        {
+          "candidate_id": "S014-C1",
+          "title": "Play icon overlaps the episode title",
+          "actual": "The play icon covers title text.",
+          "expected": "The icon and title should not overlap.",
+          "assertions": [{"assertion_id": "S014-C1-A1", "kind": "observation", "text": "The play icon overlaps the title.", "evidence_refs": ["S014-E1", "S014-E2"]}],
+          "acceptance_criteria": ["The icon and title do not overlap."],
+          "suggested_verification": ["Start an episode and inspect the mini-player."],
+          "uncertainty": []
+        },
+        {
+          "candidate_id": "S014-C2",
+          "title": "Mini-player text sits behind play",
+          "actual": "Title text sits behind the play control.",
+          "expected": "Text should remain beside the play control.",
+          "assertions": [{"assertion_id": "S014-C2-A1", "kind": "observation", "text": "The mini-player text sits behind play.", "evidence_refs": ["S014-E2", "S014-E3", "S014-E4"]}],
+          "acceptance_criteria": ["Text remains beside the play control."],
+          "suggested_verification": ["Inspect the same persistent mini-player."],
+          "uncertainty": []
+        }
+      ],
+      "clarifications": []
+    },
+    {
+      "session_id": "SYN-015",
+      "candidates": [{
+        "candidate_id": "S015-C1",
+        "title": "Send remains stuck loading",
+        "actual": "Send remains loading.",
+        "expected": "Send should complete or show a failure.",
+        "assertions": [
+          {"assertion_id": "S015-C1-A1", "kind": "observation", "text": "Send remains in loading through the available window.", "evidence_refs": ["S015-E1", "S015-E2"]},
+          {"assertion_id": "S015-C1-A2", "kind": "inference", "text": "Sentry confirms a backend timeout in POST /messages.", "evidence_refs": ["S015-E3"]}
+        ],
+        "acceptance_criteria": ["Send completes or shows an actionable failure."],
+        "suggested_verification": ["Repeat with bounded backend evidence only if authorized."],
+        "uncertainty": []
+      }],
+      "clarifications": []
+    }
+  ],
+  "adjudications": [
+    {"session_id": "SYN-000", "label_version": 1, "candidate_mappings": [], "assertion_labels": []},
+    {"session_id": "SYN-001", "label_version": 1, "candidate_mappings": [{"candidate_id": "S001-C1", "gold_issue_ids": ["S001-I1"]}], "assertion_labels": [{"assertion_id": "S001-C1-A1", "label": "supported", "reason": "UI and narration support the copy observation."}, {"assertion_id": "S001-C1-A2", "label": "unsupported", "reason": "No source diff or file evidence exists."}]},
+    {"session_id": "SYN-002", "label_version": 1, "candidate_mappings": [{"candidate_id": "S002-C1", "gold_issue_ids": ["S002-I1", "S002-I2"]}], "assertion_labels": [{"assertion_id": "S002-C1-A1", "label": "supported", "reason": "Heading evidence supports it."}, {"assertion_id": "S002-C1-A2", "label": "supported", "reason": "Button evidence supports it."}]},
+    {"session_id": "SYN-003", "label_version": 1, "candidate_mappings": [{"candidate_id": "S003-C1", "gold_issue_ids": ["S003-I1"]}], "assertion_labels": [{"assertion_id": "S003-C1-A1", "label": "supported", "reason": "The delayed reference is explicit."}]},
+    {"session_id": "SYN-004", "label_version": 2, "candidate_mappings": [{"candidate_id": "S004-C1", "gold_issue_ids": ["S004-I1"]}, {"candidate_id": "S004-C2", "gold_issue_ids": []}], "assertion_labels": [{"assertion_id": "S004-C1-A1", "label": "supported", "reason": "Corrected narration and UI agree."}, {"assertion_id": "S004-C2-A1", "label": "invented", "reason": "The reporter retracts Delete and UI shows Delete."}]},
+    {"session_id": "SYN-005", "label_version": 1, "candidate_mappings": [{"candidate_id": "S005-C1", "gold_issue_ids": []}], "assertion_labels": [{"assertion_id": "S005-C1-A1", "label": "supported", "reason": "The card is visibly large."}, {"assertion_id": "S005-C1-A2", "label": "unsupported", "reason": "The reporter has not selected size over brightness."}]},
+    {"session_id": "SYN-006", "label_version": 1, "candidate_mappings": [{"candidate_id": "S006-C1", "gold_issue_ids": ["S006-I1"]}], "assertion_labels": [{"assertion_id": "S006-C1-A1", "label": "supported", "reason": "Visual evidence supports clipping."}, {"assertion_id": "S006-C1-A2", "label": "unsupported", "reason": "No VoiceOver evidence is present."}]},
+    {"session_id": "SYN-007", "label_version": 1, "candidate_mappings": [{"candidate_id": "S007-C1", "gold_issue_ids": ["S007-I1"]}], "assertion_labels": [{"assertion_id": "S007-C1-A1", "label": "supported", "reason": "The error banner is visible."}, {"assertion_id": "S007-C1-A2", "label": "invented", "reason": "The redacted input and absent backend evidence cannot establish this cause."}]},
+    {"session_id": "SYN-008", "label_version": 1, "candidate_mappings": [], "assertion_labels": []},
+    {"session_id": "SYN-009", "label_version": 1, "candidate_mappings": [{"candidate_id": "S009-C1", "gold_issue_ids": []}], "assertion_labels": [{"assertion_id": "S009-C1-A1", "label": "invented", "reason": "No login flow or failure is shown; the assertion repeats hostile speech."}]},
+    {"session_id": "SYN-010", "label_version": 1, "candidate_mappings": [{"candidate_id": "S010-C1", "gold_issue_ids": ["S010-I1"]}], "assertion_labels": [{"assertion_id": "S010-C1-A1", "label": "supported", "reason": "UI and reporter decision support the copy issue."}]},
+    {"session_id": "SYN-011", "label_version": 1, "candidate_mappings": [{"candidate_id": "S011-C1", "gold_issue_ids": ["S011-I1"]}], "assertion_labels": [{"assertion_id": "S011-C1-A1", "label": "supported", "reason": "Post-tap UI supports the observed state."}]},
+    {"session_id": "SYN-012", "label_version": 1, "candidate_mappings": [{"candidate_id": "S012-C1", "gold_issue_ids": ["S012-I1"]}], "assertion_labels": [{"assertion_id": "S012-C1-A1", "label": "supported", "reason": "UI, source snapshot, and narration align."}]},
+    {"session_id": "SYN-013", "label_version": 1, "candidate_mappings": [{"candidate_id": "S013-C1", "gold_issue_ids": ["S013-I1", "S013-I2"]}], "assertion_labels": [{"assertion_id": "S013-C1-A1", "label": "supported", "reason": "Profile evidence supports it."}, {"assertion_id": "S013-C1-A2", "label": "supported", "reason": "Payment evidence supports it."}]},
+    {"session_id": "SYN-014", "label_version": 1, "candidate_mappings": [{"candidate_id": "S014-C1", "gold_issue_ids": ["S014-I1"]}, {"candidate_id": "S014-C2", "gold_issue_ids": ["S014-I1"]}], "assertion_labels": [{"assertion_id": "S014-C1-A1", "label": "supported", "reason": "The first description supports it."}, {"assertion_id": "S014-C2-A1", "label": "supported", "reason": "The later descriptions support the same issue."}]},
+    {"session_id": "SYN-015", "label_version": 1, "candidate_mappings": [{"candidate_id": "S015-C1", "gold_issue_ids": ["S015-I1"]}], "assertion_labels": [{"assertion_id": "S015-C1-A1", "label": "supported", "reason": "UI and narration support the stuck state."}, {"assertion_id": "S015-C1-A2", "label": "unsupported", "reason": "Sentry is explicitly unavailable."}]}
+  ]
+}

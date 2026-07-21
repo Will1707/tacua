@@ -1,0 +1,14 @@
+{
+  "spdx_license": "Apache-2.0",
+  "case_id": "negative-tampered-content",
+  "description": "Changing approved ticket content without recomputing approval digests is tampering.",
+  "mutations": [
+    {
+      "operation": "set",
+      "path": ["ticket", "title"],
+      "value": "Tampered title"
+    }
+  ],
+  "reseal": false,
+  "expected_error": "DIGEST_MISMATCH"
+}

@@ -1,0 +1,54 @@
+{
+  "contract_version": "tacua.handoff-concept@1.0.0",
+  "handoff_id": "HANDOFF-SYN-001",
+  "status": "synthetic_concept_fixture",
+  "build_identity": {
+    "app": "Sample Mobile App",
+    "platform": "iOS",
+    "version": "1.0.0-synthetic",
+    "commit": "synthetic-001"
+  },
+  "title": "Address button uses the wrong label",
+  "observed_facts": [
+    {
+      "fact_id": "F1",
+      "text": "The primary button on the address screen reads Save later.",
+      "provenance_refs": ["S001-E1", "S001-E2"]
+    }
+  ],
+  "expected_behavior": [
+    {
+      "decision_id": "D1",
+      "text": "The primary button should read Save address.",
+      "decision_source": "synthetic_gold_fixture_not_human_approved"
+    }
+  ],
+  "inferences": [],
+  "unknowns": [
+    "The production component/file is unknown.",
+    "No introducing commit or source diff has been established."
+  ],
+  "provenance": [
+    {"evidence_id": "S001-E1", "kind": "ui", "window_ms": [1000, 4500], "trust": "untrusted_evidence"},
+    {"evidence_id": "S001-E2", "kind": "speech", "window_ms": [2300, 5100], "trust": "untrusted_evidence"}
+  ],
+  "reproduction_steps": [
+    "Launch the authorized synthetic build.",
+    "Open the address screen.",
+    "Inspect the primary button label."
+  ],
+  "acceptance_criteria": [
+    "The primary address button reads Save address.",
+    "No unrelated button copy changes in the same isolated test surface."
+  ],
+  "suggested_verification": [
+    "Run the declared address-screen UI check in an isolated worktree.",
+    "Inspect the address screen in an isolated iOS test build."
+  ],
+  "authority": {
+    "repository_access": "read_only_until_isolated_trial",
+    "external_writes": false,
+    "merge": false,
+    "deploy": false
+  }
+}

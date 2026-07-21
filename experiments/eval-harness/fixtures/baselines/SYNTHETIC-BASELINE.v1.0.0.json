@@ -1,0 +1,30 @@
+{
+  "aggregate": {
+    "candidates": 16,
+    "correct_no_issue_sessions": 1,
+    "extra_candidates": 3,
+    "gold_issues": 16,
+    "invented_assertions": 3,
+    "merged_candidates": 2,
+    "missed_gold_issues": 2,
+    "no_issue_sessions": 3,
+    "sessions": 16,
+    "split_excess_candidates": 1,
+    "unnecessarily_split_gold_issues": 1,
+    "unsupported_assertions": 4
+  },
+  "candidate_run": "FIXED-SYNTHETIC-CANDIDATES@1.0.0",
+  "contract_version": "tacua.synthetic-baseline@1.0.0",
+  "corpus": "EVAL-001@1.0.0",
+  "error_instances": {
+    "extra_candidate_ids": ["S004-C2", "S005-C1", "S009-C1"],
+    "invented_assertion_ids": ["S004-C2-A1", "S007-C1-A2", "S009-C1-A1"],
+    "merged_candidate_ids": ["S002-C1", "S013-C1"],
+    "missed_gold_issue_ids": ["S002-I3", "S008-I1"],
+    "split_gold_issue_ids": ["S014-I1"],
+    "unsupported_assertion_ids": ["S001-C1-A2", "S005-C1-A2", "S006-C1-A2", "S015-C1-A2"]
+  },
+  "evaluator": "tacua-evaluator@1.0.0",
+  "status": "synthetic_fixture_regression_only",
+  "threshold_disposition": "blocked_pending_real_sessions_human_labels_and_owner_approval"
+}

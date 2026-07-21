@@ -1,0 +1,23 @@
+{
+  "schemaVersion": "tacua.deletion-graph/v1alpha1",
+  "rootId": "session-alpha-001",
+  "nodes": [
+    { "id": "session-alpha-001", "kind": "session", "dataClass": "DATA-005", "governed": true, "deletionMode": "delete", "children": ["raw-video-001", "raw-audio-001", "transcript-001", "keyframe-001", "prompt-001", "ticket-ref-001", "audit-001", "backup-001", "provider-copy-001"] },
+    { "id": "raw-video-001", "kind": "raw_media", "dataClass": "DATA-001", "governed": true, "deletionMode": "delete", "children": ["cache-video-001"] },
+    { "id": "raw-audio-001", "kind": "raw_media", "dataClass": "DATA-002", "governed": true, "deletionMode": "delete", "children": [] },
+    { "id": "transcript-001", "kind": "transcript", "dataClass": "DATA-003", "governed": true, "deletionMode": "delete", "children": [] },
+    { "id": "keyframe-001", "kind": "keyframe", "dataClass": "DATA-004", "governed": true, "deletionMode": "delete", "children": [] },
+    { "id": "prompt-001", "kind": "model_prompt", "dataClass": "DATA-009", "governed": true, "deletionMode": "delete", "children": ["model-output-001", "model-cache-001"] },
+    { "id": "model-output-001", "kind": "model_output", "dataClass": "DATA-009", "governed": true, "deletionMode": "delete", "children": [] },
+    { "id": "model-cache-001", "kind": "model_cache", "dataClass": "DATA-009", "governed": true, "deletionMode": "delete", "children": [] },
+    { "id": "cache-video-001", "kind": "media_cache", "dataClass": "DATA-004", "governed": true, "deletionMode": "delete", "children": [] },
+    { "id": "ticket-ref-001", "kind": "ticket_evidence_reference", "dataClass": "DATA-010", "governed": true, "deletionMode": "delete", "children": [] },
+    { "id": "audit-001", "kind": "audit_record", "dataClass": "DATA-012", "governed": true, "deletionMode": "tombstone_minimized", "children": [] },
+    { "id": "backup-001", "kind": "backup_copy", "dataClass": "DATA-001", "governed": true, "deletionMode": "external_contract", "children": [] },
+    { "id": "provider-copy-001", "kind": "external_provider_copy", "dataClass": "DATA-008", "governed": true, "deletionMode": "external_contract", "children": [] }
+  ],
+  "scenarios": [
+    { "id": "DELETE-001", "failedNodeIds": [], "expected": { "status": "blocked_external", "localDeleted": 10, "tombstoned": 1, "externalUnverified": 2, "failed": 0 } },
+    { "id": "DELETE-002", "failedNodeIds": ["model-cache-001"], "expected": { "status": "partial_failure", "localDeleted": 9, "tombstoned": 1, "externalUnverified": 2, "failed": 1 } }
+  ]
+}

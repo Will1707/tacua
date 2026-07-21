@@ -1,0 +1,48 @@
+name: Feature or design proposal
+description: Propose a scoped product, architecture, SDK, or self-hosting change
+title: "[Proposal]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please describe the problem before prescribing an implementation. Large or compatibility-breaking proposals may need a foundation experiment or ADR before code.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and affected user
+      description: What concrete problem exists, who experiences it, and what evidence supports it?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe the observable result without assuming a particular technology.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+      description: Outline the smallest useful approach, alternatives considered, and important trade-offs.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and compatibility
+      description: Identify affected mobile platforms, SDK/backend interfaces, deployment paths, migrations, and deliberate exclusions.
+  - type: textarea
+    id: privacy
+    attributes:
+      label: Privacy, security, and self-hosting impact
+      description: Describe new data, egress, permissions, dependencies, operator burden, or write authority. Write "No change" when applicable.
+    validations:
+      required: true
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Public-report hygiene
+      options:
+        - label: This proposal contains no credentials, private source, personal data, production telemetry, or undisclosed vulnerability details.
+          required: true

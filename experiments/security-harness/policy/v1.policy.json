@@ -1,0 +1,391 @@
+{
+  "schemaVersion": "tacua.egress-policy/v1alpha1",
+  "policyVersion": "tacua.egress/v1alpha1",
+  "defaultDecision": "deny",
+  "defaultReasonCode": "DEFAULT_DENY",
+  "organizationMode": "single_organization_per_deployment",
+  "rawMediaRetentionDays": 30,
+  "allowedOperations": [
+    "collect",
+    "persist",
+    "retrieve",
+    "prompt-build",
+    "tool-call",
+    "render-export",
+    "authorize",
+    "retain",
+    "delete"
+  ],
+  "destinations": [
+    { "id": "device_local", "recipient": "tested-app SDK encrypted local queue", "boundary": "device" },
+    { "id": "ingest_store", "recipient": "self-hosted ingest/object/database boundary", "boundary": "backend" },
+    { "id": "processing_worker", "recipient": "project-scoped asynchronous worker", "boundary": "backend" },
+    { "id": "connector_broker", "recipient": "read-only project-scoped connector broker", "boundary": "connector" },
+    { "id": "local_model", "recipient": "operator-configured local model adapter", "boundary": "model" },
+    { "id": "external_model", "recipient": "explicitly configured external model provider", "boundary": "external" },
+    { "id": "reviewer_ui", "recipient": "authorized Tacua project reviewer", "boundary": "review" },
+    { "id": "approved_handoff", "recipient": "authorized coding-agent/developer consumer", "boundary": "export" },
+    { "id": "audit_log", "recipient": "append-only minimized audit store", "boundary": "audit" },
+    { "id": "backup", "recipient": "operator-controlled backup boundary", "boundary": "backup" },
+    { "id": "secret_boundary", "recipient": "backend-only secret manager boundary", "boundary": "secret" }
+  ],
+  "reasonCodes": {
+    "DEFAULT_DENY": "No documented allow rule exists.",
+    "UNKNOWN_DATA_CLASS": "The data class is not registered.",
+    "UNKNOWN_FIELD": "The field is not registered for the data class.",
+    "UNKNOWN_DESTINATION": "The destination is not registered.",
+    "UNKNOWN_OPERATION": "The operation is not registered.",
+    "OPERATION_NOT_ALLOWED": "The rule does not permit this operation.",
+    "MISSING_PROVENANCE": "An allowed boundary requires complete immutable provenance.",
+    "APPROVAL_REQUIRED": "The rule requires an immutable project/reviewer approval.",
+    "APPROVAL_SCOPE_MISMATCH": "The approval does not match the project, field, destination, or policy version.",
+    "TRANSFORMATION_REQUIRED": "The rule requires an irreversible deterministic transformation.",
+    "PROVIDER_NOT_REGISTERED": "An app-owned evidence field requires a registered schema-defined provider.",
+    "METADATA_PAYLOAD_REJECTED": "A metadata/reference-only rule rejected content payload material.",
+    "METADATA_ONLY": "Only a content-free identifier, digest, or bounded reference may cross.",
+    "POLICY_ALLOW_TRANSFORMED": "The registered field may cross only after deterministic irreversible transformation.",
+    "POLICY_ALLOW_APPROVED": "The registered field may cross with immutable project/reviewer approval and required transformation.",
+    "POLICY_DENY_PROHIBITED": "The field is prohibited at this destination.",
+    "SECRET_BOUNDARY_ONLY": "Secret material is confined to the backend secret boundary.",
+    "AUTHORIZED_METADATA": "The registered metadata/reference is allowed with provenance.",
+    "DELETE_GOVERNED": "The governed artifact is eligible for lineage deletion.",
+    "DELETE_EXTERNAL_UNVERIFIED": "Backup/provider deletion requires a runtime contract and remains unverified."
+  },
+  "dataClasses": [
+    {
+      "id": "DATA-001",
+      "name": "tested-app screen video",
+      "fields": [
+        {
+          "path": "raw_media",
+          "classification": "high_content",
+          "rules": {
+            "device_local": { "decision": "require_explicit_project_reviewer_approval", "operations": ["collect", "persist", "retrieve", "retain", "delete"], "transform": "media_policy_filter" },
+            "ingest_store": { "decision": "require_explicit_project_reviewer_approval", "operations": ["persist", "retrieve", "retain", "delete"], "transform": "media_policy_filter" },
+            "processing_worker": { "decision": "allow_after_irreversible_transformation", "operations": ["retrieve"], "transform": "approved_window_redaction" },
+            "local_model": { "decision": "allow_after_irreversible_transformation", "operations": ["prompt-build"], "transform": "approved_window_redaction" },
+            "external_model": { "decision": "require_explicit_project_reviewer_approval", "operations": ["prompt-build"], "transform": "approved_window_redaction" },
+            "reviewer_ui": { "decision": "require_explicit_project_reviewer_approval", "operations": ["retrieve"], "transform": "authorized_media_view" }
+          }
+        },
+        {
+          "path": "digest",
+          "classification": "metadata_reference",
+          "rules": {
+            "device_local": { "decision": "allow_metadata_reference_only", "operations": ["collect", "persist", "retrieve", "delete"] },
+            "ingest_store": { "decision": "allow_metadata_reference_only", "operations": ["persist", "retrieve", "retain", "delete"] },
+            "processing_worker": { "decision": "allow_metadata_reference_only", "operations": ["retrieve"] },
+            "reviewer_ui": { "decision": "allow_metadata_reference_only", "operations": ["retrieve"] },
+            "approved_handoff": { "decision": "allow_metadata_reference_only", "operations": ["render-export"] },
+            "audit_log": { "decision": "allow_metadata_reference_only", "operations": ["persist", "retain", "delete"] }
+          }
+        }
+      ]
+    },
+    {
+      "id": "DATA-002",
+      "name": "microphone narration and supported app audio",
+      "fields": [
+        {
+          "path": "raw_audio",
+          "classification": "high_content",
+          "rules": {
+            "device_local": { "decision": "require_explicit_project_reviewer_approval", "operations": ["collect", "persist", "retrieve", "retain", "delete"], "transform": "audio_policy_filter" },
+            "ingest_store": { "decision": "require_explicit_project_reviewer_approval", "operations": ["persist", "retrieve", "retain", "delete"], "transform": "audio_policy_filter" },
+            "processing_worker": { "decision": "allow_after_irreversible_transformation", "operations": ["retrieve"], "transform": "approved_audio_window" },
+            "local_model": { "decision": "allow_after_irreversible_transformation", "operations": ["prompt-build"], "transform": "approved_audio_window" },
+            "external_model": { "decision": "require_explicit_project_reviewer_approval", "operations": ["prompt-build"], "transform": "approved_audio_window" },
+            "reviewer_ui": { "decision": "require_explicit_project_reviewer_approval", "operations": ["retrieve"], "transform": "authorized_audio_view" }
+          }
+        },
+        {
+          "path": "digest",
+          "classification": "metadata_reference",
+          "rules": {
+            "device_local": { "decision": "allow_metadata_reference_only", "operations": ["collect", "persist", "retrieve", "delete"] },
+            "ingest_store": { "decision": "allow_metadata_reference_only", "operations": ["persist", "retrieve", "retain", "delete"] },
+            "processing_worker": { "decision": "allow_metadata_reference_only", "operations": ["retrieve"] },
+            "reviewer_ui": { "decision": "allow_metadata_reference_only", "operations": ["retrieve"] },
+            "approved_handoff": { "decision": "allow_metadata_reference_only", "operations": ["render-export"] },
+            "audit_log": { "decision": "allow_metadata_reference_only", "operations": ["persist", "retain", "delete"] }
+          }
+        }
+      ]
+    },
+    {
+      "id": "DATA-003",
+      "name": "transcript, timestamps and corrections",
+      "fields": [
+        {
+          "path": "transcript_text",
+          "classification": "high_content",
+          "rules": {
+            "ingest_store": { "decision": "require_explicit_project_reviewer_approval", "operations": ["persist", "retrieve", "retain", "delete"], "transform": "transcript_redaction" },
+            "processing_worker": { "decision": "allow_after_irreversible_transformation", "operations": ["retrieve"], "transform": "transcript_redaction" },
+            "local_model": { "decision": "allow_after_irreversible_transformation", "operations": ["prompt-build"], "transform": "transcript_redaction" },
+            "external_model": { "decision": "require_explicit_project_reviewer_approval", "operations": ["prompt-build"], "transform": "transcript_redaction" },
+            "reviewer_ui": { "decision": "require_explicit_project_reviewer_approval", "operations": ["retrieve"], "transform": "authorized_transcript_view" },
+            "approved_handoff": { "decision": "require_explicit_project_reviewer_approval", "operations": ["render-export"], "transform": "approved_excerpt_escape" }
+          }
+        },
+        {
+          "path": "timing_metadata",
+          "classification": "metadata_reference",
+          "rules": {
+            "ingest_store": { "decision": "allow_metadata_reference_only", "operations": ["persist", "retrieve", "retain", "delete"] },
+            "processing_worker": { "decision": "allow_metadata_reference_only", "operations": ["retrieve"] },
+            "local_model": { "decision": "allow_metadata_reference_only", "operations": ["prompt-build"] },
+            "external_model": { "decision": "require_explicit_project_reviewer_approval", "operations": ["prompt-build"] },
+            "reviewer_ui": { "decision": "allow_metadata_reference_only", "operations": ["retrieve"] },
+            "approved_handoff": { "decision": "allow_metadata_reference_only", "operations": ["render-export"] },
+            "audit_log": { "decision": "allow_metadata_reference_only", "operations": ["persist", "retain", "delete"] }
+          }
+        }
+      ]
+    },
+    {
+      "id": "DATA-004",
+      "name": "screenshots, keyframes and evidence clips",
+      "fields": [
+        {
+          "path": "evidence_media",
+          "classification": "high_content",
+          "rules": {
+            "ingest_store": { "decision": "require_explicit_project_reviewer_approval", "operations": ["persist", "retrieve", "retain", "delete"], "transform": "evidence_media_redaction" },
+            "processing_worker": { "decision": "allow_after_irreversible_transformation", "operations": ["retrieve"], "transform": "evidence_media_redaction" },
+            "local_model": { "decision": "allow_after_irreversible_transformation", "operations": ["prompt-build"], "transform": "evidence_media_redaction" },
+            "external_model": { "decision": "require_explicit_project_reviewer_approval", "operations": ["prompt-build"], "transform": "evidence_media_redaction" },
+            "reviewer_ui": { "decision": "require_explicit_project_reviewer_approval", "operations": ["retrieve"], "transform": "authorized_evidence_view" }
+          }
+        },
+        {
+          "path": "digest",
+          "classification": "metadata_reference",
+          "rules": {
+            "ingest_store": { "decision": "allow_metadata_reference_only", "operations": ["persist", "retrieve", "retain", "delete"] },
+            "processing_worker": { "decision": "allow_metadata_reference_only", "operations": ["retrieve"] },
+            "reviewer_ui": { "decision": "allow_metadata_reference_only", "operations": ["retrieve"] },
+            "approved_handoff": { "decision": "allow_metadata_reference_only", "operations": ["render-export"] },
+            "audit_log": { "decision": "allow_metadata_reference_only", "operations": ["persist", "retain", "delete"] }
+          }
+        }
+      ]
+    },
+    {
+      "id": "DATA-005",
+      "name": "core SDK diagnostic timeline",
+      "fields": [
+        {
+          "path": "event_metadata",
+          "classification": "metadata_reference",
+          "rules": {
+            "device_local": { "decision": "allow_metadata_reference_only", "operations": ["collect", "persist", "retrieve", "delete"] },
+            "ingest_store": { "decision": "allow_metadata_reference_only", "operations": ["persist", "retrieve", "retain", "delete"] },
+            "processing_worker": { "decision": "allow_metadata_reference_only", "operations": ["retrieve"] },
+            "local_model": { "decision": "allow_metadata_reference_only", "operations": ["prompt-build"] },
+            "external_model": { "decision": "require_explicit_project_reviewer_approval", "operations": ["prompt-build"], "transform": "diagnostic_metadata_minimization" },
+            "reviewer_ui": { "decision": "allow_metadata_reference_only", "operations": ["retrieve"] },
+            "approved_handoff": { "decision": "allow_metadata_reference_only", "operations": ["render-export"] },
+            "audit_log": { "decision": "allow_metadata_reference_only", "operations": ["persist", "retain", "delete"] }
+          }
+        },
+        {
+          "path": "raw_payload",
+          "classification": "prohibited_raw_payload",
+          "rules": {}
+        }
+      ]
+    },
+    {
+      "id": "DATA-006",
+      "name": "explicit app-owned evidence-provider values",
+      "fields": [
+        {
+          "path": "allowlisted_value",
+          "classification": "provider_declared_content",
+          "rules": {
+            "device_local": { "decision": "require_explicit_project_reviewer_approval", "operations": ["collect", "persist", "retrieve", "delete"], "transform": "provider_declared_redaction" },
+            "ingest_store": { "decision": "require_explicit_project_reviewer_approval", "operations": ["persist", "retrieve", "retain", "delete"], "transform": "provider_declared_redaction" },
+            "processing_worker": { "decision": "allow_after_irreversible_transformation", "operations": ["retrieve"], "transform": "provider_declared_redaction" },
+            "local_model": { "decision": "allow_after_irreversible_transformation", "operations": ["prompt-build"], "transform": "provider_declared_redaction" },
+            "external_model": { "decision": "require_explicit_project_reviewer_approval", "operations": ["prompt-build"], "transform": "provider_declared_redaction" },
+            "reviewer_ui": { "decision": "require_explicit_project_reviewer_approval", "operations": ["retrieve"], "transform": "authorized_provider_view" }
+          }
+        },
+        {
+          "path": "provider_schema",
+          "classification": "metadata_reference",
+          "rules": {
+            "device_local": { "decision": "allow_metadata_reference_only", "operations": ["collect", "persist", "retrieve", "delete"] },
+            "ingest_store": { "decision": "allow_metadata_reference_only", "operations": ["persist", "retrieve", "retain", "delete"] },
+            "processing_worker": { "decision": "allow_metadata_reference_only", "operations": ["retrieve"] },
+            "local_model": { "decision": "allow_metadata_reference_only", "operations": ["prompt-build"] },
+            "external_model": { "decision": "require_explicit_project_reviewer_approval", "operations": ["prompt-build"] },
+            "reviewer_ui": { "decision": "allow_metadata_reference_only", "operations": ["retrieve"] },
+            "approved_handoff": { "decision": "allow_metadata_reference_only", "operations": ["render-export"] },
+            "audit_log": { "decision": "allow_metadata_reference_only", "operations": ["persist", "retain", "delete"] }
+          }
+        }
+      ]
+    },
+    {
+      "id": "DATA-007",
+      "name": "source, build and repository evidence",
+      "fields": [
+        {
+          "path": "source_content",
+          "classification": "confidential_content",
+          "rules": {
+            "processing_worker": { "decision": "allow_after_irreversible_transformation", "operations": ["retrieve"], "transform": "source_secret_redaction" },
+            "local_model": { "decision": "allow_after_irreversible_transformation", "operations": ["prompt-build"], "transform": "source_secret_redaction" },
+            "external_model": { "decision": "require_explicit_project_reviewer_approval", "operations": ["prompt-build"], "transform": "source_secret_redaction" },
+            "reviewer_ui": { "decision": "require_explicit_project_reviewer_approval", "operations": ["retrieve"], "transform": "bounded_source_excerpt" }
+          }
+        },
+        {
+          "path": "source_reference",
+          "classification": "metadata_reference",
+          "rules": {
+            "ingest_store": { "decision": "allow_metadata_reference_only", "operations": ["persist", "retrieve", "retain", "delete"] },
+            "processing_worker": { "decision": "allow_metadata_reference_only", "operations": ["retrieve"] },
+            "connector_broker": { "decision": "allow_metadata_reference_only", "operations": ["tool-call"] },
+            "local_model": { "decision": "allow_metadata_reference_only", "operations": ["prompt-build"] },
+            "external_model": { "decision": "require_explicit_project_reviewer_approval", "operations": ["prompt-build"] },
+            "reviewer_ui": { "decision": "allow_metadata_reference_only", "operations": ["retrieve"] },
+            "approved_handoff": { "decision": "allow_metadata_reference_only", "operations": ["render-export"] },
+            "audit_log": { "decision": "allow_metadata_reference_only", "operations": ["persist", "retain", "delete"] }
+          }
+        }
+      ]
+    },
+    {
+      "id": "DATA-008",
+      "name": "observability connector evidence",
+      "fields": [
+        {
+          "path": "provider_payload",
+          "classification": "provider_content",
+          "rules": {
+            "processing_worker": { "decision": "allow_after_irreversible_transformation", "operations": ["retrieve"], "transform": "provider_payload_filter" },
+            "local_model": { "decision": "allow_after_irreversible_transformation", "operations": ["prompt-build"], "transform": "provider_payload_filter" },
+            "external_model": { "decision": "require_explicit_project_reviewer_approval", "operations": ["prompt-build"], "transform": "provider_payload_filter" },
+            "reviewer_ui": { "decision": "require_explicit_project_reviewer_approval", "operations": ["retrieve"], "transform": "bounded_provider_excerpt" }
+          }
+        },
+        {
+          "path": "provider_reference",
+          "classification": "metadata_reference",
+          "rules": {
+            "ingest_store": { "decision": "allow_metadata_reference_only", "operations": ["persist", "retrieve", "retain", "delete"] },
+            "processing_worker": { "decision": "allow_metadata_reference_only", "operations": ["retrieve"] },
+            "connector_broker": { "decision": "allow_metadata_reference_only", "operations": ["tool-call"] },
+            "local_model": { "decision": "allow_metadata_reference_only", "operations": ["prompt-build"] },
+            "external_model": { "decision": "require_explicit_project_reviewer_approval", "operations": ["prompt-build"] },
+            "reviewer_ui": { "decision": "allow_metadata_reference_only", "operations": ["retrieve"] },
+            "approved_handoff": { "decision": "allow_metadata_reference_only", "operations": ["render-export"] },
+            "audit_log": { "decision": "allow_metadata_reference_only", "operations": ["persist", "retain", "delete"] }
+          }
+        }
+      ]
+    },
+    {
+      "id": "DATA-009",
+      "name": "model prompts, outputs and caches",
+      "fields": [
+        {
+          "path": "prompt_content",
+          "classification": "derived_high_content",
+          "rules": {
+            "ingest_store": { "decision": "allow_after_irreversible_transformation", "operations": ["persist", "retrieve", "retain", "delete"], "transform": "prompt_dlp_filter" },
+            "processing_worker": { "decision": "allow_after_irreversible_transformation", "operations": ["retrieve"], "transform": "prompt_dlp_filter" },
+            "local_model": { "decision": "allow_after_irreversible_transformation", "operations": ["prompt-build"], "transform": "prompt_dlp_filter" },
+            "external_model": { "decision": "require_explicit_project_reviewer_approval", "operations": ["prompt-build"], "transform": "prompt_dlp_filter" }
+          }
+        },
+        {
+          "path": "task_metadata",
+          "classification": "metadata_reference",
+          "rules": {
+            "ingest_store": { "decision": "allow_metadata_reference_only", "operations": ["persist", "retrieve", "retain", "delete"] },
+            "processing_worker": { "decision": "allow_metadata_reference_only", "operations": ["retrieve"] },
+            "local_model": { "decision": "allow_metadata_reference_only", "operations": ["prompt-build"] },
+            "external_model": { "decision": "require_explicit_project_reviewer_approval", "operations": ["prompt-build"] },
+            "audit_log": { "decision": "allow_metadata_reference_only", "operations": ["persist", "retain", "delete"] }
+          }
+        }
+      ]
+    },
+    {
+      "id": "DATA-010",
+      "name": "candidate, ticket, approval and handoff",
+      "fields": [
+        {
+          "path": "ticket_text",
+          "classification": "confidential_content",
+          "rules": {
+            "ingest_store": { "decision": "allow_after_irreversible_transformation", "operations": ["persist", "retrieve", "retain", "delete"], "transform": "ticket_dlp_filter" },
+            "processing_worker": { "decision": "allow_after_irreversible_transformation", "operations": ["retrieve"], "transform": "ticket_dlp_filter" },
+            "local_model": { "decision": "allow_after_irreversible_transformation", "operations": ["prompt-build"], "transform": "ticket_dlp_filter" },
+            "external_model": { "decision": "require_explicit_project_reviewer_approval", "operations": ["prompt-build"], "transform": "ticket_dlp_filter" },
+            "reviewer_ui": { "decision": "require_explicit_project_reviewer_approval", "operations": ["retrieve"], "transform": "authorized_ticket_view" },
+            "approved_handoff": { "decision": "require_explicit_project_reviewer_approval", "operations": ["render-export"], "transform": "deterministic_export_escape" }
+          }
+        },
+        {
+          "path": "evidence_reference",
+          "classification": "metadata_reference",
+          "rules": {
+            "ingest_store": { "decision": "allow_metadata_reference_only", "operations": ["persist", "retrieve", "retain", "delete"] },
+            "processing_worker": { "decision": "allow_metadata_reference_only", "operations": ["retrieve"] },
+            "reviewer_ui": { "decision": "allow_metadata_reference_only", "operations": ["retrieve"] },
+            "approved_handoff": { "decision": "allow_metadata_reference_only", "operations": ["render-export"] },
+            "audit_log": { "decision": "allow_metadata_reference_only", "operations": ["persist", "retain", "delete"] }
+          }
+        }
+      ]
+    },
+    {
+      "id": "DATA-011",
+      "name": "connector, model, signing and encryption credentials",
+      "fields": [
+        {
+          "path": "secret_value",
+          "classification": "critical_secret",
+          "rules": {
+            "secret_boundary": { "decision": "require_explicit_project_reviewer_approval", "operations": ["persist", "retrieve", "retain", "delete"], "transform": "secret_manager_envelope" }
+          }
+        },
+        {
+          "path": "secret_id",
+          "classification": "metadata_reference",
+          "rules": {
+            "connector_broker": { "decision": "allow_metadata_reference_only", "operations": ["tool-call"] },
+            "audit_log": { "decision": "allow_metadata_reference_only", "operations": ["persist", "retain", "delete"] },
+            "secret_boundary": { "decision": "allow_metadata_reference_only", "operations": ["persist", "retrieve", "retain", "delete"] }
+          }
+        }
+      ]
+    },
+    {
+      "id": "DATA-012",
+      "name": "audit and operational metadata",
+      "fields": [
+        {
+          "path": "audit_metadata",
+          "classification": "metadata_reference",
+          "rules": {
+            "ingest_store": { "decision": "allow_metadata_reference_only", "operations": ["persist", "retrieve", "retain", "delete"] },
+            "processing_worker": { "decision": "allow_metadata_reference_only", "operations": ["retrieve"] },
+            "reviewer_ui": { "decision": "allow_metadata_reference_only", "operations": ["retrieve"] },
+            "audit_log": { "decision": "allow_metadata_reference_only", "operations": ["persist", "retrieve", "retain", "delete"] }
+          }
+        },
+        {
+          "path": "content_payload",
+          "classification": "prohibited_audit_content",
+          "rules": {}
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "schemaVersion": "tacua.synthetic-canaries/v1alpha1",
+  "notice": "Every value is deterministic, synthetic, non-authenticating, and reserved for offline tests.",
+  "canaries": [
+    { "id": "CANARY-CREDENTIAL-API", "category": "credential", "prohibitions": ["PROHIB-001"], "mustNotEgress": true, "value": "TACUA_SYNTHETIC_DO_NOT_USE_CREDENTIAL_API_ALPHA_0001" },
+    { "id": "CANARY-AUTH-TOKEN", "category": "auth_token", "prohibitions": ["PROHIB-001"], "mustNotEgress": true, "value": "TACUA_SYNTHETIC_DO_NOT_USE_AUTH_TOKEN_BETA_0002" },
+    { "id": "CANARY-SESSION-TOKEN", "category": "session_token", "prohibitions": ["PROHIB-001"], "mustNotEgress": true, "value": "TACUA_SYNTHETIC_DO_NOT_USE_SESSION_TOKEN_GAMMA_0003" },
+    { "id": "CANARY-COOKIE", "category": "cookie", "prohibitions": ["PROHIB-001"], "mustNotEgress": true, "value": "TACUA_SYNTHETIC_DO_NOT_USE_COOKIE_DELTA_0004" },
+    { "id": "CANARY-PII", "category": "pii", "prohibitions": ["PROHIB-002"], "mustNotEgress": true, "value": "TACUA_SYNTHETIC_PII_PERSON_ALICE_INVALID_0005" },
+    { "id": "CANARY-CONFIDENTIAL-UI", "category": "confidential_ui", "prohibitions": ["PROHIB-002"], "mustNotEgress": true, "value": "TACUA_SYNTHETIC_CONFIDENTIAL_UI_OMEGA_0006" },
+    { "id": "CANARY-TYPED-FIELD", "category": "typed_field", "prohibitions": ["PROHIB-002"], "mustNotEgress": true, "value": "TACUA_SYNTHETIC_TYPED_FIELD_EPSILON_0007" },
+    { "id": "CANARY-CLIPBOARD", "category": "clipboard", "prohibitions": ["PROHIB-002"], "mustNotEgress": true, "value": "TACUA_SYNTHETIC_CLIPBOARD_ZETA_0008" },
+    { "id": "CANARY-NOTIFICATION", "category": "notification", "prohibitions": ["PROHIB-002"], "mustNotEgress": true, "value": "TACUA_SYNTHETIC_NOTIFICATION_ETA_0009" },
+    { "id": "CANARY-URL", "category": "network_url", "prohibitions": ["PROHIB-002"], "mustNotEgress": true, "value": "https://tacua-synthetic.invalid/private/CANARY_URL_0010" },
+    { "id": "CANARY-HEADER", "category": "network_header", "prohibitions": ["PROHIB-001", "PROHIB-002"], "mustNotEgress": true, "value": "TACUA_SYNTHETIC_HEADER_AUTH_THETA_0011" },
+    { "id": "CANARY-BODY", "category": "network_body", "prohibitions": ["PROHIB-002"], "mustNotEgress": true, "value": "TACUA_SYNTHETIC_RESPONSE_BODY_IOTA_0012" },
+    { "id": "CANARY-DB-ROW", "category": "database_row", "prohibitions": ["PROHIB-002"], "mustNotEgress": true, "value": "TACUA_SYNTHETIC_DATABASE_ROW_KAPPA_0013" },
+    { "id": "CANARY-SOURCE-SECRET", "category": "source_secret", "prohibitions": ["PROHIB-001"], "mustNotEgress": true, "value": "TACUA_SYNTHETIC_DO_NOT_USE_SOURCE_SECRET_LAMBDA_0014" },
+    { "id": "CANARY-CONNECTOR-OUTPUT", "category": "connector_payload", "prohibitions": ["PROHIB-002"], "mustNotEgress": true, "value": "TACUA_SYNTHETIC_CONNECTOR_RAW_OUTPUT_MU_0015" },
+    { "id": "CANARY-MODEL-CREDENTIAL-REQUEST", "category": "model_instruction", "prohibitions": ["PROHIB-001"], "mustNotEgress": true, "value": "TACUA_SYNTHETIC_MODEL_REQUEST_SECRET_NU_0016" },
+    { "id": "CANARY-PIXEL-INJECTION", "category": "prompt_injection", "prohibitions": ["PROHIB-004"], "mustNotEgress": false, "value": "TACUA_SYNTHETIC_UNTRUSTED_PIXEL_INSTRUCTION_XI_0017" },
+    { "id": "CANARY-SPEECH-INJECTION", "category": "prompt_injection", "prohibitions": ["PROHIB-004"], "mustNotEgress": false, "value": "TACUA_SYNTHETIC_UNTRUSTED_SPEECH_INSTRUCTION_OMICRON_0018" },
+    { "id": "CANARY-SOURCE-INJECTION", "category": "prompt_injection", "prohibitions": ["PROHIB-004"], "mustNotEgress": false, "value": "TACUA_SYNTHETIC_UNTRUSTED_SOURCE_INSTRUCTION_PI_0019" },
+    { "id": "CANARY-MARKDOWN-INJECTION", "category": "markdown_injection", "prohibitions": ["PROHIB-006"], "mustNotEgress": false, "value": "TACUA_SYNTHETIC_MARKDOWN_INJECTION_RHO_0020" },
+    { "id": "CANARY-JSON-INJECTION", "category": "json_injection", "prohibitions": ["PROHIB-006"], "mustNotEgress": false, "value": "TACUA_SYNTHETIC_JSON_INJECTION_SIGMA_0021" },
+    { "id": "CANARY-FILENAME", "category": "filename_metadata", "prohibitions": ["PROHIB-001"], "mustNotEgress": true, "value": "TACUA_SYNTHETIC_DO_NOT_USE_FILENAME_SECRET_TAU_0022" },
+    { "id": "CANARY-CROSS-PROJECT", "category": "cross_project_identifier", "prohibitions": ["PROHIB-006"], "mustNotEgress": true, "value": "project-beta/TACUA_SYNTHETIC_CROSS_PROJECT_UPSILON_0023" },
+    { "id": "CANARY-MALICIOUS-REFERENCE", "category": "evidence_reference", "prohibitions": ["PROHIB-006"], "mustNotEgress": true, "value": "../project-beta/evidence/TACUA_SYNTHETIC_REF_PHI_0024" },
+    { "id": "CANARY-AUDIT-PAYLOAD", "category": "audit_content", "prohibitions": ["PROHIB-001", "PROHIB-002"], "mustNotEgress": true, "value": "TACUA_SYNTHETIC_DO_NOT_USE_AUDIT_PAYLOAD_CHI_0025" }
+  ]
+}

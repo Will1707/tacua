@@ -1,0 +1,19 @@
+{
+  "spdx_license": "Apache-2.0",
+  "case_id": "negative-unapproved-ticket",
+  "description": "Draft ticket state cannot be exported as an approved handoff.",
+  "mutations": [
+    {
+      "operation": "set",
+      "path": ["ticket", "state"],
+      "value": "draft"
+    },
+    {
+      "operation": "set",
+      "path": ["approval", "state"],
+      "value": "draft"
+    }
+  ],
+  "reseal": true,
+  "expected_error": "SCHEMA_CONST"
+}

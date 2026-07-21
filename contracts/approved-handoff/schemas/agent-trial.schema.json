@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tacua.invalid/schemas/approved-handoff/1.0.0/agent-trial.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "Tacua approved-handoff coding-agent trial result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "media_type",
+    "trial_id",
+    "organization_id",
+    "project_id",
+    "ticket_id",
+    "ticket_version",
+    "handoff_digest",
+    "ticket_content_digest",
+    "json_artifact_digest",
+    "markdown_artifact_digest",
+    "registry_assertion_digest",
+    "consumer",
+    "started_at",
+    "completed_at",
+    "result",
+    "agent_questions",
+    "changes",
+    "tests",
+    "evidence_used",
+    "unauthorized_actions",
+    "reporter_intervention",
+    "acceptance",
+    "trial_digest"
+  ],
+  "properties": {
+    "contract_version": { "const": "tacua.agent-trial@1.0.0" },
+    "media_type": { "const": "application/vnd.tacua.agent-trial+json;version=1.0.0" },
+    "trial_id": { "$ref": "#/$defs/id" },
+    "organization_id": { "$ref": "#/$defs/id" },
+    "project_id": { "$ref": "#/$defs/id" },
+    "ticket_id": { "$ref": "#/$defs/id" },
+    "ticket_version": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "handoff_digest": { "$ref": "#/$defs/digest" },
+    "ticket_content_digest": { "$ref": "#/$defs/digest" },
+    "json_artifact_digest": { "$ref": "#/$defs/digest" },
+    "markdown_artifact_digest": { "$ref": "#/$defs/digest" },
+    "registry_assertion_digest": { "$ref": "#/$defs/digest" },
+    "consumer": { "$ref": "#/$defs/consumer" },
+    "started_at": { "$ref": "#/$defs/timestamp" },
+    "completed_at": { "$ref": "#/$defs/timestamp" },
+    "result": { "enum": ["fixed", "partial", "failed", "not_started"] },
+    "agent_questions": {
+      "type": "array",
+      "maxItems": 64,
+      "items": { "$ref": "#/$defs/question" }
+    },
+    "changes": {
+      "type": "array",
+      "maxItems": 256,
+      "items": { "$ref": "#/$defs/change" }
+    },
+    "tests": {
+      "type": "array",
+      "maxItems": 256,
+      "items": { "$ref": "#/$defs/test" }
+    },
+    "evidence_used": {
+      "type": "array",
+      "maxItems": 100,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/id" }
+    },
+    "unauthorized_actions": {
+      "type": "array",
+      "maxItems": 64,
+      "items": { "$ref": "#/$defs/unauthorizedAction" }
+    },
+    "reporter_intervention": { "$ref": "#/$defs/reporterIntervention" },
+    "acceptance": { "$ref": "#/$defs/acceptance" },
+    "trial_digest": { "$ref": "#/$defs/digest" }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{2,63}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "consumer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent_name", "agent_version", "model_id"],
+      "properties": {
+        "agent_name": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "agent_version": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "model_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    },
+    "question": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["question_id", "question", "blocking", "answer_source"],
+      "properties": {
+        "question_id": { "$ref": "#/$defs/id" },
+        "question": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "blocking": { "type": "boolean" },
+        "answer_source": { "enum": ["handoff", "human", "none"] }
+      }
+    },
+    "change": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository_id", "path", "operation"],
+      "properties": {
+        "repository_id": { "$ref": "#/$defs/id" },
+        "path": {
+          "type": "string",
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9._/-]{1,512}$"
+        },
+        "operation": { "enum": ["added", "modified", "deleted"] }
+      }
+    },
+    "test": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["test_id", "command_label", "status"],
+      "properties": {
+        "test_id": { "$ref": "#/$defs/id" },
+        "command_label": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "status": { "enum": ["passed", "failed", "not_run"] }
+      }
+    },
+    "unauthorizedAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action_id", "kind", "blocked"],
+      "properties": {
+        "action_id": { "$ref": "#/$defs/id" },
+        "kind": { "enum": ["external_write", "merge", "deploy", "cross_project_read", "secret_access"] },
+        "blocked": { "const": true }
+      }
+    },
+    "reporterIntervention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["interaction_count", "active_seconds", "questions_answered"],
+      "properties": {
+        "interaction_count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "active_seconds": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "questions_answered": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    },
+    "acceptance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "actor_id", "decided_at", "notes"],
+      "properties": {
+        "status": { "enum": ["accepted", "reopened", "rejected", "pending"] },
+        "actor_id": {
+          "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }]
+        },
+        "decided_at": {
+          "oneOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }]
+        },
+        "notes": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 2048 },
+            { "type": "null" }
+          ]
+        }
+      }
+    }
+  }
+}

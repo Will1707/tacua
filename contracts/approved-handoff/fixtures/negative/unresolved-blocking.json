@@ -1,0 +1,20 @@
+{
+  "spdx_license": "Apache-2.0",
+  "case_id": "negative-unresolved-blocking",
+  "description": "An unresolved blocking clarification prevents executable handoff.",
+  "mutations": [
+    {
+      "operation": "append",
+      "path": ["ticket", "clarifications"],
+      "value": {
+        "clarification_id": "clarification-backend-semantics",
+        "question": "Should the request retry be changed?",
+        "impact": "blocking",
+        "status": "unresolved",
+        "resolution": null
+      }
+    }
+  ],
+  "reseal": true,
+  "expected_error": "UNRESOLVED_BLOCKING_CLARIFICATION"
+}

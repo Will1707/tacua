@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "$id": "https://tacua.invalid/schemas/timing-event/1.0.0",
+  "title": "Tacua active-time event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "study_id", "session_id", "condition", "event_id", "offset_ms", "event_type", "activity_code"],
+  "properties": {
+    "contract_version": {"const": "tacua.timing-event@1.0.0"},
+    "study_id": {"type": "string"},
+    "session_id": {"type": "string"},
+    "condition": {"enum": ["A", "B", "C"]},
+    "event_id": {"type": "string"},
+    "offset_ms": {"type": "integer", "minimum": 0},
+    "event_type": {"enum": ["active_start", "active_stop", "interaction", "correction", "approval", "note"]},
+    "activity_code": {"type": "string"},
+    "candidate_id": {"type": "string"},
+    "issue_id": {"type": "string"},
+    "interaction_kind": {"type": "string"},
+    "evidence_gap": {"type": "string"},
+    "prevented_error": {"enum": ["yes", "no", "unknown"]},
+    "safe_note": {"type": "string"}
+  }
+}

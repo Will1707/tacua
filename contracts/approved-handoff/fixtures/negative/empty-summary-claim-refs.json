@@ -1,0 +1,14 @@
+{
+  "spdx_license": "Apache-2.0",
+  "case_id": "negative-empty-summary-claim-refs",
+  "description": "A summary without explicit claim links is not agent-ready.",
+  "mutations": [
+    {
+      "operation": "set",
+      "path": ["ticket", "summary_claim_refs"],
+      "value": []
+    }
+  ],
+  "reseal": true,
+  "expected_error": "SCHEMA_MIN_ITEMS"
+}

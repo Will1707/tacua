@@ -1,0 +1,7 @@
+{
+  "spdx_license": "Apache-2.0",
+  "case_id": "negative-markdown-mismatch",
+  "description": "Markdown changed independently from JSON is not equivalent.",
+  "markdown_suffix": "\nTampered Markdown.\n",
+  "expected_error": "MARKDOWN_EQUIVALENCE_MISMATCH"
+}

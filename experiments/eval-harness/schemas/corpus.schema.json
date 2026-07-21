@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "$id": "https://tacua.invalid/schemas/eval-corpus/1.0.0",
+  "title": "Tacua synthetic evaluation corpus",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "corpus_id", "corpus_version", "status", "sessions"],
+  "properties": {
+    "contract_version": {"const": "tacua.annotation@1.0.0"},
+    "corpus_id": {"type": "string", "minLength": 1},
+    "corpus_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+    "status": {"enum": ["synthetic_only", "human_confirmed"]},
+    "description": {"type": "string"},
+    "sessions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/session"}
+    }
+  },
+  "$defs": {
+    "buildIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["app", "platform", "version", "commit"],
+      "properties": {
+        "app": {"type": "string"},
+        "platform": {"type": "string"},
+        "version": {"type": "string"},
+        "commit": {"type": "string"}
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evidence_id", "kind", "start_ms", "end_ms", "content", "trust"],
+      "properties": {
+        "evidence_id": {"type": "string"},
+        "kind": {"enum": ["speech", "ui", "log", "source", "gap", "silence"]},
+        "start_ms": {"type": "integer", "minimum": 0},
+        "end_ms": {"type": "integer", "minimum": 0},
+        "content": {"type": "string"},
+        "trust": {"const": "untrusted_evidence"},
+        "redaction": {"enum": ["none", "synthetic_redaction", "missing"]}
+      }
+    },
+    "issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["issue_id", "boundary", "actual", "expected", "reproduction_steps", "evidence_refs", "evidence_gaps", "confidence"],
+      "properties": {
+        "issue_id": {"type": "string"},
+        "boundary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["start_ms", "end_ms"],
+          "properties": {
+            "start_ms": {"type": "integer", "minimum": 0},
+            "end_ms": {"type": "integer", "minimum": 0}
+          }
+        },
+        "actual": {"type": "string", "minLength": 1},
+        "expected": {"type": "string", "minLength": 1},
+        "reproduction_steps": {"type": "array", "items": {"type": "string"}},
+        "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "evidence_gaps": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"enum": ["high", "medium", "low"]}
+      }
+    },
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "title", "families", "synthetic", "build_identity", "metadata", "evidence", "gold", "annotation_history"],
+      "properties": {
+        "session_id": {"type": "string"},
+        "title": {"type": "string"},
+        "families": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "synthetic": {"const": true},
+        "build_identity": {"$ref": "#/$defs/buildIdentity"},
+        "metadata": {
+          "type": "object",
+          "required": ["locale", "accent", "noise", "recording_state", "connector_state"],
+          "properties": {
+            "locale": {"type": "string"},
+            "accent": {"type": "string"},
+            "noise": {"type": "string"},
+            "recording_state": {"type": "string"},
+            "connector_state": {"type": "string"}
+          }
+        },
+        "evidence": {"type": "array", "items": {"$ref": "#/$defs/evidence"}},
+        "gold": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["approval_status", "issues", "clarification_required"],
+          "properties": {
+            "approval_status": {"enum": ["synthetic_only", "human_confirmed"]},
+            "issues": {"type": "array", "items": {"$ref": "#/$defs/issue"}},
+            "clarification_required": {"type": "boolean"},
+            "clarification_target": {"type": "string"}
+          }
+        },
+        "annotation_history": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["version", "actor", "action", "reason"],
+            "properties": {
+              "version": {"type": "integer", "minimum": 1},
+              "actor": {"type": "string"},
+              "action": {"type": "string"},
+              "reason": {"type": "string"}
+            }
+          }
+        }
+      }
+    }
+  }
+}

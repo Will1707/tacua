@@ -1,0 +1,7 @@
+* text=auto eol=lf
+
+*.mov -text
+*.mp4 -text
+*.m4a -text
+*.wav -text
+*.tgz -text

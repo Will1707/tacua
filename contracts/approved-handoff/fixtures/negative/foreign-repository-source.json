@@ -1,0 +1,19 @@
+{
+  "spdx_license": "Apache-2.0",
+  "case_id": "negative-foreign-repository-source",
+  "description": "Repository evidence must match a tested build source and immutable revision.",
+  "mutations": [
+    {
+      "operation": "set",
+      "path": ["evidence_manifest", "items", 3, "source", "source_id"],
+      "value": "repo-foreign-private"
+    },
+    {
+      "operation": "set",
+      "path": ["evidence_manifest", "items", 3, "source", "snapshot_revision"],
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ],
+  "reseal": true,
+  "expected_error": "REPOSITORY_EVIDENCE_SOURCE_MISMATCH"
+}

@@ -1,0 +1,338 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tacua.invalid/schemas/approved-handoff/1.0.0/approved-handoff.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "Tacua approved ticket coding-agent handoff",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "media_type",
+    "organization_id",
+    "project_id",
+    "ticket",
+    "build_identity",
+    "evidence_manifest",
+    "approval",
+    "supersession",
+    "authority",
+    "handoff_digest"
+  ],
+  "properties": {
+    "contract_version": { "const": "tacua.approved-handoff@1.0.0" },
+    "media_type": { "const": "application/vnd.tacua.approved-handoff+json;version=1.0.0" },
+    "organization_id": { "$ref": "#/$defs/id" },
+    "project_id": { "$ref": "#/$defs/id" },
+    "ticket": { "$ref": "#/$defs/ticket" },
+    "build_identity": { "$ref": "build-identity.schema.json" },
+    "evidence_manifest": { "$ref": "evidence-manifest.schema.json" },
+    "approval": { "$ref": "#/$defs/approval" },
+    "supersession": { "$ref": "#/$defs/supersession" },
+    "authority": { "$ref": "#/$defs/authority" },
+    "handoff_digest": { "$ref": "#/$defs/digest" }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{2,63}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "boundedText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "claim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["claim_id", "kind", "support", "confidence", "statement", "evidence_refs"],
+      "properties": {
+        "claim_id": { "$ref": "#/$defs/id" },
+        "kind": { "enum": ["observed", "expected", "diagnosis", "hypothesis", "constraint"] },
+        "support": { "enum": ["direct", "inferred", "unknown"] },
+        "confidence": { "enum": ["high", "medium", "low", "unknown"] },
+        "statement": { "$ref": "#/$defs/boundedText" },
+        "evidence_refs": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        }
+      }
+    },
+    "reproStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["step_id", "action", "claim_refs", "evidence_refs"],
+      "properties": {
+        "step_id": { "$ref": "#/$defs/id" },
+        "action": { "$ref": "#/$defs/boundedText" },
+        "claim_refs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "evidence_refs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        }
+      }
+    },
+    "reproduction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "preconditions",
+        "steps",
+        "observed_result",
+        "expected_result",
+        "observed_claim_refs",
+        "expected_claim_refs",
+        "attempts",
+        "reproductions"
+      ],
+      "properties": {
+        "preconditions": {
+          "type": "array",
+          "maxItems": 32,
+          "items": { "$ref": "#/$defs/boundedText" }
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/reproStep" }
+        },
+        "observed_result": { "$ref": "#/$defs/boundedText" },
+        "expected_result": { "$ref": "#/$defs/boundedText" },
+        "observed_claim_refs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "expected_claim_refs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "attempts": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "reproductions": { "type": "integer", "minimum": 0, "maximum": 1000 }
+      }
+    },
+    "acceptanceCriterion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["criterion_id", "criterion", "verification"],
+      "properties": {
+        "criterion_id": { "$ref": "#/$defs/id" },
+        "criterion": { "$ref": "#/$defs/boundedText" },
+        "verification": { "$ref": "#/$defs/boundedText" }
+      }
+    },
+    "clarification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["clarification_id", "question", "impact", "status", "resolution"],
+      "properties": {
+        "clarification_id": { "$ref": "#/$defs/id" },
+        "question": { "$ref": "#/$defs/boundedText" },
+        "impact": { "enum": ["blocking", "non_blocking"] },
+        "status": { "enum": ["resolved", "unresolved"] },
+        "resolution": {
+          "oneOf": [
+            { "$ref": "#/$defs/boundedText" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "resolved" } } },
+          "then": { "properties": { "resolution": { "$ref": "#/$defs/boundedText" } } }
+        },
+        {
+          "if": { "properties": { "status": { "const": "unresolved" } } },
+          "then": { "properties": { "resolution": { "type": "null" } } }
+        }
+      ]
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["in_scope", "out_of_scope"],
+      "properties": {
+        "in_scope": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/boundedText" }
+        },
+        "out_of_scope": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/boundedText" }
+        }
+      }
+    },
+    "ticket": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ticket_id",
+        "ticket_version",
+        "state",
+        "title",
+        "priority",
+        "summary",
+        "summary_claim_refs",
+        "claims",
+        "reproduction",
+        "scope",
+        "acceptance_criteria",
+        "clarifications",
+        "ticket_content_digest"
+      ],
+      "properties": {
+        "ticket_id": { "$ref": "#/$defs/id" },
+        "ticket_version": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "state": { "const": "approved" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "priority": { "enum": ["P0", "P1", "P2", "P3"] },
+        "summary": { "$ref": "#/$defs/boundedText" },
+        "summary_claim_refs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "claims": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/claim" }
+        },
+        "reproduction": { "$ref": "#/$defs/reproduction" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "acceptance_criteria": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/acceptanceCriterion" }
+        },
+        "clarifications": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/clarification" }
+        },
+        "ticket_content_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "approval_id",
+        "actor_id",
+        "organization_id",
+        "project_id",
+        "ticket_id",
+        "approved_at",
+        "ticket_version",
+        "ticket_content_digest",
+        "immutable"
+      ],
+      "properties": {
+        "state": { "const": "approved" },
+        "approval_id": { "$ref": "#/$defs/id" },
+        "actor_id": { "$ref": "#/$defs/id" },
+        "organization_id": { "$ref": "#/$defs/id" },
+        "project_id": { "$ref": "#/$defs/id" },
+        "ticket_id": { "$ref": "#/$defs/id" },
+        "approved_at": { "$ref": "#/$defs/timestamp" },
+        "ticket_version": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "ticket_content_digest": { "$ref": "#/$defs/digest" },
+        "immutable": { "const": true }
+      }
+    },
+    "supersession": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "supersedes_handoff_digest",
+        "superseded_by_handoff_digest",
+        "checked_at",
+        "registry_revision"
+      ],
+      "properties": {
+        "status": { "enum": ["current", "superseded"] },
+        "supersedes_handoff_digest": {
+          "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }]
+        },
+        "superseded_by_handoff_digest": {
+          "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }]
+        },
+        "checked_at": { "$ref": "#/$defs/timestamp" },
+        "registry_revision": { "$ref": "#/$defs/id" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "current" } } },
+          "then": { "properties": { "superseded_by_handoff_digest": { "type": "null" } } }
+        },
+        {
+          "if": { "properties": { "status": { "const": "superseded" } } },
+          "then": { "properties": { "superseded_by_handoff_digest": { "$ref": "#/$defs/digest" } } }
+        }
+      ]
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "purpose",
+        "allowed_repositories",
+        "read_authorized_evidence",
+        "modify_code",
+        "run_tests",
+        "external_writes",
+        "merge",
+        "deploy"
+      ],
+      "properties": {
+        "purpose": { "const": "implement_approved_ticket" },
+        "allowed_repositories": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "read_authorized_evidence": { "const": true },
+        "modify_code": { "const": true },
+        "run_tests": { "const": true },
+        "external_writes": { "const": false },
+        "merge": { "const": false },
+        "deploy": { "const": false }
+      }
+    }
+  }
+}

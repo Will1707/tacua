@@ -1,0 +1,14 @@
+{
+  "spdx_license": "Apache-2.0",
+  "case_id": "negative-signed-url-value",
+  "description": "An obvious signed object URL must not be exported inside ticket text.",
+  "mutations": [
+    {
+      "operation": "set",
+      "path": ["ticket", "summary"],
+      "value": "Synthetic leak https://objects.example/e?X-Amz-Signature=0123456789abcdef0123456789abcdef"
+    }
+  ],
+  "reseal": true,
+  "expected_error": "SECRET_VALUE_DETECTED"
+}

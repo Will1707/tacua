@@ -1,0 +1,15 @@
+{
+  "name": "@tacua/security-harness",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test",
+    "run": "node ./scripts/run.mjs ../../artifacts/security-harness/EXP-004",
+    "verify": "node ./scripts/verify-artifacts.mjs ../../artifacts/security-harness/EXP-004"
+  }
+}

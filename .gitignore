@@ -1,0 +1,34 @@
+.DS_Store
+.codex/
+.env
+.env.*
+!.env.example
+
+node_modules/
+.pnpm-store/
+dist/
+build/
+coverage/
+__pycache__/
+*.py[cod]
+.expo/
+DerivedData/
+
+# Local experiment worktrees and raw/sensitive evidence never belong in Git.
+.worktrees/
+artifacts/
+# The detailed discovery ledger contains private founder and pilot context.
+# Publish a deliberately sanitized product overview instead.
+product-foundation/tacua/
+# Local-only validator for the private foundation document set.
+scripts/validate_foundation.py
+*.mov
+*.mp4
+*.m4a
+*.wav
+
+# Editor and Xcode user state.
+.idea/
+.vscode/
+*.xcuserstate
+xcuserdata/

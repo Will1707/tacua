@@ -1,0 +1,14 @@
+{
+  "spdx_license": "Apache-2.0",
+  "case_id": "negative-unauthorized-evidence",
+  "description": "An available reference without an affirmative handoff authorization is rejected.",
+  "mutations": [
+    {
+      "operation": "set",
+      "path": ["evidence_manifest", "items", 0, "authorization", "authorized_for_handoff"],
+      "value": false
+    }
+  ],
+  "reseal": true,
+  "expected_error": "SCHEMA_CONST"
+}

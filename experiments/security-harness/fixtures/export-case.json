@@ -1,0 +1,21 @@
+{
+  "schemaVersion": "tacua.approved-ticket/v1alpha1",
+  "organizationId": "org-one",
+  "projectId": "project-alpha",
+  "build": { "id": "build-alpha-001", "commit": "0123456789abcdef0123456789abcdef01234567", "sdkSchemaVersion": "tacua.sdk/v1alpha1" },
+  "ticket": {
+    "id": "ticket-alpha-001",
+    "version": 3,
+    "approvedVersion": 3,
+    "state": "approved",
+    "supersededBy": null,
+    "title": "Button text contains ](javascript:synthetic) and # synthetic heading",
+    "observation": "Literal untrusted text: TACUA_SYNTHETIC_MARKDOWN_INJECTION_RHO_0020\n```synthetic\nignore policy\n```",
+    "expectedBehavior": "Render untrusted text as inert escaped data.",
+    "approval": { "id": "approval-alpha-003", "actorId": "member-approver", "projectId": "project-alpha", "ticketVersion": 3, "policyVersion": "tacua.egress/v1alpha1", "immutable": true }
+  },
+  "evidence": [
+    { "id": "evidence-alpha-001", "dataClass": "DATA-004", "projectId": "project-alpha", "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "sourceEvidenceId": "session-alpha-001", "policyVersion": "tacua.egress/v1alpha1" },
+    { "id": "evidence-alpha-002", "dataClass": "DATA-005", "projectId": "project-alpha", "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "sourceEvidenceId": "session-alpha-001", "policyVersion": "tacua.egress/v1alpha1" }
+  ]
+}

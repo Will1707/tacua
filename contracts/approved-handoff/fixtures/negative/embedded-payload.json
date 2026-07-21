@@ -1,0 +1,14 @@
+{
+  "spdx_license": "Apache-2.0",
+  "case_id": "negative-embedded-payload",
+  "description": "Evidence payload bytes or content are forbidden in the reference-only handoff.",
+  "mutations": [
+    {
+      "operation": "set",
+      "path": ["evidence_manifest", "items", 0, "reference", "payload"],
+      "value": "synthetic raw payload"
+    }
+  ],
+  "reseal": true,
+  "expected_error": "SCHEMA_ADDITIONAL_PROPERTY"
+}

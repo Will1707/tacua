@@ -1,0 +1,14 @@
+{
+  "spdx_license": "Apache-2.0",
+  "case_id": "negative-unsafe-integer",
+  "description": "Contract integers must round-trip through interoperable JSON consumers.",
+  "mutations": [
+    {
+      "operation": "set",
+      "path": ["evidence_manifest", "items", 0, "time_range", "end_ms"],
+      "value": 9007199254740993
+    }
+  ],
+  "reseal": true,
+  "expected_error": "INTEGER_OUT_OF_RANGE"
+}

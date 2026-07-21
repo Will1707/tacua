@@ -1,0 +1,14 @@
+{
+  "spdx_license": "Apache-2.0",
+  "case_id": "negative-ungrounded-reproduction-step",
+  "description": "Every reproduction action must retain an evidence citation.",
+  "mutations": [
+    {
+      "operation": "set",
+      "path": ["ticket", "reproduction", "steps", 0, "evidence_refs"],
+      "value": []
+    }
+  ],
+  "reseal": true,
+  "expected_error": "SCHEMA_MIN_ITEMS"
+}

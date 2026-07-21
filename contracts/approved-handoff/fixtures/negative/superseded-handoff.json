@@ -1,0 +1,19 @@
+{
+  "spdx_license": "Apache-2.0",
+  "case_id": "negative-superseded-handoff",
+  "description": "An internally consistent but superseded handoff is not executable.",
+  "mutations": [
+    {
+      "operation": "set",
+      "path": ["supersession", "status"],
+      "value": "superseded"
+    },
+    {
+      "operation": "set",
+      "path": ["supersession", "superseded_by_handoff_digest"],
+      "value": "sha256:9999999999999999999999999999999999999999999999999999999999999999"
+    }
+  ],
+  "reseal": true,
+  "expected_error": "STALE_HANDOFF"
+}

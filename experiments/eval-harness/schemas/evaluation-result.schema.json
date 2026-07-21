@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "$id": "https://tacua.invalid/schemas/evaluation-result/1.0.0",
+  "title": "Tacua deterministic evaluation result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "evaluator", "corpus", "candidate_run", "aggregate", "per_session", "threshold_disposition"],
+  "properties": {
+    "contract_version": {"const": "tacua.evaluation-result@1.0.0"},
+    "evaluator": {"const": "tacua-evaluator@1.0.0"},
+    "corpus": {"const": "EVAL-001@1.0.0"},
+    "candidate_run": {"type": "string"},
+    "aggregate": {"$ref": "#/$defs/counts"},
+    "per_session": {"type": "array", "items": {"$ref": "#/$defs/sessionResult"}},
+    "threshold_disposition": {"const": "blocked_pending_real_sessions_human_labels_and_owner_approval"}
+  },
+  "$defs": {
+    "counts": {
+      "type": "object",
+      "required": ["sessions", "gold_issues", "candidates", "unsupported_assertions", "invented_assertions", "merged_candidates", "missed_gold_issues", "unnecessarily_split_gold_issues", "split_excess_candidates", "extra_candidates", "no_issue_sessions", "correct_no_issue_sessions"],
+      "properties": {
+        "sessions": {"type": "integer", "minimum": 0},
+        "gold_issues": {"type": "integer", "minimum": 0},
+        "candidates": {"type": "integer", "minimum": 0},
+        "unsupported_assertions": {"type": "integer", "minimum": 0},
+        "invented_assertions": {"type": "integer", "minimum": 0},
+        "merged_candidates": {"type": "integer", "minimum": 0},
+        "missed_gold_issues": {"type": "integer", "minimum": 0},
+        "unnecessarily_split_gold_issues": {"type": "integer", "minimum": 0},
+        "split_excess_candidates": {"type": "integer", "minimum": 0},
+        "extra_candidates": {"type": "integer", "minimum": 0},
+        "no_issue_sessions": {"type": "integer", "minimum": 0},
+        "correct_no_issue_sessions": {"type": "integer", "minimum": 0}
+      }
+    },
+    "sessionResult": {
+      "type": "object",
+      "required": ["session_id", "counts", "merged_candidate_ids", "missed_gold_issue_ids", "split_gold_issue_ids", "extra_candidate_ids", "unsupported_assertion_ids", "invented_assertion_ids", "no_issue_correct"],
+      "properties": {
+        "session_id": {"type": "string"},
+        "counts": {"$ref": "#/$defs/counts"},
+        "merged_candidate_ids": {"type": "array", "items": {"type": "string"}},
+        "missed_gold_issue_ids": {"type": "array", "items": {"type": "string"}},
+        "split_gold_issue_ids": {"type": "array", "items": {"type": "string"}},
+        "extra_candidate_ids": {"type": "array", "items": {"type": "string"}},
+        "unsupported_assertion_ids": {"type": "array", "items": {"type": "string"}},
+        "invented_assertion_ids": {"type": "array", "items": {"type": "string"}},
+        "no_issue_correct": {"type": ["boolean", "null"]}
+      }
+    }
+  }
+}

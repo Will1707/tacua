@@ -1,0 +1,14 @@
+{
+  "spdx_license": "Apache-2.0",
+  "case_id": "negative-evidence-authorized-after-ticket",
+  "description": "A ticket approval cannot bind evidence that was authorized later.",
+  "mutations": [
+    {
+      "operation": "set",
+      "path": ["evidence_manifest", "items", 0, "authorization", "approved_at"],
+      "value": "2026-07-20T10:20:00Z"
+    }
+  ],
+  "reseal": true,
+  "expected_error": "TICKET_APPROVAL_PRECEDES_EVIDENCE_AUTHORIZATION"
+}

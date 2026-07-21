@@ -1,0 +1,130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "$id": "https://tacua.invalid/schemas/candidate-run/1.0.0",
+  "title": "Tacua candidate run with separate adjudication",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "run_id", "run_version", "corpus", "producer", "configuration", "sessions", "adjudications"],
+  "properties": {
+    "contract_version": {"const": "tacua.candidate-run@1.0.0"},
+    "run_id": {"type": "string"},
+    "run_version": {"type": "string"},
+    "corpus": {"const": "EVAL-001@1.0.0"},
+    "producer": {
+      "type": "object",
+      "required": ["kind", "name", "version", "network_used"],
+      "properties": {
+        "kind": {"enum": ["fixed_fixture", "manual", "model"]},
+        "name": {"type": "string"},
+        "version": {"type": "string"},
+        "network_used": {"type": "boolean"}
+      }
+    },
+    "configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["adapter_version", "prompt_id", "prompt_digest", "model_id", "model_version", "parameters", "tool_policy_id", "external_destination", "retention_training_settings"],
+      "properties": {
+        "adapter_version": {"type": "string"},
+        "prompt_id": {"type": "string"},
+        "prompt_digest": {"type": ["string", "null"]},
+        "model_id": {"type": "string"},
+        "model_version": {"type": "string"},
+        "parameters": {"type": "object"},
+        "tool_policy_id": {"type": "string"},
+        "external_destination": {"type": ["string", "null"]},
+        "retention_training_settings": {"type": "string"}
+      }
+    },
+    "sessions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["session_id", "candidates", "clarifications"],
+        "properties": {
+          "session_id": {"type": "string"},
+          "candidates": {"type": "array", "items": {"$ref": "#/$defs/candidate"}},
+          "clarifications": {"type": "array", "items": {"$ref": "#/$defs/clarification"}}
+        }
+      }
+    },
+    "adjudications": {
+      "description": "Post-run labels; never visible to candidate producer.",
+      "type": "array",
+      "items": {"$ref": "#/$defs/adjudication"}
+    }
+  },
+  "$defs": {
+    "assertion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["assertion_id", "kind", "text", "evidence_refs"],
+      "properties": {
+        "assertion_id": {"type": "string"},
+        "kind": {"enum": ["observation", "expected_behavior", "inference", "unknown"]},
+        "text": {"type": "string"},
+        "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string"}}
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_id", "title", "actual", "expected", "assertions", "acceptance_criteria", "suggested_verification", "uncertainty"],
+      "properties": {
+        "candidate_id": {"type": "string"},
+        "title": {"type": "string"},
+        "actual": {"type": "string"},
+        "expected": {"type": "string"},
+        "assertions": {"type": "array", "items": {"$ref": "#/$defs/assertion"}},
+        "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+        "suggested_verification": {"type": "array", "items": {"type": "string"}},
+        "uncertainty": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "clarification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["question_id", "question", "choices", "target_gap"],
+      "properties": {
+        "question_id": {"type": "string"},
+        "question": {"type": "string"},
+        "choices": {"type": "array", "minItems": 2, "items": {"type": "string"}},
+        "target_gap": {"type": "string"}
+      }
+    },
+    "adjudication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "label_version", "candidate_mappings", "assertion_labels"],
+      "properties": {
+        "session_id": {"type": "string"},
+        "label_version": {"type": "integer", "minimum": 1},
+        "candidate_mappings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["candidate_id", "gold_issue_ids"],
+            "properties": {
+              "candidate_id": {"type": "string"},
+              "gold_issue_ids": {"type": "array", "items": {"type": "string"}}
+            }
+          }
+        },
+        "assertion_labels": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["assertion_id", "label", "reason"],
+            "properties": {
+              "assertion_id": {"type": "string"},
+              "label": {"enum": ["supported", "unsupported", "invented"]},
+              "reason": {"type": "string"}
+            }
+          }
+        }
+      }
+    }
+  }
+}

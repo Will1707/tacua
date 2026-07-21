@@ -1,0 +1,63 @@
+{
+  "contract_version": "tacua.evidence-manifest@1.0.0",
+  "manifest_id": "ABLATION-SYN-001-B0",
+  "session_id": "SYN-001",
+  "build_identity": {
+    "app": "Sample Mobile App",
+    "platform": "iOS",
+    "version": "1.0.0-synthetic",
+    "commit": "synthetic-001"
+  },
+  "items": [
+    {
+      "evidence_id": "S001-E1",
+      "class": "media",
+      "availability": "available",
+      "authorization": "synthetic",
+      "redaction_state": "not_needed",
+      "immutable_digest": "synthetic-digest-not-cryptographic-S001-E1",
+      "capture_window": {"start_ms": 1000, "end_ms": 4500},
+      "snapshot_identity": "EVAL-001@1.0.0"
+    },
+    {
+      "evidence_id": "S001-E2",
+      "class": "media",
+      "availability": "available",
+      "authorization": "synthetic",
+      "redaction_state": "not_needed",
+      "immutable_digest": "synthetic-digest-not-cryptographic-S001-E2",
+      "capture_window": {"start_ms": 2300, "end_ms": 5100},
+      "snapshot_identity": "EVAL-001@1.0.0"
+    },
+    {
+      "evidence_id": "S001-SDK",
+      "class": "safe_sdk",
+      "availability": "unavailable",
+      "authorization": "blocked",
+      "redaction_state": "missing",
+      "immutable_digest": null,
+      "capture_window": null,
+      "snapshot_identity": null
+    },
+    {
+      "evidence_id": "S001-SOURCE",
+      "class": "source",
+      "availability": "unavailable",
+      "authorization": "blocked",
+      "redaction_state": "missing",
+      "immutable_digest": null,
+      "capture_window": null,
+      "snapshot_identity": null
+    },
+    {
+      "evidence_id": "S001-OBSERVABILITY",
+      "class": "observability",
+      "availability": "unavailable",
+      "authorization": "blocked",
+      "redaction_state": "missing",
+      "immutable_digest": null,
+      "capture_window": null,
+      "snapshot_identity": null
+    }
+  ]
+}

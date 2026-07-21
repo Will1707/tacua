@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "$id": "https://tacua.invalid/schemas/egress-decision-v1alpha1.json",
+  "title": "Tacua egress decision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "caseId",
+    "dataClass",
+    "field",
+    "destination",
+    "operation",
+    "policyVersion",
+    "policyDecision",
+    "enforcementDecision",
+    "reasonCode",
+    "recipient",
+    "provenance",
+    "audit"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "tacua.egress-decision/v1alpha1" },
+    "caseId": { "type": "string", "pattern": "^[A-Z0-9-]+$" },
+    "dataClass": { "type": "string", "pattern": "^DATA-[0-9]{3}$" },
+    "field": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+    "destination": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+    "operation": {
+      "enum": [
+        "collect",
+        "persist",
+        "retrieve",
+        "prompt-build",
+        "tool-call",
+        "render-export",
+        "authorize",
+        "retain",
+        "delete"
+      ]
+    },
+    "policyVersion": { "type": "string", "const": "tacua.egress/v1alpha1" },
+    "policyDecision": {
+      "enum": [
+        "deny",
+        "allow_metadata_reference_only",
+        "allow_after_irreversible_transformation",
+        "require_explicit_project_reviewer_approval"
+      ]
+    },
+    "enforcementDecision": { "enum": ["allow", "deny"] },
+    "reasonCode": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]+$" },
+    "recipient": { "type": "string" },
+    "provenance": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "evidenceId": { "type": "string" },
+        "sourceType": { "type": "string" },
+        "sourceDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "projectId": { "type": "string" },
+        "policyVersion": { "const": "tacua.egress/v1alpha1" }
+      },
+      "required": ["evidenceId", "sourceType", "sourceDigest", "projectId", "policyVersion"]
+    },
+    "audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "caseId",
+        "dataClass",
+        "boundary",
+        "operation",
+        "policyVersion",
+        "destination",
+        "decision",
+        "reasonCode",
+        "contentHash",
+        "byteCount",
+        "expected",
+        "actual",
+        "simulatedDurationMs"
+      ],
+      "properties": {
+        "caseId": { "type": "string" },
+        "dataClass": { "type": "string" },
+        "boundary": { "type": "string" },
+        "operation": { "type": "string" },
+        "policyVersion": { "type": "string" },
+        "destination": { "type": "string" },
+        "decision": { "enum": ["allow", "deny"] },
+        "reasonCode": { "type": "string" },
+        "contentHash": { "type": ["string", "null"], "pattern": "^[a-f0-9]{64}$" },
+        "byteCount": { "type": "integer", "minimum": 0 },
+        "expected": { "enum": ["allow", "deny"] },
+        "actual": { "enum": ["allow", "deny"] },
+        "simulatedDurationMs": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

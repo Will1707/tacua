@@ -1,0 +1,223 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tacua.invalid/schemas/approved-handoff/1.0.0/evidence-item.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "Tacua authorized reference-only evidence item",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "organization_id",
+    "project_id",
+    "session_id",
+    "evidence_id",
+    "evidence_type",
+    "availability",
+    "description",
+    "time_range",
+    "source",
+    "reference",
+    "authorization",
+    "unavailable",
+    "evidence_item_digest"
+  ],
+  "properties": {
+    "contract_version": { "const": "tacua.evidence-item@1.0.0" },
+    "organization_id": { "$ref": "#/$defs/id" },
+    "project_id": { "$ref": "#/$defs/id" },
+    "session_id": { "$ref": "#/$defs/id" },
+    "evidence_id": { "$ref": "#/$defs/id" },
+    "evidence_type": {
+      "enum": [
+        "sdk.route_transition",
+        "sdk.user_interaction",
+        "sdk.runtime_error",
+        "sdk.network_metadata",
+        "sdk.trace_correlation",
+        "sdk.app_state_provider",
+        "sdk.capture_gap",
+        "media.keyframe",
+        "media.clip",
+        "media.transcript_excerpt",
+        "repository.commit_snapshot",
+        "backend.deployment_snapshot",
+        "backend.log_snapshot",
+        "backend.trace_snapshot",
+        "observability.sentry_snapshot",
+        "observability.posthog_snapshot"
+      ]
+    },
+    "availability": { "enum": ["available", "unavailable"] },
+    "description": { "type": "string", "minLength": 1, "maxLength": 2048 },
+    "time_range": {
+      "oneOf": [
+        { "$ref": "#/$defs/timeRange" },
+        { "type": "null" }
+      ]
+    },
+    "source": { "$ref": "#/$defs/source" },
+    "reference": {
+      "oneOf": [
+        { "$ref": "#/$defs/reference" },
+        { "type": "null" }
+      ]
+    },
+    "authorization": {
+      "oneOf": [
+        { "$ref": "#/$defs/authorization" },
+        { "type": "null" }
+      ]
+    },
+    "unavailable": {
+      "oneOf": [
+        { "$ref": "#/$defs/unavailable" },
+        { "type": "null" }
+      ]
+    },
+    "evidence_item_digest": { "$ref": "#/$defs/digest" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "availability": { "const": "available" } } },
+      "then": {
+        "properties": {
+          "reference": { "$ref": "#/$defs/reference" },
+          "authorization": { "$ref": "#/$defs/authorization" },
+          "unavailable": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "availability": { "const": "unavailable" } } },
+      "then": {
+        "properties": {
+          "reference": { "type": "null" },
+          "authorization": { "type": "null" },
+          "unavailable": { "$ref": "#/$defs/unavailable" }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{2,63}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "timeRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start_ms", "end_ms", "clock"],
+      "properties": {
+        "start_ms": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "end_ms": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "clock": { "const": "session_monotonic" }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["component", "source_id", "snapshot_revision", "captured_at"],
+      "properties": {
+        "component": {
+          "enum": ["mobile_sdk", "backend", "repository", "sentry", "posthog"]
+        },
+        "source_id": { "$ref": "#/$defs/id" },
+        "snapshot_revision": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "captured_at": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "locator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scheme",
+        "organization_id",
+        "project_id",
+        "evidence_id",
+        "revision_id"
+      ],
+      "properties": {
+        "scheme": { "const": "tacua-evidence" },
+        "organization_id": { "$ref": "#/$defs/id" },
+        "project_id": { "$ref": "#/$defs/id" },
+        "evidence_id": { "$ref": "#/$defs/id" },
+        "revision_id": { "$ref": "#/$defs/id" }
+      }
+    },
+    "reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["locator", "content_type", "size_bytes", "content_digest"],
+      "properties": {
+        "locator": { "$ref": "#/$defs/locator" },
+        "content_type": {
+          "enum": [
+            "application/json",
+            "text/plain",
+            "image/png",
+            "video/quicktime",
+            "application/vnd.tacua.sdk-event+json",
+            "application/vnd.tacua.connector-snapshot+json"
+          ]
+        },
+        "size_bytes": { "type": "integer", "minimum": 0, "maximum": 104857600 },
+        "content_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "authorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authorized_for_handoff",
+        "organization_id",
+        "project_id",
+        "evidence_id",
+        "decision_id",
+        "actor_id",
+        "policy_version",
+        "approved_at",
+        "immutable"
+      ],
+      "properties": {
+        "authorized_for_handoff": { "const": true },
+        "organization_id": { "$ref": "#/$defs/id" },
+        "project_id": { "$ref": "#/$defs/id" },
+        "evidence_id": { "$ref": "#/$defs/id" },
+        "decision_id": { "$ref": "#/$defs/id" },
+        "actor_id": { "$ref": "#/$defs/id" },
+        "policy_version": { "const": "tacua.egress@1.0.0" },
+        "approved_at": { "$ref": "#/$defs/timestamp" },
+        "immutable": { "const": true }
+      }
+    },
+    "unavailable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reason", "detail"],
+      "properties": {
+        "reason": {
+          "enum": [
+            "capture_gap",
+            "collection_disabled",
+            "permission_denied",
+            "provider_unavailable",
+            "connector_revoked",
+            "redacted_by_policy",
+            "not_configured",
+            "outside_retention",
+            "correlation_missing"
+          ]
+        },
+        "detail": { "type": "string", "minLength": 1, "maxLength": 512 }
+      }
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "spdx_license": "Apache-2.0",
+  "case_id": "negative-invalid-timestamp",
+  "description": "Timestamp syntax must denote a real UTC instant.",
+  "mutations": [
+    {
+      "operation": "set",
+      "path": ["approval", "approved_at"],
+      "value": "2026-99-99T99:99:99Z"
+    }
+  ],
+  "reseal": true,
+  "expected_error": "INVALID_TIMESTAMP"
+}

@@ -1,0 +1,66 @@
+name: Bug report
+description: Report a reproducible problem in the pre-release Tacua project
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Tacua is pre-release and has no supported versions. For a suspected vulnerability or sensitive-data exposure, do not continue here: use **Security > Report a vulnerability** to report it privately.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the problem and its impact.
+      placeholder: A clear, concise description of the observed behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide the smallest reliable sequence that reproduces the problem.
+      placeholder: |
+        1. Configure ...
+        2. Start ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include the Tacua revision, deployment method, host OS, mobile OS, and relevant component versions.
+      placeholder: |
+        Tacua revision:
+        Deployment method:
+        Host OS:
+        Mobile OS:
+        Other relevant versions:
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized evidence
+      description: Add minimal logs, screenshots, or recordings only after removing secrets, personal data, private source, stable device identifiers, and production telemetry.
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I have removed or replaced sensitive and identifying data from this public report.
+          required: true
+        - label: This report does not describe an undisclosed security vulnerability.
+          required: true
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Include regressions, workarounds, or self-hosting details that may help investigation.

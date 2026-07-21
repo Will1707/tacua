@@ -1,0 +1,77 @@
+name: Verify
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  contracts-and-harnesses:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.13'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Validate approved-handoff candidate
+        working-directory: contracts/approved-handoff
+        run: |
+          python3 -B scripts/handoff.py validate fixtures/positive/approved-handoff.json --markdown fixtures/positive/approved-handoff.md
+          python3 -B scripts/handoff.py validate-executable-fixture
+          python3 -B scripts/handoff.py verify fixtures/positive/approved-handoff.json fixtures/positive/approved-handoff.md
+          python3 -B scripts/handoff.py validate-trial fixtures/positive/agent-trial.json fixtures/positive/approved-handoff.json fixtures/positive/approved-handoff.md --registry-assertion fixtures/positive/registry-assertion.json --registry-key-file fixtures/positive/registry-key.synthetic.hex
+          python3 -B -m unittest discover -s tests -v
+
+      - name: Validate synthetic evaluation harness
+        working-directory: experiments/eval-harness
+        run: |
+          python3 -B src/validate_contracts.py
+          python3 -B src/evaluate.py --corpus corpus/EVAL-001.v1.0.0.json --candidates fixtures/candidates/FIXED-SYNTHETIC-CANDIDATES.v1.0.0.json --compare fixtures/baselines/SYNTHETIC-BASELINE.v1.0.0.json
+          python3 -B -m unittest discover -s tests -v
+
+      - name: Validate synthetic security harness
+        run: |
+          node --check experiments/security-harness/src/harness.mjs
+          node --check experiments/security-harness/scripts/run.mjs
+          node --check experiments/security-harness/scripts/verify-artifacts.mjs
+          node --test experiments/security-harness/test/harness.test.mjs
+          node experiments/security-harness/scripts/run.mjs artifacts/security-harness/EXP-004
+          node experiments/security-harness/scripts/verify-artifacts.mjs artifacts/security-harness/EXP-004
+
+      - name: Ensure verification artifacts are reproducible
+        run: git diff --exit-code
+
+  ios-capture-boundary:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Run platform-independent capture policy tests
+        working-directory: experiments/ios-capture-spike/package
+        run: sh tests/run-core-tests.sh
+
+      - name: Compile the ReplayKit API boundary
+        run: |
+          xcrun swiftc -typecheck \
+            -target arm64-apple-ios17.0 \
+            -sdk "$(xcrun --sdk iphoneos --show-sdk-path)" \
+            experiments/ios-capture-api-probe/CaptureAPIProbe.swift

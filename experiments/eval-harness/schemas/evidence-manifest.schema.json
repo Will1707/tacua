@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "$id": "https://tacua.invalid/schemas/evidence-manifest/1.0.0",
+  "title": "Tacua minimized evidence manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "manifest_id", "session_id", "build_identity", "items"],
+  "properties": {
+    "contract_version": {"const": "tacua.evidence-manifest@1.0.0"},
+    "manifest_id": {"type": "string"},
+    "session_id": {"type": "string"},
+    "build_identity": {"type": "object"},
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["evidence_id", "class", "availability", "authorization", "redaction_state", "immutable_digest"],
+        "properties": {
+          "evidence_id": {"type": "string"},
+          "class": {"enum": ["media", "safe_sdk", "source", "observability"]},
+          "availability": {"enum": ["available", "unavailable", "redacted"]},
+          "authorization": {"enum": ["synthetic", "approved", "blocked"]},
+          "redaction_state": {"enum": ["not_needed", "minimized", "redacted", "missing"]},
+          "immutable_digest": {"type": ["string", "null"]},
+          "capture_window": {"type": ["object", "null"]},
+          "snapshot_identity": {"type": ["string", "null"]}
+        }
+      }
+    }
+  }
+}
