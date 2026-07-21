@@ -105,6 +105,7 @@ struct CaptureManifest: Codable {
   var calibrations: [CaptureCalibration]
   var errorCodes: [String]
   var droppedBeforeFirstVideo: [String: Int]
+  var droppedDuringBackground: [String: Int]?
   var microphoneSamplesObserved: Int?
   var appAudioSamplesObserved: Int?
 }

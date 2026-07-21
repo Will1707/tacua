@@ -1,8 +1,8 @@
 # EXP-001 physical-device results
 
 Status: foreground capture, interruption discovery, verified-partial choice,
-resume, deletion, and the 30-minute foreground limit proven; background/lock
-and fault-injection checks pending
+resume, deletion, the 30-minute foreground limit, and lock recovery proven;
+fault-injection checks pending
 
 Date: 2026-07-21
 
@@ -109,6 +109,29 @@ tracks. The 121 app-audio drops represent about 0.156% of 77,523 append attempts
 and occurred without microphone or video loss. This is acceptable for closing
 the experiment's foreground-duration gate, but production promotion must either
 eliminate boundary reordering drops or define and enforce a measured threshold.
+
+## Lock-screen lifecycle run
+
+The first lock test exposed a lifecycle bug in the held-frame implementation.
+Tacua left the active writer open when the app backgrounded, then attempted to
+rotate that writer after foreground media returned. AVAssetWriter rejected the
+operation. Tacua preserved one checksum-valid segment and failed closed as
+`partial`, but added avoidable `segment_rotation_failed`,
+`video_tail_extension_failed`, and `segment_finalization_failed` gaps.
+
+The fix finalizes the current segment as soon as the app enters the background,
+suppresses held-frame rotation while the lifecycle gap is open, and starts a new
+writer only when foreground video returns. It records audio callbacks received
+while no writer is open in the nullable `droppedDuringBackground` manifest
+field.
+
+A physical lock/unlock retest completed manually with 10 checksum-valid
+segments, one closed `app_backgrounded` gap, zero stable errors, and terminal
+state `partial`. Eight segments were exactly 10 seconds; the pre-lock and final
+tails were 8.061 and 8.945 seconds. The manifest recorded 14 microphone and 15
+app-audio callbacks received during the closed lifecycle interval. No media was
+invented across the lock gap, and capture resumed into new segment indexes after
+unlock.
 
 ## Process-interruption recovery run
 

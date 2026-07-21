@@ -175,6 +175,7 @@ final class TacuaCaptureSession {
         calibrations: [],
         errorCodes: [],
         droppedBeforeFirstVideo: ["appAudio": 0, "microphone": 0],
+        droppedDuringBackground: ["appAudio": 0, "microphone": 0],
         microphoneSamplesObserved: 0,
         appAudioSamplesObserved: 0
       )
@@ -648,7 +649,8 @@ final class TacuaCaptureSession {
     if type == .video, let writer, !writer.isCompatible(withVideoSample: sampleBuffer) {
       finishCurrentSegment()
     }
-    if let writer,
+    if backgroundGapId == nil,
+      let writer,
       let boundarySeconds = TacuaCapturePolicy.segmentRotationBoundary(
         startedAtPTSSeconds: CMTimeGetSeconds(writer.startedAtPTS),
         incomingPTSSeconds: incomingPTSSeconds,
@@ -739,7 +741,13 @@ final class TacuaCaptureSession {
       }
     } else if writer == nil {
       let key = type == .audioMic ? "microphone" : "appAudio"
-      manifest.droppedBeforeFirstVideo[key, default: 0] += 1
+      if backgroundGapId != nil {
+        var dropped = manifest.droppedDuringBackground ?? [:]
+        dropped[key, default: 0] += 1
+        manifest.droppedDuringBackground = dropped
+      } else {
+        manifest.droppedBeforeFirstVideo[key, default: 0] += 1
+      }
       return
     }
 
@@ -987,6 +995,7 @@ final class TacuaCaptureSession {
           )
           self.backgroundGapId = gap.id
           self.manifest.gaps.append(gap)
+          self.finishCurrentSegment()
           self.persistManifestAndReport()
           self.eventSink("onGap", ["id": gap.id, "reason": gap.reason])
         }
