@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import signal
 
 from .config import ConfigError, load_config
 from .http_api import create_server
@@ -22,14 +23,19 @@ def main() -> None:
         parser.error(str(exc))
     server = create_server(backend)
     print(f"Tacua pilot backend listening on {config.listen_host}:{config.listen_port}", flush=True)
+
+    def stop_on_sigterm(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+
+    previous_sigterm = signal.signal(signal.SIGTERM, stop_on_sigterm)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":
     main()
-

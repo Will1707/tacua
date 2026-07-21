@@ -9,17 +9,16 @@ sessions and jobs without ever receiving the SDK upload credential.
 The service uses Python's standard library, SQLite, and filesystem media. It is
 not an Internet-facing server and must not be treated as one. In particular it
 does not yet provide TLS termination, rate limiting, an identity provider,
-automatic retention sweeping, media processing, model execution, backups,
-migrations beyond schema version 1, or multi-process coordination.
+media processing, model execution, backups, migrations beyond schema version
+1, or multi-process coordination.
 
-Two protocol/operations blockers are intentionally visible rather than papered
-over. First, launch exchange currently creates a server-generated upload token;
+One protocol blocker is intentionally visible rather than papered over. Launch
+exchange currently creates a server-generated upload token;
 if the successful response is lost, the consumed launch code cannot recover
 that token. The SDK transport protocol must adopt a client-generated,
 pre-Keychain credential (or a separately authorized resume grant) before this
-flow is production-ready. Second, retention expiry is metadata only until a
-durable sweeper is added. The example also uses a mutable Python base-image tag,
-and the standard-library threaded HTTP server has no request deadlines,
+flow is production-ready. The example also uses a mutable Python base-image
+tag, and the standard-library threaded HTTP server has no request deadlines,
 concurrency quotas, or rate limits. Pinning the image by digest and placing a
 bounded TLS proxy in front are release work, not optional hardening.
 
@@ -43,10 +42,15 @@ bounded TLS proxy in front are release work, not optional hardening.
   temporary files are all beneath the single configured state directory. In
   the container that directory is `/var/lib/tacua`.
 - Every session receives bounded raw-retention metadata with an expiry from 1
-  through 30 days after exchange (30 days by default). Automatic expiry is
-  intentionally not implemented in this pilot. Scoped admin deletion removes
-  media/diagnostics and leaves a durable tombstone plus a completed deletion
-  job.
+  through 30 days after exchange (30 days by default). Before accepting HTTP
+  traffic, the server sweeps sessions at or past that deadline, then repeats at
+  a configured interval from 30 through 3600 seconds (300 seconds by default).
+- Retention enforcement reuses scoped deletion: it atomically revokes the SDK
+  credential, cancels queued/running processing, removes raw media,
+  diagnostics, and the sealed manifest, and leaves the durable session
+  tombstone and deletion job. A filesystem failure marks that job failed but
+  does not stop the sweep or server; startup and later intervals retry the same
+  job until it succeeds.
 - Completion requires the exact stored diagnostic-envelope set, re-verifies all
   media and diagnostic files, and persists the sealed manifest outside SQLite.
 - Starting deletion atomically cancels any active processing snapshot before
@@ -78,7 +82,8 @@ The tests cover fixed-scope grants, one-time exchange, hash-only credential
 storage, admin and SDK authentication, cross-session access, path traversal,
 size/digest mismatches, idempotent and conflicting retries, missing completion
 segments, restart persistence, bounded diagnostics, durable processing jobs,
-and scoped deletion.
+scoped deletion, exact retention boundaries, durable failed-sweep recovery,
+startup retry, controlled periodic invocation, and clean worker shutdown.
 
 ## Run in Docker
 
@@ -97,6 +102,14 @@ all Linux capabilities in the example Compose deployment, and writes only to
 the `tacua-state` volume. Port `8080` is bound to loopback in the example. A
 real remote pilot still needs an authenticated TLS reverse proxy and host-level
 backup policy before it can receive sensitive QA evidence.
+
+`retention_sweep_interval_seconds` controls the in-process sweeper and is
+validated from 30 through 3600 seconds. The startup sweep is synchronous, so
+overdue evidence is deleted before the server begins handling requests. One
+periodic worker is attached to the HTTP server lifecycle and is joined during
+normal `SIGINT`/`SIGTERM` shutdown. This V1 worker is intentionally
+single-process: do not run multiple backend processes against the same state
+directory until distributed coordination and schema migrations are designed.
 
 ## HTTP surface
 

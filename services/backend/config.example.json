@@ -13,5 +13,6 @@
   "upload_token_ttl_seconds": 3600,
   "max_segment_bytes": 268435456,
   "max_diagnostic_bytes": 1048576,
-  "raw_retention_days": 30
+  "raw_retention_days": 30,
+  "retention_sweep_interval_seconds": 300
 }

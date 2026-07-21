@@ -15,7 +15,7 @@ import sqlite3
 import stat
 import tempfile
 import threading
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Callable
 
 from . import CAPTURE_CONTRACT, DIAGNOSTIC_CONTRACT, PROCESSING_JOB_CONTRACT, __version__
 from .config import BUNDLE_ID_PATTERN, ID_PATTERN, PilotConfig
@@ -60,6 +60,8 @@ def utc_now() -> datetime:
 
 
 def timestamp(value: datetime) -> str:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("timestamps must be timezone-aware")
     return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -108,7 +110,14 @@ def _require_digest(value: Any, field: str) -> str:
 class PilotBackend:
     """SQLite and filesystem implementation of the V1 pilot boundary."""
 
-    def __init__(self, config: PilotConfig, admin_secret: bytes):
+    def __init__(
+        self,
+        config: PilotConfig,
+        admin_secret: bytes,
+        *,
+        clock: Callable[[], datetime] = utc_now,
+        retention_wait: Callable[[threading.Event, float], bool] | None = None,
+    ):
         if len(admin_secret) < 32:
             raise ValueError("admin secret must be at least 32 bytes")
         for name in ("organization_id", "project_id", "application_id", "build_id"):
@@ -120,8 +129,18 @@ class PilotBackend:
             raise ValueError("build_identity_digest must be a lowercase SHA-256 digest")
         if not 1 <= config.raw_retention_days <= 30:
             raise ValueError("raw_retention_days must be from 1 through 30")
+        if not 30 <= config.retention_sweep_interval_seconds <= 3600:
+            raise ValueError("retention_sweep_interval_seconds must be from 30 through 3600")
+        if not callable(clock):
+            raise ValueError("clock must be callable")
+        if retention_wait is not None and not callable(retention_wait):
+            raise ValueError("retention_wait must be callable")
         self.config = config
         self._admin_secret = bytes(admin_secret)
+        self._clock = clock
+        self._retention_wait = (
+            retention_wait if retention_wait is not None else self._wait_for_retention_interval
+        )
         self.state_dir = config.state_directory
         if not self.state_dir.is_absolute() or self.state_dir == Path(self.state_dir.anchor):
             raise ValueError("state_directory must be an absolute non-root path")
@@ -129,6 +148,10 @@ class PilotBackend:
         self.temp_dir = self.state_dir / "tmp"
         self.db_path = self.state_dir / "tacua.sqlite3"
         self._lock = threading.RLock()
+        self._retention_worker_lock = threading.Lock()
+        self._retention_stop = threading.Event()
+        self._retention_thread: threading.Thread | None = None
+        self._last_retention_sweep: dict[str, Any] | None = None
         self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.media_dir.mkdir(exist_ok=True, mode=0o700)
         self.temp_dir.mkdir(exist_ok=True, mode=0o700)
@@ -139,6 +162,16 @@ class PilotBackend:
             directory.chmod(0o700)
         self._initialize_database()
         self._reconcile_storage()
+
+    @staticmethod
+    def _wait_for_retention_interval(stop_event: threading.Event, seconds: float) -> bool:
+        return stop_event.wait(seconds)
+
+    def _now(self) -> datetime:
+        value = self._clock()
+        if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("clock must return a timezone-aware datetime")
+        return value.astimezone(timezone.utc).replace(microsecond=0)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10, factory=ClosingConnection)
@@ -248,6 +281,8 @@ class PilotBackend:
             occurred_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs(status, requested_at);
+        CREATE INDEX IF NOT EXISTS sessions_retention_idx
+            ON sessions(raw_media_expires_at, deletion_status);
         CREATE INDEX IF NOT EXISTS audit_session_idx ON audit_events(session_id, occurred_at);
         """
         with self._connect() as conn:
@@ -407,6 +442,136 @@ class PilotBackend:
     def retention_policy(self) -> str:
         return f"raw-{self.config.raw_retention_days}d-v1"
 
+    def sweep_expired_sessions(self, *, now: datetime | None = None) -> dict[str, Any]:
+        """Delete every in-scope session whose raw-data deadline has arrived.
+
+        The explicit ``now`` seam makes boundary behavior deterministic for
+        operators and tests. Individual deletion failures are reported and do
+        not stop later eligible sessions from being attempted.
+        """
+
+        if now is None:
+            sweep_time = self._now()
+        else:
+            if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+                raise ValueError("retention sweep time must be a timezone-aware datetime")
+            sweep_time = now.astimezone(timezone.utc).replace(microsecond=0)
+        sweep_text = timestamp(sweep_time)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """SELECT session_id FROM sessions
+                   WHERE organization_id = ? AND project_id = ? AND application_id = ?
+                     AND bundle_identifier = ? AND build_id = ? AND build_identity_digest = ?
+                     AND consent_contract = ? AND deletion_status != 'deleted'
+                     AND raw_media_expires_at <= ?
+                   ORDER BY raw_media_expires_at, session_id""",
+                (*self.config.scope.values(), sweep_text),
+            ).fetchall()
+
+        attempted = [row["session_id"] for row in rows]
+        deleted: list[str] = []
+        failed: list[str] = []
+        for session_id in attempted:
+            try:
+                self._delete_session(session_id, actor_kind="retention")
+            except Exception:
+                # File failures are already made durable by _delete_session.
+                # Other transient failures remain eligible for the next pass.
+                failed.append(session_id)
+            else:
+                deleted.append(session_id)
+        return {
+            "swept_at": sweep_text,
+            "attempted_session_ids": attempted,
+            "deleted_session_ids": deleted,
+            "failed_session_ids": failed,
+        }
+
+    @property
+    def retention_worker_running(self) -> bool:
+        with self._retention_worker_lock:
+            return self._retention_thread is not None and self._retention_thread.is_alive()
+
+    @property
+    def last_retention_sweep(self) -> dict[str, Any] | None:
+        with self._retention_worker_lock:
+            if self._last_retention_sweep is None:
+                return None
+            return {
+                key: list(value) if isinstance(value, list) else value
+                for key, value in self._last_retention_sweep.items()
+            }
+
+    def start_retention_enforcement(self) -> dict[str, Any]:
+        """Run the startup sweep and start one periodic enforcement thread."""
+
+        with self._retention_worker_lock:
+            if self._retention_thread is not None and self._retention_thread.is_alive():
+                assert self._last_retention_sweep is not None
+                return {
+                    key: list(value) if isinstance(value, list) else value
+                    for key, value in self._last_retention_sweep.items()
+                }
+            initial = self.sweep_expired_sessions()
+            self._last_retention_sweep = initial
+            self._retention_stop.clear()
+            self._retention_thread = threading.Thread(
+                target=self._retention_worker_loop,
+                name="tacua-retention-sweeper",
+                daemon=True,
+            )
+            self._retention_thread.start()
+            return {
+                key: list(value) if isinstance(value, list) else value
+                for key, value in initial.items()
+            }
+
+    def _retention_worker_loop(self) -> None:
+        while True:
+            try:
+                should_stop = self._retention_wait(
+                    self._retention_stop,
+                    float(self.config.retention_sweep_interval_seconds),
+                )
+            except Exception:
+                return
+            if should_stop or self._retention_stop.is_set():
+                return
+            try:
+                result = self.sweep_expired_sessions()
+            except Exception:
+                # A database or clock failure must not terminate the service.
+                # The next interval gets a fresh attempt without persisting
+                # exception text or any capture content.
+                result = {
+                    "swept_at": None,
+                    "attempted_session_ids": [],
+                    "deleted_session_ids": [],
+                    "failed_session_ids": [],
+                    "sweep_failed": True,
+                }
+            with self._retention_worker_lock:
+                self._last_retention_sweep = result
+
+    def stop_retention_enforcement(self, timeout_seconds: float = 5.0) -> bool:
+        """Wake and join the periodic worker; safe to call more than once."""
+
+        if timeout_seconds < 0:
+            raise ValueError("retention shutdown timeout must not be negative")
+        with self._retention_worker_lock:
+            thread = self._retention_thread
+            self._retention_stop.set()
+        if thread is None:
+            return True
+        if thread is not threading.current_thread():
+            thread.join(timeout_seconds)
+        stopped = not thread.is_alive()
+        if stopped:
+            with self._retention_worker_lock:
+                if self._retention_thread is thread:
+                    self._retention_thread = None
+        return stopped
+
     def health(self) -> dict[str, Any]:
         with self._connect() as conn:
             conn.execute("SELECT 1").fetchone()
@@ -415,6 +580,10 @@ class PilotBackend:
             "service": "tacua-pilot-backend",
             "version": __version__,
             "production_ready": False,
+            "retention": {
+                "sweep_interval_seconds": self.config.retention_sweep_interval_seconds,
+                "worker_running": self.retention_worker_running,
+            },
             "contracts": {
                 "capture": CAPTURE_CONTRACT,
                 "diagnostics": DIAGNOSTIC_CONTRACT,
@@ -450,14 +619,14 @@ class PilotBackend:
                 self.config.project_id,
                 session_id,
                 outcome,
-                timestamp(utc_now()),
+                timestamp(self._now()),
             ),
         )
 
     def create_launch_code(self, requested_scope: Any) -> dict[str, Any]:
         if not isinstance(requested_scope, dict) or requested_scope != self.config.scope:
             raise ApiError(403, "SCOPE_NOT_ALLOWED", "requested launch scope is not configured")
-        now = utc_now()
+        now = self._now()
         expires_at = now + timedelta(seconds=self.config.launch_code_ttl_seconds)
         launch_code = _new_credential("lc")
         launch_id = _new_id("lch")
@@ -499,7 +668,7 @@ class PilotBackend:
         if not isinstance(scope, dict) or scope != self.config.scope:
             raise ApiError(403, "SCOPE_MISMATCH", "SDK scope does not match the launch scope")
 
-        now = utc_now()
+        now = self._now()
         now_text = timestamp(now)
         upload_expires_at = now + timedelta(seconds=self.config.upload_token_ttl_seconds)
         raw_expires_at = now + timedelta(days=self.config.raw_retention_days)
@@ -587,7 +756,7 @@ class PilotBackend:
         }
         if persisted_scope != self.config.scope:
             raise ApiError(403, "UPLOAD_SCOPE_MISMATCH", "session is outside this deployment scope")
-        if row["revoked_at"] is not None or row["token_expires_at"] <= timestamp(utc_now()):
+        if row["revoked_at"] is not None or row["token_expires_at"] <= timestamp(self._now()):
             raise ApiError(401, "UPLOAD_TOKEN_EXPIRED", "upload credential is expired or revoked")
         if row["state"] != "receiving" or row["deletion_status"] != "active":
             raise ApiError(409, "SESSION_NOT_RECEIVING", "session no longer accepts uploads")
@@ -618,7 +787,7 @@ class PilotBackend:
                 raise ApiError(403, "UPLOAD_SCOPE_MISMATCH", "session is outside this deployment scope")
             if row["deletion_status"] != "active" or row["state"] not in ("receiving", "completed"):
                 raise ApiError(409, "SESSION_NOT_RECEIVING", "session cannot be completed")
-            if row["token_expires_at"] <= timestamp(utc_now()):
+            if row["token_expires_at"] <= timestamp(self._now()):
                 raise ApiError(401, "UPLOAD_TOKEN_EXPIRED", "upload credential is expired or revoked")
             if row["state"] == "receiving" and row["revoked_at"] is not None:
                 raise ApiError(401, "UPLOAD_TOKEN_EXPIRED", "upload credential is expired or revoked")
@@ -764,7 +933,7 @@ class PilotBackend:
                 self._fsync_directory(final_path.parent)
                 self._fsync_directory(self.media_dir)
                 self._fsync_directory(self.temp_dir)
-                now_text = timestamp(utc_now())
+                now_text = timestamp(self._now())
                 receipt = {
                     "segment_id": segment_id,
                     "object_id": _new_id("obj"),
@@ -849,7 +1018,7 @@ class PilotBackend:
                 f"diagnostic contract validation failed ({exc.code})",
             ) from exc
         envelope_digest = document["envelope_digest"]
-        now_text = timestamp(utc_now())
+        now_text = timestamp(self._now())
         final_path = self._diagnostic_path(session_id, envelope_id)
         temporary: Path | None = None
         publication_needs_cleanup = False
@@ -1047,7 +1216,7 @@ class PilotBackend:
                 handle.flush()
                 os.fsync(handle.fileno())
 
-            now_text = timestamp(utc_now())
+            now_text = timestamp(self._now())
             job_id = _new_id("job")
             with self._lock, self._connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
@@ -1387,9 +1556,15 @@ class PilotBackend:
     def delete_session(self, session_id: str) -> dict[str, Any]:
         """Durably request, perform, then tombstone one in-scope session."""
 
+        return self._delete_session(session_id, actor_kind="admin")
+
+    def _delete_session(self, session_id: str, *, actor_kind: str) -> dict[str, Any]:
+        if actor_kind not in ("admin", "retention"):
+            raise ValueError("deletion actor must be admin or retention")
+
         _require_id(session_id, "session_id")
         with self._lock:
-            now_text = timestamp(utc_now())
+            now_text = timestamp(self._now())
             with self._connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 session = conn.execute(
@@ -1444,7 +1619,13 @@ class PilotBackend:
                     "UPDATE upload_tokens SET revoked_at = COALESCE(revoked_at, ?) WHERE session_id = ?",
                     (now_text, session_id),
                 )
-                self._audit(conn, "session_deletion_requested", "admin", "succeeded", session_id)
+                self._audit(
+                    conn,
+                    "session_deletion_requested",
+                    actor_kind,
+                    "succeeded",
+                    session_id,
+                )
 
             with self._connect() as conn:
                 sequences = [
@@ -1462,7 +1643,7 @@ class PilotBackend:
             try:
                 self._delete_session_files(session_id, sequences, envelope_ids)
             except OSError as exc:
-                failed_at = timestamp(utc_now())
+                failed_at = timestamp(self._now())
                 with self._connect() as conn:
                     conn.execute(
                         """UPDATE jobs SET status = 'failed', completed_at = ?,
@@ -1472,7 +1653,7 @@ class PilotBackend:
                     self._audit(conn, "session_deleted", "backend", "failed", session_id)
                 raise ApiError(500, "STORAGE_DELETE_FAILED", "session media could not be deleted") from exc
 
-            completed_at = timestamp(utc_now())
+            completed_at = timestamp(self._now())
             with self._connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 conn.execute("DELETE FROM segments WHERE session_id = ?", (session_id,))

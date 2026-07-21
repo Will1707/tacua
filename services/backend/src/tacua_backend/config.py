@@ -37,6 +37,7 @@ class PilotConfig:
     max_segment_bytes: int = 268_435_456
     max_diagnostic_bytes: int = 1_048_576
     raw_retention_days: int = 30
+    retention_sweep_interval_seconds: int = 300
 
     @property
     def scope(self) -> dict[str, str]:
@@ -104,6 +105,7 @@ def load_config(config_file: Path, admin_secret_file: Path) -> tuple[PilotConfig
         "max_segment_bytes",
         "max_diagnostic_bytes",
         "raw_retention_days",
+        "retention_sweep_interval_seconds",
     }
     unknown = sorted(set(raw) - allowed_keys)
     if unknown:
@@ -143,6 +145,9 @@ def load_config(config_file: Path, admin_secret_file: Path) -> tuple[PilotConfig
         max_segment_bytes=_bounded_int(raw, "max_segment_bytes", 268_435_456, 1, 1_073_741_824),
         max_diagnostic_bytes=_bounded_int(raw, "max_diagnostic_bytes", 1_048_576, 1024, 16_777_216),
         raw_retention_days=retention_days,
+        retention_sweep_interval_seconds=_bounded_int(
+            raw, "retention_sweep_interval_seconds", 300, 30, 3600
+        ),
     )
 
     try:

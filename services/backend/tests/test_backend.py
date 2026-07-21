@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import closing
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from email.message import Message
 from hashlib import sha256
 import io
@@ -13,6 +14,7 @@ import secrets
 import sqlite3
 import sys
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 
@@ -23,12 +25,52 @@ sys.path.insert(0, str(SOURCE))
 from tacua_backend import CAPTURE_CONTRACT, DIAGNOSTIC_CONTRACT, PROCESSING_JOB_CONTRACT  # noqa: E402
 from tacua_backend.config import ConfigError, PilotConfig, load_config  # noqa: E402
 from tacua_backend.contracts import seal as seal_contract, validate as validate_contract  # noqa: E402
-from tacua_backend.http_api import PilotRequestHandler  # noqa: E402
+from tacua_backend.http_api import PilotRequestHandler, create_server  # noqa: E402
 from tacua_backend.service import ApiError, PilotBackend  # noqa: E402
 
 
 def digest(value: bytes) -> str:
     return "sha256:" + sha256(value).hexdigest()
+
+
+def parse_timestamp(value: str) -> datetime:
+    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+class FakeClock:
+    def __init__(self, value: datetime):
+        self._value = value
+        self._lock = threading.Lock()
+
+    def __call__(self) -> datetime:
+        with self._lock:
+            return self._value
+
+    def set(self, value: datetime) -> None:
+        with self._lock:
+            self._value = value
+
+
+class ControlledRetentionWait:
+    """Let a test advance the periodic worker without sleeping for its interval."""
+
+    def __init__(self):
+        self._wake = threading.Event()
+        self.waiting = threading.Event()
+        self.intervals: list[float] = []
+
+    def __call__(self, stop_event: threading.Event, seconds: float) -> bool:
+        self.intervals.append(seconds)
+        self.waiting.set()
+        while not stop_event.is_set():
+            if self._wake.wait(0.01):
+                self._wake.clear()
+                self.waiting.clear()
+                return False
+        return True
+
+    def trigger(self) -> None:
+        self._wake.set()
 
 
 class PilotBackendTests(unittest.TestCase):
@@ -645,6 +687,176 @@ class PilotBackendTests(unittest.TestCase):
         self.assertEqual(failed["job_id"], succeeded["job_id"])
         self.assertEqual("succeeded", succeeded["status"])
 
+    def test_retention_sweep_deletes_at_the_exact_boundary_and_cancels_processing(self) -> None:
+        clock = FakeClock(datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc))
+        self.backend = PilotBackend(self.config, self.admin_secret, clock=clock)
+        session_id, token, _ = self.make_session()
+        content = b"retained-until-deadline"
+        receipt = self.put_segment(session_id, token, 0, content)
+        self.put_diagnostic(session_id, token, "env_retention")
+        processing = self.backend.complete_session(
+            session_id,
+            token,
+            self.completion(
+                session_id,
+                [(0, content)],
+                {0: receipt},
+                ["env_retention"],
+            ),
+        )
+        self.assertEqual("queued", processing["status"])
+
+        expiry = parse_timestamp(
+            self.backend.get_session(session_id)["retention"]["raw_media_expires_at"]
+        )
+        before = self.backend.sweep_expired_sessions(now=expiry - timedelta(seconds=1))
+        self.assertEqual([], before["attempted_session_ids"])
+        self.assertEqual("completed", self.backend.get_session(session_id)["state"])
+
+        clock.set(expiry)
+        at_boundary = self.backend.sweep_expired_sessions(now=expiry)
+        self.assertEqual([session_id], at_boundary["attempted_session_ids"])
+        self.assertEqual([session_id], at_boundary["deleted_session_ids"])
+        self.assertEqual([], at_boundary["failed_session_ids"])
+        tombstone = self.backend.get_session(session_id)
+        self.assertEqual("deleted", tombstone["state"])
+        self.assertEqual("deleted", tombstone["retention"]["deletion_status"])
+        self.assertEqual([], tombstone["segments"])
+        self.assertEqual([], tombstone["diagnostics"])
+        process_tombstone = next(
+            job for job in tombstone["jobs"] if job["job_id"] == processing["job_id"]
+        )
+        deletion_tombstone = next(
+            job for job in tombstone["jobs"] if job.get("job_type") == "delete_session"
+        )
+        self.assertEqual("cancelled", process_tombstone["status"])
+        self.assertEqual("succeeded", deletion_tombstone["status"])
+        self.assertFalse((self.backend.media_dir / session_id).exists())
+        retention_events = [
+            event
+            for event in self.backend.list_audit_events()
+            if event["session_id"] == session_id
+            and event["event_type"] == "session_deletion_requested"
+        ]
+        self.assertEqual("retention", retention_events[-1]["actor_kind"])
+        self.assertEqual([], self.backend.sweep_expired_sessions(now=expiry)["attempted_session_ids"])
+
+    def test_failed_retention_deletion_is_durable_and_startup_retries_it(self) -> None:
+        clock = FakeClock(datetime(2026, 2, 1, tzinfo=timezone.utc))
+        self.backend = PilotBackend(self.config, self.admin_secret, clock=clock)
+        failed_session, failed_token, _ = self.make_session()
+        healthy_session, healthy_token, _ = self.make_session()
+        self.put_segment(failed_session, failed_token, 0, b"retry-after-restart")
+        self.put_segment(healthy_session, healthy_token, 0, b"delete-in-same-pass")
+        expiry = parse_timestamp(
+            self.backend.get_session(failed_session)["retention"]["raw_media_expires_at"]
+        )
+        clock.set(expiry)
+
+        original_delete = self.backend._delete_session_files
+
+        def fail_one(session_id, sequences, envelope_ids):
+            if session_id == failed_session:
+                raise OSError("injected retention failure")
+            return original_delete(session_id, sequences, envelope_ids)
+
+        self.backend._delete_session_files = fail_one
+        result = self.backend.sweep_expired_sessions()
+        self.assertIn(failed_session, result["failed_session_ids"])
+        self.assertIn(healthy_session, result["deleted_session_ids"])
+        failed_job = next(
+            job
+            for job in self.backend.get_session(failed_session)["jobs"]
+            if job["job_type"] == "delete_session"
+        )
+        self.assertEqual("failed", failed_job["status"])
+        self.assertEqual(
+            "deletion_requested",
+            self.backend.get_session(failed_session)["retention"]["deletion_status"],
+        )
+        with closing(sqlite3.connect(self.backend.db_path)) as conn:
+            revoked_at = conn.execute(
+                "SELECT revoked_at FROM upload_tokens WHERE session_id = ?", (failed_session,)
+            ).fetchone()[0]
+        self.assertEqual(expiry.strftime("%Y-%m-%dT%H:%M:%SZ"), revoked_at)
+
+        waiter = ControlledRetentionWait()
+        restarted = PilotBackend(
+            self.config,
+            self.admin_secret,
+            clock=clock,
+            retention_wait=waiter,
+        )
+        server = create_server(
+            restarted,
+            host="127.0.0.1",
+            port=0,
+            bind_and_activate=False,
+        )
+        self.addCleanup(server.server_close)
+        self.assertTrue(restarted.retention_worker_running)
+        self.assertEqual([failed_session], restarted.last_retention_sweep["deleted_session_ids"])
+        succeeded = next(
+            job
+            for job in restarted.get_session(failed_session)["jobs"]
+            if job["job_type"] == "delete_session"
+        )
+        self.assertEqual(failed_job["job_id"], succeeded["job_id"])
+        self.assertEqual("succeeded", succeeded["status"])
+        server.server_close()
+        self.assertFalse(restarted.retention_worker_running)
+
+    def test_server_runs_controlled_periodic_retention_and_stops_worker(self) -> None:
+        clock = FakeClock(datetime(2026, 3, 1, tzinfo=timezone.utc))
+        waiter = ControlledRetentionWait()
+        self.backend = PilotBackend(
+            self.config,
+            self.admin_secret,
+            clock=clock,
+            retention_wait=waiter,
+        )
+        session_id, token, _ = self.make_session()
+        self.put_segment(session_id, token, 0, b"periodic-retention")
+        expiry = parse_timestamp(
+            self.backend.get_session(session_id)["retention"]["raw_media_expires_at"]
+        )
+
+        cycle_completed = threading.Event()
+        original_sweep = self.backend.sweep_expired_sessions
+
+        def observed_sweep(*, now=None):
+            result = original_sweep(now=now)
+            cycle_completed.set()
+            return result
+
+        self.backend.sweep_expired_sessions = observed_sweep
+        server = create_server(
+            self.backend,
+            host="127.0.0.1",
+            port=0,
+            bind_and_activate=False,
+        )
+        self.addCleanup(server.server_close)
+        self.assertTrue(cycle_completed.is_set())
+        self.assertTrue(self.backend.retention_worker_running)
+        self.assertTrue(waiter.waiting.wait(1))
+        cycle_completed.clear()
+
+        clock.set(expiry)
+        waiter.trigger()
+        self.assertTrue(cycle_completed.wait(1))
+        self.assertTrue(waiter.waiting.wait(1))
+        self.assertEqual("deleted", self.backend.get_session(session_id)["state"])
+        self.assertEqual(
+            [session_id], self.backend.last_retention_sweep["deleted_session_ids"]
+        )
+        self.assertEqual(
+            float(self.config.retention_sweep_interval_seconds), waiter.intervals[0]
+        )
+
+        server.server_close()
+        self.assertFalse(self.backend.retention_worker_running)
+
     def test_persisted_deployment_scope_fails_closed_on_config_change(self) -> None:
         self.make_session()
         changed = replace(self.config, build_id="build_other")
@@ -677,11 +889,18 @@ class PilotConfigTests(unittest.TestCase):
         return path
 
     def test_reverse_dns_bundle_id_safe_bind_and_shorter_retention(self) -> None:
-        config, _ = load_config(self.write_config(raw_retention_days=1), self.secret_file)
+        config, _ = load_config(
+            self.write_config(
+                raw_retention_days=1,
+                retention_sweep_interval_seconds=30,
+            ),
+            self.secret_file,
+        )
         self.assertEqual("app_config", config.application_id)
         self.assertEqual("com.example.kuzaba.qa", config.bundle_identifier)
         self.assertEqual("127.0.0.1", config.listen_host)
         self.assertEqual(1, config.raw_retention_days)
+        self.assertEqual(30, config.retention_sweep_interval_seconds)
 
     def test_invalid_bundle_retention_unknown_and_duplicate_config_are_rejected(self) -> None:
         with self.assertRaises(ConfigError):
@@ -690,6 +909,10 @@ class PilotConfigTests(unittest.TestCase):
             load_config(self.write_config(bundle_identifier="bundle_invalid"), self.secret_file)
         with self.assertRaises(ConfigError):
             load_config(self.write_config(raw_retention_days=31), self.secret_file)
+        with self.assertRaises(ConfigError):
+            load_config(self.write_config(retention_sweep_interval_seconds=29), self.secret_file)
+        with self.assertRaises(ConfigError):
+            load_config(self.write_config(retention_sweep_interval_seconds=3601), self.secret_file)
         with self.assertRaises(ConfigError):
             load_config(self.write_config(unknown_setting=True), self.secret_file)
         duplicate = self.root / "duplicate.json"

@@ -22,9 +22,32 @@ class PilotHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address: tuple[str, int], backend: PilotBackend):
+    def __init__(
+        self,
+        address: tuple[str, int],
+        backend: PilotBackend,
+        *,
+        bind_and_activate: bool = True,
+    ):
         self.backend = backend
-        super().__init__(address, PilotRequestHandler)
+        self._retention_started = False
+        try:
+            backend.start_retention_enforcement()
+            self._retention_started = True
+            super().__init__(address, PilotRequestHandler, bind_and_activate=bind_and_activate)
+        except Exception:
+            if self._retention_started:
+                backend.stop_retention_enforcement()
+                self._retention_started = False
+            raise
+
+    def server_close(self) -> None:
+        try:
+            if self._retention_started:
+                self.backend.stop_retention_enforcement()
+                self._retention_started = False
+        finally:
+            super().server_close()
 
 
 class PilotRequestHandler(BaseHTTPRequestHandler):
@@ -244,8 +267,15 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
         self._handle()
 
 
-def create_server(backend: PilotBackend, host: str | None = None, port: int | None = None) -> PilotHTTPServer:
+def create_server(
+    backend: PilotBackend,
+    host: str | None = None,
+    port: int | None = None,
+    *,
+    bind_and_activate: bool = True,
+) -> PilotHTTPServer:
     return PilotHTTPServer(
         (host if host is not None else backend.config.listen_host, port if port is not None else backend.config.listen_port),
         backend,
+        bind_and_activate=bind_and_activate,
     )
