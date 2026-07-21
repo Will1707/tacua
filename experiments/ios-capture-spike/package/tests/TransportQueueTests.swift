@@ -59,13 +59,16 @@ private let digestC = "sha256:" + String(repeating: "c", count: 64)
 @main
 enum TransportQueueTests {
   static func main() throws {
+    let fixtureRoot = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
     try migrationDropsLegacyGrantAuthority()
     try queueNeverPersistsSecretsOrLaunchCodes()
+    try strictIdentifierAndSensitiveKeyBounds()
     try timeAnchorSurvivesRestartAndRejectsReboot()
     try exactRetryKeepsHistoricalBodyCredentialAfterRotation()
     try completedCredentialsCannotRestartUploads()
-    try completionAloneAuthorizesCrashSafePayloadCleanup()
-    try deletionAloneAuthorizesCredentialRemoval()
+    try responseStorageFailsClosed()
+    try completionAloneAuthorizesCrashSafePayloadCleanup(fixtureRoot)
+    try deletionAloneAuthorizesCredentialRemoval(fixtureRoot)
     print("Tacua transport queue tests passed")
   }
 
@@ -161,6 +164,36 @@ enum TransportQueueTests {
     _ = try TacuaTransportQueueV2.decodeOrMigrate(encoded)
   }
 
+  private static func strictIdentifierAndSensitiveKeyBounds() throws {
+    try expectQueueError(.invalidQueue) {
+      _ = try TacuaTransportQueueV2(localSessionID: "a" + String(repeating: "b", count: 64))
+    }
+    var queue = try makeActiveQueue()
+    let unsafeRequest = TacuaJSONValue.object([
+      "protocol_version": .string("tacua.sdk-backend@1.0.0"),
+      "message_type": .string("diagnostic_upload_request"),
+      "upload_id": .string("upload_unsafe"),
+      "credential_id": .string("credential_first"),
+      "client_secret": .string("must_not_persist"),
+      "request_digest": .string(""),
+    ])
+    let digest = try TacuaCanonicalJSON.digest(
+      unsafeRequest, omittingRootField: "request_digest"
+    )
+    guard case .object(var object) = unsafeRequest else { fatalError() }
+    object["request_digest"] = .string(digest)
+    try expectQueueError(.prohibitedPersistedMaterial) {
+      try queue.enqueueNewOperation(
+        kind: .diagnostic,
+        operationID: "upload_unsafe",
+        requestCredentialID: "credential_first",
+        request: .object(object),
+        requestDigest: digest,
+        clock: TestClock(uptimeMilliseconds: 101_000, bootSessionID: "boot_001")
+      )
+    }
+  }
+
   private static func timeAnchorSurvivesRestartAndRejectsReboot() throws {
     let queue = try makeActiveQueue()
     let restarted = TestClock(uptimeMilliseconds: 105_000, bootSessionID: "boot_001")
@@ -201,51 +234,56 @@ enum TransportQueueTests {
 
   private static func completedCredentialsCannotRestartUploads() throws {
     var queue = try makeActiveQueue()
-    try enqueue(.completion, id: "completion_001", credentialID: "credential_first", queue: &queue)
-    let response = try TacuaCanonicalJSON.data(.object(["ok": .bool(true)]))
-    try queue.storeResponse(operationID: "completion_001", canonicalResponse: response, responseDigest: digestB)
-    try queue.authorizeCompletionCleanup(
-      TacuaCompletionCleanupAuthority(
-        completionID: "completion_001",
-        completionReceiptDigest: digestB,
-        manifestDigest: digestC,
-        segmentReceiptDigests: [],
-        diagnosticReceiptDigests: []
-      )
+    try queue.applyExchange(
+      remoteSessionID: "session_remote_001",
+      scopeDigest: digestA,
+      credentialID: "credential_completed",
+      capability: .completionReplayOrDeleteOnly,
+      issuedAt: "2026-07-21T10:05:00Z",
+      clock: TestClock(uptimeMilliseconds: 400_000, bootSessionID: "boot_001")
     )
     try expectQueueError(.operationNotAllowed) {
-      try enqueue(.segment, id: "upload_late", credentialID: "credential_first", queue: &queue)
+      try enqueue(.segment, id: "upload_late", credentialID: "credential_completed", queue: &queue)
     }
   }
 
-  private static func completionAloneAuthorizesCrashSafePayloadCleanup() throws {
+  private static func responseStorageFailsClosed() throws {
     var queue = try makeActiveQueue()
-    let persistence = MemoryPersistence()
-    let remover = MemoryPayloadRemover()
-    try expectQueueError(.cleanupNotAuthorized) {
-      try TacuaTransportCleanup.removeAuthorizedPayloads(
-        queue: &queue, persistence: persistence, remover: remover
+    try enqueue(.diagnostic, id: "upload_diagnostic_001", credentialID: "credential_first", queue: &queue)
+    let canonical = try TacuaCanonicalJSON.data(.object(["ok": .bool(true)]))
+    try expectQueueError(.responseConflict) {
+      try queue.storeResponse(
+        operationID: "upload_diagnostic_001", canonicalResponse: canonical,
+        responseDigest: digestB
       )
     }
-    try enqueue(.completion, id: "completion_001", credentialID: "credential_first", queue: &queue)
-    let response = try TacuaCanonicalJSON.data(.object(["receipt": .string("durable")]))
-    try queue.storeResponse(operationID: "completion_001", canonicalResponse: response, responseDigest: digestB)
-    try queue.authorizeCompletionCleanup(
-      TacuaCompletionCleanupAuthority(
-        completionID: "completion_001",
-        completionReceiptDigest: digestB,
-        manifestDigest: digestC,
-        segmentReceiptDigests: [digestA],
-        diagnosticReceiptDigests: [digestB]
+    var nonCanonical = canonical
+    nonCanonical.append(0x0A)
+    try expectQueueError(.responseConflict) {
+      try queue.storeResponse(
+        operationID: "upload_diagnostic_001", canonicalResponse: nonCanonical,
+        responseDigest: TacuaCanonicalJSON.digest(data: nonCanonical)
       )
+    }
+  }
+
+  private static func completionAloneAuthorizesCrashSafePayloadCleanup(_ root: URL) throws {
+    var queue = try fixtureQueue(
+      root,
+      requestName: "completion-request",
+      kind: .completion,
+      operationID: "completion_synthetic",
+      responseName: "completion-receipt"
     )
+    let persistence = MemoryPersistence()
+    let remover = MemoryPayloadRemover()
     try TacuaTransportCleanup.removeAuthorizedPayloads(
       queue: &queue, persistence: persistence, remover: remover
     )
     try require(persistence.snapshots.first?.payloadCleanupState == .tombstoneWritten, "Cleanup tombstone must be durable before deletion")
     try require(remover.removed == queue.localPayloadPaths, "Every payload must be removed")
     try require(queue.payloadCleanupState == .payloadsRemoved, "Cleanup must finish durably")
-    try require(queue.currentCredentialID == "credential_first", "Completion must retain the deletion credential")
+    try require(queue.currentCredentialID == "credential_receiving_resume", "Completion must retain the deletion credential")
 
     var recovered = persistence.snapshots[0]
     let retryPersistence = MemoryPersistence()
@@ -256,30 +294,72 @@ enum TransportQueueTests {
     try require(retryRemover.removed == recovered.localPayloadPaths, "A tombstoned crash must resume idempotent removal")
   }
 
-  private static func deletionAloneAuthorizesCredentialRemoval() throws {
-    var queue = try makeActiveQueue()
-    try enqueue(.deletion, id: "deletion_001", credentialID: "credential_first", queue: &queue)
-    let response = try TacuaCanonicalJSON.data(.object(["tombstone": .string("durable")]))
-    try queue.storeResponse(operationID: "deletion_001", canonicalResponse: response, responseDigest: digestC)
+  private static func deletionAloneAuthorizesCredentialRemoval(_ root: URL) throws {
+    var queue = try fixtureQueue(
+      root,
+      requestName: "deletion-request",
+      kind: .deletion,
+      operationID: "deletion_synthetic",
+      responseName: "deletion-tombstone"
+    )
     let persistence = MemoryPersistence()
     let credentials = MemoryCredentialStore()
-    credentials.values["credential_first"] = Data(repeating: 7, count: 32)
-    try expectQueueError(.deletionNotAuthorized) {
-      try TacuaTransportCleanup.removeAuthorizedCredential(
-        queue: &queue, persistence: persistence, credentialStore: credentials
-      )
-    }
-    try queue.authorizeDeletionCleanup(
-      TacuaDeletionCleanupAuthority(
-        deletionID: "deletion_001", tombstoneDigest: digestC, credentialID: "credential_first"
-      )
-    )
+    credentials.values["credential_receiving_resume"] = Data(repeating: 7, count: 32)
     try TacuaTransportCleanup.removeAuthorizedCredential(
       queue: &queue, persistence: persistence, credentialStore: credentials
     )
     try require(persistence.snapshots.first?.credentialCleanupState == .tombstoneWritten, "Credential tombstone must precede Keychain removal")
-    try require(credentials.removals == ["credential_first"], "Deletion must remove only the bound credential")
+    try require(credentials.removals == ["credential_receiving_resume"], "Deletion must remove only the bound credential")
     try require(queue.currentCredentialID == nil && queue.credentialCleanupState == .credentialRemoved, "Credential cleanup must finish durably")
     _ = try queue.encoded()
+  }
+
+  private static func canonicalFixture(_ root: URL, _ name: String) throws -> Data {
+    let data = try Data(contentsOf: root.appendingPathComponent("\(name).json"))
+    return try TacuaCanonicalJSON.data(try TacuaCanonicalJSON.parse(data))
+  }
+
+  private static func fixtureQueue(
+    _ root: URL,
+    requestName: String,
+    kind: TacuaQueuedOperationKind,
+    operationID: String,
+    responseName: String
+  ) throws -> TacuaTransportQueueV2 {
+    let requestData = try canonicalFixture(root, requestName)
+    let requestValue = try TacuaCanonicalJSON.parse(requestData)
+    guard case .object(let request) = requestValue,
+      let credentialID = request["credential_id"]?.stringValue,
+      let sessionID = request["session_id"]?.stringValue,
+      let scopeDigest = request["scope_digest"]?.stringValue,
+      let requestDigest = request[kind == .segment ? "intent_digest" : "request_digest"]?.stringValue
+    else { throw QueueTestFailure.assertion("Invalid fixture request") }
+    var queue = try TacuaTransportQueueV2(
+      localSessionID: "session_local_fixture",
+      localPayloadPaths: ["segments/000.mov", "diagnostics/events.json"]
+    )
+    try queue.applyExchange(
+      remoteSessionID: sessionID,
+      scopeDigest: scopeDigest,
+      credentialID: credentialID,
+      capability: .active,
+      issuedAt: "2026-07-21T10:00:00Z",
+      clock: TestClock(uptimeMilliseconds: 100_000, bootSessionID: "boot_fixture")
+    )
+    try queue.enqueueNewOperation(
+      kind: kind,
+      operationID: operationID,
+      requestCredentialID: credentialID,
+      request: requestValue,
+      requestDigest: requestDigest,
+      clock: TestClock(uptimeMilliseconds: 101_000, bootSessionID: "boot_fixture")
+    )
+    let responseData = try canonicalFixture(root, responseName)
+    let receipt = try TacuaSDKBackendProtocol.validateResponse(
+      responseData,
+      forCanonicalRequest: requestData
+    )
+    try queue.storeValidatedReceipt(receipt)
+    return queue
   }
 }

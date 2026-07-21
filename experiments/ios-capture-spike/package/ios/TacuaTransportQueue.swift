@@ -304,6 +304,10 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     try authorizeNew(kind: kind)
     _ = try timestampForNewOperation(clock: clock)
     let canonicalRequest = try TacuaCanonicalJSON.data(request)
+    let persistedObject = try JSONSerialization.jsonObject(with: canonicalRequest)
+    guard !Self.containsProhibitedKey(persistedObject) else {
+      throw TacuaTransportQueueError.prohibitedPersistedMaterial
+    }
     guard try TacuaCanonicalJSON.digest(request, omittingRootField: Self.digestField(for: kind))
       == requestDigest
     else {
@@ -367,9 +371,13 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     canonicalResponse: Data,
     responseDigest: String
   ) throws {
-    guard Self.validDigest(responseDigest),
-      let index = operations.firstIndex(where: { $0.operationID == operationID })
+    let responseValue = try TacuaCanonicalJSON.parse(canonicalResponse)
+    guard try TacuaCanonicalJSON.data(responseValue) == canonicalResponse,
+      TacuaCanonicalJSON.digest(data: canonicalResponse) == responseDigest
     else {
+      throw TacuaTransportQueueError.responseConflict
+    }
+    guard let index = operations.firstIndex(where: { $0.operationID == operationID }) else {
       throw TacuaTransportQueueError.operationNotFound
     }
     if let prior = operations[index].canonicalResponse {
@@ -383,7 +391,46 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     operations[index].state = .responseStored
   }
 
-  mutating func authorizeCompletionCleanup(_ authority: TacuaCompletionCleanupAuthority) throws {
+  mutating func storeValidatedReceipt(_ receipt: TacuaValidatedBackendReceipt) throws {
+    guard let operation = operations.first(where: { $0.operationID == receipt.operationID }) else {
+      throw TacuaTransportQueueError.operationNotFound
+    }
+    let expectedKind: TacuaBackendOperationKind
+    switch operation.kind {
+    case .segment: expectedKind = .segment
+    case .diagnostic: expectedKind = .diagnostic
+    case .completion: expectedKind = .completion
+    case .deletion: expectedKind = .deletion
+    }
+    guard receipt.operationKind == expectedKind,
+      receipt.remoteSessionID == remoteSessionID,
+      receipt.scopeDigest == scopeDigest
+    else {
+      throw TacuaTransportQueueError.responseConflict
+    }
+    // Re-derive every binding and cleanup authority from the exact stored request/response pair.
+    // A caller-created value cannot inject an asserted completion or deletion authority.
+    let independentlyValidated = try TacuaSDKBackendProtocol.validateResponse(
+      receipt.canonicalResponse,
+      forCanonicalRequest: operation.canonicalRequest
+    )
+    guard independentlyValidated == receipt else {
+      throw TacuaTransportQueueError.responseConflict
+    }
+    try storeResponse(
+      operationID: receipt.operationID,
+      canonicalResponse: receipt.canonicalResponse,
+      responseDigest: TacuaCanonicalJSON.digest(data: receipt.canonicalResponse)
+    )
+    if let authority = receipt.completionCleanupAuthority {
+      try authorizeCompletionCleanup(authority)
+    }
+    if let authority = receipt.deletionCleanupAuthority {
+      try authorizeDeletionCleanup(authority)
+    }
+  }
+
+  private mutating func authorizeCompletionCleanup(_ authority: TacuaCompletionCleanupAuthority) throws {
     guard Self.validIdentifier(authority.completionID),
       Self.validDigest(authority.completionReceiptDigest), Self.validDigest(authority.manifestDigest),
       authority.segmentReceiptDigests.allSatisfy(Self.validDigest),
@@ -400,7 +447,7 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     credentialCapability = .completionReplayOrDeleteOnly
   }
 
-  mutating func authorizeDeletionCleanup(_ authority: TacuaDeletionCleanupAuthority) throws {
+  private mutating func authorizeDeletionCleanup(_ authority: TacuaDeletionCleanupAuthority) throws {
     guard Self.validIdentifier(authority.deletionID), Self.validDigest(authority.tombstoneDigest),
       Self.validIdentifier(authority.credentialID), authority.credentialID == currentCredentialID,
       let operation = operations.first(where: { $0.operationID == authority.deletionID }),
@@ -498,7 +545,7 @@ struct TacuaTransportQueueV2: Codable, Equatable {
   }
 
   private static func validIdentifier(_ value: String) -> Bool {
-    value.range(of: "^[a-z][a-z0-9_-]{2,127}$", options: .regularExpression) != nil
+    value.range(of: "^[a-z][a-z0-9_-]{2,63}$", options: .regularExpression) != nil
   }
 
   private static func validDigest(_ value: String) -> Bool {
@@ -512,8 +559,14 @@ struct TacuaTransportQueueV2: Codable, Equatable {
 
   private static func containsProhibitedKey(_ value: Any) -> Bool {
     if let object = value as? [String: Any] {
-      let prohibited = Set(["secret", "launch_code", "authorization", "bearer"])
-      if object.keys.contains(where: { prohibited.contains($0.lowercased()) }) { return true }
+      let prohibited = Set([
+        "launch_code", "authorization", "bearer", "password", "cookie", "set_cookie",
+        "access_token", "refresh_token",
+      ])
+      if object.keys.contains(where: { key in
+        let normalized = key.lowercased().replacingOccurrences(of: "-", with: "_")
+        return prohibited.contains(normalized) || normalized.contains("secret")
+      }) { return true }
       return object.values.contains(where: containsProhibitedKey)
     }
     if let array = value as? [Any] { return array.contains(where: containsProhibitedKey) }
@@ -591,12 +644,13 @@ private struct TacuaLegacyUploadItem: Decodable {
 
 private enum TacuaProtocolTimestamp {
   static func parseMilliseconds(_ value: String) -> Int64? {
+    guard value.range(
+      of: "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+      options: .regularExpression
+    ) != nil else { return nil }
     let formatter = ISO8601DateFormatter()
-    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    let date = formatter.date(from: value) ?? {
-      formatter.formatOptions = [.withInternetDateTime]
-      return formatter.date(from: value)
-    }()
+    formatter.formatOptions = [.withInternetDateTime]
+    let date = formatter.date(from: value)
     guard let date else { return nil }
     return Int64((date.timeIntervalSince1970 * 1_000).rounded())
   }
