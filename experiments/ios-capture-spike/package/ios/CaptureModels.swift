@@ -34,6 +34,19 @@ public struct TacuaCaptureRecoveryOptions: Record {
   public init() {}
 }
 
+/// The public TypeScript wrapper accepts typed protocol objects and serializes them only for this
+/// native bridge. Native code parses, canonicalizes, and validates both objects before consent is
+/// consumed or Keychain is mutated.
+public struct TacuaBackendStartSessionNativeOptions: Record {
+  @Field public var approvedLaunchId: String = ""
+  @Field public var localSessionId: String = ""
+  @Field public var buildIdentityJson: String = ""
+  @Field public var scopeJson: String = ""
+  @Field public var requestedAt: String = ""
+
+  public init() {}
+}
+
 struct CaptureSegment: Codable {
   let index: Int
   let fileName: String

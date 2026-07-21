@@ -10,7 +10,7 @@ The planned V1 consists of:
 - a development-build SDK embedded in the app under test; and
 - a Docker-packaged backend for upload, asynchronous research, candidate review, and approved Markdown/JSON handoff.
 
-Tacua is currently in evidence-driven product and technical de-risking. It is not yet ready for production use. This public repository contains only sanitized contracts and technical experiments; founder interviews, private pilot details, recordings, and raw environment evidence are intentionally excluded.
+Tacua is currently in evidence-driven product and technical de-risking. It is not yet ready for production use. This public repository contains sanitized contracts, technical experiments, and a non-production vertical foundation; founder interviews, private pilot details, recordings, and raw environment evidence are intentionally excluded.
 
 See [the V1 product boundary](docs/PRODUCT.md) for the sanitized workflow,
 privacy boundary, approval model, and explicit non-goals.
@@ -26,7 +26,7 @@ The first pilot targets an authorized private Expo/React Native iOS app. The V1 
 
 ## What is here today
 
-- [`experiments/ios-capture-spike`](experiments/ios-capture-spike/package/README.md): a removable, first-party Expo/ReplayKit package candidate with segmented local recovery, plus a local-only [physical-iPhone development harness](experiments/ios-capture-spike/harness/README.md). `EXP-001` completed its physical candidate gates on one iPhone using synthetic QA data, including foreground narration, static-screen segmentation, interruption and recovery choices, scoped deletion, the 30-minute limit, lock recovery, and the deterministic [fault-injection campaign](experiments/ios-capture-spike/FAULT-INJECTION-RUNBOOK.md). Sanitized outcomes and remaining promotion blockers are recorded in the [physical-device results](experiments/ios-capture-spike/PHYSICAL-DEVICE-RESULTS.md). The candidate still has no authentication, upload, or backend integration.
+- [`experiments/ios-capture-spike`](experiments/ios-capture-spike/package/README.md): a removable, first-party Expo/ReplayKit package candidate with segmented local recovery, plus a local-only [physical-iPhone development harness](experiments/ios-capture-spike/harness/README.md). `EXP-001` completed its physical candidate gates on one iPhone using synthetic QA data, including foreground narration, static-screen segmentation, interruption and recovery choices, scoped deletion, the 30-minute limit, lock recovery, and the deterministic [fault-injection campaign](experiments/ios-capture-spike/FAULT-INJECTION-RUNBOOK.md). The package now also contains a build-pinned, redirect-rejecting SDK/backend client, Keychain credential boundary, crash-safe replay queue, and START-only session coordinator. The stopped-capture-to-protocol adapter and upload/completion/deletion orchestration remain unimplemented, so stopping a capture does not yet upload it.
 - [`experiments/eval-harness`](experiments/eval-harness/README.md): a synthetic multi-issue corpus, scorer and reporter-time protocol. Its fixtures are not product-quality evidence.
 - [`experiments/security-harness`](experiments/security-harness/README.md): deterministic, synthetic default-deny, authorization, retention and deletion contract checks. Runtime security remains unverified.
 - [`experiments/docker-topology-probe`](experiments/docker-topology-probe/README.md): a non-production container lifecycle probe. It does not select or implement the backend topology.
@@ -34,8 +34,8 @@ The first pilot targets an authorized private Expo/React Native iOS app. The V1 
 - [`contracts/runtime`](contracts/runtime/README.md): strict candidate contracts for the capture/upload manifest, sanitized SDK diagnostics, asynchronous processing jobs, and editable ticket lifecycle. Structural validation does not authorize capture, egress, or agent execution.
 - [`contracts/ticket-candidate`](contracts/ticket-candidate/README.md): the standalone production draft/review contract for immutable candidate versions, evidence-manifest binding, visual clarification choices, and exact human approval before approved-handoff export.
 - [`contracts/sdk-backend-protocol`](contracts/sdk-backend-protocol/README.md): the exact retry-safe SDK wire contract for scoped Keychain credentials, media and diagnostic receipts, idempotent completion, local cleanup authority, and deletion.
-- [`apps/reviewer`](apps/reviewer/README.md): an iOS-first Expo reviewer-app scaffold with secure self-hosted configuration, session/evidence/job views, clarification choices, and exact-version human approval controls. Launch orchestration and candidate APIs are not implemented yet.
-- [`services/backend`](services/backend/README.md): a dependency-free, Docker-packaged upload-boundary pilot with fixed deployment scope, integrity-checked segment and diagnostic persistence, contract-valid processing jobs, and durable deletion. Its documented production blockers remain release work.
+- [`apps/reviewer`](apps/reviewer/README.md): an iOS-first Expo reviewer app with secure self-hosted configuration, QA-build launch orchestration, session/evidence/job views, clarification choices, exact-version human approval, and verified Markdown/JSON file sharing.
+- [`services/backend`](services/backend/README.md): a dependency-free, Docker-packaged upload boundary with fixed deployment scope, integrity-checked segment and diagnostic persistence, contract-valid processing jobs, immutable evidence-linked candidate review, atomic approved-handoff persistence, and durable deletion. Its documented production blockers remain release work.
 - [`docs/design/visual-direction.md`](docs/design/visual-direction.md): the adaptive, cicada-derived light and dark colour system used by the reviewer app.
 
 ## Local verification
@@ -51,6 +51,9 @@ PYTHONWARNINGS=error python3 -B -m unittest discover -s contracts/sdk-backend-pr
 PYTHONWARNINGS=error python3 -B -m unittest discover -s services/backend/tests -v
 python3 -B -m unittest discover -s experiments/eval-harness/tests -v
 node --test experiments/security-harness/test/harness.test.mjs
+sh experiments/ios-capture-spike/package/tests/run-core-tests.sh
+npm --prefix apps/reviewer ci --ignore-scripts --no-audit --no-fund
+npm --prefix apps/reviewer run typecheck
 ```
 
 The security harness requires Node 22 or newer. The Docker probe additionally requires a local Docker engine and creates only labelled experiment resources; read its runbook before execution.

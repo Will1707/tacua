@@ -109,7 +109,7 @@ type BackendTransportConfiguration = {
   readonly transportConfigurationDigest: string;
   readonly transportPolicyVersion: "tacua.sdk-transport@1.0.0";
   readonly protocolVersion: "tacua.sdk-backend@1.0.0";
-  readonly queueSchemaVersion: 2;
+  readonly queueSchemaVersion: 3;
   readonly credentialStorage: "ios_keychain_when_unlocked_this_device_only";
   readonly launchCodePersistence: "transient_only";
   readonly redirectPolicy: "reject_all";
@@ -125,6 +125,126 @@ type ApprovedBackendLaunch = {
   readonly approvedLaunchId: string;
 };
 
+type BackendBuildIdentity = {
+  readonly protocol_version: "tacua.sdk-backend@1.0.0";
+  readonly message_type: "build_identity";
+  readonly build_id: string;
+  readonly platform: "ios";
+  readonly bundle_identifier: string;
+  readonly native_version: string;
+  readonly native_build: string;
+  readonly build_variant: "development" | "preview";
+  readonly distribution: "local" | "internal" | "testflight";
+  readonly react_native_version: string;
+  readonly transport_configuration_digest: string;
+  readonly expo: {
+    readonly sdk_version: string;
+    readonly runtime_version: string;
+    readonly update_id: string | null;
+    readonly update_channel: string | null;
+  } | null;
+  readonly source: {
+    readonly git_revision: string;
+    readonly working_tree_dirty: boolean;
+  };
+  readonly created_at: string;
+  readonly build_identity_digest: string;
+};
+
+type BackendCaptureScope = {
+  readonly protocol_version: "tacua.sdk-backend@1.0.0";
+  readonly message_type: "capture_scope";
+  readonly organization_id: string;
+  readonly project_id: string;
+  readonly application_id: string;
+  readonly build_id: string;
+  readonly build_identity_digest: string;
+  readonly capture_scope: "app_only";
+  readonly consent: {
+    readonly policy_version: string;
+    readonly screen_recording: "granted";
+    readonly microphone: "granted";
+    readonly diagnostics: "granted";
+    readonly raw_media_upload: "granted";
+    readonly granted_at: string;
+  };
+  readonly retention: {
+    readonly policy_version: string;
+    readonly raw_media_days: number;
+    readonly derived_data_days: number;
+  };
+  readonly scope_digest: string;
+};
+
+type BackendStartSessionOptions = {
+  readonly approvedLaunchId: string;
+  readonly localSessionId: string;
+  readonly buildIdentity: BackendBuildIdentity;
+  readonly scope: BackendCaptureScope;
+  readonly requestedAt: string;
+};
+
+type BackendStartSessionNativeOptions = {
+  readonly approvedLaunchId: string;
+  readonly localSessionId: string;
+  readonly buildIdentityJson: string;
+  readonly scopeJson: string;
+  readonly requestedAt: string;
+};
+
+type BackendStartedSession = {
+  readonly localSessionId: string;
+  readonly remoteSessionId: string;
+  readonly scopeDigest: string;
+  readonly credentialId: string;
+  readonly credentialExpiresAt: string;
+  readonly credentialCapability: "active";
+  readonly credentialAvailability:
+    | "available"
+    | "missing"
+    | "temporarily_unavailable"
+    | "unavailable";
+  readonly queueSchemaVersion: 3;
+  readonly resumeRequired: boolean;
+  readonly backendSessionState: "receiving";
+  readonly captureStarted: false;
+  readonly uploadsConnected: false;
+  readonly completionConnected: false;
+};
+
+type BackendStartRecoveryStatus = {
+  readonly localSessionId: string;
+  readonly state:
+    | "none"
+    | "credential_prepared"
+    | "exchange_outcome_unknown"
+    | "receipt_validated_queue_commit_pending"
+    | "credential_prepared_reset_pending"
+    | "exchange_outcome_unknown_reset_pending"
+    | "queue_committed";
+  readonly requiresFreshReviewerLaunch: boolean;
+  readonly remoteSessionMayExist: boolean;
+  readonly canRecoverWithoutLaunch: boolean;
+  readonly canAbandonLocally: boolean;
+  readonly resumeRequired: boolean | null;
+  readonly transportConfigurationMatchesBuild: boolean | null;
+  /** Recorded backend authority, not standalone proof that transport is currently usable. */
+  readonly credentialCapability:
+    | "requires_exchange"
+    | "requires_transport_rebind"
+    | "active"
+    | "completion_replay_or_delete_only"
+    | "deletion_replay_only"
+    | null;
+  readonly credentialAvailability:
+    | "available"
+    | "missing"
+    | "temporarily_unavailable"
+    | "unavailable"
+    | "not_applicable"
+    | null;
+};
+
 type BackendQueueStatus = {
   readonly exists: boolean;
   readonly localSessionId: string;
@@ -132,13 +252,22 @@ type BackendQueueStatus = {
   readonly scopeDigest?: string | null;
   readonly currentCredentialId?: string | null;
   readonly currentCredentialExpiresAt?: string | null;
+  /** Recorded backend authority; gate sends on this together with resumeRequired. */
   readonly credentialCapability?:
     | "requires_exchange"
+    | "requires_transport_rebind"
     | "active"
     | "completion_replay_or_delete_only"
     | "deletion_replay_only";
+  readonly credentialAvailability?:
+    | "available"
+    | "missing"
+    | "temporarily_unavailable"
+    | "unavailable"
+    | "not_applicable";
   readonly credentialTimeValid?: boolean;
   readonly resumeRequired?: boolean;
+  readonly transportConfigurationMatchesBuild?: boolean;
   readonly operationCount?: number;
   readonly queuedOperationCount?: number;
   readonly storedResponseCount?: number;
@@ -149,7 +278,7 @@ type BackendQueueStatus = {
   readonly credentialCleanupState?: "none" | "tombstone_written" | "credential_removed";
   readonly completionCleanupAuthorized?: boolean;
   readonly deletionCleanupAuthorized?: boolean;
-  readonly schemaVersion?: 2;
+  readonly schemaVersion?: 3;
 };
 
 type CaptureEventMap = {
@@ -170,6 +299,19 @@ type NativeTacuaCaptureSpikeModule = {
     granted: boolean,
   ) => ApprovedBackendLaunch;
   cancelBackendLaunch: (requestId: string) => void;
+  startBackendSession: (
+    options: BackendStartSessionNativeOptions,
+  ) => Promise<BackendStartedSession>;
+  getBackendStartRecoveryStatus: (
+    localSessionId: string,
+  ) => Promise<BackendStartRecoveryStatus>;
+  recoverBackendStart: (
+    localSessionId: string,
+  ) => Promise<BackendStartedSession>;
+  abandonBackendStart: (
+    localSessionId: string,
+    acknowledgeRemoteSessionMayExist: boolean,
+  ) => Promise<void>;
   getStatus: () => CaptureStatus;
   start: (options: CaptureStartOptions) => Promise<CaptureStatus>;
   resume: (options: CaptureStartOptions) => Promise<CaptureStatus>;
@@ -188,8 +330,13 @@ type NativeTacuaCaptureSpikeModule = {
 
 export type {
   ApprovedBackendLaunch,
+  BackendBuildIdentity,
+  BackendCaptureScope,
   BackendLaunchConsentRequest,
   BackendQueueStatus,
+  BackendStartedSession,
+  BackendStartRecoveryStatus,
+  BackendStartSessionOptions,
   BackendTransportConfiguration,
   CaptureCapabilities,
   CaptureErrorEvent,

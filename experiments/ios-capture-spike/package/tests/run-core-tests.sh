@@ -124,6 +124,27 @@ swiftc \
   "$REPO_ROOT/contracts/sdk-backend-protocol/fixtures/positive"
 
 swiftc \
+  -module-cache-path "$TEST_TMP_DIR/module-cache" \
+  ios/CapturePolicy.swift \
+  ios/TacuaCanonicalJSON.swift \
+  ios/TacuaCredentialStore.swift \
+  ios/TacuaBackendConfiguration.swift \
+  ios/TacuaLaunchLink.swift \
+  ios/TacuaTransportQueue.swift \
+  ios/TacuaTransportQueueFileStore.swift \
+  ios/TacuaSDKBackendProtocol.swift \
+  ios/TacuaSDKBackendRequests.swift \
+  ios/TacuaSDKBackendClient.swift \
+  ios/TacuaSDKStartJournal.swift \
+  ios/TacuaSDKStartLifecycle.swift \
+  tests/SDKStartLifecycleTests.swift \
+  -framework Security \
+  -o "$TEST_TMP_DIR/tacua-sdk-start-lifecycle-tests"
+
+"$TEST_TMP_DIR/tacua-sdk-start-lifecycle-tests" \
+  "$REPO_ROOT/contracts/sdk-backend-protocol/fixtures/positive"
+
+swiftc \
   -D TACUA_CAPTURE_FAULT_INJECTION \
   -module-cache-path "$TEST_TMP_DIR/module-cache" \
   ios/CaptureFaultInjection.swift \
@@ -131,6 +152,8 @@ swiftc \
   -o "$TEST_TMP_DIR/tacua-capture-fault-injection-tests"
 
 "$TEST_TMP_DIR/tacua-capture-fault-injection-tests"
+
+npm --prefix "$PACKAGE_ROOT/../harness" run typecheck
 
 swiftc \
   -module-cache-path "$TEST_TMP_DIR/module-cache" \

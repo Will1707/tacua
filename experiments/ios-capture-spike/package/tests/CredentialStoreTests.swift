@@ -52,6 +52,7 @@ enum CredentialStoreTests {
     try rejectsWrongRandomLength()
     try doesNotReturnMaterialAfterStoreFailure()
     try recoverAndRemoveUseOnlyCredentialIdentifier()
+    try ownershipVerifierPreventsDeletingAnotherItem()
     print("Tacua credential abstraction tests passed")
   }
 
@@ -124,5 +125,27 @@ enum CredentialStoreTests {
     try require(recovered == secret, "Recover failed")
     try factory.remove(credentialID: credentialID)
     try require(store.values[credentialID] == nil, "Remove retained credential")
+  }
+
+  private static func ownershipVerifierPreventsDeletingAnotherItem() throws {
+    let store = InMemoryCredentialStore()
+    let credentialID = "credential_owner_001"
+    let owned = Data(repeating: 4, count: 32)
+    let other = Data(repeating: 5, count: 32)
+    let factory = TacuaCredentialFactory(store: store)
+    store.values[credentialID] = other
+    let removedMismatch = try factory.removeIfOwned(
+      credentialID: credentialID,
+      ownershipDigest: TacuaCredentialFactory.ownershipDigest(for: owned)
+    )
+    try require(!removedMismatch, "Ownership mismatch was reported as removed")
+    try require(store.values[credentialID] == other, "Ownership mismatch removed another item")
+
+    let removedMatch = try factory.removeIfOwned(
+      credentialID: credentialID,
+      ownershipDigest: TacuaCredentialFactory.ownershipDigest(for: other)
+    )
+    try require(removedMatch, "Ownership match was not removed")
+    try require(store.values[credentialID] == nil, "Owned credential survived cleanup")
   }
 }

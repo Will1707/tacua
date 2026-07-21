@@ -3,8 +3,13 @@
 import {
   TacuaCaptureSpikeModule,
   type ApprovedBackendLaunch,
+  type BackendBuildIdentity,
+  type BackendCaptureScope,
   type BackendLaunchConsentRequest,
   type BackendQueueStatus,
+  type BackendStartedSession,
+  type BackendStartRecoveryStatus,
+  type BackendStartSessionOptions,
   type BackendTransportConfiguration,
   type CaptureCapabilities,
   type CaptureErrorEvent,
@@ -21,11 +26,17 @@ import { type EventSubscription } from "expo-modules-core";
 
 export type {
   ApprovedBackendLaunch,
+  BackendBuildIdentity,
+  BackendCaptureScope,
   BackendLaunchConsentRequest,
   BackendQueueStatus,
+  BackendStartedSession,
+  BackendStartRecoveryStatus,
+  BackendStartSessionOptions,
   BackendTransportConfiguration,
   CaptureCapabilities,
   CaptureErrorEvent,
+  CaptureEventMap,
   CaptureGapEvent,
   CaptureMarker,
   CaptureRecoveryOptions,
@@ -67,6 +78,40 @@ export function confirmBackendLaunchConsent(
 
 export function cancelBackendLaunch(requestId: string): void {
   TacuaCaptureSpikeModule.cancelBackendLaunch(requestId);
+}
+
+export function startBackendSession(
+  options: BackendStartSessionOptions,
+): Promise<BackendStartedSession> {
+  return TacuaCaptureSpikeModule.startBackendSession({
+    approvedLaunchId: options.approvedLaunchId,
+    localSessionId: options.localSessionId,
+    buildIdentityJson: JSON.stringify(options.buildIdentity),
+    scopeJson: JSON.stringify(options.scope),
+    requestedAt: options.requestedAt,
+  });
+}
+
+export function getBackendStartRecoveryStatus(
+  localSessionId: string,
+): Promise<BackendStartRecoveryStatus> {
+  return TacuaCaptureSpikeModule.getBackendStartRecoveryStatus(localSessionId);
+}
+
+export function recoverBackendStart(
+  localSessionId: string,
+): Promise<BackendStartedSession> {
+  return TacuaCaptureSpikeModule.recoverBackendStart(localSessionId);
+}
+
+export function abandonBackendStart(
+  localSessionId: string,
+  acknowledgeRemoteSessionMayExist: boolean,
+): Promise<void> {
+  return TacuaCaptureSpikeModule.abandonBackendStart(
+    localSessionId,
+    acknowledgeRemoteSessionMayExist,
+  );
 }
 
 export function getStatus(): CaptureStatus {

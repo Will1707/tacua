@@ -35,6 +35,40 @@ struct TacuaSegmentTransportMetadata: Equatable {
 }
 
 enum TacuaSDKBackendRequests {
+  /// Validates the host-supplied build identity, scope, timestamp, and transport binding through
+  /// the exact frozen launch-request validator without consuming a real launch code or creating a
+  /// credential. No request produced here is returned or sent.
+  static func validateStartArtifacts(
+    buildIdentity: TacuaJSONValue,
+    scope: TacuaJSONValue,
+    requestedAt: String,
+    configuration: TacuaBackendConfiguration
+  ) throws {
+    let preflight = try launchAfterConsent(
+      preparedCredential: TacuaPreparedCredential(
+        exchangeID: "exchange_preflight",
+        credentialID: "credential_preflight",
+        secret: Data(repeating: 0, count: TacuaKeychainCredentialStore.secretLength)
+      ),
+      launchCode: String(repeating: "L", count: 43),
+      exchangeKind: "start_session",
+      expectedSessionID: nil,
+      expectedSessionState: "receiving",
+      expectedCompletionID: nil,
+      previousCredentialID: nil,
+      buildIdentity: buildIdentity,
+      scope: scope,
+      requestedAt: requestedAt,
+      configuration: configuration
+    )
+    guard try TacuaSDKBackendProtocol.validateRequest(
+      preflight.canonicalData,
+      expectedTransportConfigurationDigest: configuration.configurationDigest
+    ) == .launch else {
+      throw TacuaSDKBackendRequestError.invalidArtifact
+    }
+  }
+
   static func launch(
     preparedCredential: TacuaPreparedCredential,
     approvedLaunchID: String,

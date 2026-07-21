@@ -13,6 +13,7 @@ enum TacuaTransportQueueError: Error, Equatable {
   case resumeRequired
   case missingCredential
   case credentialMismatch
+  case transportConfigurationMismatch
   case operationNotAllowed
   case operationConflict
   case operationNotFound
@@ -22,8 +23,135 @@ enum TacuaTransportQueueError: Error, Equatable {
   case prohibitedPersistedMaterial
 }
 
+private enum TacuaQueueBounds {
+  static let maximumEncodedBytes = 32 * 1_024 * 1_024
+  static let maximumIdentifierBytes = 64
+  static let maximumDigestBytes = 71
+  static let maximumTimestampBytes = 20
+  static let maximumRelativePathBytes = 1_024
+  static let maximumBootSessionIDBytes = 255
+  static let maximumPersistedJSONKeyBytes = 256
+  static let maximumOperations = 4_099
+  static let maximumCredentialEntries = 4_096
+  static let maximumLocalPayloadPaths = 4_099
+  static let maximumLegacyItems = 4_097
+  static let maximumLegacyObjectKindBytes = 64
+  static let maximumPayloadBindingsPerOperation = 2
+
+  /// Older builds used this value when `kern.boottime` failed. It is not a boot identity: accepting
+  /// it on two failures would incorrectly make distinct or unknown boot sessions compare equal.
+  static let unavailableBootSessionID = "unavailable"
+
+  static func validBootSessionID(_ value: String) -> Bool {
+    !value.isEmpty && value != unavailableBootSessionID
+      && value.utf8.count <= maximumBootSessionIDBytes
+  }
+}
+
+private struct TacuaDynamicCodingKey: CodingKey {
+  let stringValue: String
+  let intValue: Int? = nil
+
+  init?(stringValue: String) { self.stringValue = stringValue }
+  init?(intValue: Int) { return nil }
+}
+
+private extension KeyedDecodingContainer {
+  func decodeBoundedString(forKey key: Key, maximumUTF8Bytes: Int) throws -> String {
+    let value = try decode(String.self, forKey: key)
+    guard value.utf8.count <= maximumUTF8Bytes else {
+      throw TacuaTransportQueueError.invalidQueue
+    }
+    return value
+  }
+
+  func decodeBoundedStringIfPresent(forKey key: Key, maximumUTF8Bytes: Int) throws -> String? {
+    guard contains(key), try !decodeNil(forKey: key) else { return nil }
+    return try decodeBoundedString(forKey: key, maximumUTF8Bytes: maximumUTF8Bytes)
+  }
+
+  func decodeBoundedArray<Element: Decodable>(
+    _ type: Element.Type,
+    forKey key: Key,
+    maximumCount: Int
+  ) throws -> [Element] {
+    var valuesContainer = try nestedUnkeyedContainer(forKey: key)
+    if let count = valuesContainer.count, count > maximumCount {
+      throw TacuaTransportQueueError.invalidQueue
+    }
+    var values: [Element] = []
+    values.reserveCapacity(min(valuesContainer.count ?? 0, maximumCount))
+    while !valuesContainer.isAtEnd {
+      guard values.count < maximumCount else {
+        throw TacuaTransportQueueError.invalidQueue
+      }
+      values.append(try valuesContainer.decode(Element.self))
+    }
+    return values
+  }
+
+  func decodeBoundedArrayIfPresent<Element: Decodable>(
+    _ type: Element.Type,
+    forKey key: Key,
+    maximumCount: Int
+  ) throws -> [Element]? {
+    guard contains(key), try !decodeNil(forKey: key) else { return nil }
+    return try decodeBoundedArray(type, forKey: key, maximumCount: maximumCount)
+  }
+
+  func decodeBoundedStringArray(
+    forKey key: Key,
+    maximumCount: Int,
+    maximumElementUTF8Bytes: Int
+  ) throws -> [String] {
+    var valuesContainer = try nestedUnkeyedContainer(forKey: key)
+    if let count = valuesContainer.count, count > maximumCount {
+      throw TacuaTransportQueueError.invalidQueue
+    }
+    var values: [String] = []
+    values.reserveCapacity(min(valuesContainer.count ?? 0, maximumCount))
+    while !valuesContainer.isAtEnd {
+      guard values.count < maximumCount else {
+        throw TacuaTransportQueueError.invalidQueue
+      }
+      let value = try valuesContainer.decode(String.self)
+      guard value.utf8.count <= maximumElementUTF8Bytes else {
+        throw TacuaTransportQueueError.invalidQueue
+      }
+      values.append(value)
+    }
+    return values
+  }
+
+  func decodeBoundedStringDictionaryIfPresent(
+    forKey key: Key,
+    maximumCount: Int,
+    maximumKeyUTF8Bytes: Int,
+    maximumValueUTF8Bytes: Int
+  ) throws -> [String: String]? {
+    guard contains(key), try !decodeNil(forKey: key) else { return nil }
+    let valuesContainer = try nestedContainer(keyedBy: TacuaDynamicCodingKey.self, forKey: key)
+    let keys = valuesContainer.allKeys
+    guard keys.count <= maximumCount else { throw TacuaTransportQueueError.invalidQueue }
+    var values: [String: String] = [:]
+    values.reserveCapacity(keys.count)
+    for key in keys {
+      guard key.stringValue.utf8.count <= maximumKeyUTF8Bytes else {
+        throw TacuaTransportQueueError.invalidQueue
+      }
+      let value = try valuesContainer.decode(String.self, forKey: key)
+      guard value.utf8.count <= maximumValueUTF8Bytes else {
+        throw TacuaTransportQueueError.invalidQueue
+      }
+      values[key.stringValue] = value
+    }
+    return values
+  }
+}
+
 enum TacuaTransportCredentialCapability: String, Codable, Equatable {
   case requiresExchange = "requires_exchange"
+  case requiresTransportRebind = "requires_transport_rebind"
   case active
   case completionReplayOrDeleteOnly = "completion_replay_or_delete_only"
   case deletionReplayOnly = "deletion_replay_only"
@@ -60,6 +188,67 @@ struct TacuaQueuedOperation: Codable, Equatable {
   /// Protocol artifact digest (for example segment_receipt_digest), distinct from the hash of the
   /// complete canonical response bytes above.
   var responseArtifactDigest: String?
+
+  private enum CodingKeys: String, CodingKey {
+    case kind
+    case operationID
+    case requestCredentialID
+    case requestDigest
+    case canonicalRequest
+    case localPayloadPath
+    case localPayloadBindings
+    case state
+    case canonicalResponse
+    case responseDigest
+    case responseArtifactDigest
+  }
+}
+
+extension TacuaQueuedOperation {
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    kind = try container.decode(TacuaQueuedOperationKind.self, forKey: .kind)
+    operationID = try container.decodeBoundedString(
+      forKey: .operationID,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumIdentifierBytes
+    )
+    requestCredentialID = try container.decodeBoundedString(
+      forKey: .requestCredentialID,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumIdentifierBytes
+    )
+    requestDigest = try container.decodeBoundedString(
+      forKey: .requestDigest,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumDigestBytes
+    )
+    canonicalRequest = try container.decode(Data.self, forKey: .canonicalRequest)
+    guard canonicalRequest.count <= TacuaQueueBounds.maximumEncodedBytes else {
+      throw TacuaTransportQueueError.invalidQueue
+    }
+    localPayloadPath = try container.decodeBoundedStringIfPresent(
+      forKey: .localPayloadPath,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumRelativePathBytes
+    )
+    localPayloadBindings = try container.decodeBoundedArrayIfPresent(
+      TacuaLocalPayloadBinding.self,
+      forKey: .localPayloadBindings,
+      maximumCount: TacuaQueueBounds.maximumPayloadBindingsPerOperation
+    )
+    state = try container.decode(TacuaQueuedOperationState.self, forKey: .state)
+    canonicalResponse = try container.decodeIfPresent(Data.self, forKey: .canonicalResponse)
+    if let canonicalResponse,
+      canonicalResponse.count > TacuaQueueBounds.maximumEncodedBytes
+    {
+      throw TacuaTransportQueueError.invalidQueue
+    }
+    responseDigest = try container.decodeBoundedStringIfPresent(
+      forKey: .responseDigest,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumDigestBytes
+    )
+    responseArtifactDigest = try container.decodeBoundedStringIfPresent(
+      forKey: .responseArtifactDigest,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumDigestBytes
+    )
+  }
 }
 
 enum TacuaLocalPayloadRole: String, Codable, Equatable, Hashable {
@@ -72,6 +261,27 @@ struct TacuaLocalPayloadBinding: Codable, Equatable, Hashable {
   let role: TacuaLocalPayloadRole
   let relativePath: String
   let contentDigest: String
+
+  private enum CodingKeys: String, CodingKey {
+    case role
+    case relativePath
+    case contentDigest
+  }
+}
+
+extension TacuaLocalPayloadBinding {
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    role = try container.decode(TacuaLocalPayloadRole.self, forKey: .role)
+    relativePath = try container.decodeBoundedString(
+      forKey: .relativePath,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumRelativePathBytes
+    )
+    contentDigest = try container.decodeBoundedString(
+      forKey: .contentDigest,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumDigestBytes
+    )
+  }
 }
 
 struct TacuaServerTimeAnchor: Codable, Equatable {
@@ -81,6 +291,14 @@ struct TacuaServerTimeAnchor: Codable, Equatable {
   let bootSessionID: String
   let minimumEpochMilliseconds: Int64
 
+  private enum CodingKeys: String, CodingKey {
+    case issuedAt
+    case issuedEpochMilliseconds
+    case uptimeMillisecondsAtIssue
+    case bootSessionID
+    case minimumEpochMilliseconds
+  }
+
   static func establish(issuedAt: String, clock: TacuaMonotonicClock) throws
     -> TacuaServerTimeAnchor
   {
@@ -88,25 +306,30 @@ struct TacuaServerTimeAnchor: Codable, Equatable {
       throw TacuaTransportQueueError.invalidTimestamp
     }
     let uptime = clock.uptimeMilliseconds
-    guard uptime >= 0, !clock.bootSessionID.isEmpty else {
+    let bootSessionID = clock.bootSessionID
+    guard uptime >= 0, TacuaQueueBounds.validBootSessionID(bootSessionID) else {
       throw TacuaTransportQueueError.invalidTimeAnchor
     }
     return TacuaServerTimeAnchor(
       issuedAt: issuedAt,
       issuedEpochMilliseconds: epoch,
       uptimeMillisecondsAtIssue: uptime,
-      bootSessionID: clock.bootSessionID,
+      bootSessionID: bootSessionID,
       minimumEpochMilliseconds: epoch
     )
   }
 
   func timestamp(clock: TacuaMonotonicClock) throws -> String {
-    guard clock.bootSessionID == bootSessionID,
-      clock.uptimeMilliseconds >= uptimeMillisecondsAtIssue
+    let currentBootSessionID = clock.bootSessionID
+    let currentUptimeMilliseconds = clock.uptimeMilliseconds
+    guard TacuaQueueBounds.validBootSessionID(bootSessionID),
+      TacuaQueueBounds.validBootSessionID(currentBootSessionID),
+      currentBootSessionID == bootSessionID,
+      currentUptimeMilliseconds >= uptimeMillisecondsAtIssue
     else {
       throw TacuaTransportQueueError.resumeRequired
     }
-    let elapsed = clock.uptimeMilliseconds - uptimeMillisecondsAtIssue
+    let elapsed = currentUptimeMilliseconds - uptimeMillisecondsAtIssue
     let derived = max(minimumEpochMilliseconds, issuedEpochMilliseconds + elapsed)
     return TacuaProtocolTimestamp.format(milliseconds: derived)
   }
@@ -129,6 +352,29 @@ struct TacuaServerTimeAnchor: Codable, Equatable {
   }
 }
 
+extension TacuaServerTimeAnchor {
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    issuedAt = try container.decodeBoundedString(
+      forKey: .issuedAt,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumTimestampBytes
+    )
+    issuedEpochMilliseconds = try container.decode(Int64.self, forKey: .issuedEpochMilliseconds)
+    uptimeMillisecondsAtIssue = try container.decode(
+      Int64.self,
+      forKey: .uptimeMillisecondsAtIssue
+    )
+    bootSessionID = try container.decodeBoundedString(
+      forKey: .bootSessionID,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumBootSessionIDBytes
+    )
+    minimumEpochMilliseconds = try container.decode(
+      Int64.self,
+      forKey: .minimumEpochMilliseconds
+    )
+  }
+}
+
 protocol TacuaMonotonicClock {
   var uptimeMilliseconds: Int64 { get }
   var bootSessionID: String { get }
@@ -143,7 +389,13 @@ struct TacuaSystemMonotonicClock: TacuaMonotonicClock {
     var bootTime = timeval()
     var size = MemoryLayout<timeval>.size
     let result = sysctlbyname("kern.boottime", &bootTime, &size, nil, 0)
-    guard result == 0 else { return "unavailable" }
+    guard result == 0, size == MemoryLayout<timeval>.size,
+      bootTime.tv_sec > 0, bootTime.tv_usec >= 0, bootTime.tv_usec < 1_000_000
+    else {
+      // The empty value is deliberately invalid. In particular, do not return a stable sentinel:
+      // two lookup failures must never be mistaken for the same boot session.
+      return ""
+    }
     return "boot_\(bootTime.tv_sec)_\(bootTime.tv_usec)"
   }
 }
@@ -154,12 +406,72 @@ struct TacuaCompletionCleanupAuthority: Codable, Equatable {
   let manifestDigest: String
   let segmentReceiptDigests: [String]
   let diagnosticReceiptDigests: [String]
+
+  private enum CodingKeys: String, CodingKey {
+    case completionID
+    case completionReceiptDigest
+    case manifestDigest
+    case segmentReceiptDigests
+    case diagnosticReceiptDigests
+  }
+}
+
+extension TacuaCompletionCleanupAuthority {
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    completionID = try container.decodeBoundedString(
+      forKey: .completionID,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumIdentifierBytes
+    )
+    completionReceiptDigest = try container.decodeBoundedString(
+      forKey: .completionReceiptDigest,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumDigestBytes
+    )
+    manifestDigest = try container.decodeBoundedString(
+      forKey: .manifestDigest,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumDigestBytes
+    )
+    segmentReceiptDigests = try container.decodeBoundedStringArray(
+      forKey: .segmentReceiptDigests,
+      maximumCount: TacuaQueueBounds.maximumOperations,
+      maximumElementUTF8Bytes: TacuaQueueBounds.maximumDigestBytes
+    )
+    diagnosticReceiptDigests = try container.decodeBoundedStringArray(
+      forKey: .diagnosticReceiptDigests,
+      maximumCount: TacuaQueueBounds.maximumOperations,
+      maximumElementUTF8Bytes: TacuaQueueBounds.maximumDigestBytes
+    )
+  }
 }
 
 struct TacuaDeletionCleanupAuthority: Codable, Equatable {
   let deletionID: String
   let tombstoneDigest: String
   let credentialID: String
+
+  private enum CodingKeys: String, CodingKey {
+    case deletionID
+    case tombstoneDigest
+    case credentialID
+  }
+}
+
+extension TacuaDeletionCleanupAuthority {
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    deletionID = try container.decodeBoundedString(
+      forKey: .deletionID,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumIdentifierBytes
+    )
+    tombstoneDigest = try container.decodeBoundedString(
+      forKey: .tombstoneDigest,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumDigestBytes
+    )
+    credentialID = try container.decodeBoundedString(
+      forKey: .credentialID,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumIdentifierBytes
+    )
+  }
 }
 
 enum TacuaPayloadCleanupState: String, Codable, Equatable {
@@ -174,12 +486,18 @@ enum TacuaCredentialCleanupState: String, Codable, Equatable {
   case credentialRemoved = "credential_removed"
 }
 
-struct TacuaTransportQueueV2: Codable, Equatable {
-  static let schemaVersion = 2
-  static let maximumEncodedBytes = 32 * 1_024 * 1_024
+struct TacuaTransportQueueV3: Codable, Equatable {
+  static let schemaVersion = 3
+  static let maximumEncodedBytes = TacuaQueueBounds.maximumEncodedBytes
+  static let maximumLocalPayloadPaths = TacuaQueueBounds.maximumLocalPayloadPaths
 
-  let schemaVersion: Int
+  var schemaVersion: Int
   let localSessionID: String
+  /// Exact digest of the build-pinned backend origin/policy used for the latest exchange.
+  /// It is nil only before the first exchange or while an explicitly migrated V2 queue waits for
+  /// a fresh transport-rebinding resume exchange, plus migrated deletion cleanup queues which
+  /// intentionally cannot send again.
+  var transportConfigurationDigest: String?
   var remoteSessionID: String?
   var scopeDigest: String?
   var currentCredentialID: String?
@@ -197,14 +515,107 @@ struct TacuaTransportQueueV2: Codable, Equatable {
   var payloadCleanupState: TacuaPayloadCleanupState
   var credentialCleanupState: TacuaCredentialCleanupState
 
+  private enum CodingKeys: String, CodingKey {
+    case schemaVersion
+    case localSessionID
+    case transportConfigurationDigest
+    case remoteSessionID
+    case scopeDigest
+    case currentCredentialID
+    case currentCredentialExpiresAt
+    case credentialExpiryLedger
+    case pendingRevokedCredentialRemovals
+    case credentialCapability
+    case timeAnchor
+    case operations
+    case localPayloadPaths
+    case completionCleanupAuthority
+    case deletionCleanupAuthority
+    case payloadCleanupState
+    case credentialCleanupState
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+    localSessionID = try container.decodeBoundedString(
+      forKey: .localSessionID,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumIdentifierBytes
+    )
+    transportConfigurationDigest = try container.decodeBoundedStringIfPresent(
+      forKey: .transportConfigurationDigest,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumDigestBytes
+    )
+    remoteSessionID = try container.decodeBoundedStringIfPresent(
+      forKey: .remoteSessionID,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumIdentifierBytes
+    )
+    scopeDigest = try container.decodeBoundedStringIfPresent(
+      forKey: .scopeDigest,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumDigestBytes
+    )
+    currentCredentialID = try container.decodeBoundedStringIfPresent(
+      forKey: .currentCredentialID,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumIdentifierBytes
+    )
+    currentCredentialExpiresAt = try container.decodeBoundedStringIfPresent(
+      forKey: .currentCredentialExpiresAt,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumTimestampBytes
+    )
+    credentialExpiryLedger = try container.decodeBoundedStringDictionaryIfPresent(
+      forKey: .credentialExpiryLedger,
+      maximumCount: TacuaQueueBounds.maximumCredentialEntries,
+      maximumKeyUTF8Bytes: TacuaQueueBounds.maximumIdentifierBytes,
+      maximumValueUTF8Bytes: TacuaQueueBounds.maximumTimestampBytes
+    )
+    pendingRevokedCredentialRemovals = try container.decodeBoundedStringArray(
+      forKey: .pendingRevokedCredentialRemovals,
+      maximumCount: TacuaQueueBounds.maximumCredentialEntries,
+      maximumElementUTF8Bytes: TacuaQueueBounds.maximumIdentifierBytes
+    )
+    credentialCapability = try container.decode(
+      TacuaTransportCredentialCapability.self,
+      forKey: .credentialCapability
+    )
+    timeAnchor = try container.decodeIfPresent(TacuaServerTimeAnchor.self, forKey: .timeAnchor)
+    operations = try container.decodeBoundedArray(
+      TacuaQueuedOperation.self,
+      forKey: .operations,
+      maximumCount: TacuaQueueBounds.maximumOperations
+    )
+    localPayloadPaths = try container.decodeBoundedStringArray(
+      forKey: .localPayloadPaths,
+      maximumCount: TacuaQueueBounds.maximumLocalPayloadPaths,
+      maximumElementUTF8Bytes: TacuaQueueBounds.maximumRelativePathBytes
+    )
+    completionCleanupAuthority = try container.decodeIfPresent(
+      TacuaCompletionCleanupAuthority.self,
+      forKey: .completionCleanupAuthority
+    )
+    deletionCleanupAuthority = try container.decodeIfPresent(
+      TacuaDeletionCleanupAuthority.self,
+      forKey: .deletionCleanupAuthority
+    )
+    payloadCleanupState = try container.decode(
+      TacuaPayloadCleanupState.self,
+      forKey: .payloadCleanupState
+    )
+    credentialCleanupState = try container.decode(
+      TacuaCredentialCleanupState.self,
+      forKey: .credentialCleanupState
+    )
+  }
+
   init(localSessionID: String, localPayloadPaths: [String] = []) throws {
-    guard TacuaTransportQueueV2.validIdentifier(localSessionID),
-      localPayloadPaths.allSatisfy(TacuaTransportQueueV2.validRelativePath)
+    guard TacuaTransportQueueV3.validIdentifier(localSessionID),
+      localPayloadPaths.count <= Self.maximumLocalPayloadPaths,
+      localPayloadPaths.allSatisfy(TacuaTransportQueueV3.validRelativePath)
     else {
       throw TacuaTransportQueueError.invalidQueue
     }
     schemaVersion = Self.schemaVersion
     self.localSessionID = localSessionID
+    transportConfigurationDigest = nil
     remoteSessionID = nil
     scopeDigest = nil
     currentCredentialID = nil
@@ -221,41 +632,50 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     credentialCleanupState = .none
   }
 
-  static func decodeOrMigrate(_ data: Data) throws -> TacuaTransportQueueV2 {
-    let probe = try JSONDecoder().decode(TacuaQueueSchemaProbe.self, from: data)
+  static func decodeOrMigrate(_ data: Data) throws -> TacuaTransportQueueV3 {
+    // Bound the parser itself, not just the subsequently encoded queue. JSONDecoder must still
+    // materialize some Foundation values internally, but it never receives attacker-controlled
+    // input larger than the durable queue limit.
+    guard !data.isEmpty, data.count <= Self.maximumEncodedBytes else {
+      throw TacuaTransportQueueError.invalidQueue
+    }
+    let decoder = JSONDecoder()
+    let probe = try decoder.decode(TacuaQueueSchemaProbe.self, from: data)
     switch probe.schemaVersion {
     case schemaVersion:
-      var queue = try JSONDecoder().decode(TacuaTransportQueueV2.self, from: data)
-      if queue.credentialExpiryLedger == nil {
-        if let credentialID = queue.currentCredentialID,
-          let expiresAt = queue.currentCredentialExpiresAt
-        {
-          queue.credentialExpiryLedger = [credentialID: expiresAt]
-        } else {
-          queue.credentialExpiryLedger = [:]
-        }
+      var queue = try decoder.decode(TacuaTransportQueueV3.self, from: data)
+      try normalizeDecodedQueue(&queue)
+      try queue.validate()
+      return queue
+    case 2:
+      var queue = try decoder.decode(TacuaTransportQueueV3.self, from: data)
+      queue.schemaVersion = schemaVersion
+      switch queue.credentialCapability {
+      case .requiresExchange, .deletionReplayOnly:
+        // A deletion receipt has already terminated transport authority. Keep its local cleanup
+        // state terminal instead of manufacturing a resume transition which can never be valid.
+        break
+      case .active, .completionReplayOrDeleteOnly, .requiresTransportRebind:
+        // V2 never bound authority to a backend transport configuration. Preserve immutable
+        // requests and cleanup evidence, but block every send until a fresh resume exchange binds
+        // the queue to the currently built origin/policy digest.
+        queue.credentialCapability = .requiresTransportRebind
       }
-      for index in queue.operations.indices
-      where queue.operations[index].state == .responseStored
-        && queue.operations[index].responseArtifactDigest == nil
+      queue.transportConfigurationDigest = nil
+      // Queue-v2 accepted `"unavailable"` when the OS boot identity could not be read. That
+      // sentinel is not a trustworthy cross-restart anchor, but it must not make an otherwise
+      // recoverable durable queue unreadable. Drop only the unusable anchor and require rebind.
+      if let anchor = queue.timeAnchor,
+        !TacuaQueueBounds.validBootSessionID(anchor.bootSessionID)
       {
-        guard let response = queue.operations[index].canonicalResponse,
-          let expiry = queue.credentialExpiryLedger?[
-            queue.operations[index].requestCredentialID
-          ],
-          let receipt = try? TacuaSDKBackendProtocol.validateResponse(
-            response,
-            forCanonicalRequest: queue.operations[index].canonicalRequest,
-            expectedCurrentCredentialExpiry: expiry
-          )
-        else { throw TacuaTransportQueueError.invalidQueue }
-        queue.operations[index].responseArtifactDigest = receipt.responseDigest
+        queue.timeAnchor = nil
       }
+      try normalizeDecodedQueue(&queue)
       try queue.validate()
       return queue
     case 1:
-      let legacy = try JSONDecoder().decode(TacuaLegacyUploadQueue.self, from: data)
-      var queue = try TacuaTransportQueueV2(
+      let legacy = try decoder.decode(TacuaLegacyUploadQueue.self, from: data)
+      var queue = try TacuaTransportQueueV3(
         localSessionID: legacy.localSessionId,
         localPayloadPaths: legacy.items.compactMap { item in
           guard item.objectKind == "segment" || item.objectKind == "diagnostic_envelope" else {
@@ -281,6 +701,36 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     }
   }
 
+  private static func normalizeDecodedQueue(_ queue: inout TacuaTransportQueueV3) throws {
+    if queue.credentialExpiryLedger == nil {
+      if let credentialID = queue.currentCredentialID,
+        let expiresAt = queue.currentCredentialExpiresAt
+      {
+        queue.credentialExpiryLedger = [credentialID: expiresAt]
+      } else {
+        queue.credentialExpiryLedger = [:]
+      }
+    }
+    // queue-v2 also predates persisted protocol-artifact digests. Re-derive them from the exact
+    // immutable request/response pair before validating cleanup authorities.
+    for index in queue.operations.indices
+    where queue.operations[index].state == .responseStored
+      && queue.operations[index].responseArtifactDigest == nil
+    {
+      guard let response = queue.operations[index].canonicalResponse,
+        let expiry = queue.credentialExpiryLedger?[
+          queue.operations[index].requestCredentialID
+        ],
+        let receipt = try? TacuaSDKBackendProtocol.validateResponse(
+          response,
+          forCanonicalRequest: queue.operations[index].canonicalRequest,
+          expectedCurrentCredentialExpiry: expiry
+        )
+      else { throw TacuaTransportQueueError.invalidQueue }
+      queue.operations[index].responseArtifactDigest = receipt.responseDigest
+    }
+  }
+
   func encoded() throws -> Data {
     try validate()
     let encoder = JSONEncoder()
@@ -300,6 +750,7 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     remoteSessionID: String,
     scopeDigest: String,
     credentialID: String,
+    transportConfigurationDigest: String,
     expiresAt: String,
     previousCredentialID: String? = nil,
     capability: TacuaTransportCredentialCapability,
@@ -333,6 +784,77 @@ struct TacuaTransportQueueV2: Codable, Equatable {
       throw TacuaTransportQueueError.credentialMismatch
     }
     let newAnchor = try TacuaServerTimeAnchor.establish(issuedAt: issuedAt, clock: clock)
+    try applyExchange(
+      remoteSessionID: remoteSessionID,
+      scopeDigest: scopeDigest,
+      credentialID: credentialID,
+      transportConfigurationDigest: transportConfigurationDigest,
+      expiresAt: expiresAt,
+      previousCredentialID: previousCredentialID,
+      capability: capability,
+      timeAnchor: newAnchor
+    )
+  }
+
+  /// Reconstructs a validated START transition from the exact anchor captured when the receipt was
+  /// observed. Recovery must never re-anchor an old server timestamp to a later uptime or reboot.
+  mutating func applyRecoveredStart(
+    remoteSessionID: String,
+    scopeDigest: String,
+    credentialID: String,
+    transportConfigurationDigest: String,
+    expiresAt: String,
+    timeAnchor: TacuaServerTimeAnchor
+  ) throws {
+    guard self.remoteSessionID == nil, self.scopeDigest == nil,
+      self.transportConfigurationDigest == nil, currentCredentialID == nil,
+      currentCredentialExpiresAt == nil, credentialCapability == .requiresExchange,
+      operations.isEmpty, pendingRevokedCredentialRemovals.isEmpty,
+      completionCleanupAuthority == nil, deletionCleanupAuthority == nil
+    else { throw TacuaTransportQueueError.operationConflict }
+    try applyExchange(
+      remoteSessionID: remoteSessionID,
+      scopeDigest: scopeDigest,
+      credentialID: credentialID,
+      transportConfigurationDigest: transportConfigurationDigest,
+      expiresAt: expiresAt,
+      previousCredentialID: nil,
+      capability: .active,
+      timeAnchor: timeAnchor
+    )
+  }
+
+  private mutating func applyExchange(
+    remoteSessionID: String,
+    scopeDigest: String,
+    credentialID: String,
+    transportConfigurationDigest: String,
+    expiresAt: String,
+    previousCredentialID: String?,
+    capability: TacuaTransportCredentialCapability,
+    timeAnchor newAnchor: TacuaServerTimeAnchor
+  ) throws {
+    guard Self.validIdentifier(remoteSessionID), Self.validDigest(scopeDigest),
+      Self.validIdentifier(credentialID), Self.validDigest(transportConfigurationDigest),
+      capability != .requiresExchange, capability != .requiresTransportRebind,
+      capability != .deletionReplayOnly,
+      previousCredentialID.map(Self.validIdentifier) ?? true,
+      previousCredentialID != credentialID,
+      let expiryMilliseconds = TacuaProtocolTimestamp.parseMilliseconds(expiresAt),
+      let issueMilliseconds = TacuaProtocolTimestamp.parseMilliseconds(newAnchor.issuedAt),
+      expiryMilliseconds > issueMilliseconds,
+      newAnchor.issuedEpochMilliseconds == issueMilliseconds,
+      newAnchor.uptimeMillisecondsAtIssue >= 0,
+      TacuaQueueBounds.validBootSessionID(newAnchor.bootSessionID),
+      newAnchor.minimumEpochMilliseconds >= issueMilliseconds
+    else {
+      throw TacuaTransportQueueError.invalidQueue
+    }
+    if let existing = self.transportConfigurationDigest,
+      existing != transportConfigurationDigest
+    {
+      throw TacuaTransportQueueError.transportConfigurationMismatch
+    }
     var revokedCredentialID: String?
     if let existingCredentialID = currentCredentialID,
       existingCredentialID != credentialID
@@ -349,6 +871,7 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     }
     self.remoteSessionID = remoteSessionID
     self.scopeDigest = scopeDigest
+    self.transportConfigurationDigest = transportConfigurationDigest
     currentCredentialID = credentialID
     currentCredentialExpiresAt = expiresAt
     if credentialExpiryLedger == nil { credentialExpiryLedger = [:] }
@@ -369,7 +892,9 @@ struct TacuaTransportQueueV2: Codable, Equatable {
   }
 
   func timestampForNewOperation(clock: TacuaMonotonicClock) throws -> String {
-    guard credentialCapability != .requiresExchange, let anchor = timeAnchor,
+    guard credentialCapability != .requiresExchange,
+      credentialCapability != .requiresTransportRebind,
+      transportConfigurationDigest != nil, let anchor = timeAnchor,
       let expiresAt = currentCredentialExpiresAt,
       let expiry = TacuaProtocolTimestamp.parseMilliseconds(expiresAt)
     else {
@@ -395,6 +920,8 @@ struct TacuaTransportQueueV2: Codable, Equatable {
   ) throws {
     guard Self.validIdentifier(operationID), Self.validIdentifier(requestCredentialID),
       Self.validDigest(requestDigest),
+      operations.count < TacuaQueueBounds.maximumOperations,
+      localPayloadBindings.count <= TacuaQueueBounds.maximumPayloadBindingsPerOperation,
       localPayloadPath.map(Self.validRelativePath) ?? true,
       localPayloadBindings.allSatisfy({
         Self.validRelativePath($0.relativePath) && Self.validDigest($0.contentDigest)
@@ -412,6 +939,9 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     try authorizeNew(kind: kind)
     _ = try timestampForNewOperation(clock: clock)
     let canonicalRequest = try TacuaCanonicalJSON.data(request)
+    guard canonicalRequest.count <= Self.maximumEncodedBytes else {
+      throw TacuaTransportQueueError.invalidQueue
+    }
     let persistedObject = try JSONSerialization.jsonObject(with: canonicalRequest)
     guard !Self.containsProhibitedKey(persistedObject) else {
       throw TacuaTransportQueueError.prohibitedPersistedMaterial
@@ -446,16 +976,23 @@ struct TacuaTransportQueueV2: Codable, Equatable {
 
   /// Returns immutable request bytes and the current transport credential. Those IDs may differ
   /// after rotation; only the Authorization credential rotates during an exact durable replay.
-  func attempt(operationID: String, clock: TacuaMonotonicClock) throws -> TacuaOperationAttempt {
+  func attempt(
+    operationID: String,
+    expectedTransportConfigurationDigest: String,
+    clock: TacuaMonotonicClock
+  ) throws -> TacuaOperationAttempt {
     guard let operation = operations.first(where: { $0.operationID == operationID }) else {
       throw TacuaTransportQueueError.operationNotFound
     }
     guard let transportCredentialID = currentCredentialID else {
       throw TacuaTransportQueueError.missingCredential
     }
+    guard Self.validDigest(expectedTransportConfigurationDigest),
+      transportConfigurationDigest == expectedTransportConfigurationDigest
+    else { throw TacuaTransportQueueError.transportConfigurationMismatch }
     _ = try timestampForNewOperation(clock: clock)
     switch credentialCapability {
-    case .requiresExchange:
+    case .requiresExchange, .requiresTransportRebind:
       throw TacuaTransportQueueError.resumeRequired
     case .active:
       break
@@ -485,6 +1022,9 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     canonicalResponse: Data,
     responseDigest: String
   ) throws {
+    guard canonicalResponse.count <= Self.maximumEncodedBytes else {
+      throw TacuaTransportQueueError.responseConflict
+    }
     let responseValue = try TacuaCanonicalJSON.parse(canonicalResponse)
     let persistedResponse = try JSONSerialization.jsonObject(with: canonicalResponse)
     guard try TacuaCanonicalJSON.data(responseValue) == canonicalResponse,
@@ -605,7 +1145,11 @@ struct TacuaTransportQueueV2: Codable, Equatable {
   private func authorizedPayloadBindings(
     for authority: TacuaCompletionCleanupAuthority
   ) throws -> [TacuaLocalPayloadBinding] {
-    guard Set(authority.segmentReceiptDigests).count
+    guard authority.segmentReceiptDigests.count <= TacuaQueueBounds.maximumOperations,
+      authority.diagnosticReceiptDigests.count <= TacuaQueueBounds.maximumOperations,
+      authority.segmentReceiptDigests.count + authority.diagnosticReceiptDigests.count
+        <= TacuaQueueBounds.maximumOperations,
+      Set(authority.segmentReceiptDigests).count
       == authority.segmentReceiptDigests.count,
       Set(authority.diagnosticReceiptDigests).count
         == authority.diagnosticReceiptDigests.count
@@ -649,23 +1193,27 @@ struct TacuaTransportQueueV2: Codable, Equatable {
 
   func validate() throws {
     guard schemaVersion == Self.schemaVersion, Self.validIdentifier(localSessionID),
-      localPayloadPaths.allSatisfy(Self.validRelativePath), Set(localPayloadPaths).count == localPayloadPaths.count,
-      operations.count <= 4_099
+      localPayloadPaths.count <= Self.maximumLocalPayloadPaths,
+      operations.count <= TacuaQueueBounds.maximumOperations,
+      localPayloadPaths.allSatisfy(Self.validRelativePath),
+      Set(localPayloadPaths).count == localPayloadPaths.count
     else {
       throw TacuaTransportQueueError.invalidQueue
     }
     guard remoteSessionID.map(Self.validIdentifier) ?? true,
       scopeDigest.map(Self.validDigest) ?? true,
-      currentCredentialID.map(Self.validIdentifier) ?? true
+      currentCredentialID.map(Self.validIdentifier) ?? true,
+      transportConfigurationDigest.map(Self.validDigest) ?? true
     else {
       throw TacuaTransportQueueError.invalidQueue
     }
-    guard pendingRevokedCredentialRemovals.allSatisfy(Self.validIdentifier),
+    guard pendingRevokedCredentialRemovals.count <= TacuaQueueBounds.maximumCredentialEntries,
+      pendingRevokedCredentialRemovals.allSatisfy(Self.validIdentifier),
       Set(pendingRevokedCredentialRemovals).count == pendingRevokedCredentialRemovals.count,
       !pendingRevokedCredentialRemovals.contains(where: { $0 == currentCredentialID })
     else { throw TacuaTransportQueueError.invalidQueue }
     guard let credentialExpiryLedger,
-      credentialExpiryLedger.count <= 4_096,
+      credentialExpiryLedger.count <= TacuaQueueBounds.maximumCredentialEntries,
       credentialExpiryLedger.allSatisfy({
         Self.validIdentifier($0.key)
           && TacuaProtocolTimestamp.parseMilliseconds($0.value) != nil
@@ -674,22 +1222,47 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     guard pendingRevokedCredentialRemovals.allSatisfy({
       credentialExpiryLedger[$0] != nil
     }) else { throw TacuaTransportQueueError.invalidQueue }
+    if let timeAnchor {
+      guard let issuedEpoch = TacuaProtocolTimestamp.parseMilliseconds(timeAnchor.issuedAt),
+        timeAnchor.issuedEpochMilliseconds == issuedEpoch,
+        timeAnchor.uptimeMillisecondsAtIssue >= 0,
+        TacuaQueueBounds.validBootSessionID(timeAnchor.bootSessionID),
+        timeAnchor.minimumEpochMilliseconds >= issuedEpoch
+      else { throw TacuaTransportQueueError.invalidQueue }
+    }
     if credentialCapability == .requiresExchange {
-      guard currentCredentialID == nil, currentCredentialExpiresAt == nil, timeAnchor == nil,
+      guard transportConfigurationDigest == nil, currentCredentialID == nil,
+        currentCredentialExpiresAt == nil, timeAnchor == nil,
         credentialExpiryLedger.isEmpty
       else {
         throw TacuaTransportQueueError.invalidQueue
       }
-    } else if credentialCapability == .deletionReplayOnly,
-      credentialCleanupState == .credentialRemoved
-    {
-      guard remoteSessionID != nil, scopeDigest != nil, currentCredentialID == nil,
-        currentCredentialExpiresAt == nil
-      else {
+    } else if credentialCapability == .requiresTransportRebind {
+      guard transportConfigurationDigest == nil, remoteSessionID != nil, scopeDigest != nil,
+        currentCredentialID != nil,
+        currentCredentialExpiresAt.flatMap(TacuaProtocolTimestamp.parseMilliseconds) != nil,
+        let currentCredentialID, let currentCredentialExpiresAt,
+        credentialExpiryLedger[currentCredentialID] == currentCredentialExpiresAt
+      else { throw TacuaTransportQueueError.invalidQueue }
+    } else if credentialCapability == .deletionReplayOnly {
+      // A migrated queue-v2 deletion has no trustworthy transport binding and must remain unable to
+      // send. Its independently validated tombstone still authorizes completion of local cleanup.
+      guard remoteSessionID != nil, scopeDigest != nil, deletionCleanupAuthority != nil else {
         throw TacuaTransportQueueError.invalidQueue
       }
+      if credentialCleanupState == .credentialRemoved {
+        guard currentCredentialID == nil, currentCredentialExpiresAt == nil else {
+          throw TacuaTransportQueueError.invalidQueue
+        }
+      } else {
+        guard let currentCredentialID, let currentCredentialExpiresAt,
+          TacuaProtocolTimestamp.parseMilliseconds(currentCredentialExpiresAt) != nil,
+          credentialExpiryLedger[currentCredentialID] == currentCredentialExpiresAt
+        else { throw TacuaTransportQueueError.invalidQueue }
+      }
     } else {
-      guard remoteSessionID != nil, scopeDigest != nil, currentCredentialID != nil,
+      guard transportConfigurationDigest.map(Self.validDigest) == true,
+        remoteSessionID != nil, scopeDigest != nil, currentCredentialID != nil,
         currentCredentialExpiresAt.flatMap(TacuaProtocolTimestamp.parseMilliseconds) != nil,
         timeAnchor != nil || credentialCapability == .deletionReplayOnly
       else {
@@ -705,7 +1278,10 @@ struct TacuaTransportQueueV2: Codable, Equatable {
       let bindings = operation.localPayloadBindings ?? []
       guard Self.validIdentifier(operation.operationID),
         Self.validIdentifier(operation.requestCredentialID),
-        Self.validDigest(operation.requestDigest), operationIDs.insert(operation.operationID).inserted,
+        Self.validDigest(operation.requestDigest),
+        operation.canonicalRequest.count <= Self.maximumEncodedBytes,
+        bindings.count <= TacuaQueueBounds.maximumPayloadBindingsPerOperation,
+        operationIDs.insert(operation.operationID).inserted,
         operation.localPayloadPath.map(Self.validRelativePath) ?? true,
         bindings.allSatisfy({
           Self.validRelativePath($0.relativePath) && Self.validDigest($0.contentDigest)
@@ -734,6 +1310,7 @@ struct TacuaTransportQueueV2: Codable, Equatable {
         }
       case .responseStored:
         guard let response = operation.canonicalResponse,
+          response.count <= Self.maximumEncodedBytes,
           operation.responseDigest.map(Self.validDigest) == true,
           operation.responseArtifactDigest.map(Self.validDigest) == true,
           (try? TacuaCanonicalJSON.parse(response)) != nil
@@ -768,7 +1345,7 @@ struct TacuaTransportQueueV2: Codable, Equatable {
       break
     case .completionReplayOrDeleteOnly:
       guard kind == .deletion else { throw TacuaTransportQueueError.operationNotAllowed }
-    case .requiresExchange:
+    case .requiresExchange, .requiresTransportRebind:
       throw TacuaTransportQueueError.resumeRequired
     case .deletionReplayOnly:
       throw TacuaTransportQueueError.operationNotAllowed
@@ -814,17 +1391,22 @@ struct TacuaTransportQueueV2: Codable, Equatable {
     else { throw TacuaTransportQueueError.invalidQueue }
   }
 
-  private static func validIdentifier(_ value: String) -> Bool {
-    value.range(of: "^[a-z][a-z0-9_-]{2,63}$", options: .regularExpression) != nil
+  fileprivate static func validIdentifier(_ value: String) -> Bool {
+    guard (3...TacuaQueueBounds.maximumIdentifierBytes).contains(value.utf8.count) else {
+      return false
+    }
+    return value.range(of: "^[a-z][a-z0-9_-]{2,63}$", options: .regularExpression) != nil
   }
 
   private static func validDigest(_ value: String) -> Bool {
-    value.range(of: "^sha256:[a-f0-9]{64}$", options: .regularExpression) != nil
+    guard value.utf8.count == TacuaQueueBounds.maximumDigestBytes else { return false }
+    return value.range(of: "^sha256:[a-f0-9]{64}$", options: .regularExpression) != nil
   }
 
   private static func validRelativePath(_ value: String) -> Bool {
-    guard !value.isEmpty, !value.hasPrefix("/"), !value.contains("\0"),
-      !value.contains("\\"), value.utf8.count <= 1_024
+    let byteCount = value.utf8.count
+    guard byteCount > 0, byteCount <= TacuaQueueBounds.maximumRelativePathBytes,
+      !value.hasPrefix("/"), !value.contains("\0"), !value.contains("\\")
     else { return false }
     let components = value.split(separator: "/", omittingEmptySubsequences: false)
     return components.allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." }
@@ -837,6 +1419,9 @@ struct TacuaTransportQueueV2: Codable, Equatable {
         "access_token", "refresh_token",
       ])
       if object.keys.contains(where: { key in
+        guard key.utf8.count <= TacuaQueueBounds.maximumPersistedJSONKeyBytes else {
+          return true
+        }
         let normalized = key.lowercased().replacingOccurrences(of: "-", with: "_")
         return prohibited.contains(normalized) || normalized.contains("secret")
       }) { return true }
@@ -854,7 +1439,7 @@ struct TacuaOperationAttempt: Equatable {
 }
 
 protocol TacuaTransportQueuePersisting {
-  func persist(_ queue: TacuaTransportQueueV2) throws
+  func persist(_ queue: TacuaTransportQueueV3) throws
 }
 
 protocol TacuaLocalPayloadRemoving {
@@ -863,7 +1448,7 @@ protocol TacuaLocalPayloadRemoving {
 
 enum TacuaTransportCleanup {
   static func removePendingRevokedCredentials(
-    queue: inout TacuaTransportQueueV2,
+    queue: inout TacuaTransportQueueV3,
     persistence: TacuaTransportQueuePersisting,
     credentialStore: TacuaCredentialStoring
   ) throws {
@@ -881,7 +1466,7 @@ enum TacuaTransportCleanup {
   }
 
   static func removeAuthorizedPayloads(
-    queue: inout TacuaTransportQueueV2,
+    queue: inout TacuaTransportQueueV3,
     persistence: TacuaTransportQueuePersisting,
     remover: TacuaLocalPayloadRemoving
   ) throws {
@@ -897,7 +1482,7 @@ enum TacuaTransportCleanup {
   }
 
   static func removeAuthorizedCredential(
-    queue: inout TacuaTransportQueueV2,
+    queue: inout TacuaTransportQueueV3,
     persistence: TacuaTransportQueuePersisting,
     credentialStore: TacuaCredentialStoring
   ) throws {
@@ -925,16 +1510,60 @@ private struct TacuaLegacyUploadQueue: Decodable {
   let schemaVersion: Int
   let localSessionId: String
   let items: [TacuaLegacyUploadItem]
+
+  private enum CodingKeys: String, CodingKey {
+    case schemaVersion
+    case localSessionId
+    case items
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+    localSessionId = try container.decodeBoundedString(
+      forKey: .localSessionId,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumIdentifierBytes
+    )
+    guard schemaVersion == 1, TacuaTransportQueueV3.validIdentifier(localSessionId) else {
+      throw TacuaTransportQueueError.invalidQueue
+    }
+    items = try container.decodeBoundedArray(
+      TacuaLegacyUploadItem.self,
+      forKey: .items,
+      maximumCount: TacuaQueueBounds.maximumLegacyItems
+    )
+  }
 }
 
 private struct TacuaLegacyUploadItem: Decodable {
   let objectId: String
   let objectKind: String
+
+  private enum CodingKeys: String, CodingKey {
+    case objectId
+    case objectKind
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    objectId = try container.decodeBoundedString(
+      forKey: .objectId,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumIdentifierBytes
+    )
+    objectKind = try container.decodeBoundedString(
+      forKey: .objectKind,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumLegacyObjectKindBytes
+    )
+    guard TacuaTransportQueueV3.validIdentifier(objectId) else {
+      throw TacuaTransportQueueError.invalidQueue
+    }
+  }
 }
 
 private enum TacuaProtocolTimestamp {
   static func parseMilliseconds(_ value: String) -> Int64? {
-    guard value.range(
+    guard value.utf8.count == TacuaQueueBounds.maximumTimestampBytes,
+      value.range(
       of: "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
       options: .regularExpression
     ) != nil else { return nil }

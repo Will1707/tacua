@@ -22,10 +22,13 @@ The package now also contains the native foundation for
 `tacua.sdk-backend@1.0.0`: canonical request builders, exhaustive local request
 and response validation, a build-pinned backend origin, a redirect-rejecting and
 response-bounded `URLSession` client, Keychain-backed credentials, immutable
-request replay, and a crash-safe queue. This foundation can perform network I/O
-when its client is invoked. Automatic capture-to-manifest conversion and the
-lifecycle coordinator that exchanges, uploads, completes, and deletes a stopped
-capture are still implementation work; `stop()` does not upload by itself.
+request replay, and a crash-safe queue. A native START-only lifecycle coordinator
+now consumes an approved launch exactly once, creates a device-only credential,
+validates and sends the frozen launch exchange, and commits the validated
+receiving-session binding to that queue. It does not start ReplayKit, enqueue or
+upload media, complete a session, or delete backend data. Automatic
+capture-manifest-to-protocol conversion and the upload/completion/deletion
+lifecycle are still implementation work; `stop()` does not upload by itself.
 
 The native design-point limit is 30 minutes. A persisted monotonic deadline and an in-process timer both trigger stop; incoming sample buffers also recheck the deadline. iOS may suspend the host process in the background, so this is not a claim of wall-clock enforcement while suspended. `EXP-001` exercised foreground capture, lock recovery, process interruption, the 30-minute limit, and deterministic storage/writer/stop faults on one physical iPhone using synthetic QA data. Those results close the physical candidate gates for the spike; they do not establish a supported-device matrix or production readiness. See the [physical-device results](../PHYSICAL-DEVICE-RESULTS.md) for the exact scope and measurements.
 
@@ -51,7 +54,13 @@ type CaptureStartOptions = {
 
 The module validates safe identifier syntax, expiry, the current bundle identifier, the current `CFBundleVersion`, and the supported consent version before creating or resuming local capture data. It persists the identity fields in the manifest and checks them again for recovery. `handoffTokenIdentifier` is an opaque identifier only: never pass or persist a raw bearer token.
 
-This validation is deliberately **structural only**. The candidate module does not authenticate a handoff, verify a signature, contact a backend, perform authorization, upload media, or prove consent. Production must replace this local boundary with a cryptographically authenticated backend-issued handoff.
+This validation is deliberately **structural only**. The local capture `start`
+and `resume` APIs do not authenticate a handoff, verify a signature, contact a
+backend, perform authorization, upload media, or prove consent. Production must
+replace this local capture boundary with a cryptographically authenticated,
+backend-issued handoff. This statement does not apply to the separate backend
+launch API below: `startBackendSession` performs a network exchange with the
+build-pinned Tacua backend after affirmative launch consent.
 
 ## Backend launch and transport foundation
 
@@ -84,14 +93,89 @@ const approved = TacuaCapture.confirmBackendLaunchConsent(
   pending.consentRequestId,
   true,
 );
-// A future native lifecycle coordinator will consume approved.approvedLaunchId once.
+const receiving = await TacuaCapture.startBackendSession({
+  approvedLaunchId: approved.approvedLaunchId,
+  localSessionId: 'local_qa_001',
+  buildIdentity, // exact tacua.sdk-backend@1.0.0 build_identity object
+  scope, // exact tacua.sdk-backend@1.0.0 capture_scope object
+  requestedAt: '2026-07-21T09:57:00Z',
+});
+// receiving.captureStarted/uploadsConnected/completionConnected are all false.
 ```
+
+The host QA app, not the SDK, supplies the complete typed `buildIdentity` and
+`scope`. Native code parses them with bounded strict JSON, reconstructs the
+canonical request, verifies their own digests and cross-bindings, and requires
+the build identity's `transport_configuration_digest` to equal the built-in
+backend configuration. The SDK does not invent source, consent, retention, or
+build trust.
+
+START uses a separate, canonical, secret-free crash journal. It writes the
+exchange and credential identifiers plus a SHA-256 ownership verifier before
+the Keychain mutation, marks
+`exchange_outcome_unknown` before network I/O, and records a validated receipt
+plus the exact monotonic server-time anchor before committing the queue. No
+launch code, plaintext secret, Authorization value, or transient launch request
+is written to the journal or queue. Recovery deletes a Keychain item only when
+its bytes match that verifier, so a crashed duplicate-ID attempt cannot delete a
+pre-existing item. A recovered receipt keeps its original
+uptime/boot anchor; a reboot therefore requires a fresh resume exchange instead
+of extending credential time.
+
+`getBackendStartRecoveryStatus(localSessionId)` makes interrupted state visible.
+`credential_prepared` is known not to have reached the network and can be reset
+without the unknown-outcome acknowledgement, but a process restart has lost the
+volatile launch code, so a later START still needs a fresh reviewer launch.
+When its `canRecoverWithoutLaunch` field is true,
+`receipt_validated_queue_commit_pending` can be repaired with
+`recoverBackendStart(localSessionId)` without another launch. Queue recovery is
+structural: it remains available after a build transport change or missing
+Keychain item, and the returned `resumeRequired` flag then remains true. The
+public resume exchange that repairs that transport authority is a later slice;
+until it exists, retain the queue and keep uploads blocked. A new START cannot
+replace that committed queue, so do not request or consume another launch code
+for the same local session yet. An
+`exchange_outcome_unknown` state is deliberately **not** called remotely
+recoverable: the backend may have accepted the request, but the process lacks a
+validated remote session ID. It retains the Keychain credential and requires a
+fresh reviewer launch plus an explicit
+`abandonBackendStart(localSessionId, true)` acknowledgement before local reset;
+backend retention or operator cleanup must handle any abandoned remote session.
+If credential removal or journal cleanup fails after reset ownership is durable,
+the status becomes `credential_prepared_reset_pending` or
+`exchange_outcome_unknown_reset_pending`. Retry
+`abandonBackendStart(localSessionId, false)` to finish that local cleanup. The
+unknown-outcome acknowledgement was already recorded before the latter state was
+entered, so the retry does not ask the user to acknowledge it a second time.
+A crash/failure after receipt validation but before the receipt journal itself
+is durable remains conservatively indistinguishable from this unknown-outcome
+state. These APIs never claim that capture, uploads, or completion occurred.
+
+`credentialCapability` records the backend authority last established; it is
+not, by itself, a transport-usability signal. Even `active` is unsendable while
+`resumeRequired` is true (for example after expiry, reboot, build change, or
+Keychain loss). `requires_transport_rebind` is always blocked until the future
+resume API binds the current build. `completion_replay_or_delete_only` permits
+only exact completion replay and deletion work, while `deletion_replay_only`
+permits only exact deletion replay and receipt-authorized local cleanup. A
+deletion-only queue therefore reports `resumeRequired: false` because it is
+terminal, not because uploads are allowed. New media uploads require all of
+`credentialCapability: "active"`, `resumeRequired: false`, and
+`credentialAvailability: "available"`. A locked device can report
+`temporarily_unavailable`; retry after unlock instead of requesting a launch.
+Other Keychain failures report `unavailable` and require local diagnosis, not
+an assumed credential rotation.
 
 Credentials are 32 random bytes stored as
 `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`; secrets, bearer headers, and
 launch codes are prohibited from the durable queue. Rotation records A's
-revocation before removing A from Keychain, and startup recovery idempotently
-drains that journal. Credential validity is the half-open interval ending at
+revocation before removing A from Keychain. The host must call
+`getBackendQueueStatus(localSessionId)` for each known queue during startup; that
+explicit status read idempotently drains pending credential cleanup. Queue
+status and cleanup hold the same cross-process per-session lease as START and
+refuse to expose a queue while its receipt journal still requires recovery.
+Credential
+validity is the half-open interval ending at
 `expires_at`; an expired credential or a reboot-invalidated monotonic clock
 requires a fresh resume exchange. Exact historical request bytes remain bound to
 their original credential ID while the current credential authenticates replay.
@@ -164,6 +248,15 @@ receipt-to-local-file cleanup binding. Adversarial local files include paths
 outside the session, symlinks, directories, FIFOs, digest mismatches, and sparse
 files larger than 1 GiB.
 
+The core suite also drives the START lifecycle through success, preflight and
+one-shot-consent rejection, ambiguous transport failure, acknowledged local
+reset, validated-receipt queue recovery, delayed recovery, reboot recovery, and
+queue/journal mismatch. It asserts journal-before-Keychain ordering and scans
+every durable START artifact for prohibited launch-code and secret material. It
+also covers missing-Keychain and changed-build receipt recovery, durable journal
+removal confirmation, duplicate-ID crash recovery, lifecycle-serialized queue
+status, stale queue CAS rejection, and private storage modes.
+
 They also cover fail-closed storage thresholds, lifecycle sample admission,
 multi-boundary catch-up, and the exact QA fault-plan parser/matchers. The test
 runner syntax-parses every native source both with and without the dedicated
@@ -201,9 +294,10 @@ SDK. Promotion requires all remaining gates below to close:
 - [x] Implement and fixture-test the canonical V1 backend requests, exhaustive
   receipt validation, Keychain credential abstraction, durable replay queue,
   bounded HTTP client, and integrity-checked segment upload snapshot.
-- [ ] Connect the capture session to that foundation with the native lifecycle
-  coordinator. This candidate still only marks capture data
-  `partial_ready_for_upload`; `stop()` does not enqueue or upload it.
+- [ ] Connect a stopped capture to the START-established queue. The START-only
+  lifecycle coordinator is implemented, but this candidate still only marks
+  capture data `partial_ready_for_upload`; `stop()` does not enqueue or upload
+  it, and completion/deletion are not orchestrated.
 - [ ] Verify protected-file behavior in the production integration and provide an
   authenticated, user-visible, scoped local-data reset for an unreadable
   manifest.

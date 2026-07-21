@@ -10,6 +10,8 @@ public final class TacuaCaptureSpikeModule: Module {
   private var lastTerminalStatus: [String: Any]?
   private let sessionLock = NSLock()
   private let launchConsentGate = TacuaLaunchConsentGate()
+  private let backendCoordinatorLock = NSLock()
+  private var backendCoordinator: TacuaSDKStartLifecycleCoordinator?
 
   public func definition() -> ModuleDefinition {
     Name("TacuaCaptureSpikeModule")
@@ -51,7 +53,7 @@ public final class TacuaCaptureSpikeModule: Module {
         "transportConfigurationDigest": configuration.configurationDigest,
         "transportPolicyVersion": TacuaBackendConfiguration.policyVersion,
         "protocolVersion": TacuaSDKBackendProtocol.version,
-        "queueSchemaVersion": TacuaTransportQueueV2.schemaVersion,
+        "queueSchemaVersion": TacuaTransportQueueV3.schemaVersion,
         "credentialStorage": "ios_keychain_when_unlocked_this_device_only",
         "launchCodePersistence": "transient_only",
         "redirectPolicy": "reject_all",
@@ -86,12 +88,70 @@ public final class TacuaCaptureSpikeModule: Module {
       self.launchConsentGate.cancel(consentRequestID: requestID)
     }
 
+    AsyncFunction("startBackendSession") {
+      (options: TacuaBackendStartSessionNativeOptions, promise: Promise) in
+      do {
+        let coordinator = try self.startLifecycleCoordinator()
+        let input = TacuaSDKStartSessionInput(
+          approvedLaunchID: options.approvedLaunchId,
+          localSessionID: options.localSessionId,
+          buildIdentityJSON: Data(options.buildIdentityJson.utf8),
+          scopeJSON: Data(options.scopeJson.utf8),
+          requestedAt: options.requestedAt
+        )
+        Task {
+          do {
+            let started = try await coordinator.start(input)
+            promise.resolve(Self.backendStartedSessionValue(started))
+          } catch {
+            Self.rejectBackendStart(promise, error: error)
+          }
+        }
+      } catch {
+        Self.rejectBackendStart(promise, error: error)
+      }
+    }
+
+    AsyncFunction("getBackendStartRecoveryStatus") {
+      (localSessionID: String, promise: Promise) in
+      do {
+        let status = try self.startLifecycleCoordinator().recoveryStatus(
+          localSessionID: localSessionID
+        )
+        promise.resolve(Self.backendStartRecoveryStatusValue(status))
+      } catch {
+        Self.rejectBackendStart(promise, error: error)
+      }
+    }
+
+    AsyncFunction("recoverBackendStart") { (localSessionID: String, promise: Promise) in
+      do {
+        let started = try self.startLifecycleCoordinator().recover(
+          localSessionID: localSessionID
+        )
+        promise.resolve(Self.backendStartedSessionValue(started))
+      } catch {
+        Self.rejectBackendStart(promise, error: error)
+      }
+    }
+
+    AsyncFunction("abandonBackendStart") {
+      (localSessionID: String, acknowledgeRemoteSessionMayExist: Bool, promise: Promise) in
+      do {
+        try self.startLifecycleCoordinator().abandon(
+          localSessionID: localSessionID,
+          acknowledgeRemoteSessionMayExist: acknowledgeRemoteSessionMayExist
+        )
+        promise.resolve()
+      } catch {
+        Self.rejectBackendStart(promise, error: error)
+      }
+    }
+
     AsyncFunction("getBackendQueueStatus") { (localSessionID: String, promise: Promise) in
       do {
-        let store = try TacuaTransportQueueFileStore.applicationSupportStore()
-        guard let queue = try store.recoverCredentialCleanup(
-          localSessionID: localSessionID,
-          credentialStore: TacuaKeychainCredentialStore()
+        guard let status = try self.startLifecycleCoordinator().queueStatus(
+          localSessionID: localSessionID
         ) else {
           promise.resolve([
             "exists": false,
@@ -99,33 +159,29 @@ public final class TacuaCaptureSpikeModule: Module {
           ])
           return
         }
-        let clock = TacuaSystemMonotonicClock()
-        let credentialTimeValid = (try? queue.timestampForNewOperation(clock: clock)) != nil
-        let boundPayloadCount = queue.operations.reduce(0) {
-          $0 + ($1.localPayloadBindings?.count ?? 0)
-        }
         promise.resolve([
           "exists": true,
-          "localSessionId": queue.localSessionID,
-          "remoteSessionId": queue.remoteSessionID ?? NSNull(),
-          "scopeDigest": queue.scopeDigest ?? NSNull(),
-          "currentCredentialId": queue.currentCredentialID ?? NSNull(),
-          "currentCredentialExpiresAt": queue.currentCredentialExpiresAt ?? NSNull(),
-          "credentialCapability": queue.credentialCapability.rawValue,
-          "credentialTimeValid": credentialTimeValid,
-          "resumeRequired": queue.credentialCapability == .requiresExchange
-            || (queue.currentCredentialID != nil && !credentialTimeValid),
-          "operationCount": queue.operations.count,
-          "queuedOperationCount": queue.operations.filter { $0.state == .queued }.count,
-          "storedResponseCount": queue.operations.filter { $0.state == .responseStored }.count,
-          "boundLocalPayloadCount": boundPayloadCount,
-          "legacyUnboundPayloadCount": queue.localPayloadPaths.count,
-          "pendingRevokedCredentialRemovalCount": queue.pendingRevokedCredentialRemovals.count,
-          "payloadCleanupState": queue.payloadCleanupState.rawValue,
-          "credentialCleanupState": queue.credentialCleanupState.rawValue,
-          "completionCleanupAuthorized": queue.completionCleanupAuthority != nil,
-          "deletionCleanupAuthorized": queue.deletionCleanupAuthority != nil,
-          "schemaVersion": queue.schemaVersion,
+          "localSessionId": status.localSessionID,
+          "remoteSessionId": status.remoteSessionID ?? NSNull(),
+          "scopeDigest": status.scopeDigest ?? NSNull(),
+          "currentCredentialId": status.currentCredentialID ?? NSNull(),
+          "currentCredentialExpiresAt": status.currentCredentialExpiresAt ?? NSNull(),
+          "credentialCapability": status.credentialCapability.rawValue,
+          "credentialAvailability": status.credentialAvailability.rawValue,
+          "credentialTimeValid": status.credentialTimeValid,
+          "resumeRequired": status.resumeRequired,
+          "transportConfigurationMatchesBuild": status.transportConfigurationMatchesBuild,
+          "operationCount": status.operationCount,
+          "queuedOperationCount": status.queuedOperationCount,
+          "storedResponseCount": status.storedResponseCount,
+          "boundLocalPayloadCount": status.boundLocalPayloadCount,
+          "legacyUnboundPayloadCount": status.legacyUnboundPayloadCount,
+          "pendingRevokedCredentialRemovalCount": status.pendingRevokedCredentialRemovalCount,
+          "payloadCleanupState": status.payloadCleanupState.rawValue,
+          "credentialCleanupState": status.credentialCleanupState.rawValue,
+          "completionCleanupAuthorized": status.completionCleanupAuthorized,
+          "deletionCleanupAuthorized": status.deletionCleanupAuthorized,
+          "schemaVersion": status.schemaVersion,
         ])
       } catch {
         promise.reject(
@@ -358,6 +414,76 @@ public final class TacuaCaptureSpikeModule: Module {
     fallback: TacuaCaptureSpikeError = .recoveryIO("Tacua reported an internal capture failure.")
   ) {
     let publicError = (error as? TacuaCaptureSpikeError) ?? fallback
+    promise.reject(publicError.code, publicError.message)
+  }
+
+  private func startLifecycleCoordinator() throws -> TacuaSDKStartLifecycleCoordinator {
+    backendCoordinatorLock.lock()
+    defer { backendCoordinatorLock.unlock() }
+    if let backendCoordinator { return backendCoordinator }
+    let configuration = try TacuaBackendConfiguration.fromBuildConfiguration()
+    let credentialStore = TacuaKeychainCredentialStore()
+    let queueStore = try TacuaTransportQueueFileStore.applicationSupportStore()
+    let journalStore = try TacuaSDKStartJournalFileStore.applicationSupportStore()
+    let coordinator = TacuaSDKStartLifecycleCoordinator(
+      configuration: configuration,
+      consentGate: launchConsentGate,
+      credentialFactory: TacuaCredentialFactory(store: credentialStore),
+      exchanger: TacuaSDKBackendClient(
+        configuration: configuration,
+        credentialStore: credentialStore
+      ),
+      queueStore: queueStore,
+      journalStore: journalStore
+    )
+    backendCoordinator = coordinator
+    return coordinator
+  }
+
+  private static func backendStartedSessionValue(
+    _ started: TacuaSDKStartedSession
+  ) -> [String: Any] {
+    [
+      "localSessionId": started.localSessionID,
+      "remoteSessionId": started.remoteSessionID,
+      "scopeDigest": started.scopeDigest,
+      "credentialId": started.credentialID,
+      "credentialExpiresAt": started.credentialExpiresAt,
+      "credentialCapability": started.credentialCapability.rawValue,
+      "credentialAvailability": started.credentialAvailability.rawValue,
+      "queueSchemaVersion": started.queueSchemaVersion,
+      "resumeRequired": started.resumeRequired,
+      "backendSessionState": "receiving",
+      "captureStarted": false,
+      "uploadsConnected": false,
+      "completionConnected": false,
+    ]
+  }
+
+  private static func backendStartRecoveryStatusValue(
+    _ status: TacuaSDKStartRecoveryStatus
+  ) -> [String: Any] {
+    let resumeRequired: Any = status.resumeRequired.map { $0 as Any } ?? NSNull()
+    let transportConfigurationMatchesBuild: Any = status.transportConfigurationMatchesBuild
+      .map { $0 as Any } ?? NSNull()
+    let credentialCapability: Any = status.credentialCapability?.rawValue ?? NSNull()
+    let credentialAvailability: Any = status.credentialAvailability?.rawValue ?? NSNull()
+    return [
+      "localSessionId": status.localSessionID,
+      "state": status.state.rawValue,
+      "requiresFreshReviewerLaunch": status.requiresFreshReviewerLaunch,
+      "remoteSessionMayExist": status.remoteSessionMayExist,
+      "canRecoverWithoutLaunch": status.canRecoverWithoutLaunch,
+      "canAbandonLocally": status.canAbandonLocally,
+      "resumeRequired": resumeRequired,
+      "transportConfigurationMatchesBuild": transportConfigurationMatchesBuild,
+      "credentialCapability": credentialCapability,
+      "credentialAvailability": credentialAvailability,
+    ]
+  }
+
+  private static func rejectBackendStart(_ promise: Promise, error: Error) {
+    let publicError = (error as? TacuaSDKStartLifecycleError) ?? .persistenceFailure
     promise.reject(publicError.code, publicError.message)
   }
 
