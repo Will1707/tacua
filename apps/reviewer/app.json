@@ -1,0 +1,22 @@
+{
+  "expo": {
+    "name": "Tacua",
+    "slug": "tacua",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "scheme": "tacua",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "plugins": ["expo-router", "expo-secure-store"],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.will1707.tacua"
+    },
+    "android": {
+      "package": "com.will1707.tacua"
+    }
+  }
+}

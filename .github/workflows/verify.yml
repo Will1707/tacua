@@ -59,6 +59,13 @@ jobs:
           node experiments/security-harness/scripts/run.mjs artifacts/security-harness/EXP-004
           node experiments/security-harness/scripts/verify-artifacts.mjs artifacts/security-harness/EXP-004
 
+      - name: Type-check and bundle the reviewer app
+        working-directory: apps/reviewer
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run typecheck
+          npx expo export --platform ios --output-dir /tmp/tacua-reviewer-export
+
       - name: Ensure verification artifacts are reproducible
         run: git diff --exit-code
 
