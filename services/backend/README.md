@@ -56,6 +56,12 @@ exchange must never be redirected.
   transaction from the active-session recheck through metadata/byte integrity
   verification. This is part of the V1 single-process invariant: deletion
   cannot be accepted while a reviewer response is still being resolved.
+- Reviewer session and candidate lists are fixed 50-item keyset pages. Each
+  query reads at most 51 rows with no offset or deployment-wide completion
+  scan, and list reads share the deletion critical section. Candidate lists
+  validate only the bounded current head documents and their exact persisted
+  projections; full candidate detail continues to validate the complete
+  immutable version chain.
 - Every exported `tacua.approved-handoff@1.1.0` embeds the exact canonical JSON
   of its approved ticket-candidate row, without a trailing newline, plus mirrored
   candidate and content digests. The contract validates that source with the
@@ -180,12 +186,24 @@ request digest returns `409`.
 | `PUT` | `/v1/sdk/sessions/{session}/diagnostics/{upload}` | SDK bearer | Upload/recover diagnostics |
 | `PUT` | `/v1/sdk/sessions/{session}/completions/{completion}` | SDK bearer | Complete and queue processing |
 | `PUT` | `/v1/sdk/sessions/{session}/deletions/{deletion}` | SDK bearer | Erase/recover tombstone |
-| `GET` | `/v1/admin/sessions[/{session}]` | admin bearer | Observe sessions and receipts |
+| `GET` | `/v1/admin/sessions` | admin bearer | List one bounded page of session summaries |
+| `GET` | `/v1/admin/sessions/{session}` | admin bearer | Observe one session and its receipts |
+| `GET` | `/v1/admin/sessions/{session}/candidates` | admin bearer | List one bounded page of current candidate summaries |
 | `GET` | `/v1/admin/jobs[/{job}]` | admin bearer | Observe full runtime jobs |
 | `GET` | `/v1/admin/candidates/{candidate}/handoff.{json,md}` | admin bearer | Download the current exact approved handoff |
 | `GET` | `/v1/admin/candidates/{candidate}/versions/{version}/handoff.{json,md}` | admin bearer | Download one immutable approved handoff version |
 | `GET` | `/v1/admin/audit-events` | admin bearer | Observe content-free audit events |
 | `DELETE` | `/v1/admin/sessions/{session}` | admin bearer | Operator-requested scoped erasure |
+
+The two admin list routes return exactly
+`{"sessions":[...],"next_cursor":...}` or
+`{"candidates":[...],"next_cursor":...}`. A page contains at most 50 items.
+When `next_cursor` is non-null, send it unchanged as the single
+`Tacua-Page-Cursor` request header. Cursors are opaque, bounded to 512
+characters, scoped to their list kind, and candidate cursors are also scoped
+to the exact session. Empty, duplicate, oversized, non-canonical, cross-kind,
+and cross-session cursors fail with `400 PAGE_CURSOR_INVALID`; query strings
+remain unsupported.
 
 A start launch grant body is:
 

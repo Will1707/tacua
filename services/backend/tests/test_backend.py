@@ -1497,7 +1497,23 @@ class BackendProtocolTests(BackendHarness):
             previews=previews,
         )
         self.assertEqual(candidate, inserted)
-        self.assertEqual([candidate], self.backend.list_candidates(session_id))
+        listed = self.backend.list_candidates(session_id)
+        self.assertIsNone(listed["next_cursor"])
+        self.assertEqual(
+            [
+                {
+                    "candidate_id": candidate["candidate_id"],
+                    "candidate_version": candidate["candidate_version"],
+                    "candidate_digest": candidate["candidate_digest"],
+                    "state": candidate["state"],
+                    "priority": candidate["content"]["priority"],
+                    "title": candidate["content"]["title"],
+                    "summary": candidate["content"]["summary"]["text"],
+                    "version_created_at": candidate["version_created_at"],
+                }
+            ],
+            listed["candidates"],
+        )
 
         view = self.backend.get_candidate_evidence(
             candidate["candidate_id"],
@@ -2536,7 +2552,8 @@ class HTTPAdapterTests(BackendHarness):
         list_responses: list[tuple[int, dict]] = []
         listed._send_json = lambda status, body: list_responses.append((status, body))
         listed._dispatch()
-        self.assertEqual([candidate], list_responses[0][1]["candidates"])
+        self.assertEqual(candidate["candidate_id"], list_responses[0][1]["candidates"][0]["candidate_id"])
+        self.assertIsNone(list_responses[0][1]["next_cursor"])
 
         def bound_handler(path: str) -> PilotRequestHandler:
             handler = self.handler(path, authorization=authorization)

@@ -102,6 +102,18 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
             raise ApiError(400, code, f"one valid {name} header is required")
         return values[0]
 
+    def _page_cursor(self) -> str | None:
+        values = self.headers.get_all("Tacua-Page-Cursor") or []
+        if not values:
+            return None
+        if len(values) != 1 or not values[0] or len(values[0]) > 512:
+            raise ApiError(
+                400,
+                "PAGE_CURSOR_INVALID",
+                "Tacua-Page-Cursor is invalid",
+            )
+        return values[0]
+
     def _bearer(self) -> str | None:
         values = self.headers.get_all("Authorization") or []
         if len(values) != 1 or not values[0].startswith("Bearer "):
@@ -337,7 +349,7 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
 
         if self.command == "GET" and path == "/v1/admin/sessions":
             self._admin()
-            self._send_json(200, {"sessions": self.backend.list_sessions()})
+            self._send_json(200, self.backend.list_sessions(self._page_cursor()))
             return
         admin_session_candidates = re.fullmatch(
             rf"/v1/admin/sessions/(?P<session_id>{ID})/candidates", path
@@ -346,11 +358,10 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
             self._admin()
             self._send_json(
                 200,
-                {
-                    "candidates": self.backend.list_candidates(
-                        admin_session_candidates.group("session_id")
-                    )
-                },
+                self.backend.list_candidates(
+                    admin_session_candidates.group("session_id"),
+                    self._page_cursor(),
+                ),
             )
             return
 

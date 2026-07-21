@@ -195,16 +195,22 @@ class BackendReleaseRegressionTests(BackendHarness):
             self.backend.get_session(session_id)["retention"]["raw_media_expires_at"]
         )
         self.clock.set(expiry - timedelta(seconds=1))
-        self.assertEqual([session_id], [item["session_id"] for item in self.backend.list_sessions()])
+        self.assertEqual(
+            [session_id],
+            [item["session_id"] for item in self.backend.list_sessions()["sessions"]],
+        )
         self.assertEqual(1, len(self.backend.list_jobs()))
-        self.assertEqual(1, len(self.backend.list_candidates(session_id)))
+        self.assertEqual(
+            1,
+            len(self.backend.list_candidates(session_id)["candidates"]),
+        )
 
         self.clock.set(expiry)
         with self.assertRaises(ApiError) as captured:
             self.backend.list_candidates(session_id)
         self.assertEqual(410, captured.exception.status)
         self.assertEqual("SESSION_DELETED", captured.exception.code)
-        self.assertEqual([], self.backend.list_sessions())
+        self.assertEqual([], self.backend.list_sessions()["sessions"])
         self.assertEqual([], self.backend.list_jobs())
         self.assertFalse((self.backend.objects_dir / session_id).exists())
         self.assert_api_error(
@@ -226,7 +232,7 @@ class BackendReleaseRegressionTests(BackendHarness):
             "_erase_session_objects",
             side_effect=OSError("simulated storage outage"),
         ):
-            self.assertEqual([], self.backend.list_sessions())
+            self.assertEqual([], self.backend.list_sessions()["sessions"])
             with self.assertRaises(ApiError) as captured:
                 self.backend.get_session(session_id)
             self.assertEqual(410, captured.exception.status)

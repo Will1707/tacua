@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -70,6 +71,9 @@ MAX_SAFE_INTEGER = 9_007_199_254_740_991
 MAX_SEGMENTS = 2048
 MAX_CANDIDATE_EVIDENCE_VIEW_BYTES = 1_572_864
 MAX_HANDOFF_ARTIFACT_BYTES = 2_097_152
+LIST_PAGE_SIZE = 50
+MAX_PAGE_CURSOR_LENGTH = 512
+PAGE_CURSOR_VERSION = 1
 SCHEMA_VERSION = 2
 INTERNAL_DELETION_RESOURCE = "tacua.internal-deletion-job@1.0.0"
 SCOPE_POLICY_CONTRACT = "tacua.capture-scope-policy@1.0.0"
@@ -177,6 +181,81 @@ def _new_id(prefix: str) -> str:
 
 def _canonical_bytes(value: Any) -> bytes:
     return canonical_json(value).encode("utf-8")
+
+
+def _encode_page_cursor(value: dict[str, Any]) -> str:
+    encoded = base64.urlsafe_b64encode(_canonical_bytes(value)).rstrip(b"=").decode("ascii")
+    if not encoded or len(encoded) > MAX_PAGE_CURSOR_LENGTH:
+        raise RuntimeError("internal page cursor exceeds its wire bound")
+    return encoded
+
+
+def _decode_page_cursor(
+    value: str | None,
+    *,
+    kind: str,
+    session_id: str | None = None,
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    try:
+        if (
+            not isinstance(value, str)
+            or not 1 <= len(value) <= MAX_PAGE_CURSOR_LENGTH
+            or re.fullmatch(r"[A-Za-z0-9_-]+", value) is None
+            or len(value) % 4 == 1
+        ):
+            raise ValueError("cursor encoding is invalid")
+        padding = "=" * ((4 - len(value) % 4) % 4)
+        raw = base64.b64decode(value + padding, altchars=b"-_", validate=True)
+        document = strict_json_loads(raw)
+        if not isinstance(document, dict) or _encode_page_cursor(document) != value:
+            raise ValueError("cursor is not canonical")
+        expected_keys = (
+            {"version", "kind", "created_at", "session_id"}
+            if kind == "sessions"
+            else {"version", "kind", "session_id", "candidate_id"}
+        )
+        if (
+            set(document) != expected_keys
+            or document["version"] != PAGE_CURSOR_VERSION
+            or document["kind"] != kind
+        ):
+            raise ValueError("cursor scope is invalid")
+        if kind == "sessions":
+            created_at = document["created_at"]
+            cursor_session_id = document["session_id"]
+            if (
+                not isinstance(created_at, str)
+                or timestamp(_parse_timestamp(created_at)) != created_at
+                or not isinstance(cursor_session_id, str)
+                or ID_PATTERN.fullmatch(cursor_session_id) is None
+            ):
+                raise ValueError("session cursor position is invalid")
+        elif kind == "candidates":
+            cursor_session_id = document["session_id"]
+            candidate_id = document["candidate_id"]
+            if (
+                session_id is None
+                or cursor_session_id != session_id
+                or not isinstance(cursor_session_id, str)
+                or ID_PATTERN.fullmatch(cursor_session_id) is None
+                or not isinstance(candidate_id, str)
+                or ID_PATTERN.fullmatch(candidate_id) is None
+            ):
+                raise ValueError("candidate cursor position is invalid")
+        else:  # pragma: no cover - every caller uses one fixed internal kind
+            raise RuntimeError("unsupported internal page cursor kind")
+        return document
+    except (
+        binascii.Error,
+        UnicodeError,
+        ValueError,
+        json.JSONDecodeError,
+        DuplicateJSONKey,
+        InvalidJSONValue,
+    ) as error:
+        raise ApiError(400, "PAGE_CURSOR_INVALID", "Tacua-Page-Cursor is invalid") from error
 
 
 def _require_id(value: Any, field: str) -> str:
@@ -535,6 +614,7 @@ class PilotBackend:
             occurred_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS sessions_retention_idx ON sessions(raw_media_expires_at, state);
+        CREATE INDEX IF NOT EXISTS sessions_admin_list_idx ON sessions(created_at DESC, session_id DESC);
         CREATE INDEX IF NOT EXISTS audit_session_idx ON audit_events(session_id, occurred_at);
         CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs(status, requested_at);
         """
@@ -3065,27 +3145,145 @@ class PilotBackend:
         except CandidateStoreError as error:
             self._raise_candidate_error(error)
 
-    def list_candidates(self, session_id: str) -> list[dict[str, Any]]:
+    @staticmethod
+    def _candidate_summary(row: sqlite3.Row) -> dict[str, Any]:
+        raw = row["canonical_json"]
+        if not isinstance(raw, (bytes, str)):
+            raise ApiError(
+                500,
+                "CANDIDATE_STORAGE_CORRUPT",
+                "stored candidate failed validation",
+            )
+        candidate = PilotBackend._load_candidate_document(raw)
+        head_projection = (
+            row["head_candidate_id"],
+            row["head_candidate_version"],
+            row["head_candidate_digest"],
+            row["head_organization_id"],
+            row["head_project_id"],
+            row["head_session_id"],
+            row["head_state"],
+        )
+        expected_head_projection = (
+            candidate["candidate_id"],
+            candidate["candidate_version"],
+            candidate["candidate_digest"],
+            candidate["organization_id"],
+            candidate["project_id"],
+            candidate["session_id"],
+            candidate["state"],
+        )
+        version_projection = (
+            row["version_candidate_id"],
+            row["version_candidate_version"],
+            row["version_organization_id"],
+            row["version_project_id"],
+            row["version_session_id"],
+            row["version_state"],
+            row["version_candidate_digest"],
+            row["version_candidate_content_digest"],
+            row["version_evidence_manifest_digest"],
+            row["version_created_at"],
+        )
+        expected_version_projection = (
+            candidate["candidate_id"],
+            candidate["candidate_version"],
+            candidate["organization_id"],
+            candidate["project_id"],
+            candidate["session_id"],
+            candidate["state"],
+            candidate["candidate_digest"],
+            candidate["candidate_content_digest"],
+            candidate["evidence_manifest"]["manifest_digest"],
+            candidate["version_created_at"],
+        )
+        if (
+            head_projection != expected_head_projection
+            or version_projection != expected_version_projection
+        ):
+            raise ApiError(
+                500,
+                "CANDIDATE_STORAGE_CORRUPT",
+                "stored candidate projection changed",
+            )
+        return {
+            "candidate_id": candidate["candidate_id"],
+            "candidate_version": candidate["candidate_version"],
+            "candidate_digest": candidate["candidate_digest"],
+            "state": candidate["state"],
+            "priority": candidate["content"]["priority"],
+            "title": candidate["content"]["title"],
+            "summary": candidate["content"]["summary"]["text"],
+            "version_created_at": candidate["version_created_at"],
+        }
+
+    def list_candidates(
+        self,
+        session_id: str,
+        page_cursor: str | None = None,
+    ) -> dict[str, Any]:
         _require_id(session_id, "session_id")
+        cursor = _decode_page_cursor(
+            page_cursor,
+            kind="candidates",
+            session_id=session_id,
+        )
         with self._lock:
             self._sweep_before_review_access()
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 self._require_review_session(connection, session_id)
+                cursor_candidate_id = None if cursor is None else cursor["candidate_id"]
                 rows = connection.execute(
-                    """SELECT candidate_id FROM candidate_heads
-                        WHERE organization_id = ? AND project_id = ? AND session_id = ?
-                        ORDER BY candidate_id""",
-                    (self.config.organization_id, self.config.project_id, session_id),
+                    """SELECT heads.candidate_id AS head_candidate_id,
+                              heads.candidate_version AS head_candidate_version,
+                              heads.candidate_digest AS head_candidate_digest,
+                              heads.organization_id AS head_organization_id,
+                              heads.project_id AS head_project_id,
+                              heads.session_id AS head_session_id,
+                              heads.state AS head_state,
+                              versions.candidate_id AS version_candidate_id,
+                              versions.candidate_version AS version_candidate_version,
+                              versions.organization_id AS version_organization_id,
+                              versions.project_id AS version_project_id,
+                              versions.session_id AS version_session_id,
+                              versions.state AS version_state,
+                              versions.candidate_digest AS version_candidate_digest,
+                              versions.candidate_content_digest AS version_candidate_content_digest,
+                              versions.evidence_manifest_digest AS version_evidence_manifest_digest,
+                              versions.canonical_json AS canonical_json,
+                              versions.version_created_at AS version_created_at
+                         FROM candidate_heads AS heads
+                         LEFT JOIN candidate_versions AS versions
+                           ON versions.candidate_id = heads.candidate_id
+                          AND versions.candidate_version = heads.candidate_version
+                        WHERE heads.organization_id = ?
+                          AND heads.project_id = ?
+                          AND heads.session_id = ?
+                          AND (? IS NULL OR heads.candidate_id > ?)
+                        ORDER BY heads.candidate_id ASC
+                        LIMIT 51""",
+                    (
+                        self.config.organization_id,
+                        self.config.project_id,
+                        session_id,
+                        cursor_candidate_id,
+                        cursor_candidate_id,
+                    ),
                 ).fetchall()
-                candidates = [
-                    self._candidate_from_connection(connection, row["candidate_id"])
-                    for row in rows
-                ]
-                candidates.sort(
-                    key=lambda item: (item["version_created_at"], item["candidate_id"])
-                )
-                return candidates
+                summaries = [self._candidate_summary(row) for row in rows]
+                page = summaries[:LIST_PAGE_SIZE]
+                next_cursor = None
+                if len(summaries) > LIST_PAGE_SIZE:
+                    next_cursor = _encode_page_cursor(
+                        {
+                            "version": PAGE_CURSOR_VERSION,
+                            "kind": "candidates",
+                            "session_id": session_id,
+                            "candidate_id": page[-1]["candidate_id"],
+                        }
+                    )
+                return {"candidates": page, "next_cursor": next_cursor}
 
     def get_candidate(self, candidate_id: str, version: int | None = None) -> dict[str, Any]:
         _require_id(candidate_id, "candidate_id")
@@ -3429,14 +3627,137 @@ class PilotBackend:
     def _session_summary(
         self,
         row: sqlite3.Row,
-        completion_request_json: str | None = None,
+        completion: sqlite3.Row | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        scope = self._decode_protocol_object(row["scope_json"])
-        build = self._decode_protocol_object(row["build_identity_json"])
-        manifest_digest = None
-        if completion_request_json is not None:
-            completion_request = self._decode_protocol_object(completion_request_json)
-            manifest_digest = completion_request["capture_manifest"]["manifest_digest"]
+        try:
+            scope_raw = row["scope_json"]
+            build_raw = row["build_identity_json"]
+            scope_text = (
+                scope_raw.decode("utf-8") if isinstance(scope_raw, bytes) else scope_raw
+            )
+            build_text = (
+                build_raw.decode("utf-8") if isinstance(build_raw, bytes) else build_raw
+            )
+            scope = self._decode_protocol_object(scope_raw)
+            build = self._decode_protocol_object(build_raw)
+            validate(scope)
+            validate(build)
+            created_at = timestamp(_parse_timestamp(row["created_at"]))
+            raw_media_expires_at = timestamp(
+                _parse_timestamp(row["raw_media_expires_at"])
+            )
+            derived_data_expires_at = timestamp(
+                _parse_timestamp(row["derived_data_expires_at"])
+            )
+            if (
+                not isinstance(scope_text, str)
+                or not isinstance(build_text, str)
+                or canonical_json(scope) != scope_text
+                or canonical_json(build) != build_text
+                or scope.get("message_type") != "capture_scope"
+                or build.get("message_type") != "build_identity"
+                or scope["scope_digest"] != row["scope_digest"]
+                or build["build_identity_digest"] != row["build_identity_digest"]
+                or scope["build_identity_digest"] != build["build_identity_digest"]
+                or canonical_json(build) != self._registered_build_identity_json
+                or scope["organization_id"] != self.config.organization_id
+                or scope["project_id"] != self.config.project_id
+                or scope["application_id"] != self.config.application_id
+                or scope["build_id"] != self.config.build_id
+                or scope["consent"]["policy_version"] != self.config.consent_contract
+                or scope["retention"]["policy_version"] != RETENTION_POLICY_VERSION
+                or scope["retention"]["raw_media_days"]
+                != self.config.raw_retention_days
+                or scope["retention"]["derived_data_days"]
+                != self.config.derived_retention_days
+                or created_at != row["created_at"]
+                or raw_media_expires_at != row["raw_media_expires_at"]
+                or derived_data_expires_at != row["derived_data_expires_at"]
+                or timestamp(
+                    _parse_timestamp(row["created_at"])
+                    + timedelta(days=scope["retention"]["raw_media_days"])
+                )
+                != row["raw_media_expires_at"]
+                or timestamp(
+                    _parse_timestamp(row["created_at"])
+                    + timedelta(days=scope["retention"]["derived_data_days"])
+                )
+                != row["derived_data_expires_at"]
+            ):
+                raise ValueError("session scope or build projection changed")
+
+            state = row["state"]
+            completed_projection = (
+                row["completed_at"] is not None or row["completion_id"] is not None
+            )
+            has_completion = completion is not None
+            if (
+                state not in {"receiving", "completed", "deleting"}
+                or (state == "receiving" and (completed_projection or has_completion))
+                or (state == "completed" and (not completed_projection or not has_completion))
+                or (state == "deleting" and completed_projection != has_completion)
+            ):
+                raise ValueError("session completion projection changed")
+
+            manifest_digest = None
+            if has_completion:
+                if row["completed_at"] is None or row["completion_id"] is None:
+                    raise ValueError("completion row has no session projection")
+                completed_at = timestamp(_parse_timestamp(row["completed_at"]))
+                completion_raw = completion["request_json"]
+                completion_text = (
+                    completion_raw.decode("utf-8")
+                    if isinstance(completion_raw, bytes)
+                    else completion_raw
+                )
+                completion_request = self._decode_protocol_object(completion_raw)
+                validate(completion_request)
+                manifest = completion_request["capture_manifest"]
+                expected_manifest_retention = {
+                    "policy_version": MANIFEST_RETENTION_POLICY_VERSION,
+                    "raw_media_expires_at": row["raw_media_expires_at"],
+                    "derived_data_expires_at": row["derived_data_expires_at"],
+                    "deletion_status": "active",
+                }
+                if (
+                    not isinstance(completion_text, str)
+                    or canonical_json(completion_request) != completion_text
+                    or completion_request.get("message_type") != "completion_request"
+                    or completion["session_id"] != row["session_id"]
+                    or completion["completion_id"] != row["completion_id"]
+                    or completion["request_digest"]
+                    != completion_request["request_digest"]
+                    or completion["accepted_at"] != row["completed_at"]
+                    or completed_at != row["completed_at"]
+                    or completion_request["session_id"] != row["session_id"]
+                    or completion_request["completion_id"] != row["completion_id"]
+                    or completion_request["scope_digest"] != row["scope_digest"]
+                    or manifest["organization_id"] != scope["organization_id"]
+                    or manifest["project_id"] != scope["project_id"]
+                    or manifest["session_id"] != row["session_id"]
+                    or manifest["build_id"] != scope["build_id"]
+                    or manifest["build_identity_digest"]
+                    != scope["build_identity_digest"]
+                    or canonical_json(manifest["retention"])
+                    != canonical_json(expected_manifest_retention)
+                ):
+                    raise ValueError("stored completion projection changed")
+                manifest_digest = manifest["manifest_digest"]
+        except (
+            KeyError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+            ContractError,
+            DuplicateJSONKey,
+            InvalidJSONValue,
+            json.JSONDecodeError,
+        ) as error:
+            raise ApiError(
+                500,
+                "SESSION_STORAGE_CORRUPT",
+                "stored session failed validation",
+            ) from error
         return {
             "session_id": row["session_id"],
             "organization_id": scope["organization_id"],
@@ -3461,23 +3782,84 @@ class PilotBackend:
             },
         }
 
-    def list_sessions(self) -> list[dict[str, Any]]:
-        boundary = self._sweep_before_review_access()
-        with self._connect() as conn:
-            rows = conn.execute(
-                """SELECT * FROM sessions
-                   WHERE state != 'deleting' AND raw_media_expires_at > ?
-                   ORDER BY created_at DESC""",
-                (timestamp(boundary),),
-            ).fetchall()
-            completions = {
-                item["session_id"]: item["request_json"]
-                for item in conn.execute("SELECT session_id,request_json FROM completions")
-            }
-            return [
-                self._session_summary(row, completions.get(row["session_id"]))
-                for row in rows
-            ]
+    def list_sessions(self, page_cursor: str | None = None) -> dict[str, Any]:
+        cursor = _decode_page_cursor(page_cursor, kind="sessions")
+        with self._lock:
+            boundary = self._sweep_before_review_access()
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor_created_at = None if cursor is None else cursor["created_at"]
+                cursor_session_id = None if cursor is None else cursor["session_id"]
+                rows = conn.execute(
+                    """SELECT sessions.session_id AS session_id,
+                              sessions.state AS state,
+                              sessions.scope_digest AS scope_digest,
+                              sessions.scope_json AS scope_json,
+                              sessions.build_identity_digest AS build_identity_digest,
+                              sessions.build_identity_json AS build_identity_json,
+                              sessions.created_at AS created_at,
+                              sessions.completed_at AS completed_at,
+                              sessions.raw_media_expires_at AS raw_media_expires_at,
+                              sessions.derived_data_expires_at AS derived_data_expires_at,
+                              sessions.completion_id AS completion_id,
+                              completions.session_id AS joined_completion_session_id,
+                              completions.completion_id AS joined_completion_id,
+                              completions.request_digest AS joined_completion_request_digest,
+                              completions.request_json AS joined_completion_request_json,
+                              completions.accepted_at AS joined_completion_accepted_at
+                         FROM sessions AS sessions
+                         LEFT JOIN completions AS completions
+                           ON completions.session_id = sessions.session_id
+                        WHERE sessions.state != 'deleting'
+                          AND sessions.raw_media_expires_at > ?
+                          AND (
+                               ? IS NULL
+                               OR sessions.created_at < ?
+                               OR (
+                                    sessions.created_at = ?
+                                    AND sessions.session_id < ?
+                               )
+                          )
+                        ORDER BY sessions.created_at DESC, sessions.session_id DESC
+                        LIMIT 51""",
+                    (
+                        timestamp(boundary),
+                        cursor_created_at,
+                        cursor_created_at,
+                        cursor_created_at,
+                        cursor_session_id,
+                    ),
+                ).fetchall()
+                page_rows = rows[:LIST_PAGE_SIZE]
+                sessions = [
+                    self._session_summary(
+                        row,
+                        None
+                        if row["joined_completion_session_id"] is None
+                        else {
+                            "session_id": row["joined_completion_session_id"],
+                            "completion_id": row["joined_completion_id"],
+                            "request_digest": row[
+                                "joined_completion_request_digest"
+                            ],
+                            "request_json": row["joined_completion_request_json"],
+                            "accepted_at": row["joined_completion_accepted_at"],
+                        },
+                    )
+                    for row in page_rows
+                ]
+                next_cursor = None
+                if len(rows) > LIST_PAGE_SIZE:
+                    last = page_rows[-1]
+                    next_cursor = _encode_page_cursor(
+                        {
+                            "version": PAGE_CURSOR_VERSION,
+                            "kind": "sessions",
+                            "created_at": last["created_at"],
+                            "session_id": last["session_id"],
+                        }
+                    )
+                return {"sessions": sessions, "next_cursor": next_cursor}
 
     def get_session(self, session_id: str) -> dict[str, Any]:
         _require_id(session_id, "session_id")
@@ -3499,13 +3881,12 @@ class PilotBackend:
                 raise ApiError(410, "SESSION_DELETED", "session was deleted")
             self._require_review_session(conn, session_id)
             completion = conn.execute(
-                "SELECT request_json,response_bytes FROM completions WHERE session_id = ?",
+                """SELECT session_id,completion_id,request_digest,request_json,
+                          accepted_at,response_bytes
+                     FROM completions WHERE session_id = ?""",
                 (session_id,),
             ).fetchone()
-            result = self._session_summary(
-                row,
-                completion["request_json"] if completion is not None else None,
-            )
+            result = self._session_summary(row, completion)
             result["build_identity"] = self._decode_protocol_object(row["build_identity_json"])
             result["scope"] = self._decode_protocol_object(row["scope_json"])
             result["credentials"] = [
