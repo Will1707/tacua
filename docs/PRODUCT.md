@@ -47,6 +47,12 @@ Tacua has three planned first-party parts:
 - a provider-neutral Docker deployment containing the API, durable processing,
   structured state, and media storage interfaces.
 
+The ownership and launch boundary between those components is fixed in
+[ADR-012](decisions/ADR-012-v1-component-boundary.md). The embedded SDK owns
+capture, local recovery, and upload because app-only ReplayKit media remains in
+the tested application's sandbox; the reviewer app orchestrates sessions and
+reviews backend-owned candidates.
+
 The SDK is essential: screen recording alone does not give a coding agent enough
 context to distinguish a visual symptom from navigation, application state,
 network, console, or backend behavior. The exact event set and storage topology
@@ -108,8 +114,24 @@ authorization, repository scope, and current build/evidence scope.
 ## Current proof level
 
 The repository contains candidate contracts and risk-reduction experiments, not
-a deployable V1. Local synthetic contract suites pass, and the capture SDK has
-compiled and linked inside an isolated arm64 iOS Simulator host. Physical-device
-ReplayKit behavior, 30-minute resource limits, upload/processing, runtime
-security, real-agent outcomes, and an operator-ready Docker topology are still
-release blockers.
+a deployable V1. Local synthetic contract suites pass. `EXP-001` also completed
+its physical candidate gates on one iPhone using synthetic QA data: foreground
+narration and app audio, static-screen segmentation, the 30-minute limit, lock
+recovery, process interruption, the fixed recovery choices, scoped deletion,
+and deterministic storage/writer/stop fault handling. Every segment accepted as
+evidence matched its manifest byte length and SHA-256 value; the detailed scope
+and measurements are recorded in the
+[physical-device results](../experiments/ios-capture-spike/PHYSICAL-DEVICE-RESULTS.md).
+
+That result proves a local capture candidate, not a production SDK. The
+experiment did not authenticate a handoff, prove consent, upload media, contact
+a backend, or authorize external model egress. The 30-minute run dropped 121 of
+77,523 app-audio append attempts (about 0.156%); production promotion must
+eliminate those boundary-ordering drops or define and enforce a measured
+acceptance threshold. Protected-file behavior and an authenticated,
+user-visible reset for corrupt local session data also require production
+verification.
+
+Upload and processing, backend-issued authorization, runtime security and
+retention/deletion enforcement, a real pilot-to-agent outcome, and an
+operator-ready Docker topology remain release blockers.

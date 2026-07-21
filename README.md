@@ -25,11 +25,12 @@ The first pilot targets an authorized private Expo/React Native iOS app. The V1 
 
 ## What is here today
 
-- [`experiments/ios-capture-spike`](experiments/ios-capture-spike/package/README.md): a removable, first-party Expo/ReplayKit package candidate with segmented local recovery, plus a local-only [physical-iPhone development harness](experiments/ios-capture-spike/harness/README.md). Physical runs cover foreground narration, static-screen segmentation, interruption and recovery choices, scoped deletion, the 30-minute limit, lock recovery, and the deterministic [fault-injection campaign](experiments/ios-capture-spike/FAULT-INJECTION-RUNBOOK.md). Sanitized outcomes are recorded in the [physical-device results](experiments/ios-capture-spike/PHYSICAL-DEVICE-RESULTS.md).
+- [`experiments/ios-capture-spike`](experiments/ios-capture-spike/package/README.md): a removable, first-party Expo/ReplayKit package candidate with segmented local recovery, plus a local-only [physical-iPhone development harness](experiments/ios-capture-spike/harness/README.md). `EXP-001` completed its physical candidate gates on one iPhone using synthetic QA data, including foreground narration, static-screen segmentation, interruption and recovery choices, scoped deletion, the 30-minute limit, lock recovery, and the deterministic [fault-injection campaign](experiments/ios-capture-spike/FAULT-INJECTION-RUNBOOK.md). Sanitized outcomes and remaining promotion blockers are recorded in the [physical-device results](experiments/ios-capture-spike/PHYSICAL-DEVICE-RESULTS.md). The candidate still has no authentication, upload, or backend integration.
 - [`experiments/eval-harness`](experiments/eval-harness/README.md): a synthetic multi-issue corpus, scorer and reporter-time protocol. Its fixtures are not product-quality evidence.
 - [`experiments/security-harness`](experiments/security-harness/README.md): deterministic, synthetic default-deny, authorization, retention and deletion contract checks. Runtime security remains unverified.
 - [`experiments/docker-topology-probe`](experiments/docker-topology-probe/README.md): a non-production container lifecycle probe. It does not select or implement the backend topology.
 - [`contracts/approved-handoff`](contracts/approved-handoff/README.md): a strict candidate Markdown/JSON agent-handoff contract that separates offline structure from externally authenticated execution trust. [ADR-011](docs/decisions/ADR-011-approved-handoff.md) remains unaccepted until a trusted real-consumer trial passes.
+- [`contracts/runtime`](contracts/runtime/README.md): strict candidate contracts for the capture/upload manifest, sanitized SDK diagnostics, asynchronous processing jobs, and editable ticket lifecycle. Structural validation does not authorize capture, egress, or agent execution.
 
 ## Local verification
 
@@ -37,6 +38,8 @@ The contract and synthetic harnesses have no network dependency:
 
 ```sh
 python3 -B -m unittest discover -s contracts/approved-handoff/tests -v
+python3 -B contracts/runtime/scripts/validate.py bundle contracts/runtime/fixtures/positive
+python3 -B -m unittest discover -s contracts/runtime/tests -v
 python3 -B -m unittest discover -s experiments/eval-harness/tests -v
 node --test experiments/security-harness/test/harness.test.mjs
 ```
