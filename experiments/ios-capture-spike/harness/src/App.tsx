@@ -1,6 +1,7 @@
 import * as TacuaCapture from '@tacua/ios-capture-spike';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
+  Alert,
   Button,
   Platform,
   SafeAreaView,
@@ -198,6 +199,21 @@ export default function App(): React.JSX.Element {
     }
   };
 
+  const requestDeleteSession = (sessionId: string, segmentCount: number) => {
+    Alert.alert(
+      'Delete this local session?',
+      `This permanently removes ${segmentCount} verified segment${segmentCount === 1 ? '' : 's'} and its metadata from this device.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: () => void deleteSession(sessionId),
+        },
+      ],
+    );
+  };
+
   const recording = status?.recorderRecording === true;
 
   return (
@@ -323,7 +339,12 @@ export default function App(): React.JSX.Element {
                   <Button
                     title="Delete"
                     color="#ef4444"
-                    onPress={() => void deleteSession(session.sessionId)}
+                    onPress={() =>
+                      requestDeleteSession(
+                        session.sessionId,
+                        session.segmentCount,
+                      )
+                    }
                     disabled={busy}
                   />
                 </View>

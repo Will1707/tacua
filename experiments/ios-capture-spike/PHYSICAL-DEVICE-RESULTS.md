@@ -1,7 +1,7 @@
 # EXP-001 physical-device results
 
-Status: foreground capture, interruption discovery, verified-partial choice, and
-resume proven; deletion and long-run checks pending
+Status: foreground capture, interruption discovery, verified-partial choice,
+resume, and deletion proven; long-run checks pending
 
 Date: 2026-07-21
 
@@ -98,11 +98,14 @@ one explicit `process_resume` gap when new media arrived. Manual stop finalized
 four segments with 2,309 microphone samples and 2,284 app-audio samples in
 total. The terminal state remained `partial`, correctly preserving the original
 interruption code and recovery gap as evidence. Explicit `Delete` validation
-remains pending.
+then removed only this newest four-segment synthetic session. The recovery count
+dropped from five to four, and a direct lookup confirmed the exact session
+manifest no longer existed. The harness now requires a destructive confirmation
+that states how many verified segments and associated metadata will be removed.
 
 ## Evidence handling
 
 Raw media was copied to private temporary directories for `ffprobe` and checksum
 inspection, then deleted immediately after aggregate measurements were recorded.
-Synthetic source sessions remain only in the app container until the planned
-recovery-choice and deletion checks complete.
+Remaining synthetic source sessions stay only in the app container until the
+long-run test and final test-data cleanup.
