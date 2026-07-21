@@ -34,15 +34,22 @@ export function CandidateEvidencePanel({
   error,
   onInspectionStateChange,
 }: Props) {
-  const referencedEvidence = useMemo(() => new Set([
+  const referencedEvidence = useMemo(() => Array.from(new Set([
     ...candidate.content.actual_behavior.evidence_refs,
     ...candidate.content.summary.evidence_refs,
-  ]), [candidate.content.actual_behavior.evidence_refs, candidate.content.summary.evidence_refs]);
-  const keyframe = evidence?.items.find((item) => (
-    item.evidence_type === "media.keyframe"
-    && item.preview.status === "available"
-    && referencedEvidence.has(item.evidence_id)
-  )) ?? evidence?.items.find((item) => item.evidence_type === "media.keyframe" && item.preview.status === "available");
+    ...candidate.content.claims.flatMap((claim) => claim.evidence_refs),
+  ])), [
+    candidate.content.actual_behavior.evidence_refs,
+    candidate.content.claims,
+    candidate.content.summary.evidence_refs,
+  ]);
+  const keyframe = referencedEvidence
+    .map((evidenceId) => evidence?.items.find((item) => item.evidence_id === evidenceId))
+    .find((item) => (
+      item?.evidence_type === "media.keyframe"
+      && item.availability === "available"
+      && item.preview.status === "available"
+    ));
   const events = useMemo(
     () => [...(evidence?.diagnostic_events ?? [])].sort((left, right) => left.elapsed_ms - right.elapsed_ms).slice(0, maximumVisibleEvents),
     [evidence?.diagnostic_events],
@@ -135,7 +142,7 @@ function KeyframePreview({
   if (!item) {
     return (
       <View style={{ minHeight: 112, borderRadius: 14, borderCurve: "continuous", backgroundColor: colors.groupedBackground, alignItems: "center", justifyContent: "center", padding: 16 }}>
-        <Text selectable style={{ color: colors.secondaryLabel, textAlign: "center" }}>No screenshot was bound to this ticket.</Text>
+        <Text selectable style={{ color: colors.secondaryLabel, textAlign: "center" }}>No available screenshot was referenced by this ticket. Approval remains locked.</Text>
       </View>
     );
   }
