@@ -1,8 +1,8 @@
 # EXP-001 physical-device results
 
-Status: foreground capture, interruption discovery, verified-partial choice,
-resume, deletion, the 30-minute foreground limit, and lock recovery proven;
-fault-injection checks pending
+Status: physical candidate gates complete for foreground capture, interruption,
+verified-partial choice, resume, scoped deletion, the 30-minute foreground
+limit, lock recovery, and deterministic storage/writer/stop fault handling
 
 Date: 2026-07-21
 
@@ -166,9 +166,47 @@ dropped from five to four, and a direct lookup confirmed the exact session
 manifest no longer existed. The harness now requires a destructive confirmation
 that states how many verified segments and associated metadata will be removed.
 
+## Deterministic fault-injection campaign
+
+The dedicated QA variant at commit `ad1fc1e` exercised all seven plans in the
+fault-injection runbook on the physical device. The variant required the
+compile-time condition, exact harness bundle identifier, Info.plist opt-in, and
+one exact launch environment value. A separately compiled ordinary pod binary
+contained none of the plan names, QA stop reason, or environment key.
+
+The two low-storage cases replaced only Tacua's capacity decision. They did not
+fill the personal device or claim to reproduce an operating-system `ENOSPC`
+failure. Writer and ReplayKit-stop cases exercised the real writer, recorder,
+watchdogs, manifests, sidecars, and cleanup paths around the injected boundary.
+
+| Plan | Physical outcome | Verified integrity |
+| --- | --- | ---: |
+| `low_storage_start` | Rejected with `ERR_TACUA_CAPTURE_STORAGE_LOW` before ReplayKit or session creation | No new session |
+| `low_storage_writer_1` | `partial`; `ERR_TACUA_CAPTURE_STORAGE_LOW`; `segment_rotation_failed`; index 1 was never claimed | 1/1 segment |
+| `writer_finish_failure_1` | `partial`; `ERR_TACUA_CAPTURE_WRITER_FINISH`; index 1 published no trusted artifact | 1/1 segment |
+| `writer_finish_timeout_1` | `partial` after 45.9 seconds; `ERR_TACUA_CAPTURE_WRITER_TIMEOUT`; the real late callback left only an untrusted partial and could not publish index 1 | 1/1 segment |
+| `stop_failure_once` | First callback failed; the serialized retry performed the live stop; `partial` with `ERR_TACUA_CAPTURE_STOP_FAILED` | 5/5 segments |
+| `stop_timeout_once` | One 15-second watchdog elapsed, then the serialized live retry stopped ReplayKit; `partial` after 20.2 seconds | 3/3 segments |
+| `stop_timeout_twice` | The operator observed the first Stop reach `stop_failed_capture_active`; the mandatory second Stop performed live cleanup; terminal `partial` after 36.8 seconds | 19/19 segments |
+
+For every plan that produced media, each listed segment matched manifest byte
+length, MOV SHA-256, and sidecar SHA-256. The stop plans ended with ReplayKit
+inactive, no partial files, and only their expected stable error and gap
+reasons. Segment counts vary with operator timing and are evidence counts, not
+performance measurements.
+
+One ordinary 10-second capture was started unintentionally between plans. It
+was stopped manually, excluded from fault evidence, and deleted. Each planned
+campaign session was also deleted through the harness's scoped confirmation UI
+after private inspection. The final device check found zero campaign sessions;
+older synthetic sessions were unchanged. All temporary media/metadata copies
+and device-command JSON containing private identifiers were deleted from the
+Mac before these aggregate results were written.
+
 ## Evidence handling
 
 Raw media was copied to private temporary directories for `ffprobe` and checksum
 inspection, then deleted immediately after aggregate measurements were recorded.
-Remaining synthetic source sessions stay only in the app container until the
-background/lock checks and final test-data cleanup.
+The eight older synthetic source sessions remain only in the app container
+pending an explicit all-test-data cleanup decision. No fault-campaign session
+or private Mac copy remains.
