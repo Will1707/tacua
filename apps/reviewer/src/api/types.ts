@@ -187,6 +187,7 @@ export type TicketCandidate = {
     readonly notes: readonly string[];
   };
   readonly approval: null | {
+    readonly approval_id: string;
     readonly actor_type: "human";
     readonly actor_id: string;
     readonly approved_at: string;

@@ -95,6 +95,7 @@ export class TacuaApiClient {
       readonly reason: string;
       readonly clarification_id?: string;
       readonly selected_choice_id?: string;
+      readonly resolution_note?: string;
     },
   ): Promise<TicketCandidate> {
     const idempotencyKey = [

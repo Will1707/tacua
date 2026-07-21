@@ -2,7 +2,7 @@
 
 import { useLocalSearchParams } from "expo-router";
 import { useCallback, useEffect, useState } from "react";
-import { ActivityIndicator, Alert, Pressable, ScrollView, Text, View } from "react-native";
+import { ActivityIndicator, Alert, Pressable, ScrollView, Text, TextInput, View } from "react-native";
 
 import type { TicketCandidate } from "@/api/types";
 import { ActionButton } from "@/components/action-button";
@@ -19,6 +19,11 @@ export default function CandidateRoute() {
   const [loading, setLoading] = useState(true);
   const [action, setAction] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [clarificationDraft, setClarificationDraft] = useState<{
+    readonly clarificationId: string;
+    readonly choiceId: string;
+    readonly note: string;
+  } | null>(null);
 
   const load = useCallback(async () => {
     if (!client || !candidateId) return;
@@ -49,7 +54,7 @@ export default function CandidateRoute() {
     } finally { setAction(null); }
   }
 
-  async function resolveClarification(clarificationId: string, choiceId: string) {
+  async function resolveClarification(clarificationId: string, choiceId: string, resolutionNote?: string) {
     if (!client || !config || !candidate) return;
     setAction(`clarification:${clarificationId}`);
     try {
@@ -63,7 +68,9 @@ export default function CandidateRoute() {
         reason: "Reviewer selected one bounded clarification choice.",
         clarification_id: clarificationId,
         selected_choice_id: choiceId,
+        ...(resolutionNote ? { resolution_note: resolutionNote } : {}),
       }));
+      setClarificationDraft(null);
     } catch (caught) {
       Alert.alert("Clarification was not saved", caught instanceof Error ? caught.message : "The backend rejected the choice.");
     } finally { setAction(null); }
@@ -138,26 +145,86 @@ export default function CandidateRoute() {
         {candidate.content.scope.in_scope.map((item) => <Text selectable key={`in:${item}`} style={{ color: colors.label }}>✓ {item}</Text>)}
         {candidate.content.scope.out_of_scope.map((item) => <Text selectable key={`out:${item}`} style={{ color: colors.secondaryLabel }}>Not included: {item}</Text>)}
       </SectionCard>
-      {unresolved.map((clarification) => (
-        <SectionCard key={clarification.clarification_id} title={clarification.impact === "blocking" ? "Decision required" : "Clarification"}>
-          <Text selectable style={{ color: colors.label, fontSize: 16 }}>{clarification.question}</Text>
-          {clarification.choices.map((choice) => (
-            <Pressable
-              key={choice.choice_id}
-              accessibilityRole="radio"
-              accessibilityState={{ checked: false, busy: action === `clarification:${clarification.clarification_id}` }}
-              disabled={action !== null}
-              onPress={() => void resolveClarification(clarification.clarification_id, choice.choice_id)}
-              style={({ pressed }) => ({ borderColor: colors.separator, borderWidth: 1, borderRadius: 12, borderCurve: "continuous", padding: 12, gap: 4, opacity: action !== null ? 0.5 : pressed ? 0.65 : 1 })}
-            >
-              <ChoicePreview choice={choice} />
-              <Text selectable style={{ color: colors.label, fontWeight: "700" }}>{choice.label}</Text>
-              <Text selectable style={{ color: colors.secondaryLabel }}>{choice.description}</Text>
-              <Text selectable style={{ color: colors.secondaryLabel }}>{choice.consequence}</Text>
-            </Pressable>
-          ))}
-        </SectionCard>
-      ))}
+      {unresolved.map((clarification) => {
+        const draft = clarificationDraft?.clarificationId === clarification.clarification_id
+          ? clarificationDraft
+          : null;
+        const selectedChoice = draft
+          ? clarification.choices.find((choice) => choice.choice_id === draft.choiceId)
+          : undefined;
+        return (
+          <SectionCard key={clarification.clarification_id} title={clarification.impact === "blocking" ? "Decision required" : "Clarification"}>
+            <Text selectable style={{ color: colors.label, fontSize: 16 }}>{clarification.question}</Text>
+            {clarification.choices.map((choice) => (
+              <Pressable
+                key={choice.choice_id}
+                accessibilityRole="radio"
+                accessibilityHint={choice.requires_note ? "Requires a short explanation before saving." : undefined}
+                accessibilityState={{ checked: draft?.choiceId === choice.choice_id, busy: action === `clarification:${clarification.clarification_id}` }}
+                disabled={action !== null}
+                onPress={() => {
+                  if (choice.requires_note) {
+                    setClarificationDraft({ clarificationId: clarification.clarification_id, choiceId: choice.choice_id, note: "" });
+                  } else {
+                    setClarificationDraft(null);
+                    void resolveClarification(clarification.clarification_id, choice.choice_id);
+                  }
+                }}
+                style={({ pressed }) => ({
+                  borderColor: draft?.choiceId === choice.choice_id ? colors.primary : colors.separator,
+                  borderWidth: draft?.choiceId === choice.choice_id ? 2 : 1,
+                  borderRadius: 12,
+                  borderCurve: "continuous",
+                  padding: 12,
+                  gap: 4,
+                  opacity: action !== null ? 0.5 : pressed ? 0.65 : 1,
+                })}
+              >
+                <ChoicePreview choice={choice} />
+                <Text selectable style={{ color: colors.label, fontWeight: "700" }}>{choice.label}</Text>
+                <Text selectable style={{ color: colors.secondaryLabel }}>{choice.description}</Text>
+                <Text selectable style={{ color: colors.secondaryLabel }}>{choice.consequence}</Text>
+                {choice.requires_note ? <Text selectable style={{ color: colors.orange, fontSize: 13, fontWeight: "700" }}>Explanation required</Text> : null}
+              </Pressable>
+            ))}
+            {draft && selectedChoice?.requires_note ? (
+              <View style={{ gap: 8 }}>
+                <Text nativeID={`clarification-note-${clarification.clarification_id}`} style={{ color: colors.label, fontWeight: "700" }}>
+                  Why choose “{selectedChoice.label}”?
+                </Text>
+                <TextInput
+                  accessibilityLabelledBy={`clarification-note-${clarification.clarification_id}`}
+                  multiline
+                  maxLength={2048}
+                  placeholder="Add the context the implementation agent will need"
+                  placeholderTextColor={colors.tertiaryLabel}
+                  value={draft.note}
+                  onChangeText={(note) => setClarificationDraft({ ...draft, note })}
+                  style={{
+                    minHeight: 96,
+                    borderColor: colors.separator,
+                    borderWidth: 1,
+                    borderRadius: 12,
+                    borderCurve: "continuous",
+                    backgroundColor: colors.groupedBackground,
+                    color: colors.label,
+                    fontSize: 16,
+                    lineHeight: 22,
+                    padding: 12,
+                    textAlignVertical: "top",
+                  }}
+                />
+                <ActionButton
+                  label="Save choice and explanation"
+                  disabled={!draft.note.trim()}
+                  loading={action === `clarification:${clarification.clarification_id}`}
+                  onPress={() => void resolveClarification(clarification.clarification_id, draft.choiceId, draft.note.trim())}
+                />
+              </View>
+            ) : null}
+          </SectionCard>
+        );
+      })}
 
       {candidate.state === "ready_for_review" ? (
         <SectionCard title="Exact version to approve">
@@ -171,7 +238,7 @@ export default function CandidateRoute() {
       <View style={{ gap: 10, paddingTop: 4 }}>
         {candidate.state === "draft" || candidate.state === "needs_clarification" ? <ActionButton label="Mark ready for review" disabled={unresolved.some((item) => item.impact === "blocking")} loading={action === "mark_ready"} onPress={() => void transition("mark_ready", "Reviewer completed candidate preparation.")} /> : null}
         {candidate.state === "ready_for_review" ? <ActionButton label="Approve exact version" loading={action === "approve"} onPress={() => Alert.alert("Approve this ticket?", "Approval binds this exact candidate digest. It does not authorize a coding agent until an approved handoff is exported.", [{ text: "Cancel", style: "cancel" }, { text: "Approve", onPress: () => void transition("approve", "Reviewer approved the exact candidate version.") }])} /> : null}
-        {candidate.state !== "approved" && candidate.state !== "rejected" ? <ActionButton destructive label="Reject candidate" loading={action === "reject"} onPress={() => Alert.alert("Reject this candidate?", undefined, [{ text: "Cancel", style: "cancel" }, { text: "Reject", style: "destructive", onPress: () => void transition("reject", "Reviewer rejected the candidate.") }])} /> : null}
+        {candidate.state === "needs_clarification" || candidate.state === "ready_for_review" ? <ActionButton destructive label="Reject candidate" loading={action === "reject"} onPress={() => Alert.alert("Reject this candidate?", undefined, [{ text: "Cancel", style: "cancel" }, { text: "Reject", style: "destructive", onPress: () => void transition("reject", "Reviewer rejected the candidate.") }])} /> : null}
       </View>
     </ScrollView>
   );
