@@ -3,8 +3,8 @@
 
 FROM python:3.13-slim
 
-LABEL org.opencontainers.image.title="Tacua pilot backend" \
-      org.opencontainers.image.description="Non-production SDK upload-boundary vertical slice" \
+LABEL org.opencontainers.image.title="Tacua backend" \
+      org.opencontainers.image.description="Self-hosted SDK capture transport and processing queue" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 ENV PYTHONUNBUFFERED=1 \
@@ -18,6 +18,8 @@ RUN groupadd --gid 10001 tacua \
 
 WORKDIR /app
 COPY --chown=root:root services/backend/src/ /app/services/backend/src/
+COPY --chown=root:root contracts/sdk-backend-protocol/src/ /app/contracts/sdk-backend-protocol/src/
+COPY --chown=root:root contracts/sdk-backend-protocol/schemas/ /app/contracts/sdk-backend-protocol/schemas/
 COPY --chown=root:root contracts/runtime/src/ /app/contracts/runtime/src/
 COPY --chown=root:root contracts/runtime/schemas/ /app/contracts/runtime/schemas/
 

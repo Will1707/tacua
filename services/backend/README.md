@@ -1,93 +1,88 @@
-# Tacua pilot backend
+# Tacua self-hosted backend
 
-This is a dependency-free, deliberately **non-production** backend vertical
-slice. It exercises the real V1 ownership boundary: the embedded SDK exchanges
-a reviewer-created launch code, then directly uploads recoverable capture
-segments and sanitized diagnostics. The reviewer/admin side can inspect durable
-sessions and jobs without ever receiving the SDK upload credential.
+This service is the Docker-deployable backend for the frozen
+`tacua.sdk-backend@1.0.0` transport. It accepts capture data directly from the
+SDK embedded in an authorized iOS QA build, keeps exact durable receipts for
+recovery, and queues a complete `tacua.processing-job@1.0.0` for the later
+analysis worker. Reviewer/admin routes retain session and job observation.
 
-The service uses Python's standard library, SQLite, and filesystem media. It is
-not an Internet-facing server and must not be treated as one. In particular it
-does not yet provide TLS termination, rate limiting, an identity provider,
-media processing, model execution, backups, migrations beyond schema version
-1, or multi-process coordination.
+The implementation is Apache-2.0, dependency-free Python using SQLite and the
+filesystem. It is intentionally one organization per deployment and does not
+implement cross-customer multi-tenancy. Put a bounded TLS reverse proxy in
+front of it outside loopback development; authenticated SDK routes and launch
+exchange must never be redirected.
 
-One protocol blocker is intentionally visible rather than papered over. Launch
-exchange currently creates a server-generated upload token;
-if the successful response is lost, the consumed launch code cannot recover
-that token. The SDK transport protocol must adopt a client-generated,
-pre-Keychain credential (or a separately authorized resume grant) before this
-flow is production-ready. The example also uses a mutable Python base-image
-tag, and the standard-library threaded HTTP server has no request deadlines,
-concurrency quotas, or rate limits. Pinning the image by digest and placing a
-bounded TLS proxy in front are release work, not optional hardening.
+## Trust and persistence boundary
 
-## Boundary and persistence
+- The SDK creates a 32-byte bearer secret and credential ID before launch and
+  stores the secret in iOS Keychain. The backend stores only a keyed HMAC
+  verifier derived from the mounted deployment secret. It never creates,
+  returns, persists, or logs a plaintext SDK secret.
+- Admin-created launch codes are 32 random bytes, one-use, short-lived, and
+  stored only as keyed verifiers. Launch request bodies are never persisted.
+  Exact consumed-code retries are bound by the validated canonical request
+  digest and return the original non-secret response bytes.
+- The deployment mounts the full sealed SDK-protocol build identity and
+  validates its artifact digest and transport configuration at startup. A
+  start grant pins that registered artifact plus a static capture-scope policy
+  (organization, project, application, build, required consent contract, and
+  retention). The SDK supplies `consent.granted_at` and the resulting sealed
+  `scope_digest` only after consent inside the tested app.
+- Ordered credential history is server-owned. Resume revokes A and issues B in
+  one SQLite transaction. An authenticated current credential may recover an
+  exact historical receipt, but a missing operation must name the current
+  credential. Completed-session credentials can only replay their bound
+  completion or request/replay deletion.
+- Segment bytes are authenticated before reading, streamed through SHA-256 to
+  a temporary file, verified, atomically published, and committed with the
+  canonical intent and exact receipt bytes. The wire contract binds a
+  `sidecar_digest`; V1 deliberately does **not** upload or expose sidecar bytes.
+  Processing may derive media metadata from verified media later.
+- Diagnostics persist the canonical runtime envelope. Completion verifies the
+  exact keyed sets of stored segment and diagnostic receipts, re-verifies every
+  object, durably writes the full request, queues the full processing job, and
+  returns the only local payload-cleanup authority.
+- SDK, operator, and retention deletion use a two-phase erasure state. The
+  first transaction revokes credentials and processing access. Crash recovery
+  finishes filesystem erasure before success can be reported. The final
+  transaction removes session metadata and retains only the exact tombstone
+  plus its keyed replay verifier for the configured period (at most 30 days).
+- Audit events have fixed content-free columns. They cannot contain launch
+  codes, bearer secrets, Authorization values, or request bodies.
 
-- One configured organization, project, internal Tacua application ID,
-  reverse-DNS bundle identifier, build ID, sealed build-identity digest, and
-  consent contract are accepted by a deployment.
-- Reviewer/admin requests use a bearer secret loaded from a mounted secret
-  file. The secret is never persisted by the service.
-- A launch code is short-lived, single-use, and stored only as a SHA-256 hash.
-- Exchanging it creates a session and returns a distinct short-lived SDK upload
-  token exactly once. Only that token's hash is persisted.
-- Segment bodies are streamed through SHA-256 verification into a temporary
-  file and atomically published only after byte count and digest match.
-- Publication fsyncs its directories, and startup removes recognized temporary
-  or uncommitted crash orphans while failing closed if committed files vanished.
-- Retrying an index with identical content returns the original receipt;
-  different content at that index is rejected with `SEGMENT_CONFLICT`.
-- SQLite, media, validated diagnostic envelopes, sealed manifests, and upload
-  temporary files are all beneath the single configured state directory. In
-  the container that directory is `/var/lib/tacua`.
-- Every session receives bounded raw-retention metadata with an expiry from 1
-  through 30 days after exchange (30 days by default). Before accepting HTTP
-  traffic, the server sweeps sessions at or past that deadline, then repeats at
-  a configured interval from 30 through 3600 seconds (300 seconds by default).
-- Retention enforcement reuses scoped deletion: it atomically revokes the SDK
-  credential, cancels queued/running processing, removes raw media,
-  diagnostics, and the sealed manifest, and leaves the durable session
-  tombstone and deletion job. A filesystem failure marks that job failed but
-  does not stop the sweep or server; startup and later intervals retry the same
-  job until it succeeds.
-- Completion requires the exact stored diagnostic-envelope set, re-verifies all
-  media and diagnostic files, and persists the sealed manifest outside SQLite.
-- Starting deletion atomically cancels any active processing snapshot before
-  the durable two-phase file deletion begins.
-- Audit events have fixed, content-free columns. They cannot contain request
-  bodies, diagnostic values, launch codes, upload tokens, or administrator
-  secrets.
+The admin secret also roots launch and credential verifiers. Back it up as a
+deployment secret. Rotating it invalidates outstanding launch codes and SDK
+credentials; perform that as an explicit deployment reset, not as an ordinary
+admin-token rotation.
 
-The pilot advertises the repository runtime contract versions:
+## Schema reset from the earlier pilot
 
-- `tacua.capture-upload-manifest@1.0.0`
-- `tacua.diagnostic-envelope@1.0.0`
-- `tacua.processing-job@1.0.0`
+The old server-generated-token pilot used SQLite schema version 1. Those
+credentials cannot be migrated without violating the new client-generated
+secret contract. Startup therefore fails closed when it sees schema 1 and asks
+the operator to back up and use an empty state directory. Fresh protocol V1
+state uses schema version 2. There is no silent or lossy migration.
 
-Diagnostic envelopes, sealed capture manifests, and queued processing-job
-snapshots are validated by the repository's dependency-free runtime validator.
-The semantic `envelope_digest` and `manifest_digest` are kept distinct from the
-SHA-256 digest of the HTTP bytes used for transport integrity.
-
-## Run the tests
+## Run tests
 
 From the repository root:
 
 ```sh
-PYTHONWARNINGS=error python3 -m unittest discover -s services/backend/tests -v
+PYTHONWARNINGS=error PYTHONDONTWRITEBYTECODE=1 \
+  python3 -B -m unittest discover -s services/backend/tests -v
+
+PYTHONWARNINGS=error python3 -B -m unittest discover \
+  -s contracts/sdk-backend-protocol/tests -v
 ```
 
-The tests cover fixed-scope grants, one-time exchange, hash-only credential
-storage, admin and SDK authentication, cross-session access, path traversal,
-size/digest mismatches, idempotent and conflicting retries, missing completion
-segments, restart persistence, bounded diagnostics, durable processing jobs,
-scoped deletion, exact retention boundaries, durable failed-sweep recovery,
-startup retry, controlled periodic invocation, and clean worker shutdown.
+The backend suite uses the frozen positive fixtures as lifecycle templates and
+covers strict JSON, build/config/scope pins, no-secret persistence, exact
+launch and operation replay, atomic rotation, historical receipt recovery,
+cross-state capability denial, streamed integrity, completion binding, durable
+job creation, erasure recovery, tombstone expiry, retention boundaries, and
+the literal HTTP header mapping.
 
-## Run in Docker
-
-Create local mounted files; `local/` is ignored by Git and the Docker build:
+## Run with Docker Compose
 
 ```sh
 mkdir -p services/backend/local
@@ -97,80 +92,80 @@ chmod 600 services/backend/local/admin-secret
 docker compose -f services/backend/compose.yaml up --build
 ```
 
-The image runs as UID/GID `10001`, supports a read-only root filesystem, drops
-all Linux capabilities in the example Compose deployment, and writes only to
-the `tacua-state` volume. Port `8080` is bound to loopback in the example. A
-real remote pilot still needs an authenticated TLS reverse proxy and host-level
-backup policy before it can receive sensitive QA evidence.
+The example runs as UID/GID `10001`, drops Linux capabilities, uses a read-only
+root filesystem, writes only to `/var/lib/tacua`, and binds port 8080 to host
+loopback. `backend_origin` is the normalized public origin used by the QA build
+(normally the HTTPS reverse-proxy origin), not the container listener address.
+Its digest must equal `build_identity.transport_configuration_digest`.
 
-`retention_sweep_interval_seconds` controls the in-process sweeper and is
-validated from 30 through 3600 seconds. The startup sweep is synchronous, so
-overdue evidence is deleted before the server begins handling requests. One
-periodic worker is attached to the HTTP server lifecycle and is joined during
-normal `SIGINT`/`SIGTERM` shutdown. This V1 worker is intentionally
-single-process: do not run multiple backend processes against the same state
-directory until distributed coordination and schema migrations are designed.
+The configuration pins one full sealed `build_identity` artifact for this V1
+deployment. Its `transport_configuration_digest` must match `backend_origin`
+and the configured transport policy. To authorize another build, deploy a
+separately pinned instance or explicitly reset/reconfigure an empty instance.
+`raw_retention_days`, `derived_retention_days`, and the capture scope must match
+exactly. The in-process retention worker is single-process; do not run multiple
+backend replicas over one SQLite/state volume.
 
 ## HTTP surface
 
-All request and response bodies are JSON except segment `PUT` bodies. JSON
-requests and segment uploads require one `Content-Length`; chunked transfer is
-rejected. Every uploaded object needs an `X-Content-SHA256` header in the form
-`sha256:<64 lowercase hex characters>`.
-
-Segment uploads also require one `X-Tacua-Segment-ID` header and a `Content-Type`
-of `video/quicktime` or `video/mp4`. The server binds that client-owned ID,
-sequence, content type, object ID, byte count, digest, timestamp, and receipt
-digest. The SDK copies only the six runtime receipt fields into its
-capture manifest; the response-only `idempotent_retry` flag is not a contract
-receipt field.
+All SDK JSON requests use strict UTF-8 `application/json` and one
+`Content-Length`; chunked bodies, duplicate headers/keys, floats, unsafe
+integers, non-NFC strings, queries, fragments, encoded paths, and path aliases
+are rejected. First durable writes return `201`; exact recovery returns `200`
+with the exact persisted response bytes. ID reuse with another canonical
+request digest returns `409`.
 
 | Method | Path | Authentication | Purpose |
 | --- | --- | --- | --- |
-| `GET` | `/healthz` | public | Health, service version, and contract versions |
-| `GET` | `/version` | public | Service version |
-| `POST` | `/v1/admin/launch-codes` | admin | Create one scoped launch code |
-| `POST` | `/v1/sdk/launch-code-exchanges` | launch code in body | Consume code and receive the SDK token once |
-| `PUT` | `/v1/sdk/sessions/{session}/segments/{sequence}` | SDK token | Upload/retry one media segment |
-| `PUT` | `/v1/sdk/sessions/{session}/diagnostics/{envelope}` | SDK token | Upload/retry one bounded diagnostic envelope |
-| `POST` | `/v1/sdk/sessions/{session}/completion` | SDK token | Verify declarations, close upload, and queue processing |
-| `GET` | `/v1/admin/sessions[/{session}]` | admin | Inspect session metadata and receipts |
-| `GET` | `/v1/admin/jobs[/{job}]` | admin | Inspect durable processing/deletion jobs |
-| `GET` | `/v1/admin/audit-events` | admin | Inspect content-free audit events |
-| `DELETE` | `/v1/admin/sessions/{session}` | admin | Run scoped deletion and retain its job/tombstone |
+| `GET` | `/healthz` | public | Storage/protocol health |
+| `GET` | `/version` | public | Service and protocol version |
+| `GET` | `/v1/admin/builds` | admin bearer | List the registered reviewer build projection |
+| `POST` | `/v1/admin/launch-codes` | admin bearer | Create a start or resume grant |
+| `POST` | `/v1/sdk/launch-exchanges` | launch code in body | Start/resume and issue the client-owned credential |
+| `PUT` | `/v1/sdk/sessions/{session}/segments/{sequence}/{segment}` | SDK bearer | Upload/recover media |
+| `PUT` | `/v1/sdk/sessions/{session}/diagnostics/{upload}` | SDK bearer | Upload/recover diagnostics |
+| `PUT` | `/v1/sdk/sessions/{session}/completions/{completion}` | SDK bearer | Complete and queue processing |
+| `PUT` | `/v1/sdk/sessions/{session}/deletions/{deletion}` | SDK bearer | Erase/recover tombstone |
+| `GET` | `/v1/admin/sessions[/{session}]` | admin bearer | Observe sessions and receipts |
+| `GET` | `/v1/admin/jobs[/{job}]` | admin bearer | Observe full runtime jobs |
+| `GET` | `/v1/admin/audit-events` | admin bearer | Observe content-free audit events |
+| `DELETE` | `/v1/admin/sessions/{session}` | admin bearer | Operator-requested scoped erasure |
 
-Admin launch creation uses the exact mounted scope:
+A start launch grant body is:
 
 ```json
 {
-  "scope": {
-    "organization_id": "org_example",
-    "project_id": "project_example",
-    "application_id": "app_example",
-    "bundle_identifier": "com.example.app",
-    "build_id": "build_example",
-    "build_identity_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
-    "consent_contract": "tacua-consent-v1"
-  }
+  "exchange_kind": "start_session",
+  "build_id": "build_example"
 }
 ```
 
-The SDK exchange sends the returned opaque `launch_code` together with that
-same scope. A successful response contains a new `session_id`, the one-time
-display of `upload_token`, both expiry timestamps, and the retention policy.
+The backend resolves that ID to the sealed build artifact mounted in
+`config.json`; the reviewer does not construct or echo a protocol artifact. A
+successful response includes `launch_id`, the one-time `launch_code`,
+`build_identity_digest`, `scope_policy_digest`, and `expires_at`. The frozen SDK
+exchange remains unchanged and contains the exact registered `build_identity`
+plus the SDK's post-consent sealed `scope`.
 
-Completion wraps a complete, sealed
-`tacua.capture-upload-manifest@1.0.0` document as `capture_manifest` and a
-non-empty `diagnostic_envelope_ids` array. See
-`contracts/runtime/fixtures/positive/capture.json` for the complete manifest
-shape; partial manifests are deliberately rejected.
+A resume grant body is
+`{"exchange_kind":"resume_session","session_id":"session_..."}`. The
+backend snapshots that session's exact build, scope, state, completion binding,
+and current credential into the grant. Frozen complete examples live in
+`contracts/sdk-backend-protocol/fixtures/positive/`.
 
-Every uploaded segment must appear once as `available`, and every available
-declaration must have a matching stored receipt. `unavailable` declarations are
-accepted without content. Completion revokes the upload token and inserts a
-durable, contract-valid queued `tacua.processing-job@1.0.0` snapshot for the
-later transcription/alignment/research worker. Retrying the exact sealed
-manifest after a lost response returns the same job even though normal uploads
-have already been revoked. Deletion uses a separate internal resource type and
-is a durable, retryable two-phase operation; it never masquerades as a
-processing job.
+The binary segment route reconstructs `segment_upload_intent` from route fields
+and these literal required headers:
+
+- `Tacua-Protocol-Version`
+- `Idempotency-Key` (`upload_id`)
+- `Tacua-Scope-Digest`
+- `Tacua-Credential-ID`
+- `Tacua-Sidecar-Digest`
+- `Tacua-Intent-Digest`
+- `Tacua-Requested-At`
+- `Tacua-Content-Digest`
+- `Content-Type`
+- `Content-Length`
+
+`Tacua-Content-Digest` is the private lowercase `sha256:<hex>` field from the
+contract; it does not overload HTTP `Content-Digest`.

@@ -9,3 +9,8 @@
 !contracts/runtime/src/**
 !contracts/runtime/schemas/
 !contracts/runtime/schemas/**
+!contracts/sdk-backend-protocol/
+!contracts/sdk-backend-protocol/src/
+!contracts/sdk-backend-protocol/src/**
+!contracts/sdk-backend-protocol/schemas/
+!contracts/sdk-backend-protocol/schemas/**
