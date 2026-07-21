@@ -65,6 +65,12 @@ from .handoff_store import (
     StoredHandoff,
     initialize_schema as initialize_handoff_schema,
 )
+from .processing_jobs import (
+    ProcessingJobClaim,
+    ProcessingJobStore,
+    ProcessingJobStoreError,
+    initialize_processing_job_schema,
+)
 
 
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
@@ -442,6 +448,9 @@ class PilotBackend:
                        UNION ALL SELECT accepted_at FROM segments
                        UNION ALL SELECT accepted_at FROM diagnostics
                        UNION ALL SELECT accepted_at FROM completions
+                       UNION ALL SELECT recorded_at FROM tacua_processing_job_versions
+                       UNION ALL SELECT acquired_at FROM tacua_processing_job_leases
+                       UNION ALL SELECT renewed_at FROM tacua_processing_job_leases
                        UNION ALL SELECT accepted_at FROM pending_deletions
                        UNION ALL SELECT deleted_at FROM tombstones
                        UNION ALL SELECT occurred_at FROM audit_events
@@ -628,6 +637,13 @@ class PilotBackend:
             elif pinned["pin_json"] != pin_json:
                 raise ValueError("configured deployment pin differs from persisted state")
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        with self._connect() as conn:
+            try:
+                initialize_processing_job_schema(conn)
+            except (ContractError, ProcessingJobStoreError, sqlite3.Error, ValueError) as error:
+                raise ValueError(
+                    "persisted processing-job state failed safe schema-v2 adoption"
+                ) from error
 
     def _initialize_review_storage(self) -> None:
         """Initialize append-only review state before serving concurrent requests."""
@@ -659,6 +675,22 @@ class PilotBackend:
             organization_id=self.config.organization_id,
             project_id=self.config.project_id,
         )
+
+    def _processing_job_store(self, connection: sqlite3.Connection) -> ProcessingJobStore:
+        return ProcessingJobStore(
+            connection,
+            organization_id=self.config.organization_id,
+            project_id=self.config.project_id,
+            now=self._now,
+            token_verifier=lambda job_id, version, token: self._verifier(
+                "processing_lease", f"{job_id}:{version}", token
+            ),
+            token_factory=lambda: secrets.token_urlsafe(32),
+        )
+
+    @staticmethod
+    def _raise_processing_job_error(error: ProcessingJobStoreError) -> None:
+        raise ApiError(error.status, error.code, error.message) from error
 
     def _verified_candidate_publication_manifest(
         self,
@@ -2090,6 +2122,18 @@ class PilotBackend:
                         accepted_at,
                     )
                     self._verify_row_object(existing)
+                    try:
+                        durable_jobs = self._processing_job_store(conn).list(
+                            session_id=session_id
+                        )
+                    except ProcessingJobStoreError as error:
+                        self._raise_processing_job_error(error)
+                    if len(durable_jobs) != 1:
+                        raise ApiError(
+                            500,
+                            "PROCESSING_JOB_STORAGE_CORRUPT",
+                            "stored processing-job state failed validation",
+                        )
                     return StoredResponse(200, bytes(existing["response_bytes"]))
                 if (
                     session["state"] != "receiving"
@@ -2225,14 +2269,22 @@ class PilotBackend:
                         canonical_json(job),
                     ),
                 )
+                # The initial job validates the complete durable completion
+                # anchor inside this same write transaction. Publish the
+                # session projection first; any later failure rolls all rows
+                # and the projection back together.
+                conn.execute(
+                    "UPDATE sessions SET state = 'completed', completed_at = ?, completion_id = ? WHERE session_id = ?",
+                    (accepted_text, completion_id, session_id),
+                )
+                try:
+                    self._processing_job_store(conn).put_initial(job)
+                except ProcessingJobStoreError as error:
+                    self._raise_processing_job_error(error)
                 conn.execute(
                     """UPDATE credentials SET current_state = 'completion_replay_or_delete_only',
                        replay_completion_id = ? WHERE credential_id = ?""",
                     (completion_id, current["credential_id"]),
-                )
-                conn.execute(
-                    "UPDATE sessions SET state = 'completed', completed_at = ?, completion_id = ? WHERE session_id = ?",
-                    (accepted_text, completion_id, session_id),
                 )
                 self._audit(conn, "session_completed", "sdk", "succeeded", session_id, accepted_text)
             published = None
@@ -3871,6 +3923,7 @@ class PilotBackend:
 
         self._sweep_before_review_access()
         with self._connect() as conn:
+            conn.execute("BEGIN")
             row = conn.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
             if row is None:
                 tombstone = conn.execute(
@@ -3934,12 +3987,10 @@ class PilotBackend:
             result["completion_receipt"] = (
                 self._decode_protocol_object(bytes(completion["response_bytes"])) if completion else None
             )
-            full_jobs = [
-                self._decode_protocol_object(item["job_json"])
-                for item in conn.execute(
-                    "SELECT job_json FROM jobs WHERE session_id = ? ORDER BY requested_at", (session_id,)
-                )
-            ]
+            try:
+                full_jobs = self._processing_job_store(conn).list(session_id=session_id)
+            except ProcessingJobStoreError as error:
+                self._raise_processing_job_error(error)
             result["jobs"] = [
                 {
                     "job_id": job["job_id"],
@@ -3956,28 +4007,43 @@ class PilotBackend:
 
     def list_jobs(self) -> list[dict[str, Any]]:
         boundary = self._sweep_before_review_access()
-        with self._connect() as conn:
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN")
+            store = self._processing_job_store(conn)
+            try:
+                store.validate_population()
+            except ProcessingJobStoreError as error:
+                self._raise_processing_job_error(error)
             rows = conn.execute(
-                """SELECT jobs.job_json FROM jobs
+                """SELECT jobs.job_id FROM jobs
                    JOIN sessions ON sessions.session_id = jobs.session_id
                    WHERE jobs.organization_id = ? AND jobs.project_id = ?
                      AND sessions.state != 'deleting'
                      AND sessions.raw_media_expires_at > ?
-                   ORDER BY jobs.requested_at DESC""",
+                   ORDER BY jobs.requested_at DESC, jobs.job_id DESC""",
                 (
                     self.config.organization_id,
                     self.config.project_id,
                     timestamp(boundary),
                 ),
             ).fetchall()
-        return [self._decode_protocol_object(row["job_json"]) for row in rows]
+            try:
+                return [store.get(row["job_id"]) for row in rows]
+            except ProcessingJobStoreError as error:
+                self._raise_processing_job_error(error)
 
     def get_job(self, job_id: str) -> dict[str, Any]:
         _require_id(job_id, "job_id")
         boundary = self._sweep_before_review_access()
-        with self._connect() as conn:
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN")
+            store = self._processing_job_store(conn)
+            try:
+                store.validate_population()
+            except ProcessingJobStoreError as error:
+                self._raise_processing_job_error(error)
             row = conn.execute(
-                """SELECT jobs.job_json FROM jobs
+                """SELECT jobs.job_id FROM jobs
                    JOIN sessions ON sessions.session_id = jobs.session_id
                    WHERE jobs.job_id = ? AND jobs.organization_id = ?
                      AND jobs.project_id = ? AND sessions.state != 'deleting'
@@ -3989,9 +4055,101 @@ class PilotBackend:
                     timestamp(boundary),
                 ),
             ).fetchone()
-        if row is None:
-            raise ApiError(404, "JOB_NOT_FOUND", "job was not found")
-        return self._decode_protocol_object(row["job_json"])
+            if row is None:
+                raise ApiError(404, "JOB_NOT_FOUND", "job was not found")
+            try:
+                return store.get(row["job_id"])
+            except ProcessingJobStoreError as error:
+                self._raise_processing_job_error(error)
+
+    def claim_processing_job(self, worker_id: str) -> dict[str, Any] | None:
+        """Atomically lease the oldest queued or expired-running job.
+
+        This is an internal single-process boundary.  Startup never calls it,
+        so merely starting Tacua cannot process data or authorize egress.
+        """
+
+        retry_required = False
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                result = self._processing_job_store(conn).claim(worker_id)
+            except ProcessingJobStoreError as error:
+                self._raise_processing_job_error(error)
+            claim = result.claim
+            retry_required = result.retry_required
+        if retry_required:
+            raise ApiError(
+                409,
+                "PROCESSING_CLAIM_RETRY",
+                "bounded processing cleanup made progress; retry the claim",
+            )
+        return None if claim is None else claim.as_dict()
+
+    def checkpoint_processing_stage(
+        self,
+        job_id: str,
+        stage_name: str,
+        lease_token: str,
+        *,
+        detail: str | None = None,
+    ) -> dict[str, Any]:
+        """Commit one exact non-final stage checkpoint and release its lease."""
+
+        _require_id(job_id, "job_id")
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                return self._processing_job_store(conn).checkpoint(
+                    job_id, stage_name, lease_token, detail=detail
+                )
+            except ProcessingJobStoreError as error:
+                self._raise_processing_job_error(error)
+
+    def renew_processing_lease(
+        self,
+        job_id: str,
+        stage_name: str,
+        lease_token: str,
+    ) -> dict[str, Any]:
+        """Heartbeat one live lease by one fixed, bounded interval."""
+
+        _require_id(job_id, "job_id")
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                return self._processing_job_store(conn).renew(
+                    job_id, stage_name, lease_token
+                )
+            except ProcessingJobStoreError as error:
+                self._raise_processing_job_error(error)
+
+    def fail_processing_job(
+        self,
+        job_id: str,
+        stage_name: str,
+        lease_token: str,
+        *,
+        code: str,
+        detail: str,
+        retryable: bool,
+    ) -> dict[str, Any]:
+        """Record a retry boundary or a terminal processing failure."""
+
+        _require_id(job_id, "job_id")
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                return self._processing_job_store(conn).fail(
+                    job_id,
+                    stage_name,
+                    lease_token,
+                    code=code,
+                    detail=detail,
+                    retryable=retryable,
+                )
+            except ProcessingJobStoreError as error:
+                self._raise_processing_job_error(error)
 
     def list_audit_events(self) -> list[dict[str, Any]]:
         boundary = self._sweep_before_review_access()

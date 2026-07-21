@@ -45,6 +45,31 @@ exchange must never be redirected.
   exact keyed sets of stored segment and diagnostic receipts, re-verifies every
   object, durably writes the full request, queues the full processing job, and
   returns the only local payload-cleanup authority.
+- Every queued processing job has an append-only, sealed version chain. The
+  existing `jobs.job_json` value is only the verified current-head projection;
+  startup and every worker/admin read revalidate that projection, the complete
+  contiguous digest chain, immutable scope/inputs/pipeline configuration, and
+  its exact lease relationship. Existing valid schema-v2 version-one rows are
+  backfilled losslessly. A later head without history, a broken chain, or a
+  corrupt projection makes startup fail closed.
+- The internal worker boundary is opt-in: normal startup never claims a job,
+  runs a model, or changes the fixed default-deny egress policy. A claim uses one
+  SQLite `BEGIN IMMEDIATE` transaction to append the running snapshot and store
+  one HMAC-verified opaque lease. The oldest eligible job wins; concurrent
+  claimers cannot both own it. Leases last five minutes and a live holder may
+  roll them forward by at most five minutes per heartbeat for as long as work
+  remains alive. An expired lease is an immutable failed-attempt checkpoint
+  before a bounded reclaim; the old token can never checkpoint or renew the new
+  attempt.
+- Version one is exactly `queued` with all five stages `pending`, zero attempts,
+  and no timestamps. A retry records a sealed running/failed attempt snapshot,
+  then exposes a new `queued` head whose current stage is reset to `pending`,
+  retains the attempt count, and has `started_at: null` as required by the frozen
+  contract. The next claim increments that count. Non-retryable failure or
+  exhaustion of the fixed three attempts is terminal. Checkpoints currently
+  cover the first four exact stages; final `generate_tickets` success remains
+  deliberately unavailable until the real evidence/output publication boundary
+  is implemented—this foundation does not invent model output or candidates.
 - SDK, operator, and retention deletion use a two-phase erasure state. The
   first transaction revokes credentials and processing access. Crash recovery
   finishes filesystem erasure before success can be reported. The final
@@ -88,8 +113,9 @@ artifacts present when deletion is accepted: segment objects, diagnostic
 envelope objects, the completion artifact, processing-job artifacts, and
 derived preview revisions that have a non-null physical `relative_path`.
 Candidate/evidence binding rows, version heads, membership rows, indexes,
-content-free audits, credentials, and the retained tombstone are metadata and
-are deliberately not counted as separate erased objects.
+processing-job version/lease rows, content-free audits, credentials, and the
+retained tombstone are metadata and are deliberately not counted as separate
+erased objects.
 
 The admin secret also roots launch and credential verifiers. Back it up as a
 deployment secret. Rotating it invalidates outstanding launch codes and SDK
@@ -122,6 +148,12 @@ launch and operation replay, atomic rotation, historical receipt recovery,
 cross-state capability denial, streamed integrity, completion binding, durable
 job creation, erasure recovery, tombstone expiry, retention boundaries, and
 the literal HTTP header mapping.
+
+The processing-job tests additionally cover safe schema-v2 backfill, inert
+startup, exact head/list projections, concurrent claims, atomic lease-write
+rollback, restart and expiry reclaim, rolling bounded heartbeats, stale-token
+denial, retry exhaustion, chain/configuration/storage tampering, and a
+checkpoint-versus-deletion race.
 
 ## Run with Docker Compose
 

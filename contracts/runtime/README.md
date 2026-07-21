@@ -17,6 +17,16 @@ All artifacts carry organization, project, tested build and capture-session scop
 
 Job outputs intentionally reference a generated candidate by ID and version, not by its final digest. The candidate then binds the sealed final job digest. This direction avoids a cryptographic dependency cycle while preserving an auditable provenance chain.
 
+The processing-job schema describes one sealed snapshot. The backend adds the
+append-only transition policy: version one is exactly queued with every stage
+pending at attempt zero; a queued retry also exposes a pending current stage
+while its prior immutable version records the failed attempt; each new claim
+increments that stage's attempt count; and the configured `max_attempts` is a
+hard bound. The frozen schema requires every queued snapshot to have root
+`started_at: null`, so the original start remains auditable in earlier versions
+and is restored on running snapshots. Pipeline configuration, scope, inputs,
+execution policy, and default-deny egress cannot change across a chain.
+
 ## Validation
 
 No third-party package or network access is required:
