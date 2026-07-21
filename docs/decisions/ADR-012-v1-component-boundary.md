@@ -38,13 +38,18 @@ The normal launch flow is:
    organization, project, tested application/build, and consent contract.
 3. Tacua deep-links to the QA build with the opaque launch code. The code is not
    a reusable upload bearer and must not contain evidence or credentials.
-4. The embedded SDK exchanges the code over the authenticated backend channel,
-   validates the returned scope against the installed app/build, obtains
-   explicit consent, and starts capture.
-5. The SDK uploads verified media segments and diagnostic envelopes directly to
+4. The embedded SDK verifies that it is an authorized QA build, presents the
+   exact capture and upload consent policy, and records the explicit grant
+   before sending the launch exchange. It creates and securely persists its
+   client credential before that exchange.
+5. The SDK exchanges the code only with its build-pinned backend origin. The
+   backend validates the code, build/configuration binding and consent contract;
+   the SDK then validates the returned scope against the installed app/build
+   before starting capture.
+6. The SDK uploads verified media segments and diagnostic envelopes directly to
    the backend. The reviewer app observes backend state; it never reads the
    tested app's sandbox.
-6. The reviewer returns to Tacua to review and approve generated candidates.
+7. The reviewer returns to Tacua to review and approve generated candidates.
 
 Raw upload credentials must not be persisted in capture manifests, emitted to
 logs, or embedded in exported tickets. Offline retries may retain only the
