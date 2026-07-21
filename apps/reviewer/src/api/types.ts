@@ -50,6 +50,26 @@ export type CaptureSession = {
   readonly jobs?: readonly ProcessingJob[];
 };
 
+export type RegisteredBuild = {
+  readonly build_id: string;
+  readonly application_id: string;
+  readonly bundle_identifier: string;
+  readonly native_version: string;
+  readonly native_build: string;
+  readonly distribution: "local" | "internal" | "testflight";
+  readonly build_identity_digest: string;
+};
+
+export type LaunchGrant = {
+  readonly launch_id: string;
+  readonly launch_code: string;
+  readonly exchange_kind: "start_session";
+  readonly session_id: null;
+  readonly build_identity_digest: string;
+  readonly scope_policy_digest: string;
+  readonly expires_at: string;
+};
+
 export type ClarificationChoice = {
   readonly choice_id: string;
   readonly label: string;

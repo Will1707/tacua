@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { Link } from "expo-router";
-import { useCallback, useEffect, useState } from "react";
-import { ActivityIndicator, Pressable, RefreshControl, ScrollView, Text, View } from "react-native";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ActivityIndicator, AppState, Pressable, RefreshControl, ScrollView, Text, View } from "react-native";
 
 import type { CaptureSession } from "@/api/types";
+import { LaunchReviewCard } from "@/components/launch-review-card";
 import { MessageState } from "@/components/message-state";
 import { StatusPill } from "@/components/status-pill";
 import { useBackend } from "@/hooks/use-backend";
@@ -34,8 +35,18 @@ export default function ReviewsRoute() {
     void refresh();
   }, [refresh]);
 
+  const appState = useRef(AppState.currentState);
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", (nextState) => {
+      const returnedToTacua = appState.current !== "active" && nextState === "active";
+      appState.current = nextState;
+      if (returnedToTacua) void refresh();
+    });
+    return () => subscription.remove();
+  }, [refresh]);
+
   if (configLoading) return <View style={{ flex: 1, justifyContent: "center" }}><ActivityIndicator /></View>;
-  if (!config) {
+  if (!config || !client) {
     return (
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 20 }}>
         <MessageState title="Connect your Tacua backend" detail="Configure the HTTPS endpoint and mounted administrator credential for this single-organization deployment." />
@@ -54,6 +65,7 @@ export default function ReviewsRoute() {
         <Text selectable style={{ color: colors.secondaryLabel, flex: 1 }} numberOfLines={1}>{config.baseUrl}</Text>
         <Link href="/settings" style={{ color: colors.primary, fontWeight: "700" }}>Settings</Link>
       </View>
+      <LaunchReviewCard client={client} targetScheme={config.targetScheme} />
       {error ? <MessageState title="Could not load sessions" detail={error} /> : null}
       {!error && !loading && sessions.length === 0 ? <MessageState title="No review sessions yet" detail="A session will appear here after the QA build exchanges a launch code with this backend." /> : null}
       {sessions.map((session) => (

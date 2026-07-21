@@ -5,7 +5,9 @@ import type {
   CandidateEvidenceView,
   CaptureSession,
   EvidencePreview,
+  LaunchGrant,
   ProcessingJob,
+  RegisteredBuild,
   TicketCandidate,
 } from "@/api/types";
 import { fetch, type FetchRequestInit } from "expo/fetch";
@@ -43,6 +45,30 @@ function operationFingerprint(value: string): string {
 
 function quotedEntityTag(digest: string): string {
   return `"${digest}"`;
+}
+
+function hasExactKeys(value: object, expected: readonly string[]): boolean {
+  const keys = Object.keys(value).sort();
+  const sortedExpected = [...expected].sort();
+  return keys.length === sortedExpected.length
+    && keys.every((key, index) => key === sortedExpected[index]);
+}
+
+function isIdentifier(value: unknown): value is string {
+  return typeof value === "string" && /^[a-z][a-z0-9_-]{2,63}$/.test(value);
+}
+
+function isDigest(value: unknown): value is string {
+  return typeof value === "string" && /^sha256:[a-f0-9]{64}$/.test(value);
+}
+
+function isTimestamp(value: unknown): value is string {
+  if (typeof value !== "string" || !/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/.test(value)) {
+    return false;
+  }
+  const parsed = new Date(value);
+  return !Number.isNaN(parsed.valueOf())
+    && parsed.toISOString() === `${value.slice(0, -1)}.000Z`;
 }
 
 function bytesToBase64(bytes: Uint8Array): string {
@@ -180,6 +206,81 @@ export class TacuaApiClient {
   async listSessions(): Promise<readonly CaptureSession[]> {
     const response = await this.request<{ readonly sessions: readonly CaptureSession[] }>("/v1/admin/sessions");
     return response.sessions;
+  }
+
+  async listBuilds(): Promise<readonly RegisteredBuild[]> {
+    const response = await this.request<{ readonly builds: readonly RegisteredBuild[] }>("/v1/admin/builds");
+    if (
+      !response
+      || typeof response !== "object"
+      || !hasExactKeys(response, ["builds"])
+      || !Array.isArray(response.builds)
+      || response.builds.length > 100
+      || response.builds.some((build) => (
+        !build
+        || typeof build !== "object"
+        || !hasExactKeys(build, [
+          "build_id",
+          "application_id",
+          "bundle_identifier",
+          "native_version",
+          "native_build",
+          "distribution",
+          "build_identity_digest",
+        ])
+        || !isIdentifier(build.build_id)
+        || !isIdentifier(build.application_id)
+        || typeof build.bundle_identifier !== "string"
+        || build.bundle_identifier.length < 3
+        || build.bundle_identifier.length > 255
+        || !/^[A-Za-z0-9][A-Za-z0-9-]*(?:\.[A-Za-z0-9][A-Za-z0-9-]*)+$/.test(build.bundle_identifier)
+        || typeof build.native_version !== "string"
+        || build.native_version.length < 1
+        || build.native_version.length > 64
+        || typeof build.native_build !== "string"
+        || build.native_build.length < 1
+        || build.native_build.length > 64
+        || !["local", "internal", "testflight"].includes(build.distribution)
+        || !isDigest(build.build_identity_digest)
+      ))
+    ) {
+      throw new TacuaApiError(502, "INVALID_BUILD_REGISTRY", "The backend returned an invalid build registry.");
+    }
+    return response.builds;
+  }
+
+  async createLaunchGrant(buildId: string): Promise<LaunchGrant> {
+    if (!isIdentifier(buildId)) {
+      throw new TacuaApiError(0, "INVALID_BUILD_ID", "The selected build identifier is invalid.");
+    }
+    const grant = await this.request<LaunchGrant>("/v1/admin/launch-codes", {
+      method: "POST",
+      body: JSON.stringify({ exchange_kind: "start_session", build_id: buildId }),
+    });
+    if (
+      !grant
+      || typeof grant !== "object"
+      || !hasExactKeys(grant, [
+        "launch_id",
+        "launch_code",
+        "exchange_kind",
+        "session_id",
+        "build_identity_digest",
+        "scope_policy_digest",
+        "expires_at",
+      ])
+      || !isIdentifier(grant.launch_id)
+      || typeof grant.launch_code !== "string"
+      || !/^[A-Za-z0-9_-]{32,512}$/.test(grant.launch_code)
+      || grant.exchange_kind !== "start_session"
+      || grant.session_id !== null
+      || !isDigest(grant.build_identity_digest)
+      || !isDigest(grant.scope_policy_digest)
+      || !isTimestamp(grant.expires_at)
+    ) {
+      throw new TacuaApiError(502, "INVALID_LAUNCH_GRANT", "The backend returned an invalid launch grant.");
+    }
+    return grant;
   }
 
   getSession(sessionId: string): Promise<CaptureSession> {
