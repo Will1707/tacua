@@ -25,9 +25,13 @@ npm start
 ```
 
 The app accepts an HTTPS backend origin. Loopback HTTP is allowed only in a
-development build. The administrator token is kept in `expo-secure-store` with
-this-device-only, when-unlocked accessibility. Never commit a real endpoint,
-credential, recording, or private pilot identifier.
+development build. The complete endpoint-and-credential configuration is
+committed as one `expo-secure-store` value with this-device-only, when-unlocked
+accessibility, preventing a partial settings write from pairing an old token
+with a new origin. Authenticated requests use the native Expo fetch boundary,
+omit cookies, reject redirects, and verify the response origin before parsing
+bounded JSON. Never commit a real endpoint, credential, recording, or private
+pilot identifier.
 
 The default bundle identifiers and QA target scheme are development
 placeholders for the repository owner and must remain configurable for other

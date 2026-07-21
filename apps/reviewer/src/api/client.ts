@@ -2,6 +2,9 @@
 
 import type { BackendConfig } from "@/config/backend-config";
 import type { CaptureSession, ProcessingJob, TicketCandidate } from "@/api/types";
+import { fetch, type FetchRequestInit } from "expo/fetch";
+
+const maximumResponseCharacters = 2_000_000;
 
 export class TacuaApiError extends Error {
   constructor(
@@ -19,22 +22,52 @@ type ErrorResponse = { readonly error?: { readonly code?: unknown; readonly mess
 export class TacuaApiClient {
   constructor(private readonly config: BackendConfig) {}
 
-  private async request<T>(path: string, init?: RequestInit): Promise<T> {
+  private async request<T>(path: string, init?: FetchRequestInit): Promise<T> {
+    if (!path.startsWith("/") || path.startsWith("//")) {
+      throw new TacuaApiError(0, "INVALID_REQUEST_PATH", "The Tacua request path is invalid.");
+    }
+    const endpoint = new URL(path, `${this.config.baseUrl}/`);
+    if (endpoint.origin !== this.config.baseUrl) {
+      throw new TacuaApiError(0, "INVALID_REQUEST_ORIGIN", "The Tacua request escaped the configured backend.");
+    }
+
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15_000);
+    const headers = new Headers(init?.headers);
+    headers.set("Accept", "application/json");
+    headers.set("Authorization", `Bearer ${this.config.adminToken}`);
+    headers.set("Cache-Control", "no-store");
+    if (init?.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+
     try {
-      const response = await fetch(`${this.config.baseUrl}${path}`, {
+      const response = await fetch(endpoint, {
         ...init,
-        cache: "no-store",
-        headers: {
-          Accept: "application/json",
-          Authorization: `Bearer ${this.config.adminToken}`,
-          ...(init?.body ? { "Content-Type": "application/json" } : {}),
-          ...init?.headers,
-        },
+        credentials: "omit",
+        redirect: "error",
+        headers,
         signal: controller.signal,
       });
-      const body = (await response.json().catch(() => null)) as T | ErrorResponse | null;
+      if (new URL(response.url).origin !== this.config.baseUrl || response.redirected) {
+        throw new TacuaApiError(502, "UNEXPECTED_RESPONSE_ORIGIN", "The backend response came from another origin.");
+      }
+
+      const declaredLength = response.headers.get("Content-Length");
+      if (declaredLength !== null && (!/^\d+$/.test(declaredLength) || Number(declaredLength) > maximumResponseCharacters * 4)) {
+        throw new TacuaApiError(502, "RESPONSE_TOO_LARGE", "The Tacua backend response exceeded the reviewer limit.");
+      }
+      const contentType = response.headers.get("Content-Type")?.split(";", 1)[0]?.trim().toLowerCase();
+      const rawBody = await response.text();
+      if (rawBody.length > maximumResponseCharacters) {
+        throw new TacuaApiError(502, "RESPONSE_TOO_LARGE", "The Tacua backend response exceeded the reviewer limit.");
+      }
+      let body: T | ErrorResponse | null = null;
+      if (contentType === "application/json") {
+        try {
+          body = JSON.parse(rawBody) as T | ErrorResponse;
+        } catch {
+          body = null;
+        }
+      }
       if (!response.ok) {
         const error = body && typeof body === "object" && "error" in body
           ? (body as ErrorResponse).error
@@ -45,7 +78,9 @@ export class TacuaApiClient {
           typeof error?.message === "string" ? error.message : "The Tacua backend request failed.",
         );
       }
-      if (body === null) throw new TacuaApiError(502, "INVALID_RESPONSE", "The Tacua backend returned invalid JSON.");
+      if (body === null) {
+        throw new TacuaApiError(502, "INVALID_RESPONSE", "The Tacua backend returned invalid JSON.");
+      }
       return body as T;
     } catch (error) {
       if (error instanceof TacuaApiError) throw error;
