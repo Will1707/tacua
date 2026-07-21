@@ -31,7 +31,7 @@ enum CaptureTransportPolicyTests {
     try authenticatedReceiptAndIdempotency()
     try receiptConflictsFailClosed()
     try queueShapeAndStateAreFailClosed()
-    try deletionRequiresEveryReceipt()
+    try legacyQueueNeverAuthorizesDeletion()
     try boundedRetryAndGrantExpiry()
     try queueContainsNoBearerCredential()
     try diagnosticsAreShapeBoundAndSanitized()
@@ -204,7 +204,7 @@ enum CaptureTransportPolicyTests {
     }
   }
 
-  private static func deletionRequiresEveryReceipt() throws {
+  private static func legacyQueueNeverAuthorizesDeletion() throws {
     var queue = makeQueue()
     try require(
       !TacuaCaptureTransportPolicy.canDeleteLocalMedia(queue: queue),
@@ -233,8 +233,8 @@ enum CaptureTransportPolicyTests {
       transportAuthenticated: true
     )
     try require(
-      TacuaCaptureTransportPolicy.canDeleteLocalMedia(queue: queue),
-      "All segment and manifest receipts must permit scoped local deletion"
+      !TacuaCaptureTransportPolicy.canDeleteLocalMedia(queue: queue),
+      "Legacy upload receipts must never substitute for a V1 completion cleanup authority"
     )
   }
 

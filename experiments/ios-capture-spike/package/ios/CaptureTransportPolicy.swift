@@ -186,13 +186,9 @@ enum TacuaCaptureTransportPolicy {
   }
 
   static func canDeleteLocalMedia(queue: TacuaUploadQueue) -> Bool {
-    guard (try? validate(queue: queue)) != nil else { return false }
-    let segments = queue.items.filter { $0.objectKind == .segment }
-    let manifests = queue.items.filter { $0.objectKind == .manifest }
-    guard !segments.isEmpty, manifests.count == 1 else { return false }
-    return (segments + manifests).allSatisfy { item in
-      item.state == .received && item.receipt != nil
-    }
+    // Schema-v1 receipts prove upload durability only. They predate the V1 completion
+    // receipt's explicit local_cleanup authority and can never authorize deletion.
+    false
   }
 
   static func retryDecision(
