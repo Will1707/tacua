@@ -1,6 +1,7 @@
 # EXP-001 physical-device results
 
-Status: foreground capture proven; interruption and long-run checks pending
+Status: foreground capture and interruption discovery proven; recovery choices
+and long-run checks pending
 
 Date: 2026-07-21
 
@@ -69,9 +70,23 @@ coverage under ReplayKit's variable frame cadence. The next implementation
 experiment must evaluate safe last-frame extension and timer-driven rotation
 without inventing user interaction or dropping narration.
 
+## Process-interruption recovery run
+
+The operator started a narrated capture and Tacua Capture Lab was then
+force-terminated and relaunched through the paired-device development bridge.
+Before termination, the session finalized 10 segments containing 11,127
+microphone samples and 11,026 app-audio samples. The recovery scan transitioned
+the persisted manifest from `recording` to `recoverable_partial`, retained all
+10 segments, added only `ERR_TACUA_CAPTURE_INTERRUPTED`, and reported zero
+continuity gaps. Every manifest SHA-256 value matched its copied segment.
+
+The harness now runs recovery discovery automatically on launch. Explicit
+`Resume`, `Keep partial`, and `Delete` choice validation remains pending; Tacua
+does not make one of those destructive or state-changing choices automatically.
+
 ## Evidence handling
 
-Raw media was copied once to a private temporary directory for `ffprobe` and
-checksum inspection, then deleted immediately after these aggregate measurements
-were recorded. Synthetic source sessions remain only in the app container until
-the planned recovery and deletion checks complete.
+Raw media was copied to private temporary directories for `ffprobe` and checksum
+inspection, then deleted immediately after aggregate measurements were recorded.
+Synthetic source sessions remain only in the app container until the planned
+recovery-choice and deletion checks complete.

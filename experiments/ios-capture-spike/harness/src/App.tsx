@@ -74,6 +74,9 @@ export default function App(): React.JSX.Element {
 
   useEffect(() => {
     setStatus(TacuaCapture.getStatus());
+    void refreshRecovery().catch((error: unknown) => {
+      log(`Initial recovery scan failed: ${safeMessage(error)}`);
+    });
     const subscriptions = [
       TacuaCapture.subscribe('onState', (event) => {
         setStatus(event);
@@ -89,7 +92,7 @@ export default function App(): React.JSX.Element {
       TacuaCapture.subscribe('onError', (event) => log(`${event.code}: ${event.reason}`)),
     ];
     return () => subscriptions.forEach((subscription) => subscription.remove());
-  }, [log]);
+  }, [log, refreshRecovery]);
 
   const start = async () => {
     if (!consented) return;
