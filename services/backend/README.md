@@ -56,6 +56,13 @@ exchange must never be redirected.
   transaction from the active-session recheck through metadata/byte integrity
   verification. This is part of the V1 single-process invariant: deletion
   cannot be accepted while a reviewer response is still being resolved.
+- Every exported `tacua.approved-handoff@1.1.0` embeds the exact canonical JSON
+  of its approved ticket-candidate row, without a trailing newline, plus mirrored
+  candidate and content digests. The contract validates that source with the
+  authoritative ticket-candidate validator and cross-binds scope, build,
+  evidence, approval, and the convenience projection. Persistence then requires
+  byte-for-byte equality with `candidate_versions.canonical_json`, so fields not
+  displayed in the projected ticket cannot be silently dropped or substituted.
 - A candidate evidence view is at most 1.5 MiB of canonical JSON and contains
   at most 512 diagnostic events. Eligible events are sorted by monotonic time,
   sequence, and event ID; the response contains the largest deterministic
@@ -130,6 +137,20 @@ The configuration pins one full sealed `build_identity` artifact for this V1
 deployment. Its `transport_configuration_digest` must match `backend_origin`
 and the configured transport policy. To authorize another build, deploy a
 separately pinned instance or explicitly reset/reconfigure an empty instance.
+It also requires an `approved_handoff` object with exactly `build_identity`,
+`authority`, and `registry_revision`. The handoff build identity must be a full
+sealed `tacua.build-identity@1.0.0` artifact whose organization, project, build,
+mobile app, source revision, distribution, and SDK configuration digest match
+the registered SDK build and deployment transport pin. Tacua does not infer a
+native binary digest, SDK source revision, backend image, deployment, or source
+repository identity: supply measured immutable values, or use the contract's
+explicit unavailable backend representation when that identity truly is not
+available. The authority is structural handoff scope (`external_writes`,
+`merge`, and `deploy` remain false), and its repository allow-list must cover
+every source named by the build identity. The registry revision is a bounded
+Tacua identifier; it is not an authenticated execution-trust assertion. All
+three values are part of the durable deployment pin, so changing any of them
+requires an explicit empty-state reset instead of silently reusing state.
 `raw_retention_days`, `derived_retention_days`, and the capture scope must match
 exactly. V1 requires the raw and derived periods to be equal because erasure is
 session-scoped; independently expiring those data classes is not represented as
@@ -161,6 +182,8 @@ request digest returns `409`.
 | `PUT` | `/v1/sdk/sessions/{session}/deletions/{deletion}` | SDK bearer | Erase/recover tombstone |
 | `GET` | `/v1/admin/sessions[/{session}]` | admin bearer | Observe sessions and receipts |
 | `GET` | `/v1/admin/jobs[/{job}]` | admin bearer | Observe full runtime jobs |
+| `GET` | `/v1/admin/candidates/{candidate}/handoff.{json,md}` | admin bearer | Download the current exact approved handoff |
+| `GET` | `/v1/admin/candidates/{candidate}/versions/{version}/handoff.{json,md}` | admin bearer | Download one immutable approved handoff version |
 | `GET` | `/v1/admin/audit-events` | admin bearer | Observe content-free audit events |
 | `DELETE` | `/v1/admin/sessions/{session}` | admin bearer | Operator-requested scoped erasure |
 

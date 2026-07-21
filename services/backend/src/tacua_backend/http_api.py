@@ -354,6 +354,39 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        candidate_handoff = re.fullmatch(
+            rf"/v1/admin/candidates/(?P<candidate_id>{ID})"
+            rf"(?:/versions/(?P<version>{VERSION}))?/handoff\.(?P<format>json|md)",
+            path,
+        )
+        if candidate_handoff and self.command == "GET":
+            self._admin()
+            raw_version = candidate_handoff.group("version")
+            handoff = self.backend.get_candidate_handoff(
+                candidate_handoff.group("candidate_id"),
+                None if raw_version is None else int(raw_version),
+            )
+            markdown = candidate_handoff.group("format") == "md"
+            body = handoff.markdown_bytes if markdown else handoff.json_bytes
+            body_digest = (
+                handoff.markdown_digest if markdown else handoff.json_digest
+            )
+            self._send_bytes(
+                200,
+                body,
+                "text/markdown; charset=utf-8"
+                if markdown
+                else "application/vnd.tacua.approved-handoff+json;version=1.1.0",
+                headers={
+                    "ETag": f'"{body_digest}"',
+                    "Tacua-Body-Digest": body_digest,
+                    "Tacua-Handoff-Digest": handoff.handoff_digest,
+                    "Tacua-Candidate-Digest": handoff.candidate_digest,
+                    "Tacua-Candidate-Version": str(handoff.candidate_version),
+                },
+            )
+            return
+
         candidate_preview = re.fullmatch(
             rf"/v1/admin/candidates/(?P<candidate_id>{ID})/versions/"
             rf"(?P<version>{VERSION})/evidence/(?P<evidence_id>{ID})/preview",

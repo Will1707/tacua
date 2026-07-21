@@ -4,12 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import re
+from types import ModuleType
 import unicodedata
 from typing import Any
 from urllib.parse import urlsplit
+
+from .contracts import ContractError as SDKContractError, validate as validate_sdk_artifact
 
 
 ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{2,63}$")
@@ -18,6 +22,33 @@ BUNDLE_ID_PATTERN = re.compile(
 )
 DIGEST_PATTERN = re.compile(r"^sha256:[a-f0-9]{64}$")
 TRANSPORT_POLICY_VERSION = "tacua.sdk-transport@1.0.0"
+APPROVED_HANDOFF_KEYS = frozenset(
+    {"build_identity", "authority", "registry_revision"}
+)
+
+
+def _load_approved_handoff_contract() -> ModuleType:
+    repository_root = Path(__file__).resolve().parents[4]
+    module_path = (
+        repository_root
+        / "contracts"
+        / "approved-handoff"
+        / "src"
+        / "handoff_contract.py"
+    )
+    if not module_path.is_file():
+        raise RuntimeError("Tacua approved-handoff validator is unavailable")
+    specification = importlib.util.spec_from_file_location(
+        "tacua_config_approved_handoff_contract", module_path
+    )
+    if specification is None or specification.loader is None:
+        raise RuntimeError("Tacua approved-handoff validator cannot be loaded")
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
+APPROVED_HANDOFF_CONTRACT = _load_approved_handoff_contract()
 
 
 class ConfigError(ValueError):
@@ -91,6 +122,7 @@ class PilotConfig:
     tombstone_retention_days: int = 30
     retention_sweep_interval_seconds: int = 300
     transport_policy_version: str = TRANSPORT_POLICY_VERSION
+    approved_handoff: dict[str, Any] | None = None
 
     @property
     def bundle_identifier(self) -> str:
@@ -129,6 +161,7 @@ class PilotConfig:
             "build_id": self.build_id,
             "build_identity_digest": self.build_identity_digest,
             "build_identity": self.build_identity,
+            "approved_handoff": self.approved_handoff,
             "consent_contract": self.consent_contract,
             "raw_retention_days": self.raw_retention_days,
             "derived_retention_days": self.derived_retention_days,
@@ -162,6 +195,76 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def validate_approved_handoff_config(config: PilotConfig) -> None:
+    approved_handoff = config.approved_handoff
+    if not isinstance(approved_handoff, dict):
+        raise ConfigError("approved_handoff must be an object")
+    if set(approved_handoff) != APPROVED_HANDOFF_KEYS:
+        raise ConfigError(
+            "approved_handoff must contain exactly build_identity, authority, and registry_revision"
+        )
+
+    build_identity = approved_handoff["build_identity"]
+    authority = approved_handoff["authority"]
+    registry_revision = approved_handoff["registry_revision"]
+    if not isinstance(registry_revision, str) or not ID_PATTERN.fullmatch(
+        registry_revision
+    ):
+        raise ConfigError("approved_handoff.registry_revision is not a Tacua identifier")
+    if unicodedata.normalize("NFC", registry_revision) != registry_revision:
+        raise ConfigError("approved_handoff.registry_revision must be NFC-normalized")
+
+    try:
+        validate_sdk_artifact(config.build_identity)
+        if config.build_identity.get("message_type") != "build_identity":
+            raise ConfigError("build_identity must have message_type build_identity")
+        APPROVED_HANDOFF_CONTRACT.validate_build_identity(build_identity)
+        APPROVED_HANDOFF_CONTRACT.validate_authority(authority)
+    except (SDKContractError, APPROVED_HANDOFF_CONTRACT.ContractError) as exc:
+        raise ConfigError(
+            "approved_handoff must contain a valid sealed build identity and authority"
+        ) from exc
+
+    sdk_build = config.build_identity
+    distribution = {
+        "local": "local-development",
+        "internal": "internal",
+        "testflight": "testflight",
+    }.get(sdk_build["distribution"])
+    mobile = build_identity["mobile"]
+    if (
+        distribution is None
+        or sdk_build["source"]["working_tree_dirty"] is not False
+        or build_identity["organization_id"] != config.organization_id
+        or build_identity["project_id"] != config.project_id
+        or build_identity["build_id"] != sdk_build["build_id"]
+        or mobile["platform"] != sdk_build["platform"]
+        or mobile["application_id"] != sdk_build["bundle_identifier"]
+        or mobile["app_version"] != sdk_build["native_version"]
+        or mobile["build_number"] != sdk_build["native_build"]
+        or mobile["distribution"] != distribution
+        or mobile["source"]["revision"] != sdk_build["source"]["git_revision"]
+        or mobile["source"]["dirty"] is not False
+        or sdk_build["transport_configuration_digest"]
+        != config.transport_configuration_digest
+        or build_identity["sdk"]["configuration_digest"]
+        != config.transport_configuration_digest
+    ):
+        raise ConfigError(
+            "approved_handoff build identity does not match the configured SDK build and transport"
+        )
+
+    source_repositories = {mobile["source"]["repository_id"]}
+    if build_identity["backend"]["availability"] == "available":
+        source_repositories.update(
+            source["repository_id"] for source in build_identity["backend"]["sources"]
+        )
+    if not source_repositories <= set(authority["allowed_repositories"]):
+        raise ConfigError(
+            "approved_handoff authority does not cover every configured source repository"
+        )
+
+
 def load_config(config_file: Path, admin_secret_file: Path) -> tuple[PilotConfig, bytes]:
     """Load public configuration and the administrator/verifier root secret."""
 
@@ -181,6 +284,7 @@ def load_config(config_file: Path, admin_secret_file: Path) -> tuple[PilotConfig
         "application_id",
         "reviewer_id",
         "build_identity",
+        "approved_handoff",
         "consent_contract",
         "backend_origin",
         "transport_policy_version",
@@ -212,6 +316,9 @@ def load_config(config_file: Path, admin_secret_file: Path) -> tuple[PilotConfig
     build_identity = raw.get("build_identity")
     if not isinstance(build_identity, dict):
         raise ConfigError("build_identity must be the full sealed SDK protocol artifact")
+    approved_handoff = raw.get("approved_handoff")
+    if not isinstance(approved_handoff, dict):
+        raise ConfigError("approved_handoff must be an object")
     policy = str(raw.get("transport_policy_version", TRANSPORT_POLICY_VERSION))
     if policy != TRANSPORT_POLICY_VERSION:
         raise ConfigError(f"transport_policy_version must be {TRANSPORT_POLICY_VERSION}")
@@ -226,6 +333,7 @@ def load_config(config_file: Path, admin_secret_file: Path) -> tuple[PilotConfig
         **ids,
         reviewer_id=reviewer_id,
         build_identity=json.loads(_canonical_json(build_identity)),
+        approved_handoff=json.loads(_canonical_json(approved_handoff)),
         consent_contract=_required_text(raw, "consent_contract", 128),
         backend_origin=normalize_backend_origin(_required_text(raw, "backend_origin", 2048)),
         state_directory=state_directory,
@@ -242,6 +350,7 @@ def load_config(config_file: Path, admin_secret_file: Path) -> tuple[PilotConfig
         retention_sweep_interval_seconds=_bounded_int(raw, "retention_sweep_interval_seconds", 300, 30, 3600),
         transport_policy_version=policy,
     )
+    validate_approved_handoff_config(config)
 
     try:
         secret = admin_secret_file.read_bytes().rstrip(b"\r\n")

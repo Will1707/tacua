@@ -317,6 +317,19 @@ class HandoffStoreTests(unittest.TestCase):
 
         self.assertEqual(self.artifacts.json_bytes, created.json_bytes)
         self.assertEqual(self.artifacts.markdown_bytes, created.markdown_bytes)
+        self.assertEqual(
+            TICKET_CONTRACT.canonical_json(self.candidate),
+            self.artifacts.handoff["source_candidate"]["canonical_json"],
+        )
+        self.assertEqual(
+            self.candidate["candidate_digest"],
+            self.artifacts.handoff["source_candidate"]["candidate_digest"],
+        )
+        self.assertFalse(
+            self.artifacts.handoff["source_candidate"]["canonical_json"].endswith(
+                "\n"
+            )
+        )
         self.assertEqual(created, retry)
         self.assertTrue(created.current)
         self.assertEqual(created, self.store.get(self.candidate["candidate_id"]))
@@ -360,6 +373,50 @@ class HandoffStoreTests(unittest.TestCase):
                 "HANDOFF_CANDIDATE_MISMATCH",
                 lambda: self.store.put(mismatched, self.artifacts),
             )
+
+    def test_unprojected_source_change_cannot_be_substituted(self) -> None:
+        altered = copy.deepcopy(self.candidate)
+        altered["transition"]["reason"] = (
+            "A different exact source snapshot with the same ticket projection."
+        )
+        altered = TICKET_CONTRACT.seal(altered)
+        TICKET_CONTRACT.validate(altered)
+        altered_artifacts = exported(altered, self.manifest, self.sdk_build)
+        self.assertEqual(
+            self.artifacts.handoff["ticket"]["title"],
+            altered_artifacts.handoff["ticket"]["title"],
+        )
+        self.assertNotEqual(
+            self.artifacts.handoff["source_candidate"]["candidate_digest"],
+            altered_artifacts.handoff["source_candidate"]["candidate_digest"],
+        )
+        with self.connection:
+            self.begin()
+            self.assert_store_error(
+                "HANDOFF_CANDIDATE_MISMATCH",
+                lambda: self.store.put(self.candidate, altered_artifacts),
+            )
+
+        with self.connection:
+            self.begin()
+            self.put(self.candidate, self.artifacts)
+        with self.connection:
+            self.begin()
+            self.connection.execute(
+                """UPDATE candidate_versions
+                      SET candidate_digest = ?, canonical_json = ?
+                    WHERE candidate_id = ? AND candidate_version = ?""",
+                (
+                    altered["candidate_digest"],
+                    TICKET_CONTRACT.canonical_json(altered),
+                    altered["candidate_id"],
+                    altered["candidate_version"],
+                ),
+            )
+        self.assert_store_error(
+            "HANDOFF_STORAGE_CORRUPT",
+            lambda: self.store.get(self.candidate["candidate_id"]),
+        )
 
     def test_exact_version_is_immutable_and_corruption_fails_closed(self) -> None:
         with self.connection:

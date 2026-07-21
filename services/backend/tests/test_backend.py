@@ -23,6 +23,7 @@ from unittest.mock import patch
 SOURCE = Path(__file__).resolve().parents[1] / "src"
 REPOSITORY = SOURCE.parents[2]
 FIXTURES = REPOSITORY / "contracts" / "sdk-backend-protocol" / "fixtures" / "positive"
+HANDOFF_FIXTURES = REPOSITORY / "contracts" / "approved-handoff" / "fixtures" / "positive"
 sys.path.insert(0, str(SOURCE))
 
 from tacua_backend.config import (  # noqa: E402
@@ -47,6 +48,7 @@ from tacua_backend.handoff_export import (  # noqa: E402
     HandoffExportError,
     export_approved_candidate,
 )
+from tacua_backend.handoff_store import HandoffStore, HandoffStoreError  # noqa: E402
 from tacua_backend.evidence_domain import (  # noqa: E402
     EvidenceStore,
     ITEM_VERSION,
@@ -63,6 +65,62 @@ from tacua_backend.service import (  # noqa: E402
     PilotBackend,
     strict_json_loads,
 )
+
+
+def approved_handoff_config(build: dict, scope: dict) -> dict:
+    handoff_build = json.loads(
+        (HANDOFF_FIXTURES / "build-identity.json").read_text(encoding="utf-8")
+    )
+    handoff_build["organization_id"] = scope["organization_id"]
+    handoff_build["project_id"] = scope["project_id"]
+    handoff_build["build_id"] = build["build_id"]
+    handoff_build["mobile"].update(
+        {
+            "platform": build["platform"],
+            "application_id": build["bundle_identifier"],
+            "app_version": build["native_version"],
+            "build_number": build["native_build"],
+            "distribution": {
+                "local": "local-development",
+                "internal": "internal",
+                "testflight": "testflight",
+            }[build["distribution"]],
+        }
+    )
+    handoff_build["mobile"]["source"].update(
+        {
+            "repository_id": "repo_mobile",
+            "revision": build["source"]["git_revision"],
+            "dirty": False,
+        }
+    )
+    handoff_build["backend"] = {
+        "availability": "unavailable",
+        "environment": "self_hosted_qa",
+        "deployment_id": None,
+        "image_digest": None,
+        "deployed_at": None,
+        "sources": [],
+        "unavailable_reason": "deployment_identity_unavailable",
+    }
+    handoff_build["sdk"]["configuration_digest"] = build[
+        "transport_configuration_digest"
+    ]
+    handoff_build = HANDOFF.seal_build_identity(handoff_build)
+    return {
+        "build_identity": handoff_build,
+        "authority": {
+            "purpose": "implement_approved_ticket",
+            "allowed_repositories": ["repo_mobile"],
+            "read_authorized_evidence": True,
+            "modify_code": True,
+            "run_tests": True,
+            "external_writes": False,
+            "merge": False,
+            "deploy": False,
+        },
+        "registry_revision": "registry_synthetic_1",
+    }
 
 
 def instant(value: str) -> datetime:
@@ -118,6 +176,7 @@ class BackendHarness(unittest.TestCase):
             project_id=self.scope["project_id"],
             application_id=self.scope["application_id"],
             build_identity=copy.deepcopy(build),
+            approved_handoff=approved_handoff_config(build, self.scope),
             consent_contract=self.scope["consent"]["policy_version"],
             backend_origin="https://qa.tacua.example",
             state_directory=Path(self.temporary.name),
@@ -746,6 +805,174 @@ class BackendProtocolTests(BackendHarness):
                 ).fetchone()[0],
             )
 
+    def test_candidate_publication_rechecks_both_preview_phases_and_final_insert(self) -> None:
+        lifecycle = self.full_completed_session()
+        session_id = lifecycle["launch_receipt"]["session_id"]
+        candidate, manifest, previews = self.candidate_bundle(session_id)
+        guarded_transactions: list[bool] = []
+        original = self.backend._verified_candidate_publication_manifest
+
+        def observed_guard(
+            connection: sqlite3.Connection, document: dict
+        ) -> tuple[EvidenceStore, dict]:
+            guarded_transactions.append(connection.in_transaction)
+            return original(connection, document)
+
+        with patch.object(
+            self.backend,
+            "_verified_candidate_publication_manifest",
+            side_effect=observed_guard,
+        ):
+            inserted = self.backend.persist_candidate_bundle(
+                candidate=candidate,
+                evidence_manifest=manifest,
+                previews=previews,
+            )
+
+        self.assertEqual(candidate, inserted)
+        self.assertEqual([True, True, True], guarded_transactions)
+
+    def test_candidate_publication_treats_manifest_membership_as_order_independent(self) -> None:
+        lifecycle = self.full_completed_session()
+        session_id = lifecycle["launch_receipt"]["session_id"]
+        candidate, manifest, previews = self.candidate_bundle(session_id)
+        candidate["evidence_manifest"]["evidence_ids"] = list(
+            reversed(candidate["evidence_manifest"]["evidence_ids"])
+        )
+        candidate = TICKET_CONTRACT.seal(candidate)
+        TICKET_CONTRACT.validate_chain([candidate])
+
+        inserted = self.backend.persist_candidate_bundle(
+            candidate=candidate,
+            evidence_manifest=manifest,
+            previews=previews,
+        )
+
+        self.assertEqual(candidate, inserted)
+
+    def test_preview_second_phase_guard_rejects_session_retirement(self) -> None:
+        lifecycle = self.full_completed_session()
+        session_id = lifecycle["launch_receipt"]["session_id"]
+        candidate, manifest, previews = self.candidate_bundle(session_id)
+        original_write = EvidenceStore._write
+
+        def retire_after_file_write(
+            store: EvidenceStore,
+            relative_path: Path,
+            staging_relative_path: Path,
+            body: bytes,
+        ) -> Path:
+            target = original_write(store, relative_path, staging_relative_path, body)
+            store.connection.execute(
+                "UPDATE sessions SET state = 'deleting' WHERE session_id = ?",
+                (session_id,),
+            )
+            store.connection.commit()
+            return target
+
+        with patch.object(EvidenceStore, "_write", new=retire_after_file_write):
+            self.assert_api_error(
+                410,
+                "SESSION_DELETED",
+                lambda: self.backend.persist_candidate_bundle(
+                    candidate=candidate,
+                    evidence_manifest=manifest,
+                    previews=previews,
+                ),
+            )
+
+        with self.backend._connect() as connection:
+            self.assertEqual(
+                0,
+                connection.execute(
+                    "SELECT COUNT(*) FROM tacua_evidence_preview_revisions"
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                0,
+                connection.execute(
+                    "SELECT COUNT(*) FROM candidate_versions"
+                ).fetchone()[0],
+            )
+
+    def test_preview_first_phase_guard_rejects_session_retirement(self) -> None:
+        lifecycle = self.full_completed_session()
+        session_id = lifecycle["launch_receipt"]["session_id"]
+        candidate, manifest, previews = self.candidate_bundle(session_id)
+        original_put_manifest = EvidenceStore.put_manifest
+
+        def retire_after_manifest(
+            store: EvidenceStore, **values: object
+        ) -> dict:
+            result = original_put_manifest(store, **values)
+            store.connection.execute(
+                "UPDATE sessions SET state = 'deleting' WHERE session_id = ?",
+                (session_id,),
+            )
+            store.connection.commit()
+            return result
+
+        with patch.object(EvidenceStore, "put_manifest", new=retire_after_manifest):
+            self.assert_api_error(
+                410,
+                "SESSION_DELETED",
+                lambda: self.backend.persist_candidate_bundle(
+                    candidate=candidate,
+                    evidence_manifest=manifest,
+                    previews=previews,
+                ),
+            )
+
+        with self.backend._connect() as connection:
+            self.assertEqual(
+                0,
+                connection.execute(
+                    "SELECT COUNT(*) FROM tacua_evidence_file_journal"
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                0,
+                connection.execute(
+                    "SELECT COUNT(*) FROM candidate_versions"
+                ).fetchone()[0],
+            )
+
+    def test_generated_insert_guard_rechecks_exact_session_build(self) -> None:
+        lifecycle = self.full_completed_session()
+        session_id = lifecycle["launch_receipt"]["session_id"]
+        candidate, manifest, previews = self.candidate_bundle(session_id)
+        original_put_preview = EvidenceStore.put_preview
+
+        def change_build_after_preview(
+            store: EvidenceStore, **values: object
+        ) -> dict:
+            result = original_put_preview(store, **values)
+            store.connection.execute(
+                "UPDATE sessions SET build_identity_digest = ? WHERE session_id = ?",
+                ("sha256:" + "0" * 64, session_id),
+            )
+            store.connection.commit()
+            return result
+
+        with patch.object(EvidenceStore, "put_preview", new=change_build_after_preview):
+            self.assert_api_error(
+                500,
+                "CANDIDATE_SESSION_BINDING_CORRUPT",
+                lambda: self.backend.persist_candidate_bundle(
+                    candidate=candidate,
+                    evidence_manifest=manifest,
+                    previews=previews,
+                ),
+            )
+
+        with self.backend._connect() as connection:
+            self.assertEqual(
+                0,
+                connection.execute(
+                    "SELECT COUNT(*) FROM candidate_versions"
+                ).fetchone()[0],
+            )
+
     def test_candidate_read_finishes_before_deletion_is_accepted(self) -> None:
         lifecycle = self.full_completed_session()
         session_id = lifecycle["launch_receipt"]["session_id"]
@@ -1112,29 +1339,47 @@ class BackendProtocolTests(BackendHarness):
             ).body
         )
         self.clock.set(approved["approval"]["approved_at"])
+        handoff_config = self.config.approved_handoff
+        self.assertIsInstance(handoff_config, dict)
         artifacts = export_approved_candidate(
             candidate=approved,
             evidence_manifest=manifest,
             sdk_build_identity=self.build,
-            handoff_build_identity=self.handoff_build_identity(),
-            authority={
-                "purpose": "implement_approved_ticket",
-                "allowed_repositories": ["repo_mobile"],
-                "read_authorized_evidence": True,
-                "modify_code": True,
-                "run_tests": True,
-                "external_writes": False,
-                "merge": False,
-                "deploy": False,
-            },
-            registry_revision="registry_local_001",
+            handoff_build_identity=handoff_config["build_identity"],
+            authority=handoff_config["authority"],
+            registry_revision=handoff_config["registry_revision"],
             checked_at=self.clock(),
+        )
+        stored = self.backend.get_candidate_handoff(
+            approved["candidate_id"], approved["candidate_version"]
+        )
+        self.assertEqual(artifacts.json_bytes, stored.json_bytes)
+        self.assertEqual(artifacts.markdown_bytes, stored.markdown_bytes)
+        self.assertEqual(
+            stored,
+            self.backend.get_candidate_handoff(approved["candidate_id"]),
         )
         self.assertEqual(3, artifacts.handoff["ticket"]["ticket_version"])
         self.assertIsNone(
             artifacts.handoff["supersession"]["supersedes_handoff_digest"]
         )
+        self.assertEqual(
+            TICKET_CONTRACT.canonical_json(approved),
+            artifacts.handoff["source_candidate"]["canonical_json"],
+        )
+        self.assertEqual(
+            approved["candidate_digest"],
+            artifacts.handoff["source_candidate"]["candidate_digest"],
+        )
+        self.assertEqual(
+            approved["candidate_content_digest"],
+            artifacts.handoff["source_candidate"]["candidate_content_digest"],
+        )
+        self.assertFalse(
+            artifacts.handoff["source_candidate"]["canonical_json"].endswith("\n")
+        )
         self.assertTrue(artifacts.json_bytes.endswith(b"\n"))
+        self.assertIn(b"## Exact approved source candidate", artifacts.markdown_bytes)
         self.assertIn(b"## Canonical JSON", artifacts.markdown_bytes)
         self.assertEqual(sha256_digest(artifacts.json_bytes), artifacts.json_digest)
         self.assertEqual(
@@ -1145,7 +1390,7 @@ class BackendProtocolTests(BackendHarness):
             HANDOFF.validate_handoff(artifacts.handoff, executable=True)
         self.assertEqual("TRUST_INPUT_REQUIRED", captured.exception.code)
 
-        missing_binary_identity = self.handoff_build_identity()
+        missing_binary_identity = copy.deepcopy(handoff_config["build_identity"])
         missing_binary_identity["mobile"].pop("native_binary_digest")
         with self.assertRaises(HandoffExportError) as captured:
             export_approved_candidate(
@@ -1154,10 +1399,93 @@ class BackendProtocolTests(BackendHarness):
                 sdk_build_identity=self.build,
                 handoff_build_identity=missing_binary_identity,
                 authority=artifacts.handoff["authority"],
-                registry_revision="registry_local_001",
+                registry_revision=handoff_config["registry_revision"],
                 checked_at=self.clock(),
             )
         self.assertEqual("HANDOFF_BUILD_INVALID", captured.exception.code)
+
+    def test_handoff_failure_rolls_back_approval_and_session_erasure_cascades(self) -> None:
+        lifecycle = self.full_completed_session()
+        session_id = lifecycle["launch_receipt"]["session_id"]
+        candidate, manifest, previews = self.candidate_bundle(session_id)
+        self.backend.persist_candidate_bundle(
+            candidate=candidate,
+            evidence_manifest=manifest,
+            previews=previews,
+        )
+        resolved = json.loads(
+            self.backend.transition_candidate(
+                candidate["candidate_id"],
+                if_match=candidate["candidate_digest"],
+                idempotency_key="candidate:handoff-rollback:resolve",
+                body=self.candidate_transition_body(
+                    candidate, "resolve_clarification"
+                ),
+            ).body
+        )
+        approval_body = self.candidate_transition_body(resolved, "approve")
+        with patch.object(
+            HandoffStore,
+            "put",
+            side_effect=HandoffStoreError(
+                "HANDOFF_STORAGE_CORRUPT", "synthetic storage failure"
+            ),
+        ):
+            self.assert_api_error(
+                500,
+                "HANDOFF_STORAGE_CORRUPT",
+                lambda: self.backend.transition_candidate(
+                    resolved["candidate_id"],
+                    if_match=resolved["candidate_digest"],
+                    idempotency_key="candidate:handoff-rollback:approve",
+                    body=approval_body,
+                ),
+            )
+
+        self.assertEqual(
+            resolved,
+            self.backend.get_candidate(resolved["candidate_id"]),
+        )
+        with self.backend._connect() as connection:
+            self.assertEqual(
+                2,
+                connection.execute(
+                    "SELECT COUNT(*) FROM candidate_versions WHERE candidate_id = ?",
+                    (resolved["candidate_id"],),
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                0,
+                connection.execute("SELECT COUNT(*) FROM approved_handoffs").fetchone()[0],
+            )
+
+        approved = json.loads(
+            self.backend.transition_candidate(
+                resolved["candidate_id"],
+                if_match=resolved["candidate_digest"],
+                idempotency_key="candidate:handoff-rollback:approve",
+                body=approval_body,
+            ).body
+        )
+        self.assertEqual(
+            approved["candidate_digest"],
+            self.backend.get_candidate_handoff(
+                approved["candidate_id"], approved["candidate_version"]
+            ).candidate_digest,
+        )
+
+        tombstone = self.backend.delete_session(session_id)
+        self.assertEqual(7, tombstone["erasure"]["erased_object_count"])
+        with self.backend._connect() as connection:
+            self.assertEqual(
+                0,
+                connection.execute("SELECT COUNT(*) FROM approved_handoffs").fetchone()[0],
+            )
+        self.assert_api_error(
+            404,
+            "HANDOFF_NOT_FOUND",
+            lambda: self.backend.get_candidate_handoff(approved["candidate_id"]),
+        )
 
     def test_candidate_review_is_bound_to_verified_screenshot_bytes(self) -> None:
         lifecycle = self.full_completed_session()
@@ -1233,6 +1561,145 @@ class BackendProtocolTests(BackendHarness):
             approved["candidate_version"],
             candidate_digest=approved["candidate_digest"],
             manifest_digest=manifest["manifest_digest"],
+        )
+
+    def test_approval_verifies_only_keyframes_referenced_by_ticket_content(self) -> None:
+        lifecycle = self.full_completed_session()
+        session_id = lifecycle["launch_receipt"]["session_id"]
+        candidate, manifest, previews = self.candidate_bundle(session_id)
+        unrelated = copy.deepcopy(
+            next(
+                item
+                for item in manifest["items"]
+                if item["evidence_id"] == "evidence_frame"
+            )
+        )
+        unrelated["evidence_id"] = "evidence_unrelated_frame"
+        unrelated["description"] = "A valid screenshot not cited by this ticket."
+        unrelated["source"]["snapshot_revision"] = "snapshot_unrelated_frame"
+        unrelated["reference"]["locator"]["evidence_id"] = unrelated["evidence_id"]
+        unrelated["reference"]["locator"]["revision_id"] = "revision_unrelated_frame"
+        manifest = seal_manifest(
+            {
+                **manifest,
+                "items": [*manifest["items"], seal_item(unrelated)],
+                "manifest_digest": "sha256:" + "0" * 64,
+            }
+        )
+        candidate["evidence_manifest"] = {
+            "manifest_id": manifest["manifest_id"],
+            "manifest_digest": manifest["manifest_digest"],
+            "evidence_ids": [item["evidence_id"] for item in manifest["items"]],
+        }
+        candidate = TICKET_CONTRACT.seal(candidate)
+        unrelated_preview = {
+            **previews[0],
+            "evidence_id": unrelated["evidence_id"],
+            "preview_revision_id": "preview_unrelated",
+        }
+        self.backend.persist_candidate_bundle(
+            candidate=candidate,
+            evidence_manifest=manifest,
+            previews=[*previews, unrelated_preview],
+        )
+        resolved = json.loads(
+            self.backend.transition_candidate(
+                candidate["candidate_id"],
+                if_match=candidate["candidate_digest"],
+                idempotency_key="candidate:referenced-keyframes:resolve",
+                body=self.candidate_transition_body(
+                    candidate, "resolve_clarification"
+                ),
+            ).body
+        )
+        verified_requests: list[list[str]] = []
+        original = EvidenceStore.get_verified_keyframes_for_approval
+
+        def observe_verified_ids(
+            store: EvidenceStore, *, evidence_ids: list[str], **binding: object
+        ) -> dict:
+            verified_requests.append(list(evidence_ids))
+            return original(store, evidence_ids=evidence_ids, **binding)
+
+        with patch.object(
+            EvidenceStore,
+            "get_verified_keyframes_for_approval",
+            new=observe_verified_ids,
+        ):
+            approved = json.loads(
+                self.backend.transition_candidate(
+                    resolved["candidate_id"],
+                    if_match=resolved["candidate_digest"],
+                    idempotency_key="candidate:referenced-keyframes:approve",
+                    body=self.candidate_transition_body(resolved, "approve"),
+                ).body
+            )
+
+        self.assertEqual("approved", approved["state"])
+        self.assertEqual([["evidence_frame"]], verified_requests)
+
+    def test_unreferenced_keyframe_cannot_unlock_candidate_approval(self) -> None:
+        lifecycle = self.full_completed_session()
+        session_id = lifecycle["launch_receipt"]["session_id"]
+        candidate, manifest, previews = self.candidate_bundle(session_id)
+        items = copy.deepcopy(manifest["items"])
+        referenced = next(
+            item for item in items if item["evidence_id"] == "evidence_frame"
+        )
+        unrelated = copy.deepcopy(referenced)
+        referenced["evidence_type"] = "sdk.user_interaction"
+        referenced["description"] = "A ticket-cited interaction without image semantics."
+        unrelated["evidence_id"] = "evidence_unrelated_frame"
+        unrelated["description"] = "A valid screenshot not cited by this ticket."
+        unrelated["source"]["snapshot_revision"] = "snapshot_unrelated_frame"
+        unrelated["reference"]["locator"]["evidence_id"] = unrelated["evidence_id"]
+        unrelated["reference"]["locator"]["revision_id"] = "revision_unrelated_frame"
+        manifest = seal_manifest(
+            {
+                **manifest,
+                "items": [*items, unrelated],
+                "manifest_digest": "sha256:" + "0" * 64,
+            }
+        )
+        candidate["evidence_manifest"] = {
+            "manifest_id": manifest["manifest_id"],
+            "manifest_digest": manifest["manifest_digest"],
+            "evidence_ids": [item["evidence_id"] for item in manifest["items"]],
+        }
+        candidate = TICKET_CONTRACT.seal(candidate)
+        unrelated_preview = {
+            **previews[0],
+            "evidence_id": unrelated["evidence_id"],
+            "preview_revision_id": "preview_unrelated_only",
+        }
+        self.backend.persist_candidate_bundle(
+            candidate=candidate,
+            evidence_manifest=manifest,
+            previews=[unrelated_preview],
+        )
+        resolved = json.loads(
+            self.backend.transition_candidate(
+                candidate["candidate_id"],
+                if_match=candidate["candidate_digest"],
+                idempotency_key="candidate:unrelated-keyframe:resolve",
+                body=self.candidate_transition_body(
+                    candidate, "resolve_clarification"
+                ),
+            ).body
+        )
+        self.assert_api_error(
+            409,
+            "CANDIDATE_SCREENSHOT_REQUIRED",
+            lambda: self.backend.transition_candidate(
+                resolved["candidate_id"],
+                if_match=resolved["candidate_digest"],
+                idempotency_key="candidate:unrelated-keyframe:approve",
+                body=self.candidate_transition_body(resolved, "approve"),
+            ),
+        )
+        self.assertEqual(
+            "ready_for_review",
+            self.backend.get_candidate(candidate["candidate_id"])["state"],
         )
 
     def test_candidate_approval_and_deletion_fail_closed(self) -> None:
@@ -1834,6 +2301,7 @@ class StrictJSONAndConfigTests(unittest.TestCase):
                 "application_id": scope["application_id"],
                 "reviewer_id": "reviewer_owner",
                 "build_identity": build,
+                "approved_handoff": approved_handoff_config(build, scope),
                 "consent_contract": scope["consent"]["policy_version"],
                 "backend_origin": "https://qa.tacua.example",
                 "state_directory": str(root / "state"),
@@ -1842,11 +2310,92 @@ class StrictJSONAndConfigTests(unittest.TestCase):
             secret_path.write_bytes(b"a" * 32 + b"\n")
             config, secret = load_config(config_path, secret_path)
             self.assertEqual(build["transport_configuration_digest"], config.transport_configuration_digest)
+            self.assertEqual(
+                config.approved_handoff,
+                config.deployment_pin["approved_handoff"],
+            )
+            loaded_handoff = copy.deepcopy(config.approved_handoff)
+            document["approved_handoff"]["authority"]["allowed_repositories"].append(
+                "repo_unrelated"
+            )
+            self.assertEqual(loaded_handoff, config.approved_handoff)
             self.assertEqual(b"a" * 32, secret)
             document["unknown"] = True
             config_path.write_text(json.dumps(document), encoding="utf-8")
             with self.assertRaises(ConfigError):
                 load_config(config_path, secret_path)
+
+    def test_mounted_config_requires_exact_matching_approved_handoff_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path = root / "config.json"
+            secret_path = root / "secret"
+            secret_path.write_bytes(b"a" * 32)
+            build = fixture("build-identity")
+            scope = fixture("capture-scope")
+            document = {
+                "organization_id": scope["organization_id"],
+                "project_id": scope["project_id"],
+                "application_id": scope["application_id"],
+                "reviewer_id": "reviewer_owner",
+                "build_identity": build,
+                "approved_handoff": approved_handoff_config(build, scope),
+                "consent_contract": scope["consent"]["policy_version"],
+                "backend_origin": "https://qa.tacua.example",
+                "state_directory": str(root / "state"),
+            }
+
+            def rejected(mutator) -> None:
+                invalid = copy.deepcopy(document)
+                mutator(invalid)
+                config_path.write_text(json.dumps(invalid), encoding="utf-8")
+                with self.assertRaises(ConfigError):
+                    load_config(config_path, secret_path)
+
+            rejected(lambda value: value.pop("approved_handoff"))
+            rejected(
+                lambda value: value["approved_handoff"].__setitem__("unexpected", True)
+            )
+            rejected(
+                lambda value: value["approved_handoff"].__setitem__(
+                    "registry_revision", "Registry Invalid"
+                )
+            )
+            rejected(
+                lambda value: value["approved_handoff"]["authority"].__setitem__(
+                    "deploy", True
+                )
+            )
+            rejected(
+                lambda value: value["approved_handoff"]["build_identity"].__setitem__(
+                    "build_identity_digest", "sha256:" + "0" * 64
+                )
+            )
+
+            def mismatch_organization(value: dict) -> None:
+                artifact = value["approved_handoff"]["build_identity"]
+                artifact["organization_id"] = "org_other"
+                value["approved_handoff"]["build_identity"] = (
+                    HANDOFF.seal_build_identity(artifact)
+                )
+
+            rejected(mismatch_organization)
+
+            def mismatch_transport(value: dict) -> None:
+                artifact = value["approved_handoff"]["build_identity"]
+                artifact["sdk"]["configuration_digest"] = "sha256:" + "9" * 64
+                value["approved_handoff"]["build_identity"] = (
+                    HANDOFF.seal_build_identity(artifact)
+                )
+
+            rejected(mismatch_transport)
+
+            def omit_authorized_repository(value: dict) -> None:
+                value["approved_handoff"]["authority"]["allowed_repositories"] = [
+                    "repo_sample_mobile_app"
+                ]
+
+            rejected(omit_authorized_repository)
 
     def test_registered_build_must_be_sealed_and_match_transport_pin(self) -> None:
         build = fixture("build-identity")
@@ -1900,6 +2449,7 @@ class StrictJSONAndConfigTests(unittest.TestCase):
                 scope["consent"]["policy_version"],
                 "https://qa.tacua.example",
                 root,
+                approved_handoff=approved_handoff_config(build, scope),
             )
             with self.assertRaisesRegex(ValueError, "empty state directory"):
                 PilotBackend(config, b"x" * 32)
@@ -2063,6 +2613,82 @@ class HTTPAdapterTests(BackendHarness):
         with self.assertRaises(ApiError) as captured:
             malformed._dispatch()
         self.assertEqual("CANDIDATE_ETAG_INVALID", captured.exception.code)
+
+    def test_handoff_routes_return_exact_authenticated_json_and_markdown(self) -> None:
+        lifecycle = self.full_completed_session()
+        session_id = lifecycle["launch_receipt"]["session_id"]
+        candidate, manifest, previews = self.candidate_bundle(session_id)
+        self.backend.persist_candidate_bundle(
+            candidate=candidate,
+            evidence_manifest=manifest,
+            previews=previews,
+        )
+        resolved = json.loads(
+            self.backend.transition_candidate(
+                candidate["candidate_id"],
+                if_match=candidate["candidate_digest"],
+                idempotency_key="candidate:http-handoff:resolve",
+                body=self.candidate_transition_body(
+                    candidate, "resolve_clarification"
+                ),
+            ).body
+        )
+        approved = json.loads(
+            self.backend.transition_candidate(
+                resolved["candidate_id"],
+                if_match=resolved["candidate_digest"],
+                idempotency_key="candidate:http-handoff:approve",
+                body=self.candidate_transition_body(resolved, "approve"),
+            ).body
+        )
+        stored = self.backend.get_candidate_handoff(approved["candidate_id"])
+        authorization = "Bearer " + self.admin_secret.decode("ascii")
+        cases = (
+            (
+                f"/v1/admin/candidates/{approved['candidate_id']}/handoff.json",
+                stored.json_bytes,
+                stored.json_digest,
+                "application/vnd.tacua.approved-handoff+json;version=1.1.0",
+            ),
+            (
+                f"/v1/admin/candidates/{approved['candidate_id']}/versions/"
+                f"{approved['candidate_version']}/handoff.md",
+                stored.markdown_bytes,
+                stored.markdown_digest,
+                "text/markdown; charset=utf-8",
+            ),
+        )
+        for path, expected_body, expected_digest, expected_type in cases:
+            handler = self.handler(path, authorization=authorization)
+            sent: list[tuple[int, bytes, str, dict[str, str]]] = []
+            handler._send_bytes = lambda status, payload, content_type="application/json", headers=None: sent.append(
+                (status, payload, content_type, headers or {})
+            )
+            handler._dispatch()
+            self.assertEqual((200, expected_body, expected_type), sent[0][:3])
+            self.assertEqual(f'"{expected_digest}"', sent[0][3]["ETag"])
+            self.assertEqual(expected_digest, sent[0][3]["Tacua-Body-Digest"])
+            self.assertEqual(
+                stored.handoff_digest, sent[0][3]["Tacua-Handoff-Digest"]
+            )
+            self.assertEqual(
+                approved["candidate_digest"],
+                sent[0][3]["Tacua-Candidate-Digest"],
+            )
+            parsed_handoff = json.loads(stored.json_bytes)
+            self.assertEqual(
+                parsed_handoff["source_candidate"]["candidate_digest"],
+                sent[0][3]["Tacua-Candidate-Digest"],
+            )
+            self.assertEqual(
+                str(approved["candidate_version"]),
+                sent[0][3]["Tacua-Candidate-Version"],
+            )
+
+        unauthenticated = self.handler(cases[0][0])
+        with self.assertRaises(ApiError) as captured:
+            unauthenticated._dispatch()
+        self.assertEqual(401, captured.exception.status)
 
     def test_segment_route_reconstructs_exact_canonical_intent(self) -> None:
         launch_request, launch_receipt, _, _ = self.start_session()

@@ -34,6 +34,7 @@ from .config import (
     TRANSPORT_POLICY_VERSION,
     PilotConfig,
     normalize_backend_origin,
+    validate_approved_handoff_config,
 )
 from .contracts import (
     ContractError,
@@ -56,11 +57,19 @@ from .evidence_domain import (
     initialize_schema as initialize_evidence_schema,
     sha256_digest as evidence_sha256_digest,
 )
+from .handoff_export import HandoffExportError, export_approved_candidate
+from .handoff_store import (
+    HandoffStore,
+    HandoffStoreError,
+    StoredHandoff,
+    initialize_schema as initialize_handoff_schema,
+)
 
 
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 MAX_SEGMENTS = 2048
 MAX_CANDIDATE_EVIDENCE_VIEW_BYTES = 1_572_864
+MAX_HANDOFF_ARTIFACT_BYTES = 2_097_152
 SCHEMA_VERSION = 2
 INTERNAL_DELETION_RESOURCE = "tacua.internal-deletion-job@1.0.0"
 SCOPE_POLICY_CONTRACT = "tacua.capture-scope-policy@1.0.0"
@@ -235,6 +244,7 @@ class PilotBackend:
             != config.transport_configuration_digest
         ):
             raise ValueError("build_identity transport configuration differs from deployment")
+        validate_approved_handoff_config(config)
         if not all(
             1 <= value <= 30
             for value in (
@@ -257,6 +267,11 @@ class PilotBackend:
         self.config = config
         self._registered_build_identity = strict_json_loads(canonical_json(config.build_identity))
         self._registered_build_identity_json = canonical_json(self._registered_build_identity)
+        self._approved_handoff = strict_json_loads(
+            canonical_json(config.approved_handoff)
+        )
+        if not isinstance(self._approved_handoff, dict):  # pragma: no cover - startup validation invariant
+            raise ValueError("approved_handoff configuration is invalid")
         self._admin_secret = bytes(admin_secret)
         self._verifier_key = hmac.new(
             self._admin_secret,
@@ -540,6 +555,7 @@ class PilotBackend:
         self._candidate_store().initialize_schema()
         with self._connect() as conn:
             initialize_evidence_schema(conn)
+            initialize_handoff_schema(conn)
             EvidenceStore(conn, self.derived_evidence_dir).recover_file_journal()
 
     def _candidate_store(self) -> CandidateStore:
@@ -550,11 +566,165 @@ class PilotBackend:
             reviewer_id=self.config.reviewer_id,
             clock=self._clock,
             approval_guard=self._verify_candidate_approval_evidence,
+            generated_insert_guard=self._verify_generated_candidate_publication,
             version_append_guard=self._append_candidate_evidence_version,
         )
 
     def _evidence_store(self, connection: sqlite3.Connection) -> EvidenceStore:
         return EvidenceStore(connection, self.derived_evidence_dir)
+
+    def _handoff_store(self, connection: sqlite3.Connection) -> HandoffStore:
+        return HandoffStore(
+            connection,
+            organization_id=self.config.organization_id,
+            project_id=self.config.project_id,
+        )
+
+    def _verified_candidate_publication_manifest(
+        self,
+        connection: sqlite3.Connection,
+        candidate: dict[str, Any],
+    ) -> tuple[EvidenceStore, dict[str, Any]]:
+        """Recheck the complete session/build/evidence publication boundary.
+
+        Callers invoke this only while their own ``BEGIN IMMEDIATE`` is
+        active.  That makes the checks and the guarded evidence/candidate
+        write one SQLite serialization point, independently of the V1
+        process-wide lock.
+        """
+
+        session = self._require_review_session(
+            connection,
+            candidate["session_id"],
+            require_completed=True,
+        )
+        now = self._now()
+        try:
+            raw_expires = _parse_timestamp(session["raw_media_expires_at"])
+            derived_expires = _parse_timestamp(session["derived_data_expires_at"])
+            scope_raw = session["scope_json"]
+            build_raw = session["build_identity_json"]
+            scope = self._decode_protocol_object(scope_raw)
+            build = self._decode_protocol_object(build_raw)
+            validate(scope)
+            validate(build)
+        except (KeyError, TypeError, ValueError, ContractError) as error:
+            raise ApiError(
+                500,
+                "CANDIDATE_SESSION_BINDING_CORRUPT",
+                "stored candidate session binding failed validation",
+            ) from error
+
+        if raw_expires != derived_expires:
+            raise ApiError(
+                500,
+                "CANDIDATE_SESSION_BINDING_CORRUPT",
+                "stored candidate session retention boundaries differ",
+            )
+        if derived_expires <= now:
+            raise ApiError(
+                410,
+                "SESSION_RETENTION_EXPIRED",
+                "session retention has expired",
+            )
+        if connection.execute(
+            "SELECT 1 FROM pending_deletions WHERE session_id = ?",
+            (candidate["session_id"],),
+        ).fetchone() is not None:
+            raise ApiError(410, "SESSION_DELETED", "session deletion is in progress")
+
+        scope_text = scope_raw.decode("utf-8") if isinstance(scope_raw, bytes) else scope_raw
+        build_text = build_raw.decode("utf-8") if isinstance(build_raw, bytes) else build_raw
+        if (
+            not isinstance(scope_text, str)
+            or not isinstance(build_text, str)
+            or canonical_json(scope) != scope_text
+            or canonical_json(build) != build_text
+            or canonical_json(build) != self._registered_build_identity_json
+            or scope["scope_digest"] != session["scope_digest"]
+            or build["build_identity_digest"] != session["build_identity_digest"]
+            or candidate["organization_id"] != self.config.organization_id
+            or candidate["project_id"] != self.config.project_id
+            or candidate["build_id"] != self.config.build_id
+            or candidate["build_identity_digest"] != self.config.build_identity_digest
+            or candidate["build_id"] != build["build_id"]
+            or candidate["build_identity_digest"] != build["build_identity_digest"]
+            or scope["organization_id"] != candidate["organization_id"]
+            or scope["project_id"] != candidate["project_id"]
+            or scope["application_id"] != self.config.application_id
+            or scope["build_id"] != candidate["build_id"]
+            or scope["build_identity_digest"] != candidate["build_identity_digest"]
+        ):
+            raise ApiError(
+                500,
+                "CANDIDATE_SESSION_BINDING_CORRUPT",
+                "stored candidate session binding changed",
+            )
+
+        evidence = self._evidence_store(connection)
+        manifest = evidence.get_manifest(**self._candidate_binding(candidate))
+        if (
+            manifest["organization_id"] != candidate["organization_id"]
+            or manifest["project_id"] != candidate["project_id"]
+            or manifest["session_id"] != candidate["session_id"]
+            or manifest["manifest_id"]
+            != candidate["evidence_manifest"]["manifest_id"]
+            or manifest["manifest_digest"]
+            != candidate["evidence_manifest"]["manifest_digest"]
+            or {item["evidence_id"] for item in manifest["items"]}
+            != set(candidate["evidence_manifest"]["evidence_ids"])
+        ):
+            raise ApiError(
+                409,
+                "CANDIDATE_EVIDENCE_MISMATCH",
+                "candidate evidence binding changed during publication",
+            )
+        return evidence, manifest
+
+    def _verify_generated_candidate_publication(
+        self,
+        connection: sqlite3.Connection,
+        candidate: dict[str, Any],
+    ) -> None:
+        """Final fail-closed check inside the generated-head transaction."""
+
+        evidence, manifest = self._verified_candidate_publication_manifest(
+            connection, candidate
+        )
+        keyframe_ids = [
+            item["evidence_id"]
+            for item in manifest["items"]
+            if item["evidence_type"] == "media.keyframe"
+            and item["availability"] == "available"
+        ]
+        if not keyframe_ids:
+            raise ApiError(
+                409,
+                "CANDIDATE_SCREENSHOT_REQUIRED",
+                "candidate publication requires a bound available screenshot",
+            )
+        evidence.get_verified_keyframes_for_approval(
+            evidence_ids=keyframe_ids,
+            **self._candidate_binding(candidate),
+        )
+
+    def _candidate_preview_transaction_guard(
+        self, candidate: dict[str, Any]
+    ) -> Callable[[sqlite3.Connection], None]:
+        """Create a closed guard from an already contract-validated candidate.
+
+        ``EvidenceStore.put_preview`` receives this callback explicitly; none
+        of the preview/request fields can replace or influence the callback.
+        """
+
+        snapshot = strict_json_loads(canonical_json(candidate))
+        if not isinstance(snapshot, dict):  # pragma: no cover - validated caller invariant
+            raise ApiError(500, "CANDIDATE_STORAGE_CORRUPT", "candidate snapshot is invalid")
+
+        def guard(connection: sqlite3.Connection) -> None:
+            self._verified_candidate_publication_manifest(connection, snapshot)
+
+        return guard
 
     def _verify_candidate_approval_evidence(
         self,
@@ -572,10 +742,11 @@ class PilotBackend:
                 "CANDIDATE_EVIDENCE_MISMATCH",
                 "candidate evidence membership changed",
             )
+        referenced_ids = TICKET_CONTRACT.content_evidence_refs(parent["content"])
         keyframe_ids = [
             item["evidence_id"]
             for item in manifest["items"]
-            if item["evidence_id"] in candidate_ids
+            if item["evidence_id"] in referenced_ids
             and item["evidence_type"] == "media.keyframe"
             and item["availability"] == "available"
         ]
@@ -583,7 +754,7 @@ class PilotBackend:
             raise CandidateStoreError(
                 409,
                 "CANDIDATE_SCREENSHOT_REQUIRED",
-                "approval requires a bound available screenshot",
+                "approval requires an available screenshot referenced by ticket content",
             )
         verified = evidence.get_verified_keyframes_for_approval(
             evidence_ids=keyframe_ids,
@@ -624,6 +795,70 @@ class PilotBackend:
         binding = self._candidate_binding(candidate)
         binding.pop("manifest_digest")
         evidence.put_manifest(manifest=manifest, **binding)
+        if candidate["state"] == "approved":
+            _, approved_manifest = self._verified_candidate_publication_manifest(
+                connection, candidate
+            )
+            self._persist_approved_candidate_handoff(
+                connection,
+                candidate=candidate,
+                evidence_manifest=approved_manifest,
+            )
+
+    def _persist_approved_candidate_handoff(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        candidate: dict[str, Any],
+        evidence_manifest: dict[str, Any],
+    ) -> None:
+        """Export and store a handoff in the candidate approval transaction."""
+
+        store = self._handoff_store(connection)
+        try:
+            try:
+                current = store.get(candidate["candidate_id"])
+            except HandoffStoreError as error:
+                if error.code != "HANDOFF_NOT_FOUND":
+                    raise
+                current = None
+            session = self._require_review_session(
+                connection,
+                candidate["session_id"],
+                require_completed=True,
+            )
+            sdk_build = self._decode_protocol_object(session["build_identity_json"])
+            approved_at = _parse_timestamp(candidate["approval"]["approved_at"])
+            artifacts = export_approved_candidate(
+                candidate=candidate,
+                evidence_manifest=evidence_manifest,
+                sdk_build_identity=sdk_build,
+                handoff_build_identity=self._approved_handoff["build_identity"],
+                authority=self._approved_handoff["authority"],
+                registry_revision=self._approved_handoff["registry_revision"],
+                checked_at=max(approved_at, self._now()),
+                supersedes_handoff_digest=(
+                    None if current is None else current.handoff_digest
+                ),
+            )
+            store.put(candidate, artifacts)
+        except HandoffStoreError as error:
+            status = 409 if error.code in {
+                "HANDOFF_VERSION_COLLISION",
+                "HANDOFF_SUPERSESSION_MISMATCH",
+                "HANDOFF_STORAGE_CONFLICT",
+            } else 500
+            raise CandidateStoreError(
+                status,
+                error.code,
+                "approved handoff could not be persisted",
+            ) from error
+        except (HandoffExportError, sqlite3.Error) as error:
+            raise CandidateStoreError(
+                500,
+                "HANDOFF_EXPORT_FAILED",
+                "approved handoff could not be exported",
+            ) from error
 
     @staticmethod
     def _fsync_directory(path: Path) -> None:
@@ -2088,6 +2323,9 @@ class PilotBackend:
                        (SELECT COUNT(*) FROM diagnostics WHERE session_id = ?) +
                        (SELECT COUNT(*) FROM completions WHERE session_id = ?) +
                        (SELECT COUNT(*) FROM jobs WHERE session_id = ?) +
+                       (SELECT 2 * COUNT(*) FROM approved_handoffs
+                          WHERE organization_id = ? AND project_id = ?
+                            AND session_id = ?) +
                        (SELECT COUNT(*) FROM tacua_evidence_preview_revisions
                           WHERE manifest_row_id IN (
                               SELECT manifest_row_id FROM tacua_evidence_manifests
@@ -2098,6 +2336,9 @@ class PilotBackend:
                         session_id,
                         session_id,
                         session_id,
+                        session_id,
+                        self.config.organization_id,
+                        self.config.project_id,
                         session_id,
                         self.config.organization_id,
                         self.config.project_id,
@@ -2790,6 +3031,9 @@ class PilotBackend:
                     manifest=evidence_manifest,
                     **binding_without_digest,
                 )
+                preview_transaction_guard = self._candidate_preview_transaction_guard(
+                    candidate
+                )
                 for preview in previews:
                     if not isinstance(preview, dict) or set(preview) != {
                         "evidence_id",
@@ -2804,7 +3048,16 @@ class PilotBackend:
                             "INVALID_CANDIDATE_PREVIEWS",
                             "candidate preview fields are invalid",
                         )
-                    evidence.put_preview(**binding, **preview)
+                    evidence.put_preview(
+                        evidence_id=preview["evidence_id"],
+                        preview_revision_id=preview["preview_revision_id"],
+                        content_type=preview["content_type"],
+                        size_bytes=preview["size_bytes"],
+                        content_digest=preview["content_digest"],
+                        body=preview["body"],
+                        transaction_guard=preview_transaction_guard,
+                        **binding,
+                    )
             except EvidenceDomainError as error:
                 self._raise_evidence_error(error)
         try:
@@ -2847,6 +3100,55 @@ class PilotBackend:
                 candidate = self._candidate_from_connection(connection, candidate_id, version)
                 self._require_review_session(connection, candidate["session_id"])
                 return candidate
+
+    def get_candidate_handoff(
+        self,
+        candidate_id: str,
+        version: int | None = None,
+    ) -> StoredHandoff:
+        _require_id(candidate_id, "candidate_id")
+        if version is not None and (
+            isinstance(version, bool) or not isinstance(version, int) or version < 1
+        ):
+            raise ApiError(400, "INVALID_CANDIDATE_VERSION", "candidate version is invalid")
+        with self._lock:
+            self._sweep_before_review_access()
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    handoff = self._handoff_store(connection).get(
+                        candidate_id, version
+                    )
+                except HandoffStoreError as error:
+                    if error.code == "HANDOFF_NOT_FOUND":
+                        raise ApiError(
+                            404,
+                            "HANDOFF_NOT_FOUND",
+                            "approved handoff was not found",
+                        ) from error
+                    raise ApiError(
+                        500,
+                        "HANDOFF_STORAGE_CORRUPT",
+                        "stored approved handoff failed validation",
+                    ) from error
+                candidate = self._candidate_from_connection(
+                    connection,
+                    candidate_id,
+                    handoff.candidate_version,
+                )
+                self._require_review_session(connection, candidate["session_id"])
+                if (
+                    candidate["state"] != "approved"
+                    or candidate["candidate_digest"] != handoff.candidate_digest
+                    or len(handoff.json_bytes) > MAX_HANDOFF_ARTIFACT_BYTES
+                    or len(handoff.markdown_bytes) > MAX_HANDOFF_ARTIFACT_BYTES
+                ):
+                    raise ApiError(
+                        500,
+                        "HANDOFF_STORAGE_CORRUPT",
+                        "stored approved handoff differs from its candidate",
+                    )
+                return handoff
 
     def _candidate_diagnostic_events(
         self,

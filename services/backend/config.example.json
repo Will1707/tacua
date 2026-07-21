@@ -28,6 +28,58 @@
     },
     "transport_configuration_digest": "sha256:c247c8dfdd0a21d4410748aa9f847d026008c7a0c3944f1a54a1183f1e67b452"
   },
+  "approved_handoff": {
+    "build_identity": {
+      "contract_version": "tacua.build-identity@1.0.0",
+      "media_type": "application/vnd.tacua.build-identity+json;version=1.0.0",
+      "organization_id": "org_example",
+      "project_id": "project_example",
+      "build_id": "build_example",
+      "mobile": {
+        "platform": "ios",
+        "application_id": "com.example.app",
+        "app_version": "1.0.0",
+        "build_number": "1",
+        "distribution": "testflight",
+        "source": {
+          "repository_id": "repo_example_mobile",
+          "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "dirty": false
+        },
+        "native_binary_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "backend": {
+        "availability": "unavailable",
+        "environment": "self-hosted-example",
+        "deployment_id": null,
+        "image_digest": null,
+        "deployed_at": null,
+        "sources": [],
+        "unavailable_reason": "not_deployed"
+      },
+      "sdk": {
+        "package_name": "@tacua/mobile-sdk",
+        "package_version": "0.1.0",
+        "source_revision": "cccccccccccccccccccccccccccccccccccccccc",
+        "capture_schema_version": "tacua.sdk-evidence@1.0.0",
+        "configuration_digest": "sha256:c247c8dfdd0a21d4410748aa9f847d026008c7a0c3944f1a54a1183f1e67b452"
+      },
+      "build_identity_digest": "sha256:354850f0230238edeaa9a125ddc7abadb59cce291036722124be9bcd094e9bc9"
+    },
+    "authority": {
+      "purpose": "implement_approved_ticket",
+      "allowed_repositories": [
+        "repo_example_mobile"
+      ],
+      "read_authorized_evidence": true,
+      "modify_code": true,
+      "run_tests": true,
+      "external_writes": false,
+      "merge": false,
+      "deploy": false
+    },
+    "registry_revision": "registry_initial"
+  },
   "consent_contract": "tacua.consent-v1",
   "backend_origin": "https://qa.example.com",
   "transport_policy_version": "tacua.sdk-transport@1.0.0",

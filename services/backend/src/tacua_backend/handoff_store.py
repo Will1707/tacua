@@ -10,7 +10,12 @@ import sqlite3
 from typing import Any
 
 from .candidate_domain import ContractError as CandidateContractError, TICKET_CONTRACT
-from .handoff_export import HANDOFF, HandoffArtifacts, map_candidate_ticket
+from .handoff_export import (
+    HANDOFF,
+    HandoffArtifacts,
+    map_candidate_ticket,
+    map_source_candidate,
+)
 
 
 class HandoffStoreError(ValueError):
@@ -141,6 +146,7 @@ class HandoffStore:
             or candidate["project_id"] != self.project_id
             or handoff["organization_id"] != self.organization_id
             or handoff["project_id"] != self.project_id
+            or handoff["source_candidate"] != map_source_candidate(candidate)
             or handoff["ticket"] != expected_ticket
             or handoff["build_identity"]["build_id"] != candidate["build_id"]
             or handoff["evidence_manifest"]["session_id"]
@@ -384,6 +390,10 @@ class HandoffStore:
             or self._bytes_digest(stored.markdown_bytes) != stored.markdown_digest
             or document["handoff_digest"] != stored.handoff_digest
             or row["candidate_digest"] != candidate["candidate_digest"]
+            or row["candidate_digest"]
+            != document["source_candidate"]["candidate_digest"]
+            or row["candidate_json"]
+            != document["source_candidate"]["canonical_json"]
             or row["candidate_id"] != document["ticket"]["ticket_id"]
             or row["candidate_version"] != document["ticket"]["ticket_version"]
             or row["organization_id"] != document["organization_id"]

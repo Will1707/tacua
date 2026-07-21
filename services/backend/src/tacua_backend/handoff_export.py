@@ -162,6 +162,19 @@ def map_candidate_ticket(candidate: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def map_source_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Bind the handoff to the exact canonical approved candidate snapshot."""
+
+    return {
+        "contract_version": candidate["contract_version"],
+        "candidate_id": candidate["candidate_id"],
+        "candidate_version": candidate["candidate_version"],
+        "candidate_digest": candidate["candidate_digest"],
+        "candidate_content_digest": candidate["candidate_content_digest"],
+        "canonical_json": TICKET_CONTRACT.canonical_json(candidate),
+    }
+
+
 def _map_evidence(
     candidate: dict[str, Any], manifest: dict[str, Any]
 ) -> dict[str, Any]:
@@ -313,10 +326,11 @@ def export_approved_candidate(
     _validate_build_mapping(candidate, sdk_build_identity, handoff_build_identity)
 
     handoff = {
-        "contract_version": "tacua.approved-handoff@1.0.0",
-        "media_type": "application/vnd.tacua.approved-handoff+json;version=1.0.0",
+        "contract_version": "tacua.approved-handoff@1.1.0",
+        "media_type": "application/vnd.tacua.approved-handoff+json;version=1.1.0",
         "organization_id": candidate["organization_id"],
         "project_id": candidate["project_id"],
+        "source_candidate": map_source_candidate(candidate),
         "ticket": map_candidate_ticket(candidate),
         "build_identity": copy.deepcopy(handoff_build_identity),
         "evidence_manifest": _map_evidence(candidate, evidence_manifest),

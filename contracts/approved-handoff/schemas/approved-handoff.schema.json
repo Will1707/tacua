@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://tacua.invalid/schemas/approved-handoff/1.0.0/approved-handoff.schema.json",
+  "$id": "https://tacua.invalid/schemas/approved-handoff/1.1.0/approved-handoff.schema.json",
   "$comment": "SPDX-License-Identifier: Apache-2.0",
   "title": "Tacua approved ticket coding-agent handoff",
   "type": "object",
@@ -10,6 +10,7 @@
     "media_type",
     "organization_id",
     "project_id",
+    "source_candidate",
     "ticket",
     "build_identity",
     "evidence_manifest",
@@ -19,10 +20,11 @@
     "handoff_digest"
   ],
   "properties": {
-    "contract_version": { "const": "tacua.approved-handoff@1.0.0" },
-    "media_type": { "const": "application/vnd.tacua.approved-handoff+json;version=1.0.0" },
+    "contract_version": { "const": "tacua.approved-handoff@1.1.0" },
+    "media_type": { "const": "application/vnd.tacua.approved-handoff+json;version=1.1.0" },
     "organization_id": { "$ref": "#/$defs/id" },
     "project_id": { "$ref": "#/$defs/id" },
+    "source_candidate": { "$ref": "#/$defs/sourceCandidate" },
     "ticket": { "$ref": "#/$defs/ticket" },
     "build_identity": { "$ref": "build-identity.schema.json" },
     "evidence_manifest": { "$ref": "evidence-manifest.schema.json" },
@@ -48,6 +50,26 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 4096
+    },
+    "sourceCandidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "candidate_id",
+        "candidate_version",
+        "candidate_digest",
+        "candidate_content_digest",
+        "canonical_json"
+      ],
+      "properties": {
+        "contract_version": { "const": "tacua.ticket-candidate@1.0.0" },
+        "candidate_id": { "$ref": "#/$defs/id" },
+        "candidate_version": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "candidate_digest": { "$ref": "#/$defs/digest" },
+        "candidate_content_digest": { "$ref": "#/$defs/digest" },
+        "canonical_json": { "type": "string", "minLength": 2, "maxLength": 1048575 }
+      }
     },
     "claim": {
       "type": "object",

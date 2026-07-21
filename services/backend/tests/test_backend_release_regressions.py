@@ -287,7 +287,7 @@ class BackendReleaseRegressionTests(BackendHarness):
 
 
 class BackendContainerRegressionTests(unittest.TestCase):
-    def test_image_contains_the_runtime_ticket_candidate_contract(self) -> None:
+    def test_image_contains_runtime_review_and_handoff_contracts(self) -> None:
         repository = Path(__file__).resolve().parents[3]
         dockerfile = (repository / "services/backend/Dockerfile").read_text(
             encoding="utf-8"
@@ -296,10 +296,11 @@ class BackendContainerRegressionTests(unittest.TestCase):
             repository / "services/backend/Dockerfile.dockerignore"
         ).read_text(encoding="utf-8")
 
-        for suffix in ("src/", "schemas/"):
-            contract_path = f"contracts/ticket-candidate/{suffix}"
-            self.assertIn(f"COPY --chown=root:root {contract_path}", dockerfile)
-            self.assertIn(f"!{contract_path}", dockerignore)
+        for contract in ("ticket-candidate", "approved-handoff"):
+            for suffix in ("src/", "schemas/"):
+                contract_path = f"contracts/{contract}/{suffix}"
+                self.assertIn(f"COPY --chown=root:root {contract_path}", dockerfile)
+                self.assertIn(f"!{contract_path}", dockerignore)
 
 
 if __name__ == "__main__":

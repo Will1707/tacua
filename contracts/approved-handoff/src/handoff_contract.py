@@ -7,11 +7,13 @@ import copy
 import hashlib
 import html
 import hmac
+import importlib.util
 import json
 import re
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Iterable
 
 
@@ -49,6 +51,29 @@ SECRET_PATTERNS = (
     ),
     re.compile(r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://[^\s/@:]+:[^\s/@]+@"),
 )
+
+
+def _load_ticket_candidate_contract() -> ModuleType:
+    contracts_root = Path(__file__).resolve().parents[2]
+    module_path = (
+        contracts_root
+        / "ticket-candidate"
+        / "src"
+        / "ticket_candidate_contract.py"
+    )
+    if not module_path.is_file():
+        raise RuntimeError("Tacua ticket-candidate validator is unavailable")
+    specification = importlib.util.spec_from_file_location(
+        "tacua_handoff_ticket_candidate_contract", module_path
+    )
+    if specification is None or specification.loader is None:
+        raise RuntimeError("Tacua ticket-candidate validator cannot be loaded")
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
+TICKET_CANDIDATE = _load_ticket_candidate_contract()
 
 
 class ContractError(ValueError):
@@ -96,6 +121,7 @@ def approval_subject(handoff: dict[str, Any]) -> dict[str, Any]:
         "contract_version": handoff["contract_version"],
         "organization_id": handoff["organization_id"],
         "project_id": handoff["project_id"],
+        "source_candidate": copy.deepcopy(handoff["source_candidate"]),
         "ticket": ticket,
         "build_identity_digest": handoff["build_identity"]["build_identity_digest"],
         "evidence_manifest_digest": handoff["evidence_manifest"]["evidence_manifest_digest"],
@@ -371,6 +397,294 @@ def _validate_text_and_secrets(value: Any) -> None:
                     raise ContractError("SECRET_VALUE_DETECTED", path, "credential-like value is forbidden")
 
 
+def validate_authority(authority: dict[str, Any]) -> None:
+    """Validate a standalone approved-handoff authority object."""
+
+    schema, schema_path = SCHEMAS.load("approved-handoff.schema.json")
+    errors = SCHEMAS._errors(
+        authority,
+        schema["$defs"]["authority"],
+        "$.authority",
+        schema,
+        schema_path,
+    )
+    if errors:
+        raise errors[0]
+    _validate_text_and_secrets(authority)
+
+
+def _reject_source_candidate_duplicate_keys(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ContractError(
+                "SOURCE_CANDIDATE_DUPLICATE_KEY",
+                "$.source_candidate.canonical_json",
+                "embedded candidate JSON contains a duplicate object key",
+            )
+        result[key] = value
+    return result
+
+
+def _parse_source_candidate_integer(value: str) -> int:
+    parsed = int(value)
+    if abs(parsed) > MAX_SAFE_INTEGER:
+        raise ContractError(
+            "SOURCE_CANDIDATE_UNSAFE_INTEGER",
+            "$.source_candidate.canonical_json",
+            "embedded candidate integer exceeds the interoperable JSON range",
+        )
+    return parsed
+
+
+def _reject_source_candidate_float(_: str) -> Any:
+    raise ContractError(
+        "SOURCE_CANDIDATE_FLOAT_FORBIDDEN",
+        "$.source_candidate.canonical_json",
+        "embedded candidate JSON permits integers, not floats",
+    )
+
+
+def _reject_source_candidate_constant(_: str) -> Any:
+    raise ContractError(
+        "SOURCE_CANDIDATE_JSON_INVALID",
+        "$.source_candidate.canonical_json",
+        "embedded candidate JSON contains a non-JSON numeric constant",
+    )
+
+
+def parse_source_candidate(source: dict[str, Any]) -> dict[str, Any]:
+    """Strictly parse and validate the exact canonical approved candidate."""
+
+    raw = source["canonical_json"]
+    try:
+        candidate = json.loads(
+            raw,
+            object_pairs_hook=_reject_source_candidate_duplicate_keys,
+            parse_int=_parse_source_candidate_integer,
+            parse_float=_reject_source_candidate_float,
+            parse_constant=_reject_source_candidate_constant,
+        )
+    except ContractError:
+        raise
+    except (json.JSONDecodeError, TypeError, ValueError) as error:
+        raise ContractError(
+            "SOURCE_CANDIDATE_JSON_INVALID",
+            "$.source_candidate.canonical_json",
+            "embedded candidate is not valid JSON",
+        ) from error
+    _require(
+        isinstance(candidate, dict),
+        "SOURCE_CANDIDATE_ROOT_TYPE",
+        "$.source_candidate.canonical_json",
+        "embedded candidate must be a JSON object",
+    )
+    _validate_text_and_secrets(candidate)
+    _require(
+        canonical_json(candidate) == raw,
+        "SOURCE_CANDIDATE_JSON_NOT_CANONICAL",
+        "$.source_candidate.canonical_json",
+        "embedded candidate must be exact Tacua Canonical JSON without a trailing newline",
+    )
+    try:
+        TICKET_CANDIDATE.validate(candidate)
+    except TICKET_CANDIDATE.ContractError as error:
+        raise ContractError(
+            "SOURCE_CANDIDATE_INVALID",
+            "$.source_candidate.canonical_json",
+            f"ticket-candidate validation failed ({error.code})",
+        ) from error
+
+    for field in (
+        "contract_version",
+        "candidate_id",
+        "candidate_version",
+        "candidate_digest",
+        "candidate_content_digest",
+    ):
+        _require(
+            source[field] == candidate[field],
+            "SOURCE_CANDIDATE_METADATA_MISMATCH",
+            f"$.source_candidate.{field}",
+            "source metadata must exactly mirror the embedded candidate",
+        )
+    _require(
+        candidate["state"] == "approved",
+        "SOURCE_CANDIDATE_NOT_APPROVED",
+        "$.source_candidate.canonical_json",
+        "embedded candidate must be an approved immutable version",
+    )
+    return candidate
+
+
+def _resolved_source_clarification(clarification: dict[str, Any]) -> str | None:
+    if clarification["status"] != "resolved":
+        return None
+    if clarification["resolution_note"]:
+        return clarification["resolution_note"]
+    selected_id = clarification["selected_choice_id"]
+    for choice in clarification["choices"]:
+        if choice["choice_id"] == selected_id:
+            return choice["label"]
+    raise ContractError(
+        "SOURCE_CANDIDATE_CLARIFICATION_INVALID",
+        "$.source_candidate.canonical_json",
+        "resolved clarification has no selected choice",
+    )
+
+
+def _source_step_action(step: dict[str, Any]) -> str:
+    parts = [step["action"]]
+    if step["expected_result"] is not None:
+        parts.append("Expected: " + step["expected_result"])
+    if step["actual_result"] is not None:
+        parts.append("Observed: " + step["actual_result"])
+    return "\n".join(parts)
+
+
+def project_source_candidate_ticket(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Return the deterministic convenience-ticket projection for a source candidate."""
+
+    content = candidate["content"]
+    return {
+        "ticket_id": candidate["candidate_id"],
+        "ticket_version": candidate["candidate_version"],
+        "state": "approved",
+        "title": content["title"],
+        "priority": content["priority"],
+        "summary": content["summary"]["text"],
+        "summary_claim_refs": copy.deepcopy(content["summary"]["claim_refs"]),
+        "claims": copy.deepcopy(content["claims"]),
+        "reproduction": {
+            "preconditions": [
+                item["text"] for item in content["reproduction"]["preconditions"]
+            ],
+            "steps": [
+                {
+                    "step_id": item["step_id"],
+                    "action": _source_step_action(item),
+                    "claim_refs": copy.deepcopy(item["claim_refs"]),
+                    "evidence_refs": copy.deepcopy(item["evidence_refs"]),
+                }
+                for item in content["reproduction"]["steps"]
+            ],
+            "observed_result": content["actual_behavior"]["text"],
+            "expected_result": content["expected_behavior"]["text"],
+            "observed_claim_refs": copy.deepcopy(
+                content["actual_behavior"]["claim_refs"]
+            ),
+            "expected_claim_refs": copy.deepcopy(
+                content["expected_behavior"]["claim_refs"]
+            ),
+            "attempts": content["reproduction"]["attempts"],
+            "reproductions": content["reproduction"]["reproductions"],
+        },
+        "scope": copy.deepcopy(content["scope"]),
+        "acceptance_criteria": [
+            {
+                "criterion_id": item["criterion_id"],
+                "criterion": item["criterion"],
+                "verification": item["verification"],
+            }
+            for item in content["acceptance_criteria"]
+        ],
+        "clarifications": [
+            {
+                "clarification_id": item["clarification_id"],
+                "question": item["question"],
+                "impact": item["impact"],
+                "status": item["status"],
+                "resolution": _resolved_source_clarification(item),
+            }
+            for item in content["clarifications"]
+        ],
+        "ticket_content_digest": "sha256:" + "0" * 64,
+    }
+
+
+def _validate_source_candidate_binding(
+    handoff: dict[str, Any], candidate: dict[str, Any]
+) -> None:
+    ticket = handoff["ticket"]
+    approval = handoff["approval"]
+    candidate_approval = candidate["approval"]
+    for field in ("organization_id", "project_id"):
+        _require(
+            candidate[field] == handoff[field],
+            "SOURCE_CANDIDATE_SCOPE_MISMATCH",
+            f"$.source_candidate.canonical_json.{field}",
+            "embedded candidate and handoff scope differ",
+        )
+    for candidate_field, ticket_field in (
+        ("candidate_id", "ticket_id"),
+        ("candidate_version", "ticket_version"),
+    ):
+        _require(
+            candidate[candidate_field] == ticket[ticket_field],
+            "SOURCE_CANDIDATE_TICKET_MISMATCH",
+            f"$.ticket.{ticket_field}",
+            "convenience ticket does not identify the embedded candidate",
+        )
+    _require(
+        candidate["build_id"] == handoff["build_identity"]["build_id"],
+        "SOURCE_CANDIDATE_BUILD_MISMATCH",
+        "$.build_identity.build_id",
+        "build identity does not identify the embedded candidate build",
+    )
+    _require(
+        candidate["session_id"] == handoff["evidence_manifest"]["session_id"],
+        "SOURCE_CANDIDATE_EVIDENCE_MISMATCH",
+        "$.evidence_manifest.session_id",
+        "evidence session does not identify the embedded candidate session",
+    )
+    _require(
+        candidate["evidence_manifest"]["manifest_id"]
+        == handoff["evidence_manifest"]["manifest_id"],
+        "SOURCE_CANDIDATE_EVIDENCE_MISMATCH",
+        "$.evidence_manifest.manifest_id",
+        "evidence manifest does not identify the embedded candidate manifest",
+    )
+    handoff_evidence_ids = {
+        item["evidence_id"] for item in handoff["evidence_manifest"]["items"]
+    }
+    _require(
+        handoff_evidence_ids == set(candidate_approval["authorized_evidence_ids"]),
+        "SOURCE_CANDIDATE_EVIDENCE_MISMATCH",
+        "$.evidence_manifest.items",
+        "handoff evidence must equal the embedded approval's authorized evidence set",
+    )
+    _require(
+        handoff_evidence_ids <= set(candidate["evidence_manifest"]["evidence_ids"]),
+        "SOURCE_CANDIDATE_EVIDENCE_MISMATCH",
+        "$.evidence_manifest.items",
+        "handoff evidence is absent from the embedded candidate manifest binding",
+    )
+    for field in ("approval_id", "actor_id", "approved_at"):
+        _require(
+            approval[field] == candidate_approval[field],
+            "SOURCE_CANDIDATE_APPROVAL_MISMATCH",
+            f"$.approval.{field}",
+            "handoff approval does not match the embedded candidate approval",
+        )
+    _require(
+        approval["ticket_version"]
+        == candidate_approval["approved_candidate_version"],
+        "SOURCE_CANDIDATE_APPROVAL_MISMATCH",
+        "$.approval.ticket_version",
+        "handoff approval does not bind the embedded approved version",
+    )
+    expected_ticket = project_source_candidate_ticket(candidate)
+    expected_ticket["ticket_content_digest"] = ticket["ticket_content_digest"]
+    _require(
+        ticket == expected_ticket,
+        "SOURCE_CANDIDATE_TICKET_MISMATCH",
+        "$.ticket",
+        "convenience ticket is not the deterministic projection of the embedded candidate",
+    )
+
+
 def parse_timestamp(value: str, path: str) -> datetime:
     try:
         parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
@@ -603,6 +917,7 @@ def _validate_handoff_at_time(
     SCHEMAS.validate(handoff, "approved-handoff.schema.json")
     validate_build_identity(handoff["build_identity"])
     validate_evidence_manifest(handoff["evidence_manifest"])
+    source_candidate = parse_source_candidate(handoff["source_candidate"])
 
     organization_id = handoff["organization_id"]
     project_id = handoff["project_id"]
@@ -831,6 +1146,7 @@ def _validate_handoff_at_time(
             "a superseding handoff must identify a later ticket version",
         )
 
+    _validate_source_candidate_binding(handoff, source_candidate)
     _validate_digest(handoff["handoff_digest"], digest_without(handoff, "handoff_digest"), "$.handoff_digest")
     if executable:
         _require(
@@ -926,6 +1242,7 @@ def render_markdown(handoff: dict[str, Any]) -> str:
     ticket = handoff["ticket"]
     build = handoff["build_identity"]
     manifest = handoff["evidence_manifest"]
+    source_candidate = handoff["source_candidate"]
     lines = [
         "<!-- SPDX-License-Identifier: Apache-2.0 -->",
         "# Tacua approved ticket",
@@ -937,6 +1254,16 @@ def render_markdown(handoff: dict[str, Any]) -> str:
         f"- Build identity digest: `{build['build_identity_digest']}`",
         f"- Evidence manifest digest: `{manifest['evidence_manifest_digest']}`",
         f"- Supersession: `{handoff['supersession']['status']}`",
+        "",
+        "## Exact approved source candidate",
+        "",
+        f"- Candidate/version: `{source_candidate['candidate_id']}` / `{source_candidate['candidate_version']}`",
+        f"- Candidate digest: `{source_candidate['candidate_digest']}`",
+        f"- Candidate content digest: `{source_candidate['candidate_content_digest']}`",
+        "",
+        "The JSON below is the exact canonical approved ticket-candidate source, without an artifact trailing newline.",
+        "",
+        _pre(source_candidate["canonical_json"], "source_candidate.canonical_json"),
         "",
         "## Title",
         "",
@@ -1085,10 +1412,11 @@ def render_markdown(handoff: dict[str, Any]) -> str:
 
     lines.extend(
         [
-            "## Agent authority",
+            "## Structural scope — not execution authority",
             "",
-            "- May read the authorized evidence references, modify code in the listed repositories, and run tests.",
-            "- May not write to external systems, merge, or deploy.",
+            "- This file is not execution authorization. Before acting, obtain and verify a current trusted registry assertion for this exact handoff digest.",
+            "- Only after that independent authorization, the requested scope permits reading the authorized evidence references, modifying code in the listed repositories, and running tests.",
+            "- This structural scope never permits external writes, merge, or deploy.",
             "- Repositories: " + ", ".join(f"`{repo}`" for repo in handoff["authority"]["allowed_repositories"]),
             "",
             "## Canonical JSON",
