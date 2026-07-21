@@ -68,7 +68,11 @@ export default function App(): React.JSX.Element {
 
   const refreshRecovery = useCallback(async () => {
     const sessions = await TacuaCapture.listRecoverableSessions();
-    setRecoverable(sessions);
+    setRecoverable(
+      [...sessions].sort((left, right) =>
+        (right.createdAt ?? '').localeCompare(left.createdAt ?? ''),
+      ),
+    );
     log(`Recovery scan: ${sessions.length} local session(s)`);
   }, [log]);
 
@@ -264,12 +268,27 @@ export default function App(): React.JSX.Element {
             <Text style={styles.body}>No recovery metadata loaded.</Text>
           ) : (
             recoverable.map((session) => (
-              <View key={session.sessionId} style={styles.sessionRow}>
+              <View
+                key={session.sessionId}
+                style={[
+                  styles.sessionRow,
+                  session.state === 'recoverable_partial'
+                    ? styles.actionSession
+                    : null,
+                ]}
+              >
                 <View style={styles.sessionText}>
-                  <Text style={styles.metric}>{session.sessionId}</Text>
+                  <Text style={styles.metric}>
+                    {session.state === 'recoverable_partial'
+                      ? 'Interrupted · action required'
+                      : session.state === 'completed'
+                        ? 'Completed session'
+                        : 'Local session'}
+                  </Text>
                   <Text style={styles.muted}>
                     {session.state} · {session.segmentCount} segment(s)
                   </Text>
+                  <Text style={styles.sessionId}>{session.sessionId}</Text>
                 </View>
                 <View style={styles.sessionActions}>
                   {RESUMABLE_STATES.has(session.state) ? (
@@ -368,6 +387,13 @@ const styles = StyleSheet.create({
   },
   sessionText: { flex: 1 },
   sessionActions: { alignItems: 'flex-end', gap: 4 },
+  actionSession: {
+    backgroundColor: '#24324a',
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingBottom: 10,
+  },
+  sessionId: { color: '#64748b', fontSize: 10 },
   log: {
     color: '#a7f3d0',
     fontSize: 12,
