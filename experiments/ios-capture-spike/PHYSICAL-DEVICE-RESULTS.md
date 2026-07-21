@@ -1,7 +1,7 @@
 # EXP-001 physical-device results
 
-Status: foreground capture, interruption discovery, and verified-partial choice
-proven; resume, deletion, and long-run checks pending
+Status: foreground capture, interruption discovery, verified-partial choice, and
+resume proven; deletion and long-run checks pending
 
 Date: 2026-07-21
 
@@ -84,7 +84,6 @@ The harness now runs recovery discovery automatically on launch. The operator
 explicitly selected `Keep partial`; the manifest transitioned to
 `partial_ready_for_upload` while retaining all 10 verified segments, zero gaps,
 and the stable interruption code. The operation did not upload or delete media.
-Explicit `Resume` and `Delete` validation remains pending.
 
 The first choice attempt exposed a recovery-UI defect: sessions were presented
 oldest-first and primarily identified by opaque IDs, so the operator selected an
@@ -92,6 +91,14 @@ older four-segment partial session. The harness now sorts newest-first and
 highlights `Interrupted · action required` with its segment count. The second
 attempt selected the intended 10-segment session. No data was lost during the
 incorrect selection, but V1 must carry this disambiguation into its recovery UI.
+
+A second interrupted session validated `Resume`. Tacua retained two pre-crash
+segments, resumed at segment index 2, incremented `resumeCount` to 1, and closed
+one explicit `process_resume` gap when new media arrived. Manual stop finalized
+four segments with 2,309 microphone samples and 2,284 app-audio samples in
+total. The terminal state remained `partial`, correctly preserving the original
+interruption code and recovery gap as evidence. Explicit `Delete` validation
+remains pending.
 
 ## Evidence handling
 

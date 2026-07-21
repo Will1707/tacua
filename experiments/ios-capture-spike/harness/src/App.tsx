@@ -31,6 +31,23 @@ function safeMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function recoveryTitle(state: string): string {
+  switch (state) {
+    case 'recoverable_partial':
+      return 'Interrupted · action required';
+    case 'partial_ready_for_upload':
+      return 'Verified partial';
+    case 'partial':
+      return 'Partial session';
+    case 'completed':
+      return 'Completed session';
+    case 'failed_no_verified_segments':
+      return 'Failed session';
+    default:
+      return 'Local session';
+  }
+}
+
 export default function App(): React.JSX.Element {
   const [consented, setConsented] = useState(false);
   const [status, setStatus] = useState<TacuaCapture.CaptureStatus | null>(null);
@@ -279,11 +296,7 @@ export default function App(): React.JSX.Element {
               >
                 <View style={styles.sessionText}>
                   <Text style={styles.metric}>
-                    {session.state === 'recoverable_partial'
-                      ? 'Interrupted · action required'
-                      : session.state === 'completed'
-                        ? 'Completed session'
-                        : 'Local session'}
+                    {recoveryTitle(session.state)}
                   </Text>
                   <Text style={styles.muted}>
                     {session.state} · {session.segmentCount} segment(s)
