@@ -7,11 +7,28 @@ import Foundation
 import ReplayKit
 
 final class SegmentWriter {
+  private typealias FinishCompletion = (Result<CaptureSegment, Error>) -> Void
+
+  private enum FinishState {
+    case notStarted
+    case awaitingWriterCallback
+    case committing
+    case terminal
+  }
+
+  private enum WriterCallbackDecision {
+    case commit
+    case timeout(FinishCompletion)
+    case ignore
+  }
+
   let index: Int
   let startedAtPTS: CMTime
 
   private let partialURL: URL
   private let finalURL: URL
+  private let sidecarURL: URL
+  private let stagedSidecarURL: URL
   private let writer: AVAssetWriter
   private let videoInput: AVAssetWriterInput
   private let appAudioInput: AVAssetWriterInput
@@ -33,9 +50,13 @@ final class SegmentWriter {
   private var finished = false
   private(set) var fatalError: Error?
   private let finishLock = NSLock()
-  private var finishCompletionDelivered = false
-  private var finishCompletion: ((Result<CaptureSegment, Error>) -> Void)?
+  private var finishState = FinishState.notStarted
+  private var finishDeadlineUptimeSeconds: Double?
+  private var finishCompletion: FinishCompletion?
   private var finishWatchdog: DispatchWorkItem?
+#if TACUA_CAPTURE_FAULT_INJECTION
+  private var injectedFinishBehavior = TacuaCaptureInjectedFinishBehavior.none
+#endif
 
   init(
     index: Int,
@@ -63,6 +84,10 @@ final class SegmentWriter {
     let stem = String(format: "segment-%06d", index)
     partialURL = directory.appendingPathComponent("\(stem).partial.mov")
     finalURL = directory.appendingPathComponent("\(stem).mov")
+    sidecarURL = finalURL
+      .deletingPathExtension()
+      .appendingPathExtension("segment.json")
+    stagedSidecarURL = directory.appendingPathComponent("\(stem).segment.json.partial")
 
     let fileManager = FileManager.default
     if fileManager.fileExists(atPath: partialURL.path) {
@@ -70,6 +95,12 @@ final class SegmentWriter {
     }
     if fileManager.fileExists(atPath: finalURL.path) {
       throw TacuaCaptureSpikeError.writerCreation("A finalized segment already exists at index \(index).")
+    }
+    if fileManager.fileExists(atPath: sidecarURL.path) {
+      throw TacuaCaptureSpikeError.writerCreation("A finalized segment sidecar already exists at index \(index).")
+    }
+    if fileManager.fileExists(atPath: stagedSidecarURL.path) {
+      try fileManager.removeItem(at: stagedSidecarURL)
     }
 
     writer = try AVAssetWriter(outputURL: partialURL, fileType: .mov)
@@ -119,6 +150,13 @@ final class SegmentWriter {
   }
 
   var latestPTS: CMTime { lastPTS }
+
+#if TACUA_CAPTURE_FAULT_INJECTION
+  func configureFaultInjection(_ behavior: TacuaCaptureInjectedFinishBehavior) {
+    precondition(!finished, "Writer fault injection must be configured before finalization.")
+    injectedFinishBehavior = behavior
+  }
+#endif
 
   func makeHeldVideoSample(at presentationTimeStamp: CMTime) throws -> CMSampleBuffer {
     guard presentationTimeStamp.isValid,
@@ -250,36 +288,88 @@ final class SegmentWriter {
   }
 
   func finish(completion: @escaping (Result<CaptureSegment, Error>) -> Void) {
-    guard !finished else {
+    let watchdog = DispatchWorkItem { [self] in
+      timeoutFinalization()
+    }
+
+    finishLock.lock()
+    guard case .notStarted = finishState else {
+      finishLock.unlock()
       completion(.failure(TacuaCaptureSpikeError.writerFailed("Segment \(index) was finalized twice.")))
       return
     }
     finished = true
+    finishState = .awaitingWriterCallback
+    finishDeadlineUptimeSeconds = ProcessInfo.processInfo.systemUptime
+      + TacuaCapturePolicy.writerFinalizationWatchdogSeconds
     finishCompletion = completion
+    finishWatchdog = watchdog
+    finishLock.unlock()
 
     videoInput.markAsFinished()
     appAudioInput.markAsFinished()
     microphoneInput.markAsFinished()
 
-    let watchdog = DispatchWorkItem { [self] in
-      writer.cancelWriting()
-      deliverFinish(.failure(TacuaCaptureSpikeError.writerTimeout))
-    }
-    finishWatchdog = watchdog
     DispatchQueue.global(qos: .utility).asyncAfter(
       deadline: .now() + TacuaCapturePolicy.writerFinalizationWatchdogSeconds,
       execute: watchdog
     )
 
-    writer.finishWriting { [self] in
-      guard writer.status == .completed else {
-        let code = writer.error?.tacuaStableCode ?? "AVAssetWriter:\(writer.status.rawValue)"
-        deliverFinish(
-          .failure(TacuaCaptureSpikeError.writerFailed("Segment \(index) failed to finalize (\(code))."))
+#if TACUA_CAPTURE_FAULT_INJECTION
+    switch injectedFinishBehavior {
+    case .failure:
+      failFinalization(
+        TacuaCaptureSpikeError.writerFailed(
+          "The QA harness injected a bounded writer-finalization failure for segment \(index)."
         )
-        return
+      )
+      return
+    case .timeout:
+      // Let AVAssetWriter finish for real, but delay delivery of its callback
+      // until after the production deadline. The watchdog must win, and the
+      // actual late callback must be unable to publish media or a sidecar.
+      let delayedCallbackDeadline = DispatchTime.now()
+        + TacuaCapturePolicy.writerFinalizationWatchdogSeconds + 1
+      writer.finishWriting { [self] in
+        DispatchQueue.global(qos: .utility).asyncAfter(
+          deadline: delayedCallbackDeadline
+        ) { [self] in
+          handleWriterCompletion()
+        }
       }
+      return
+    case .none:
+      break
+    }
+#endif
 
+    writer.finishWriting { [self] in
+      handleWriterCompletion()
+    }
+  }
+
+  private func handleWriterCompletion() {
+    switch claimWriterCallback() {
+    case .ignore:
+      return
+    case .timeout(let completion):
+      cancelWriterIfActive()
+      cleanupFailedCommitArtifacts()
+      completion(.failure(TacuaCaptureSpikeError.writerTimeout))
+      return
+    case .commit:
+      break
+    }
+
+    guard writer.status == .completed else {
+      let code = writer.error?.tacuaStableCode ?? "AVAssetWriter:\(writer.status.rawValue)"
+      failFinalization(
+        TacuaCaptureSpikeError.writerFailed("Segment \(index) failed to finalize (\(code)).")
+      )
+      return
+    }
+
+    DispatchQueue.global(qos: .utility).async { [self] in
       do {
         let fileManager = FileManager.default
         let attributes = try fileManager.attributesOfItem(atPath: partialURL.path)
@@ -304,47 +394,177 @@ final class SegmentWriter {
           droppedMicrophoneSamples: droppedMicrophoneSamples
         )
 
-        let sidecarURL = finalURL
-          .deletingPathExtension()
-          .appendingPathExtension("segment.json")
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let sidecar = try encoder.encode(segment)
-        try sidecar.write(to: sidecarURL, options: [.atomic, .completeFileProtectionUnlessOpen])
-
-        try fileManager.moveItem(at: partialURL, to: finalURL)
+        try sidecar.write(
+          to: stagedSidecarURL,
+          options: [.atomic, .completeFileProtectionUnlessOpen]
+        )
         try fileManager.setAttributes(
           [.protectionKey: FileProtectionType.completeUnlessOpen],
-          ofItemAtPath: finalURL.path
+          ofItemAtPath: partialURL.path
         )
 
-        deliverFinish(.success(segment))
+        publishPreparedSegment(segment)
       } catch {
-        deliverFinish(
-          .failure(
-            TacuaCaptureSpikeError.writerFailed(
-              "Segment \(index) could not commit its verified media and sidecar."
-            )
+        failFinalization(
+          TacuaCaptureSpikeError.writerFailed(
+            "Segment \(index) could not commit its verified media and sidecar."
           )
         )
       }
     }
   }
 
-  private func deliverFinish(_ result: Result<CaptureSegment, Error>) {
-    let completion: ((Result<CaptureSegment, Error>) -> Void)?
+  private func claimWriterCallback() -> WriterCallbackDecision {
     finishLock.lock()
-    if finishCompletionDelivered {
-      completion = nil
+    defer { finishLock.unlock() }
+
+    guard case .awaitingWriterCallback = finishState else { return .ignore }
+    guard !finishDeadlineHasElapsedLocked() else {
+      guard let completion = takeTerminalCompletionLocked() else { return .ignore }
+      return .timeout(completion)
+    }
+    finishState = .committing
+    return .commit
+  }
+
+  /// Publishes the verified pair under the same lock used by the watchdog.
+  /// The sidecar is the recovery commit marker, so it is moved first and the
+  /// old sidecar-plus-partial crash window remains recoverable. If filesystem
+  /// operations cross the monotonic deadline, both trusted names are removed
+  /// before the timeout is delivered.
+  private func publishPreparedSegment(_ segment: CaptureSegment) {
+    var completion: FinishCompletion?
+    var result: Result<CaptureSegment, Error>?
+    var shouldCancelWriter = false
+
+    finishLock.lock()
+    guard case .committing = finishState else {
+      finishLock.unlock()
+      cleanupFailedCommitArtifacts()
+      return
+    }
+
+    if finishDeadlineHasElapsedLocked() {
+      completion = takeTerminalCompletionLocked()
+      result = .failure(TacuaCaptureSpikeError.writerTimeout)
+      shouldCancelWriter = true
     } else {
-      finishCompletionDelivered = true
-      finishWatchdog?.cancel()
-      finishWatchdog = nil
-      completion = finishCompletion
-      finishCompletion = nil
+      do {
+        let fileManager = FileManager.default
+        try fileManager.moveItem(at: stagedSidecarURL, to: sidecarURL)
+        try fileManager.moveItem(at: partialURL, to: finalURL)
+
+        if finishDeadlineHasElapsedLocked() {
+          cleanupFailedCommitArtifacts()
+          completion = takeTerminalCompletionLocked()
+          result = .failure(TacuaCaptureSpikeError.writerTimeout)
+          shouldCancelWriter = true
+        } else {
+          completion = takeTerminalCompletionLocked()
+          result = .success(segment)
+        }
+      } catch {
+        cleanupFailedCommitArtifacts()
+        completion = takeTerminalCompletionLocked()
+        if finishDeadlineHasElapsedLocked() {
+          result = .failure(TacuaCaptureSpikeError.writerTimeout)
+          shouldCancelWriter = true
+        } else {
+          result = .failure(
+            TacuaCaptureSpikeError.writerFailed(
+              "Segment \(index) could not publish its verified media and sidecar."
+            )
+          )
+        }
+      }
     }
     finishLock.unlock()
-    completion?(result)
+
+    guard let completion, let result else {
+      cleanupFailedCommitArtifacts()
+      return
+    }
+    if shouldCancelWriter {
+      cancelWriterIfActive()
+      cleanupFailedCommitArtifacts()
+    }
+    completion(result)
+  }
+
+  private func timeoutFinalization() {
+    finishLock.lock()
+    let completion = takeTerminalCompletionLocked()
+    finishLock.unlock()
+
+    guard let completion else { return }
+    cancelWriterIfActive()
+    cleanupFailedCommitArtifacts()
+    completion(.failure(TacuaCaptureSpikeError.writerTimeout))
+  }
+
+  private func failFinalization(_ error: Error) {
+    var terminalError = error
+    finishLock.lock()
+    if finishDeadlineHasElapsedLocked() {
+      terminalError = TacuaCaptureSpikeError.writerTimeout
+    }
+    let completion = takeTerminalCompletionLocked()
+    finishLock.unlock()
+
+    guard let completion else {
+      cleanupFailedCommitArtifacts()
+      return
+    }
+    cancelWriterIfActive()
+    cleanupFailedCommitArtifacts()
+    completion(.failure(terminalError))
+  }
+
+  /// Must be called with `finishLock` held.
+  private func takeTerminalCompletionLocked() -> FinishCompletion? {
+    switch finishState {
+    case .awaitingWriterCallback, .committing:
+      finishState = .terminal
+    case .notStarted, .terminal:
+      return nil
+    }
+    finishWatchdog?.cancel()
+    finishWatchdog = nil
+    let completion = finishCompletion
+    finishCompletion = nil
+    return completion
+  }
+
+  /// Must be called with `finishLock` held.
+  private func finishDeadlineHasElapsedLocked() -> Bool {
+    guard let finishDeadlineUptimeSeconds else { return true }
+    return ProcessInfo.processInfo.systemUptime >= finishDeadlineUptimeSeconds
+  }
+
+  private func cancelWriterIfActive() {
+    if writer.status == .unknown || writer.status == .writing {
+      writer.cancelWriting()
+    }
+  }
+
+  /// Removes every filename that recovery could interpret as a trusted
+  /// segment. The AVAssetWriter partial remains available for explicit partial
+  /// accounting, but a timed-out or failed commit can never leave its sidecar.
+  private func cleanupFailedCommitArtifacts() {
+    let fileManager = FileManager.default
+    try? fileManager.removeItem(at: sidecarURL)
+    try? fileManager.removeItem(at: stagedSidecarURL)
+    if fileManager.fileExists(atPath: finalURL.path) {
+      if !fileManager.fileExists(atPath: partialURL.path) {
+        try? fileManager.moveItem(at: finalURL, to: partialURL)
+      }
+      if fileManager.fileExists(atPath: finalURL.path) {
+        try? fileManager.removeItem(at: finalURL)
+      }
+    }
   }
 
   private static func makeAudioInput(channelCount: Int, bitRate: Int) -> AVAssetWriterInput {

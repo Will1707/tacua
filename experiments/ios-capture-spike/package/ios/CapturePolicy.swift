@@ -4,6 +4,9 @@ import Foundation
 
 enum TacuaCapturePolicy {
   static let maximumDurationSeconds: Double = 1_800
+  static let minimumFreeStorageBytes: Int64 = 256 * 1_024 * 1_024
+  static let maximumCatchUpSegmentRotations = 60
+  static let minimumSegmentBoundaryToleranceSeconds: Double = 1e-9
   static let startWatchdogSeconds: Double = 60
   static let stopWatchdogSeconds: Double = 15
   static let writerFinalizationWatchdogSeconds: Double = 15
@@ -26,6 +29,21 @@ enum TacuaCapturePolicy {
   static func hasReachedDeadline(hostUptimeSeconds: Double, deadlineHostUptimeSeconds: Double?) -> Bool {
     guard let deadlineHostUptimeSeconds else { return false }
     return hostUptimeSeconds >= deadlineHostUptimeSeconds
+  }
+
+  static func hasSufficientStorage(
+    availableBytes: Int64?,
+    requiredBytes: Int64 = minimumFreeStorageBytes
+  ) -> Bool {
+    guard let availableBytes, requiredBytes >= 0 else { return false }
+    return availableBytes >= requiredBytes
+  }
+
+  static func shouldAdmitCaptureSample(
+    backgroundGapOpen: Bool,
+    foregroundSignalObserved: Bool
+  ) -> Bool {
+    !backgroundGapOpen || foregroundSignalObserved
   }
 
   static func microphoneStreamHasStalled(
@@ -60,13 +78,76 @@ enum TacuaCapturePolicy {
     incomingPTSSeconds: Double,
     segmentDurationSeconds: Double
   ) -> Double? {
+    segmentRotationBoundaries(
+      startedAtPTSSeconds: startedAtPTSSeconds,
+      incomingPTSSeconds: incomingPTSSeconds,
+      segmentDurationSeconds: segmentDurationSeconds
+    ).first
+  }
+
+  static func segmentRotationBoundaries(
+    startedAtPTSSeconds: Double,
+    incomingPTSSeconds: Double,
+    segmentDurationSeconds: Double
+  ) -> [Double] {
+    guard case .boundaries(let boundaries) = segmentRotationPlan(
+      startedAtPTSSeconds: startedAtPTSSeconds,
+      incomingPTSSeconds: incomingPTSSeconds,
+      segmentDurationSeconds: segmentDurationSeconds
+    ) else { return [] }
+    return boundaries
+  }
+
+  static func segmentRotationPlan(
+    startedAtPTSSeconds: Double,
+    incomingPTSSeconds: Double,
+    segmentDurationSeconds: Double,
+    maximumBoundaryCount: Int = maximumCatchUpSegmentRotations
+  ) -> SegmentRotationPlan {
     guard startedAtPTSSeconds.isFinite,
       incomingPTSSeconds.isFinite,
       segmentDurationSeconds.isFinite,
       segmentDurationSeconds > 0,
-      incomingPTSSeconds - startedAtPTSSeconds >= segmentDurationSeconds
-    else { return nil }
-    return startedAtPTSSeconds + segmentDurationSeconds
+      maximumBoundaryCount > 0
+    else { return .none }
+
+    let elapsedSeconds = incomingPTSSeconds - startedAtPTSSeconds
+    let magnitude = [
+      1,
+      abs(startedAtPTSSeconds),
+      abs(incomingPTSSeconds),
+      abs(segmentDurationSeconds),
+    ].max() ?? 1
+    let toleranceSeconds = max(
+      minimumSegmentBoundaryToleranceSeconds,
+      magnitude * Double.ulpOfOne * 8
+    )
+    guard elapsedSeconds + toleranceSeconds >= segmentDurationSeconds else {
+      return .none
+    }
+
+    let rawBoundaryCount = elapsedSeconds / segmentDurationSeconds
+    let nearestBoundaryCount = rawBoundaryCount.rounded()
+    let nearestElapsedSeconds = nearestBoundaryCount * segmentDurationSeconds
+    let normalizedBoundaryCount = abs(elapsedSeconds - nearestElapsedSeconds) <= toleranceSeconds
+      ? nearestBoundaryCount
+      : rawBoundaryCount.rounded(.down)
+    guard normalizedBoundaryCount.isFinite, normalizedBoundaryCount > 0 else {
+      return .none
+    }
+    guard normalizedBoundaryCount <= Double(maximumBoundaryCount) else {
+      return .excessive
+    }
+
+    let boundaries: [Double] = (1...Int(normalizedBoundaryCount)).compactMap { index -> Double? in
+      let boundary = startedAtPTSSeconds + Double(index) * segmentDurationSeconds
+      guard boundary.isFinite, boundary <= incomingPTSSeconds + toleranceSeconds else { return nil }
+      // A tolerance-admitted exact boundary may be a fraction later than the
+      // incoming Double. Clamp it so the next writer never starts after the
+      // sample that triggered rotation.
+      return min(boundary, incomingPTSSeconds)
+    }
+    return boundaries.isEmpty ? .none : .boundaries(boundaries)
   }
 
   static func recoverySource(finalExists: Bool, partialExists: Bool) -> RecoverySource? {
@@ -83,6 +164,12 @@ enum TacuaCapturePolicy {
     guard recorderStillRecording else { return .finalizeStopped }
     return attempt < maximumAttempts ? .retry : .preserveActiveSession
   }
+}
+
+enum SegmentRotationPlan: Equatable {
+  case none
+  case boundaries([Double])
+  case excessive
 }
 
 enum RecoverySource: Equatable {

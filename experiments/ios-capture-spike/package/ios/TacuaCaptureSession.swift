@@ -12,7 +12,6 @@ final class TacuaCaptureSession {
   typealias TerminalSink = (_ session: TacuaCaptureSession, _ payload: [String: Any]) -> Void
   typealias StopCompletion = (Result<[String: Any], Error>) -> Void
 
-  private static let minimumFreeStorageBytes: Int64 = 256 * 1_024 * 1_024
   private static let resumableStates: Set<String> = [
     "prepared",
     "recording",
@@ -21,7 +20,10 @@ final class TacuaCaptureSession {
     "partial",
     "failed_no_verified_segments",
     "stop_failed_capture_active",
+    "start_cleanup_pending",
   ]
+  private static let recorderOwnershipLock = NSLock()
+  private static var activeRecorderOwnershipToken: UUID?
 
   let sessionId: String
 
@@ -33,6 +35,7 @@ final class TacuaCaptureSession {
   private let terminalSink: TerminalSink
   private let directory: URL
   private let manifestURL: URL
+  private let recorderOwnershipToken: UUID
 
   private var manifest: CaptureManifest
   private var durationBudgetSeconds = TacuaCapturePolicy.maximumDurationSeconds
@@ -49,9 +52,16 @@ final class TacuaCaptureSession {
   private var stopCompletions: [StopCompletion] = []
   private var pendingStartCompletion: ((Result<[String: Any], Error>) -> Void)?
   private var recorderStartIssued = false
+  private var recorderStartCompletionResolved = false
+  private var recorderOwnershipReleased = false
   private var manifestPersistenceFailed = false
   private var stopAttempt = 0
   private var stopAttemptGeneration = 0
+  private var stopAttemptSuppressedRecorderCall = false
+  private var bypassInjectedStopBehavior = false
+  private var realStopGeneration: Int?
+  private var stopMustRepeatAfterStartResolution = false
+  private var moduleDestructionRequested = false
   private var observers: [NSObjectProtocol] = []
   private var backgroundGapId: String?
   private var pendingResumeGapId: String?
@@ -61,8 +71,17 @@ final class TacuaCaptureSession {
   private var stopWatchdog: DispatchWorkItem?
   private var durationWorkItem: DispatchWorkItem?
   private var microphoneWatchdog: DispatchWorkItem?
+  private var destructionRetryWorkItem: DispatchWorkItem?
   private var idleTimerOverrideActive = false
   private var idleTimerWasDisabledBeforeCapture = false
+
+  private var acceptsCaptureSamples: Bool {
+    manifest.state == "recording" || manifest.state == "stop_failed_capture_active"
+  }
+#if TACUA_CAPTURE_FAULT_INJECTION
+  private let faultInjection: TacuaCaptureFaultLease?
+  private var faultStopInvocationCount = 0
+#endif
 
   init(
     options: TacuaCaptureStartOptions,
@@ -79,12 +98,33 @@ final class TacuaCaptureSession {
     let handoff = Self.handoff(from: options)
     try Self.validateCandidateHandoff(handoff)
 
+    let ownershipToken = UUID()
+    guard Self.claimRecorderOwnership(ownershipToken) else {
+      throw TacuaCaptureSpikeError.captureAlreadyRunning
+    }
+    var initializationCompleted = false
+    defer {
+      if !initializationCompleted {
+        Self.releaseRecorderOwnership(ownershipToken)
+      }
+    }
+    recorderOwnershipToken = ownershipToken
+
+#if TACUA_CAPTURE_FAULT_INJECTION
+    faultInjection = TacuaCaptureFaultRuntime.claimProcessLease()
+#endif
+
     sessionId = options.sessionId
     segmentDurationSeconds = options.segmentDurationSeconds
     self.eventSink = eventSink
     self.terminalSink = terminalSink
 
     let root = try Self.storageRoot(create: true)
+#if TACUA_CAPTURE_FAULT_INJECTION
+    if faultInjection?.shouldFailPreparationStorageCheck == true {
+      throw TacuaCaptureSpikeError.insufficientStorage
+    }
+#endif
     guard Self.hasMinimumFreeStorage(at: root) else {
       throw TacuaCaptureSpikeError.insufficientStorage
     }
@@ -181,6 +221,7 @@ final class TacuaCaptureSession {
       )
       try persistManifest()
     }
+    initializationCompleted = true
   }
 
   deinit {
@@ -188,21 +229,24 @@ final class TacuaCaptureSession {
     stopWatchdog?.cancel()
     durationWorkItem?.cancel()
     microphoneWatchdog?.cancel()
+    destructionRetryWorkItem?.cancel()
     removeLifecycleObservers()
+    if !recorderOwnershipReleased {
+      Self.releaseRecorderOwnership(recorderOwnershipToken)
+    }
   }
 
   func start(completion: @escaping (Result<[String: Any], Error>) -> Void) {
-    guard recorder.isAvailable else {
-      completion(.failure(TacuaCaptureSpikeError.captureUnavailable))
-      return
-    }
-
     queue.async { [self] in
       guard pendingStartCompletion == nil, manifest.state == "prepared" else {
         completion(.failure(TacuaCaptureSpikeError.captureAlreadyRunning))
         return
       }
       pendingStartCompletion = completion
+      guard recorder.isAvailable else {
+        completeStartFailureOnQueue(TacuaCaptureSpikeError.captureUnavailable)
+        return
+      }
       scheduleStartWatchdogOnQueue()
       DispatchQueue.main.async { [self] in
         AVAudioApplication.requestRecordPermission { [weak self] granted in
@@ -228,16 +272,34 @@ final class TacuaCaptureSession {
 
   func cancelForModuleDestruction() {
     queue.async { [self] in
+      moduleDestructionRequested = true
       if let completion = pendingStartCompletion {
         pendingStartCompletion = nil
-        startWatchdog?.cancel()
-        startWatchdog = nil
+        if !recorderStartIssued {
+          startWatchdog?.cancel()
+          startWatchdog = nil
+        }
         completion(.failure(TacuaCaptureSpikeError.moduleDestroyed))
       }
       recordError(
         TacuaCaptureSpikeError.moduleDestroyed.code,
         gapReason: "module_destroyed"
       )
+      bypassInjectedStopBehavior = true
+      if isStopping,
+        stopAttemptSuppressedRecorderCall,
+        !stopFinalizationStarted,
+        !didCompleteStop
+      {
+        // A QA timeout can deliberately omit ReplayKit's callback without ever
+        // issuing stopCapture. Invalidate that attempt so module teardown always
+        // has a live cleanup owner and makes a real bounded stop request.
+        stopAttemptGeneration += 1
+        stopWatchdog?.cancel()
+        stopWatchdog = nil
+        stopAttemptSuppressedRecorderCall = false
+        isStopping = false
+      }
       requestStopOnQueue(reason: "module_destroyed")
     }
   }
@@ -387,15 +449,35 @@ final class TacuaCaptureSession {
           self.process(sampleBuffer, type: sampleType, hostUptimeSeconds: uptime)
         }
       },
-      completionHandler: { [weak self] error in
-        guard let self else { return }
+      // ReplayKit owns this completion until the start attempt resolves. Keep
+      // the session alive through that point so a module teardown cannot drop
+      // the only cleanup owner just before a late successful start callback.
+      completionHandler: { [self] error in
         self.queue.async {
+          self.recorderStartCompletionResolved = true
+          self.startWatchdog?.cancel()
+          self.startWatchdog = nil
           guard self.pendingStartCompletion != nil else {
             if error == nil {
-              let recorder = self.recorder
-              DispatchQueue.main.async {
-                if recorder.isRecording { recorder.stopCapture { _ in } }
+              if !self.isStopping {
+                self.isStopping = true
+                self.manifest.state = "stopping"
+                self.manifest.stopReason = "late_start_cleanup"
+                self.persistManifestAndReport()
+                self.emitState()
               }
+              if self.stopWatchdog != nil || self.realStopGeneration != nil {
+                self.stopMustRepeatAfterStartResolution = true
+              } else {
+                self.stopAttempt = 0
+                self.issueStopAttemptOnQueue()
+              }
+            } else if self.isStopping {
+              if self.stopWatchdog == nil, self.realStopGeneration == nil {
+                self.finalizeAfterRecorderStopOnQueue()
+              }
+            } else {
+              self.releaseRecorderOwnershipIfSafeOnQueue()
             }
             return
           }
@@ -438,24 +520,43 @@ final class TacuaCaptureSession {
     pendingStartCompletion = nil
     startWatchdog?.cancel()
     startWatchdog = nil
-    manifest.state = "start_failed"
+    let unresolvedRecorderStart = recorderStartIssued && !recorderStartCompletionResolved
     appendErrorCode(error.code)
+    manifest.state = unresolvedRecorderStart ? "start_cleanup_pending" : "start_failed"
+    if unresolvedRecorderStart {
+      isStopping = true
+      stopAttempt = 0
+      manifest.stopReason = "start_timeout_cleanup"
+    }
     persistManifestAndReport()
     emitState()
     restoreIdleTimerOverride()
+    releaseRecorderOwnershipIfSafeOnQueue()
     completion(.failure(error))
-    if recorderStartIssued {
-      let recorder = recorder
-      DispatchQueue.main.async {
-        if recorder.isRecording { recorder.stopCapture { _ in } }
-      }
+    if unresolvedRecorderStart {
+      issueStopAttemptOnQueue()
     }
   }
 
   private func scheduleStartWatchdogOnQueue() {
     startWatchdog?.cancel()
     let workItem = DispatchWorkItem { [self] in
-      completeStartFailureOnQueue(TacuaCaptureSpikeError.startTimeout)
+      startWatchdog = nil
+      if pendingStartCompletion != nil {
+        completeStartFailureOnQueue(TacuaCaptureSpikeError.startTimeout)
+      } else if recorderStartIssued, !recorderStartCompletionResolved, isStopping {
+        recordError(
+          TacuaCaptureSpikeError.startTimeout.code,
+          gapReason: "start_capture_timeout"
+        )
+        manifest.state = "start_cleanup_pending"
+        persistManifestAndReport()
+        emitState()
+        if stopWatchdog == nil, realStopGeneration == nil {
+          stopAttempt = 0
+          issueStopAttemptOnQueue()
+        }
+      }
     }
     startWatchdog = workItem
     queue.asyncAfter(
@@ -477,30 +578,118 @@ final class TacuaCaptureSession {
 
   private func requestStopOnQueue(reason: String) {
     guard !didCompleteStop else { return }
-    guard !isStopping else { return }
+    if isStopping {
+      if realStopGeneration != nil, stopWatchdog == nil {
+        // A real ReplayKit stop call crossed its watchdog but has not returned.
+        // Do not overlap another stopCapture call with it. Keep ownership until
+        // its callback arrives, and keep explicit callers bounded meanwhile.
+        rejectStopCompletionsOnQueue(TacuaCaptureSpikeError.stopTimeout)
+        if moduleDestructionRequested {
+          scheduleDestructionStopRetryOnQueue()
+        }
+        return
+      }
+      if manifest.state == "start_cleanup_pending",
+        stopWatchdog == nil,
+        realStopGeneration == nil,
+        !stopFinalizationStarted
+      {
+        stopAttempt = 0
+        issueStopAttemptOnQueue()
+      }
+      return
+    }
+
+    let shouldFinalizeWithoutRecorder = manifest.state == "prepared" && !recorderStartIssued
+
+    if let startCompletion = pendingStartCompletion {
+      pendingStartCompletion = nil
+      if !recorderStartIssued {
+        startWatchdog?.cancel()
+        startWatchdog = nil
+      }
+      startCompletion(
+        .failure(TacuaCaptureSpikeError.captureStartCancelled)
+      )
+    }
+
     isStopping = true
     stopAttempt = 0
     durationWorkItem?.cancel()
     durationWorkItem = nil
     microphoneWatchdog?.cancel()
     microphoneWatchdog = nil
-    manifest.state = "stopping"
+    let waitingForStartResolution = recorderStartIssued && !recorderStartCompletionResolved
+    manifest.state = waitingForStartResolution ? "start_cleanup_pending" : "stopping"
     manifest.stopReason = reason
     persistManifestAndReport()
     emitState()
-    issueStopAttemptOnQueue()
+    if shouldFinalizeWithoutRecorder {
+      finalizeAfterRecorderStopOnQueue()
+    } else if waitingForStartResolution, !moduleDestructionRequested {
+      // The start completion will issue the first serialized live stop. The
+      // existing start watchdog remains the bounded fallback if ReplayKit omits it.
+      return
+    } else {
+      issueStopAttemptOnQueue()
+    }
   }
 
   private func issueStopAttemptOnQueue() {
     guard isStopping, !stopFinalizationStarted, !didCompleteStop else { return }
+    guard stopWatchdog == nil, realStopGeneration == nil else { return }
     stopAttempt += 1
     stopAttemptGeneration += 1
+#if TACUA_CAPTURE_FAULT_INJECTION
+    faultStopInvocationCount += 1
+    let faultInvocation = faultStopInvocationCount
+    let injectedStopBehavior = bypassInjectedStopBehavior
+      ? TacuaCaptureInjectedStopBehavior.none
+      : faultInjection?.stopBehavior(attempt: faultInvocation) ?? .none
+    stopAttemptSuppressedRecorderCall = injectedStopBehavior != .none
+#else
+    stopAttemptSuppressedRecorderCall = false
+#endif
     let generation = stopAttemptGeneration
+    if !stopAttemptSuppressedRecorderCall {
+      realStopGeneration = generation
+    }
     scheduleStopWatchdogOnQueue(generation: generation)
     DispatchQueue.main.async { [self] in
+#if TACUA_CAPTURE_FAULT_INJECTION
+      switch injectedStopBehavior {
+      case .timeout:
+        // The real recorder remains active. The production watchdog observes
+        // that state and drives retry/preservation exactly as it would if
+        // ReplayKit omitted its callback.
+        return
+      case .failure:
+        let recorderStillRecording = recorder.isRecording
+        queue.async {
+          self.handleStopAttemptResultOnQueue(
+            generation: generation,
+            recorderStillRecording: recorderStillRecording,
+            error: TacuaCaptureSpikeError.captureStopFailed
+          )
+        }
+        return
+      case .none:
+        break
+      }
+#endif
+      let shouldInvokeLiveStop = queue.sync {
+        realStopGeneration == generation
+          && isStopping
+          && !stopFinalizationStarted
+          && !didCompleteStop
+      }
+      guard shouldInvokeLiveStop else { return }
       recorder.stopCapture { [self] error in
         let recorderStillRecording = recorder.isRecording
         queue.async {
+          if self.realStopGeneration == generation {
+            self.realStopGeneration = nil
+          }
           self.handleStopAttemptResultOnQueue(
             generation: generation,
             recorderStillRecording: recorderStillRecording,
@@ -531,6 +720,25 @@ final class TacuaCaptureSession {
             TacuaCaptureSpikeError.stopTimeout.code,
             gapReason: "stop_capture_timeout"
           )
+          if self.realStopGeneration == generation {
+            // The watchdog bounds the caller, not ReplayKit's ownership of its
+            // in-flight callback. Retain the generation and process lease so a
+            // retry cannot overlap the live stopCapture call. A late callback
+            // will resume the serialized coordinator.
+            self.stopWatchdog?.cancel()
+            self.stopWatchdog = nil
+            self.manifest.state = self.recorderStartIssued
+              && !self.recorderStartCompletionResolved
+              ? "start_cleanup_pending"
+              : "stopping"
+            self.persistManifestAndReport()
+            self.emitState()
+            self.rejectStopCompletionsOnQueue(TacuaCaptureSpikeError.stopTimeout)
+            if self.moduleDestructionRequested {
+              self.scheduleDestructionStopRetryOnQueue()
+            }
+            return
+          }
           self.handleStopAttemptResultOnQueue(
             generation: generation,
             recorderStillRecording: recorderStillRecording,
@@ -556,6 +764,7 @@ final class TacuaCaptureSession {
       !stopFinalizationStarted,
       !didCompleteStop
     else { return }
+    stopAttemptSuppressedRecorderCall = false
     stopWatchdog?.cancel()
     stopWatchdog = nil
     if error != nil {
@@ -563,6 +772,12 @@ final class TacuaCaptureSession {
         TacuaCaptureSpikeError.captureStopFailed.code,
         gapReason: "stop_capture_error"
       )
+    }
+    if stopMustRepeatAfterStartResolution {
+      stopMustRepeatAfterStartResolution = false
+      stopAttempt = 0
+      issueStopAttemptOnQueue()
+      return
     }
 
     switch TacuaCapturePolicy.stopTimeoutDisposition(
@@ -581,20 +796,81 @@ final class TacuaCaptureSession {
   private func preserveActiveStopFailureOnQueue() {
     stopWatchdog?.cancel()
     stopWatchdog = nil
+    realStopGeneration = nil
+    if moduleDestructionRequested {
+      manifest.state = "stopping"
+      persistManifestAndReport()
+      emitState()
+      scheduleDestructionStopRetryOnQueue()
+      return
+    }
+    if recorderStartIssued, !recorderStartCompletionResolved {
+      manifest.state = "start_cleanup_pending"
+      persistManifestAndReport()
+      emitState()
+      let completions = stopCompletions
+      stopCompletions.removeAll()
+      for completion in completions {
+        completion(.failure(TacuaCaptureSpikeError.stopTimeout))
+      }
+      return
+    }
     isStopping = false
     manifest.state = "stop_failed_capture_active"
     persistManifestAndReport()
     emitState()
+    rejectStopCompletionsOnQueue(TacuaCaptureSpikeError.stopTimeout)
+  }
+
+  private func rejectStopCompletionsOnQueue(_ error: TacuaCaptureSpikeError) {
     let completions = stopCompletions
     stopCompletions.removeAll()
     for completion in completions {
-      completion(.failure(TacuaCaptureSpikeError.stopTimeout))
+      completion(.failure(error))
     }
+  }
+
+  private func scheduleDestructionStopRetryOnQueue() {
+    destructionRetryWorkItem?.cancel()
+    let workItem = DispatchWorkItem { [self] in
+      guard moduleDestructionRequested,
+        isStopping,
+        !stopFinalizationStarted,
+        !didCompleteStop
+      else { return }
+      destructionRetryWorkItem = nil
+      if realStopGeneration != nil {
+        // Keep this cleanup owner alive while ReplayKit still owns a timed-out
+        // real callback. Retrying here would create overlapping live calls.
+        scheduleDestructionStopRetryOnQueue()
+        return
+      }
+      stopAttempt = 0
+      issueStopAttemptOnQueue()
+    }
+    destructionRetryWorkItem = workItem
+    queue.asyncAfter(deadline: .now() + 5, execute: workItem)
   }
 
   private func finalizeAfterRecorderStopOnQueue() {
     guard !stopFinalizationStarted else { return }
+    if recorderStartIssued, !recorderStartCompletionResolved {
+      manifest.state = "start_cleanup_pending"
+      persistManifestAndReport()
+      emitState()
+      let completions = stopCompletions
+      stopCompletions.removeAll()
+      for completion in completions {
+        completion(.failure(TacuaCaptureSpikeError.startCleanupPending))
+      }
+      if moduleDestructionRequested {
+        scheduleDestructionStopRetryOnQueue()
+      }
+      return
+    }
     stopFinalizationStarted = true
+    destructionRetryWorkItem?.cancel()
+    destructionRetryWorkItem = nil
     stopWatchdog?.cancel()
     stopWatchdog = nil
     finishCurrentSegment()
@@ -635,7 +911,21 @@ final class TacuaCaptureSession {
     type: RPSampleBufferType,
     hostUptimeSeconds: Double
   ) {
-    guard manifest.state == "recording", !isStopping else { return }
+    guard acceptsCaptureSamples, !isStopping else { return }
+    if !TacuaCapturePolicy.shouldAdmitCaptureSample(
+      backgroundGapOpen: backgroundGapId != nil,
+      foregroundSignalObserved: foregroundReturnHostUptimeSeconds != nil
+    ) {
+      var dropped = manifest.droppedDuringBackground ?? [:]
+      switch type {
+      case .video: dropped["video", default: 0] += 1
+      case .audioApp: dropped["appAudio", default: 0] += 1
+      case .audioMic: dropped["microphone", default: 0] += 1
+      @unknown default: break
+      }
+      manifest.droppedDuringBackground = dropped
+      return
+    }
     if TacuaCapturePolicy.hasReachedDeadline(
       hostUptimeSeconds: hostUptimeSeconds,
       deadlineHostUptimeSeconds: manifest.automaticStopHostUptimeSeconds
@@ -646,48 +936,92 @@ final class TacuaCaptureSession {
 
     let incomingPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
     let incomingPTSSeconds = CMTimeGetSeconds(incomingPTS)
+    if type == .video, (!incomingPTS.isValid || !incomingPTSSeconds.isFinite) {
+      failAndStopOnQueue(
+        error: TacuaCaptureSpikeError.writerCreation("ReplayKit emitted an invalid video timestamp."),
+        gapReason: "video_timestamp_invalid"
+      )
+      return
+    }
+
+    let returningFromBackground = type == .video
+      && foregroundReturnHostUptimeSeconds != nil
+      && backgroundGapId != nil
+    let hasVideoClockDiscontinuity: Bool
+    if type == .video,
+      !returningFromBackground,
+      let priorPTS = latestVideoPTS,
+      let priorHostUptimeSeconds = latestVideoHostUptimeSeconds,
+      TacuaCapturePolicy.videoClockHasDiscontinuity(
+        priorMediaPTSSeconds: CMTimeGetSeconds(priorPTS),
+        currentMediaPTSSeconds: incomingPTSSeconds,
+        priorHostUptimeSeconds: priorHostUptimeSeconds,
+        currentHostUptimeSeconds: hostUptimeSeconds
+      )
+    {
+      hasVideoClockDiscontinuity = true
+      finishCurrentSegment()
+      openGap(reason: "video_pts_discontinuity", priorMediaPTS: priorPTS, nextMediaPTS: incomingPTS)
+      latestMicrophonePTS = nil
+      latestMicrophoneHostUptimeSeconds = nil
+      scheduleMicrophoneWatchdogOnQueue()
+    } else {
+      hasVideoClockDiscontinuity = false
+    }
+
     if type == .video, let writer, !writer.isCompatible(withVideoSample: sampleBuffer) {
       finishCurrentSegment()
     }
-    if backgroundGapId == nil,
-      let writer,
-      let boundarySeconds = TacuaCapturePolicy.segmentRotationBoundary(
+    if backgroundGapId == nil, !hasVideoClockDiscontinuity, let writer {
+      let rotationPlan = TacuaCapturePolicy.segmentRotationPlan(
         startedAtPTSSeconds: CMTimeGetSeconds(writer.startedAtPTS),
         incomingPTSSeconds: incomingPTSSeconds,
         segmentDurationSeconds: segmentDurationSeconds
       )
-    {
-      do {
-        try rotateCurrentSegment(
-          at: CMTime(seconds: boundarySeconds, preferredTimescale: 1_000_000_000),
-          hostUptimeSeconds: hostUptimeSeconds
+      let boundaries: [Double]
+      switch rotationPlan {
+      case .none:
+        boundaries = []
+      case .boundaries(let plannedBoundaries):
+        boundaries = plannedBoundaries
+      case .excessive:
+        failAndStopOnQueue(
+          error: TacuaCaptureSpikeError.rotationLimitExceeded,
+          gapReason: "segment_rotation_limit_exceeded"
         )
-      } catch {
-        failAndStopOnQueue(error: error, gapReason: "segment_rotation_failed")
         return
+      }
+      for boundarySeconds in boundaries {
+        let boundaryPTS = CMTime(
+          seconds: boundarySeconds,
+          preferredTimescale: 1_000_000_000
+        )
+        let openingVideoSample = type == .video
+          && CMTimeCompare(incomingPTS, boundaryPTS) == 0
+          ? sampleBuffer
+          : nil
+        do {
+          try rotateCurrentSegment(
+            at: boundaryPTS,
+            hostUptimeSeconds: hostUptimeSeconds,
+            openingVideoSample: openingVideoSample
+          )
+        } catch {
+          failAndStopOnQueue(error: error, gapReason: "segment_rotation_failed")
+          return
+        }
       }
     }
 
     if type == .video {
       let pts = incomingPTS
       let mediaSeconds = incomingPTSSeconds
-      guard pts.isValid, mediaSeconds.isFinite else {
-        failAndStopOnQueue(
-          error: TacuaCaptureSpikeError.writerCreation("ReplayKit emitted an invalid video timestamp."),
-          gapReason: "video_timestamp_invalid"
-        )
-        return
-      }
-      let closedBackgroundGap: Bool
       if foregroundReturnHostUptimeSeconds != nil, backgroundGapId != nil {
         closeBackgroundGap(nextMediaPTS: pts, closedHostUptimeSeconds: hostUptimeSeconds)
         foregroundReturnHostUptimeSeconds = nil
         latestMicrophonePTS = nil
         latestMicrophoneHostUptimeSeconds = nil
         scheduleMicrophoneWatchdogOnQueue()
-        closedBackgroundGap = true
-      } else {
-        closedBackgroundGap = false
       }
       if let id = pendingResumeGapId {
         closeGap(id: id, nextMediaPTS: pts, closedHostUptimeSeconds: hostUptimeSeconds)
@@ -707,18 +1041,6 @@ final class TacuaCaptureSession {
         )
         return
       }
-      if let priorPTS = latestVideoPTS,
-        let priorHostUptimeSeconds = latestVideoHostUptimeSeconds,
-        TacuaCapturePolicy.videoClockHasDiscontinuity(
-          priorMediaPTSSeconds: CMTimeGetSeconds(priorPTS),
-          currentMediaPTSSeconds: mediaSeconds,
-          priorHostUptimeSeconds: priorHostUptimeSeconds,
-          currentHostUptimeSeconds: hostUptimeSeconds
-        ),
-        !closedBackgroundGap
-      {
-        openGap(reason: "video_pts_discontinuity", priorMediaPTS: priorPTS, nextMediaPTS: pts)
-      }
       latestVideoPTS = pts
       latestVideoHostUptimeSeconds = hostUptimeSeconds
 
@@ -731,9 +1053,7 @@ final class TacuaCaptureSession {
           )
         } catch {
           failAndStopOnQueue(
-            error: TacuaCaptureSpikeError.writerCreation(
-              "Tacua could not create the next protected capture segment."
-            ),
+            error: error,
             gapReason: "writer_creation_failed"
           )
           return
@@ -784,6 +1104,11 @@ final class TacuaCaptureSession {
     hostUptimeSeconds: Double,
     appendFirstVideoAsHeldFrame: Bool
   ) throws {
+#if TACUA_CAPTURE_FAULT_INJECTION
+    if faultInjection?.shouldFailWriterStorageCheck(segmentIndex: nextSegmentIndex) == true {
+      throw TacuaCaptureSpikeError.insufficientStorage
+    }
+#endif
     guard Self.hasMinimumFreeStorage(at: directory) else {
       throw TacuaCaptureSpikeError.insufficientStorage
     }
@@ -793,6 +1118,11 @@ final class TacuaCaptureSession {
       firstVideoSample: firstVideoSample,
       hostUptimeSeconds: hostUptimeSeconds
     )
+#if TACUA_CAPTURE_FAULT_INJECTION
+    nextWriter.configureFaultInjection(
+      faultInjection?.finishBehavior(segmentIndex: nextSegmentIndex) ?? .none
+    )
+#endif
     writer = nextWriter
     nextSegmentIndex += 1
     let mediaSeconds = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(firstVideoSample))
@@ -817,11 +1147,14 @@ final class TacuaCaptureSession {
 
   private func rotateCurrentSegment(
     at boundaryPTS: CMTime,
-    hostUptimeSeconds: Double
+    hostUptimeSeconds: Double,
+    openingVideoSample: CMSampleBuffer?
   ) throws {
     guard let currentWriter = writer else { return }
     let closingFrame = try currentWriter.makeHeldVideoSample(at: boundaryPTS)
-    let openingFrame = try currentWriter.makeHeldVideoSample(at: boundaryPTS)
+    let heldOpeningFrame = openingVideoSample == nil
+      ? try currentWriter.makeHeldVideoSample(at: boundaryPTS)
+      : nil
     guard currentWriter.appendHeldVideoFrame(
       closingFrame,
       hostUptimeSeconds: hostUptimeSeconds
@@ -831,10 +1164,23 @@ final class TacuaCaptureSession {
       )
     }
     finishCurrentSegment(extendVideoToLatestPTS: false)
+    let openingFrame: CMSampleBuffer
+    let appendOpeningAsHeldFrame: Bool
+    if let openingVideoSample {
+      openingFrame = openingVideoSample
+      appendOpeningAsHeldFrame = false
+    } else if let heldOpeningFrame {
+      openingFrame = heldOpeningFrame
+      appendOpeningAsHeldFrame = true
+    } else {
+      throw TacuaCaptureSpikeError.writerFailed(
+        "The next segment could not retain its boundary video frame."
+      )
+    }
     try startWriter(
       firstVideoSample: openingFrame,
       hostUptimeSeconds: hostUptimeSeconds,
-      appendFirstVideoAsHeldFrame: true
+      appendFirstVideoAsHeldFrame: appendOpeningAsHeldFrame
     )
   }
 
@@ -853,10 +1199,19 @@ final class TacuaCaptureSession {
     finalizationGroup.enter()
     writer.finish { [self] result in
       queue.async {
+#if TACUA_CAPTURE_FAULT_INJECTION
+        var shouldRequestInjectedWriterStop = false
+#endif
         switch result {
         case .success(let segment):
           self.manifest.segments.append(segment)
           self.manifest.segments.sort { $0.index < $1.index }
+#if TACUA_CAPTURE_FAULT_INJECTION
+          shouldRequestInjectedWriterStop =
+            self.faultInjection?.shouldRequestStop(
+              afterCommittedSegmentIndex: segment.index
+            ) == true
+#endif
           self.eventSink(
             "onSegment",
             [
@@ -876,6 +1231,17 @@ final class TacuaCaptureSession {
         }
         self.persistManifestAndReport()
         self.finalizationGroup.leave()
+#if TACUA_CAPTURE_FAULT_INJECTION
+        if shouldRequestInjectedWriterStop,
+          !self.isStopping,
+          self.writer?.index == 1
+        {
+          // This trigger is native and session-scoped so a JS remount cannot
+          // miss it or issue a duplicate Stop. Requiring the index-1 writer
+          // avoids treating a lifecycle-finalized segment 0 as fault evidence.
+          self.requestStopOnQueue(reason: "qa_writer_fault_after_segment_0")
+        }
+#endif
       }
     }
   }
@@ -910,6 +1276,9 @@ final class TacuaCaptureSession {
     persistManifestAndReport()
     let result = snapshot()
     terminalSnapshot = result
+    // Publish the final manifest before another session or recovery operation
+    // can acquire the process token and touch capture storage.
+    releaseRecorderOwnershipIfSafeOnQueue()
     emitState()
     terminalSink(self, result)
     let completions = stopCompletions
@@ -979,12 +1348,14 @@ final class TacuaCaptureSession {
       center.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: nil) {
         [weak self] _ in
         self?.queue.async {
-          guard let self, self.backgroundGapId == nil, self.manifest.state == "recording" else {
-            return
-          }
+          guard let self else { return }
+          // A foreground notification is only an admission signal until the
+          // next background transition. Clear it even when a gap is already open.
+          self.foregroundReturnHostUptimeSeconds = nil
           self.microphoneWatchdog?.cancel()
           self.microphoneWatchdog = nil
           self.microphoneNeedsValidation = true
+          guard self.acceptsCaptureSamples, self.backgroundGapId == nil else { return }
           let gap = CaptureGap(
             id: UUID().uuidString,
             reason: "app_backgrounded",
@@ -1005,7 +1376,7 @@ final class TacuaCaptureSession {
       center.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: nil) {
         [weak self] _ in
         self?.queue.async {
-          guard let self, self.backgroundGapId != nil, self.manifest.state == "recording" else {
+          guard let self, self.backgroundGapId != nil, self.acceptsCaptureSamples else {
             return
           }
           self.foregroundReturnHostUptimeSeconds = ProcessInfo.processInfo.systemUptime
@@ -1036,8 +1407,47 @@ final class TacuaCaptureSession {
     }
   }
 
+  private static func claimRecorderOwnership(_ token: UUID) -> Bool {
+    recorderOwnershipLock.lock()
+    defer { recorderOwnershipLock.unlock() }
+    guard activeRecorderOwnershipToken == nil else { return false }
+    activeRecorderOwnershipToken = token
+    return true
+  }
+
+  private static func releaseRecorderOwnership(_ token: UUID) {
+    recorderOwnershipLock.lock()
+    defer { recorderOwnershipLock.unlock() }
+    if activeRecorderOwnershipToken == token {
+      activeRecorderOwnershipToken = nil
+    }
+  }
+
+  static var hasProcessRecorderOwnership: Bool {
+    recorderOwnershipLock.lock()
+    defer { recorderOwnershipLock.unlock() }
+    return activeRecorderOwnershipToken != nil
+  }
+
+  static func withExclusiveRecoveryAccess<T>(_ operation: () throws -> T) throws -> T {
+    let token = UUID()
+    guard claimRecorderOwnership(token) else {
+      throw TacuaCaptureSpikeError.captureAlreadyRunning
+    }
+    defer { releaseRecorderOwnership(token) }
+    return try operation()
+  }
+
+  private func releaseRecorderOwnershipIfSafeOnQueue() {
+    guard !recorderOwnershipReleased else { return }
+    guard didCompleteStop || manifest.state == "start_failed" else { return }
+    guard !recorderStartIssued || recorderStartCompletionResolved else { return }
+    Self.releaseRecorderOwnership(recorderOwnershipToken)
+    recorderOwnershipReleased = true
+  }
+
   private func snapshot() -> [String: Any] {
-    [
+    var result: [String: Any] = [
       "sessionId": manifest.sessionId,
       "state": manifest.state,
       "segmentCount": manifest.segments.count,
@@ -1055,6 +1465,10 @@ final class TacuaCaptureSession {
       "appAudioSamplesObserved": manifest.appAudioSamplesObserved ?? 0,
       "appAudioAvailable": (manifest.appAudioSamplesObserved ?? 0) > 0,
     ]
+#if TACUA_CAPTURE_FAULT_INJECTION
+    result["testFaultPlan"] = faultInjection?.plan.rawValue ?? NSNull()
+#endif
+    return result
   }
 
   private func emitState() {
@@ -1203,6 +1617,7 @@ final class TacuaCaptureSession {
       "recording",
       "stopping",
       "stop_failed_capture_active",
+      "start_cleanup_pending",
     ].contains(manifest.state)
     guard interruptedState else { return }
     let code = "ERR_TACUA_CAPTURE_INTERRUPTED"
@@ -1259,8 +1674,9 @@ final class TacuaCaptureSession {
 
   private static func hasMinimumFreeStorage(at url: URL) -> Bool {
     let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-    guard let available = values?.volumeAvailableCapacityForImportantUsage else { return false }
-    return available >= minimumFreeStorageBytes
+    return TacuaCapturePolicy.hasSufficientStorage(
+      availableBytes: values?.volumeAvailableCapacityForImportantUsage
+    )
   }
 
   private static func isValidSessionId(_ value: String) -> Bool {

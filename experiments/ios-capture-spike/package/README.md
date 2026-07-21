@@ -14,7 +14,7 @@ It is a candidate implementation, not the production Tacua SDK contract. Its sch
 - Reconciles a finalized segment, or a sidecar-verified partial segment, after interruption. It never invents a segment from an unverified file.
 - Records host-clock/media-clock calibration, markers, dual-clock continuity gaps, stable public error codes, and truthful nullable status values. A long interval between ReplayKit video samples is not itself a gap when media time and host uptime advance together.
 - Finalizes the active segment when the host app backgrounds or the phone locks, records one explicit lifecycle gap, and starts a new segment only after foreground video returns. Audio callbacks received while the writer is intentionally closed are counted separately in `droppedDuringBackground`; Tacua does not synthesize media across the lifecycle gap.
-- Applies bounded start, stop, microphone-startup, and writer-finalization watchdogs. A timed-out stop is retried once. If ReplayKit still reports that it is recording, the session remains installed in the nonterminal `stop_failed_capture_active` state and `stop()` rejects; it is never reported as stopped.
+- Applies bounded start, stop, microphone-startup, and writer-finalization watchdogs. The writer deadline spans AVAssetWriter's callback, checksum calculation, sidecar staging, and publication; if timeout wins, no recovery sidecar remains and a late callback cannot publish the segment. A stop attempt that did not issue a live ReplayKit call may retry once. If a live call crosses its watchdog, Tacua bounds the caller but retains exclusive process ownership until that callback resolves, so it never overlaps `stopCapture` calls or reports an unconfirmed stop. If two synthetic timeout attempts leave ReplayKit recording, the session remains installed in the nonterminal `stop_failed_capture_active` state and `stop()` rejects.
 - Temporarily disables the iOS idle timer while capture is active and restores the host app's prior setting on terminal stop or start failure. This prevents an unattended foreground QA run from auto-locking the device without overriding an app that had already disabled auto-lock.
 - Uses iOS complete-unless-open file protection and excludes capture storage from device backup.
 
@@ -87,5 +87,19 @@ npm run test:core
 ```
 
 The tests cover terminal classification, deadline behavior, media-clock segment boundaries, dual-clock microphone stall detection, crash-window source selection, structural handoff validation, expiry/build-independent deletion authorization, and fail-closed stop-timeout decisions.
+
+They also cover fail-closed storage thresholds, lifecycle sample admission,
+multi-boundary catch-up, and the exact QA fault-plan parser/matchers. The test
+runner syntax-parses every native source both with and without the dedicated
+fault condition, compiles and runs the platform-independent policy and fault
+tests, and verifies that plan names do not appear in a non-fault binary. A full
+local Xcode build is still required to compile the complete module in each
+configuration.
+
+Physical fault injection is available only in the Capture Lab build and is
+excluded at compile time from ordinary builds. Its four independent gates,
+supported plans, acceptance criteria, evidence boundary, and mandatory cleanup
+are defined in
+[`../FAULT-INJECTION-RUNBOOK.md`](../FAULT-INJECTION-RUNBOOK.md).
 
 Source type-checking against the target Expo/Xcode toolchain is also required. Before promotion beyond the spike, test a development build on a physical iPhone for ReplayKit consent and callbacks, microphone/app-audio formats and continuity, background/foreground and lock transitions, interruption and process kill, 30-minute resource usage, low storage, writer and stop fault injection, protected-file behavior, and recovery of verified partial segments. Simulator-only results are insufficient.

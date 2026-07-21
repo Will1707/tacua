@@ -22,6 +22,9 @@ type CaptureCapabilities = {
   readonly requiredConsentVersion: "tacua-local-capture-consent-v1";
   readonly handoffTrust: "structural_only";
   readonly schemaVersion: number;
+  readonly testFaultInjectionCompiled?: true;
+  readonly testFaultPlan?: string | null;
+  readonly testFaultLeaseConsumed?: boolean;
 };
 
 type CaptureStatus = {
@@ -40,6 +43,7 @@ type CaptureStatus = {
   readonly microphoneSamplesObserved: number;
   readonly appAudioSamplesObserved: number;
   readonly appAudioAvailable: boolean;
+  readonly testFaultPlan?: string | null;
 };
 
 type CaptureStartOptions = {

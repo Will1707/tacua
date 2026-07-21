@@ -17,7 +17,7 @@ public final class TacuaCaptureSpikeModule: Module {
 
     Function("getCapabilities") { () -> [String: Any] in
       let recorder = RPScreenRecorder.shared()
-      return [
+      var result: [String: Any] = [
         "platform": "ios",
         "api": "ReplayKit.startCapture",
         "available": recorder.isAvailable,
@@ -33,6 +33,13 @@ public final class TacuaCaptureSpikeModule: Module {
         "handoffTrust": "structural_only",
         "schemaVersion": 2,
       ]
+#if TACUA_CAPTURE_FAULT_INJECTION
+      result["testFaultInjectionCompiled"] = true
+      result["testFaultPlan"] = TacuaCaptureFaultRuntime.configuredProcessPlan()?.rawValue
+        ?? NSNull()
+      result["testFaultLeaseConsumed"] = TacuaCaptureFaultRuntime.processLeaseWasClaimed
+#endif
+      return result
     }
 
     Function("getStatus") { () -> [String: Any] in
@@ -43,8 +50,9 @@ public final class TacuaCaptureSpikeModule: Module {
         return terminalStatus
       }
       let recorder = RPScreenRecorder.shared()
+      let processCleanupPending = TacuaCaptureSession.hasProcessRecorderOwnership
       return [
-        "state": "idle",
+        "state": processCleanupPending ? "process_cleanup_pending" : "idle",
         "segmentCount": 0,
         "gapCount": 0,
         "markerCount": 0,
@@ -100,7 +108,11 @@ public final class TacuaCaptureSpikeModule: Module {
         return
       }
       do {
-        promise.resolve(try TacuaCaptureSession.listRecoverableSessions())
+        promise.resolve(
+          try TacuaCaptureSession.withExclusiveRecoveryAccess {
+            try TacuaCaptureSession.listRecoverableSessions()
+          }
+        )
       } catch {
         Self.reject(
           promise,
@@ -117,7 +129,11 @@ public final class TacuaCaptureSpikeModule: Module {
         return
       }
       do {
-        promise.resolve(try TacuaCaptureSession.markPartialReadyForUpload(options: options))
+        promise.resolve(
+          try TacuaCaptureSession.withExclusiveRecoveryAccess {
+            try TacuaCaptureSession.markPartialReadyForUpload(options: options)
+          }
+        )
       } catch {
         Self.reject(
           promise,
@@ -130,12 +146,14 @@ public final class TacuaCaptureSpikeModule: Module {
     }
 
     AsyncFunction("deleteSession") { (options: TacuaCaptureRecoveryOptions, promise: Promise) in
-      if self.currentSession()?.sessionId == options.sessionId {
+      if self.currentSession() != nil {
         Self.reject(promise, error: TacuaCaptureSpikeError.captureAlreadyRunning)
         return
       }
       do {
-        try TacuaCaptureSession.deleteSession(options: options)
+        try TacuaCaptureSession.withExclusiveRecoveryAccess {
+          try TacuaCaptureSession.deleteSession(options: options)
+        }
         promise.resolve()
       } catch {
         Self.reject(
@@ -181,7 +199,13 @@ public final class TacuaCaptureSpikeModule: Module {
         case .success(let snapshot):
           promise.resolve(snapshot)
         case .failure(let error):
-          self.clearSession(ifMatching: session)
+          let retainedCleanupErrors = [
+            TacuaCaptureSpikeError.captureStartCancelled.code,
+            TacuaCaptureSpikeError.startTimeout.code,
+          ]
+          if !retainedCleanupErrors.contains(error.tacuaStableCode) {
+            self.clearSession(ifMatching: session)
+          }
           Self.reject(promise, error: error)
         }
       }

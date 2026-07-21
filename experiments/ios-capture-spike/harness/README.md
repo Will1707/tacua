@@ -26,3 +26,12 @@ actions. Delete local sessions after evidence has been minimized and recorded.
 Sanitized experiment observations live in
 [`../PHYSICAL-DEVICE-RESULTS.md`](../PHYSICAL-DEVICE-RESULTS.md). Raw media and
 stable device identifiers must never be added to that file or committed.
+
+The deterministic low-storage, writer-finalization, and ReplayKit-stop campaign
+uses a separate compile-time QA variant. Follow
+[`../FAULT-INJECTION-RUNBOOK.md`](../FAULT-INJECTION-RUNBOOK.md); never simulate
+low storage by filling the phone, and never leave the double-stop-timeout plan
+without performing its required live cleanup stop. A Start attempt consumes the
+process's one-shot lease and disables further starts until relaunch. For the two
+writer-finalization plans, the harness calls Stop once automatically after
+segment 0 commits.

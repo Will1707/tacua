@@ -26,6 +26,7 @@ private func expectValidationError(
 enum CapturePolicyTests {
   static func main() throws {
     try terminalClassification()
+    try storageAndLifecycleAdmission()
     try deadlineAndMicrophoneContinuity()
     try videoClockContinuity()
     try segmentRotation()
@@ -33,6 +34,46 @@ enum CapturePolicyTests {
     try candidateHandoffValidation()
     try deletionAuthorizationAndStopSafety()
     print("Tacua capture core policy tests passed")
+  }
+
+  private static func storageAndLifecycleAdmission() throws {
+    try expect(
+      !TacuaCapturePolicy.hasSufficientStorage(availableBytes: nil),
+      "Unavailable storage capacity must fail closed"
+    )
+    try expect(
+      !TacuaCapturePolicy.hasSufficientStorage(
+        availableBytes: TacuaCapturePolicy.minimumFreeStorageBytes - 1
+      ),
+      "One byte below the storage threshold must be rejected"
+    )
+    try expect(
+      TacuaCapturePolicy.hasSufficientStorage(
+        availableBytes: TacuaCapturePolicy.minimumFreeStorageBytes
+      ),
+      "The exact storage threshold must be admitted"
+    )
+    try expect(
+      !TacuaCapturePolicy.shouldAdmitCaptureSample(
+        backgroundGapOpen: true,
+        foregroundSignalObserved: false
+      ),
+      "Samples must be rejected while a background gap remains open"
+    )
+    try expect(
+      TacuaCapturePolicy.shouldAdmitCaptureSample(
+        backgroundGapOpen: true,
+        foregroundSignalObserved: true
+      ),
+      "A foreground lifecycle signal must reopen sample admission"
+    )
+    try expect(
+      TacuaCapturePolicy.shouldAdmitCaptureSample(
+        backgroundGapOpen: false,
+        foregroundSignalObserved: false
+      ),
+      "Samples outside a background gap must be admitted"
+    )
   }
 
   private static func videoClockContinuity() throws {
@@ -97,6 +138,74 @@ enum CapturePolicyTests {
         segmentDurationSeconds: 10
       ) == nil,
       "Invalid clocks must never create a synthetic boundary"
+    )
+    try expect(
+      TacuaCapturePolicy.segmentRotationBoundaries(
+        startedAtPTSSeconds: 100,
+        incomingPTSSeconds: 125,
+        segmentDurationSeconds: 10
+      ) == [110, 120],
+      "A late sample must return every elapsed segment boundary"
+    )
+    try expect(
+      TacuaCapturePolicy.segmentRotationBoundaries(
+        startedAtPTSSeconds: 100,
+        incomingPTSSeconds: 130,
+        segmentDurationSeconds: 10
+      ) == [110, 120, 130],
+      "An exact incoming boundary must be included"
+    )
+    try expect(
+      TacuaCapturePolicy.segmentRotationBoundaries(
+        startedAtPTSSeconds: 100,
+        incomingPTSSeconds: 99,
+        segmentDurationSeconds: 10
+      ).isEmpty,
+      "A regressing incoming clock must not create boundaries"
+    )
+    try expect(
+      TacuaCapturePolicy.segmentRotationBoundaries(
+        startedAtPTSSeconds: 100,
+        incomingPTSSeconds: 130,
+        segmentDurationSeconds: 0
+      ).isEmpty,
+      "A non-positive segment duration must not create boundaries"
+    )
+    try expect(
+      TacuaCapturePolicy.segmentRotationBoundaries(
+        startedAtPTSSeconds: 100,
+        incomingPTSSeconds: .infinity,
+        segmentDurationSeconds: 10
+      ).isEmpty,
+      "Invalid incoming clocks must not create boundaries"
+    )
+    for timescale in [30.0, 600.0, 44_100.0] {
+      let startedAt = 1.0 / timescale
+      let incoming = (1.0 + 2.0 * timescale) / timescale
+      try expect(
+        TacuaCapturePolicy.segmentRotationBoundaries(
+          startedAtPTSSeconds: startedAt,
+          incomingPTSSeconds: incoming,
+          segmentDurationSeconds: 2
+        ).count == 1,
+        "An exact two-second media boundary at timescale \(Int(timescale)) must survive Double conversion"
+      )
+    }
+    try expect(
+      TacuaCapturePolicy.segmentRotationPlan(
+        startedAtPTSSeconds: 0,
+        incomingPTSSeconds: Double(TacuaCapturePolicy.maximumCatchUpSegmentRotations + 1) * 2,
+        segmentDurationSeconds: 2
+      ) == .excessive,
+      "A single callback must not allocate an unbounded number of catch-up writers"
+    )
+    try expect(
+      TacuaCapturePolicy.segmentRotationPlan(
+        startedAtPTSSeconds: 0,
+        incomingPTSSeconds: Double(TacuaCapturePolicy.maximumCatchUpSegmentRotations) * 2,
+        segmentDurationSeconds: 2
+      ) != .excessive,
+      "The bounded catch-up limit itself must remain admissible"
     )
   }
 

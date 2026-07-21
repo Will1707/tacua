@@ -12,7 +12,8 @@
       "deploymentTarget": "17.0",
       "supportsTablet": false,
       "infoPlist": {
-        "NSMicrophoneUsageDescription": "Tacua records your spoken QA narration alongside an in-app screen recording only after you start a test session."
+        "NSMicrophoneUsageDescription": "Tacua records your spoken QA narration alongside an in-app screen recording only after you start a test session.",
+        "TacuaCaptureFaultInjectionEnabled": true
       }
     },
     "plugins": ["expo-dev-client"],

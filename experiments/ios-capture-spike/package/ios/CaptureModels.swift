@@ -127,9 +127,11 @@ enum TacuaCaptureSpikeError: Error {
   case microphonePermissionDenied
   case microphoneSamplesMissing
   case captureStartFailed(String)
+  case captureStartCancelled
   case captureHandlerFailed
   case captureStopFailed
   case startTimeout
+  case startCleanupPending
   case stopTimeout
   case moduleDestroyed
   case insufficientStorage
@@ -139,6 +141,7 @@ enum TacuaCaptureSpikeError: Error {
   case writerCreation(String)
   case writerFailed(String)
   case writerTimeout
+  case rotationLimitExceeded
 
   var code: String {
     switch self {
@@ -158,9 +161,11 @@ enum TacuaCaptureSpikeError: Error {
     case .microphonePermissionDenied: return "ERR_TACUA_CAPTURE_MICROPHONE_DENIED"
     case .microphoneSamplesMissing: return "ERR_TACUA_CAPTURE_MICROPHONE_MISSING"
     case .captureStartFailed: return "ERR_TACUA_CAPTURE_START_FAILED"
+    case .captureStartCancelled: return "ERR_TACUA_CAPTURE_START_CANCELLED"
     case .captureHandlerFailed: return "ERR_TACUA_CAPTURE_HANDLER_FAILED"
     case .captureStopFailed: return "ERR_TACUA_CAPTURE_STOP_FAILED"
     case .startTimeout: return "ERR_TACUA_CAPTURE_START_TIMEOUT"
+    case .startCleanupPending: return "ERR_TACUA_CAPTURE_START_CLEANUP_PENDING"
     case .stopTimeout: return "ERR_TACUA_CAPTURE_STOP_TIMEOUT"
     case .moduleDestroyed: return "ERR_TACUA_CAPTURE_MODULE_DESTROYED"
     case .insufficientStorage: return "ERR_TACUA_CAPTURE_STORAGE_LOW"
@@ -170,6 +175,7 @@ enum TacuaCaptureSpikeError: Error {
     case .writerCreation: return "ERR_TACUA_CAPTURE_WRITER_CREATE"
     case .writerFailed: return "ERR_TACUA_CAPTURE_WRITER_FINISH"
     case .writerTimeout: return "ERR_TACUA_CAPTURE_WRITER_TIMEOUT"
+    case .rotationLimitExceeded: return "ERR_TACUA_CAPTURE_ROTATION_LIMIT"
     }
   }
 
@@ -207,12 +213,16 @@ enum TacuaCaptureSpikeError: Error {
       return "Tacua did not receive microphone samples and stopped the capture."
     case .captureStartFailed(let detail):
       return "ReplayKit could not start the candidate capture (\(detail))."
+    case .captureStartCancelled:
+      return "The capture was stopped before ReplayKit finished starting."
     case .captureHandlerFailed:
       return "ReplayKit reported a fatal capture-handler failure."
     case .captureStopFailed:
       return "ReplayKit reported an error while stopping capture."
     case .startTimeout:
       return "ReplayKit did not finish starting within the bounded start window."
+    case .startCleanupPending:
+      return "ReplayKit start cleanup is still pending; retry Stop or relaunch the app process."
     case .stopTimeout:
       return "ReplayKit did not confirm stop within the bounded stop window."
     case .moduleDestroyed:
@@ -227,6 +237,8 @@ enum TacuaCaptureSpikeError: Error {
       return detail
     case .writerTimeout:
       return "The current capture segment did not finalize within the bounded writer window."
+    case .rotationLimitExceeded:
+      return "ReplayKit emitted a media-clock jump too large to segment safely."
     }
   }
 }
