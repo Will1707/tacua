@@ -8,7 +8,7 @@ import hashlib
 import json
 import re
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -269,6 +269,8 @@ def validate_capture(value: dict[str, Any]) -> None:
         validate_range(gap["time_range"], duration, f"$.gaps[{index}].time_range")
     receipts = value["upload"]["receipts"]
     unique([item["segment_id"] for item in receipts], "$.upload.receipts")
+    unique([item["object_id"] for item in receipts], "$.upload.receipts")
+    unique([item["receipt_digest"] for item in receipts], "$.upload.receipts")
     for index, receipt in enumerate(receipts):
         require(receipt["receipt_digest"] == digest_without(receipt, "receipt_digest"), "DIGEST_MISMATCH", f"$.upload.receipts[{index}].receipt_digest", "receipt changed")
         content = available.get(receipt["segment_id"])
@@ -276,10 +278,15 @@ def validate_capture(value: dict[str, Any]) -> None:
         require(receipt["content_digest"] == content["content_digest"] and receipt["size_bytes"] == content["size_bytes"], "UPLOAD_INTEGRITY_MISMATCH", f"$.upload.receipts[{index}]", "receipt differs from local segment")
     if value["upload"]["state"] == "complete":
         require({r["segment_id"] for r in receipts} == set(available), "INCOMPLETE_UPLOAD", "$.upload.receipts", "complete upload must receipt every available segment")
+    if value["capture_state"] == "complete":
+        require(bool(available), "COMPLETE_CAPTURE_REQUIRES_SEGMENT", "$.segments", "complete capture requires verified media")
+        require(value["streams"]["microphone"] == "enabled", "COMPLETE_NARRATION_REQUIRED", "$.streams.microphone", "complete narrated capture requires microphone evidence")
     start = parse_time(value["started_at"], "$.started_at")
     if value["ended_at"]:
         require(parse_time(value["ended_at"], "$.ended_at") >= start, "INVALID_CHRONOLOGY", "$.ended_at", "capture ended before it started")
-    require(parse_time(value["retention"]["raw_media_expires_at"], "$.retention.raw_media_expires_at") > start, "INVALID_RETENTION", "$.retention", "raw-media expiry must follow capture")
+    raw_expiry = parse_time(value["retention"]["raw_media_expires_at"], "$.retention.raw_media_expires_at")
+    require(raw_expiry > start, "INVALID_RETENTION", "$.retention", "raw-media expiry must follow capture")
+    require(raw_expiry <= start + timedelta(days=30), "MAX_RAW_RETENTION_EXCEEDED", "$.retention.raw_media_expires_at", "raw media may not silently exceed the 30-day V1 default")
 
 
 def validate_diagnostics(value: dict[str, Any]) -> None:
@@ -355,6 +362,14 @@ def validate_ticket(value: dict[str, Any]) -> None:
     content = value["content"]
     claim_ids = {claim["claim_id"] for claim in content["claims"]}
     require(len(claim_ids) == len(content["claims"]), "DUPLICATE_VALUE", "$.content.claims", "claim IDs must be unique")
+    unique([item["precondition_id"] for item in content["preconditions"]], "$.content.preconditions")
+    unique([item["step_id"] for item in content["reproduction_steps"]], "$.content.reproduction_steps")
+    unique([item["criterion_id"] for item in content["acceptance_criteria"]], "$.content.acceptance_criteria")
+    unique([item["uncertainty_id"] for item in content["uncertainty"]["items"]], "$.content.uncertainty.items")
+    unique([item["clarification_id"] for item in content["clarifications"]], "$.content.clarifications")
+    for index, claim in enumerate(content["claims"]):
+        if claim["support"] in {"direct", "inferred"}:
+            require(bool(claim["evidence_refs"]), "SUPPORTED_CLAIM_REQUIRES_EVIDENCE", f"$.content.claims[{index}].evidence_refs", "supported claims must cite evidence")
     for path, child in walk(content, "$.content"):
         if isinstance(child, dict) and isinstance(child.get("claim_refs"), list):
             require(set(child["claim_refs"]) <= claim_ids, "UNKNOWN_CLAIM_REFERENCE", f"{path}.claim_refs", "claim reference is missing")
@@ -374,6 +389,25 @@ def validate_ticket(value: dict[str, Any]) -> None:
         require(approval["candidate_version"] == value["candidate_version"] and approval["candidate_content_digest"] == value["candidate_content_digest"], "APPROVAL_BINDING_MISMATCH", "$.approval", "approval does not bind this version")
         require(approval["actor_id"] == transition["actor_id"], "APPROVAL_ACTOR_MISMATCH", "$.approval.actor_id", "approval actor differs from transition actor")
         require(value["review"]["status"] == "reviewed" and not value["review"]["reviewer_action_required"], "REVIEW_REQUIRED", "$.review", "approved candidate must be reviewed")
+    created = parse_time(value["created_at"], "$.created_at")
+    updated = parse_time(value["updated_at"], "$.updated_at")
+    transitioned = parse_time(transition["occurred_at"], "$.transition.occurred_at")
+    require(created <= transitioned <= updated, "INVALID_CHRONOLOGY", "$.transition.occurred_at", "transition must occur within the candidate snapshot window")
+    reviewed_at = value["review"]["last_reviewed_at"]
+    if value["review"]["status"] == "unreviewed":
+        require(reviewed_at is None, "REVIEW_CHRONOLOGY_MISMATCH", "$.review.last_reviewed_at", "unreviewed candidate cannot claim a review time")
+    elif value["review"]["status"] == "reviewed":
+        require(reviewed_at is not None, "REVIEW_CHRONOLOGY_MISMATCH", "$.review.last_reviewed_at", "reviewed candidate requires a review time")
+    if reviewed_at is not None:
+        reviewed = parse_time(reviewed_at, "$.review.last_reviewed_at")
+        require(created <= reviewed <= updated, "INVALID_CHRONOLOGY", "$.review.last_reviewed_at", "review time must fall within the candidate snapshot window")
+    if value["state"] == "approved":
+        approved = parse_time(value["approval"]["approved_at"], "$.approval.approved_at")
+        require(approved == transitioned, "APPROVAL_CHRONOLOGY_MISMATCH", "$.approval.approved_at", "approval must bind the human approval transition")
+    if value["state"] == "rejected":
+        rejection = value["rejection"]
+        require(transition["actor_type"] == "human" and transition["actor_id"] == rejection["actor_id"], "REJECTION_TRANSITION_REQUIRED", "$.transition", "rejection requires the same human actor")
+        require(parse_time(rejection["rejected_at"], "$.rejection.rejected_at") == transitioned, "REJECTION_CHRONOLOGY_MISMATCH", "$.rejection.rejected_at", "rejection must bind the human rejection transition")
 
 
 def validate_bundle(capture: dict[str, Any], diagnostics: dict[str, Any], job: dict[str, Any], ticket: dict[str, Any]) -> None:

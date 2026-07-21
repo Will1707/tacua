@@ -109,6 +109,38 @@ class RuntimeContractTests(unittest.TestCase):
             validate(ticket)
         self.assertEqual("FIRST_VERSION_MUST_BE_DRAFT", raised.exception.code)
 
+    def test_complete_capture_requires_narration_and_enforces_raw_retention_ceiling(self) -> None:
+        capture = load_bundle()[0]
+        capture["streams"]["microphone"] = "disabled"
+        capture = seal(capture)
+        with self.assertRaises(ContractError) as raised:
+            validate(capture)
+        self.assertEqual("COMPLETE_NARRATION_REQUIRED", raised.exception.code)
+
+        capture = load_bundle()[0]
+        capture["retention"]["raw_media_expires_at"] = "2026-08-21T10:00:01Z"
+        capture = seal(capture)
+        with self.assertRaises(ContractError) as raised:
+            validate(capture)
+        self.assertEqual("MAX_RAW_RETENTION_EXCEEDED", raised.exception.code)
+
+    def test_supported_claims_require_evidence_and_ticket_ids_are_unique(self) -> None:
+        ticket = load_bundle()[3]
+        ticket["content"]["claims"][0]["evidence_refs"] = []
+        ticket = seal(ticket)
+        with self.assertRaises(ContractError) as raised:
+            validate(ticket)
+        self.assertEqual("SUPPORTED_CLAIM_REQUIRES_EVIDENCE", raised.exception.code)
+
+        ticket = load_bundle()[3]
+        ticket["content"]["reproduction_steps"].append(
+            copy.deepcopy(ticket["content"]["reproduction_steps"][0])
+        )
+        ticket = seal(ticket)
+        with self.assertRaises(ContractError) as raised:
+            validate(ticket)
+        self.assertEqual("DUPLICATE_VALUE", raised.exception.code)
+
 
 if __name__ == "__main__":
     unittest.main()

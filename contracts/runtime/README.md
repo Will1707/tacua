@@ -35,9 +35,20 @@ python3 scripts/regenerate_fixture.py
 
 The validator checks the bundled Draft 2020-12 subset plus cross-artifact scope, chronology, sequence, receipt/content checksum, lifecycle, grounding-reference and approval invariants. It rejects unknown contract versions. Consumers must implement exact-version dispatch; future changes require a new version and conformance fixtures rather than silently ignoring fields.
 
+For the V1 narrated-capture boundary, a `complete` capture must contain at
+least one verified media segment and declare the microphone stream enabled.
+Raw-media expiry must be after capture start and no later than 30 days after
+it; an operator may choose a shorter deployment policy. Receipt object IDs and
+receipt digests are unique within a manifest, and every direct or inferred
+ticket claim must cite evidence.
+
 ## Trust and payload boundary
 
 - Evidence references use internal `tacua-evidence` locators; signed URLs, credentials, raw headers, request bodies and response bodies are not contract fields.
+- Artifact digests (`manifest_digest`, `envelope_digest`, and `job_digest`) bind
+  canonical contract content with their own digest field omitted. A transport
+  may additionally checksum uploaded bytes, but that transport checksum must
+  not be substituted for the artifact digest in downstream provenance.
 - `unavailable` and capture/collection gaps are first-class and must remain visible to processing and review.
 - External model destinations require an explicit default-deny authorization decision. Repository and SaaS context inputs are read-only.
 - Human approval binds one exact candidate content digest and version. Editing after approval creates a new draft version; it does not mutate the approved snapshot.
