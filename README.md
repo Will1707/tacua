@@ -25,7 +25,7 @@ The first pilot targets an authorized private Expo/React Native iOS app. The V1 
 
 ## What is here today
 
-- [`experiments/ios-capture-spike`](experiments/ios-capture-spike/package/README.md): a removable, first-party Expo/ReplayKit package candidate with segmented local recovery. Its isolated arm64 iOS Simulator app build and Debug Maestro route check passed; a reviewed Release visual baseline and physical-device ReplayKit behavior remain unverified.
+- [`experiments/ios-capture-spike`](experiments/ios-capture-spike/package/README.md): a removable, first-party Expo/ReplayKit package candidate with segmented local recovery, plus a local-only [physical-iPhone development harness](experiments/ios-capture-spike/harness/README.md). A first physical-device run proved narrated media capture and exposed [two open timing findings](experiments/ios-capture-spike/PHYSICAL-DEVICE-RESULTS.md); interruption, recovery, duration, and resource behavior remain unverified.
 - [`experiments/eval-harness`](experiments/eval-harness/README.md): a synthetic multi-issue corpus, scorer and reporter-time protocol. Its fixtures are not product-quality evidence.
 - [`experiments/security-harness`](experiments/security-harness/README.md): deterministic, synthetic default-deny, authorization, retention and deletion contract checks. Runtime security remains unverified.
 - [`experiments/docker-topology-probe`](experiments/docker-topology-probe/README.md): a non-production container lifecycle probe. It does not select or implement the backend topology.

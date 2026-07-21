@@ -39,6 +39,7 @@ final class TacuaCaptureSession {
   private var writer: SegmentWriter?
   private var nextSegmentIndex = 0
   private var latestVideoPTS: CMTime?
+  private var latestVideoHostUptimeSeconds: Double?
   private var latestMicrophonePTS: CMTime?
   private var latestMicrophoneHostUptimeSeconds: Double?
   private var isStopping = false
@@ -677,13 +678,20 @@ final class TacuaCaptureSession {
         )
         return
       }
-      if let priorPTS = latestVideoPTS {
-        let delta = CMTimeGetSeconds(CMTimeSubtract(pts, priorPTS))
-        if delta > 0.5, !closedBackgroundGap {
-          openGap(reason: "video_pts_discontinuity", priorMediaPTS: priorPTS, nextMediaPTS: pts)
-        }
+      if let priorPTS = latestVideoPTS,
+        let priorHostUptimeSeconds = latestVideoHostUptimeSeconds,
+        TacuaCapturePolicy.videoClockHasDiscontinuity(
+          priorMediaPTSSeconds: CMTimeGetSeconds(priorPTS),
+          currentMediaPTSSeconds: mediaSeconds,
+          priorHostUptimeSeconds: priorHostUptimeSeconds,
+          currentHostUptimeSeconds: hostUptimeSeconds
+        ),
+        !closedBackgroundGap
+      {
+        openGap(reason: "video_pts_discontinuity", priorMediaPTS: priorPTS, nextMediaPTS: pts)
       }
       latestVideoPTS = pts
+      latestVideoHostUptimeSeconds = hostUptimeSeconds
 
       if let writer, !writer.isCompatible(withVideoSample: sampleBuffer) {
         finishCurrentSegment()

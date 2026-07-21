@@ -1,0 +1,24 @@
+{
+  "name": "@tacua/ios-capture-harness",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Physical-iPhone development client for Tacua EXP-001",
+  "license": "Apache-2.0",
+  "main": "index.ts",
+  "scripts": {
+    "start": "expo start --dev-client",
+    "ios": "expo run:ios",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@tacua/ios-capture-spike": "file:../package",
+    "expo": "~56.0.12",
+    "expo-dev-client": "~56.0.12",
+    "react": "19.2.3",
+    "react-native": "0.85.3"
+  },
+  "devDependencies": {
+    "@types/react": "~19.2.2",
+    "typescript": "~6.0.3"
+  }
+}

@@ -27,10 +27,41 @@ enum CapturePolicyTests {
   static func main() throws {
     try terminalClassification()
     try deadlineAndMicrophoneContinuity()
+    try videoClockContinuity()
     try crashWindowRecoverySource()
     try candidateHandoffValidation()
     try deletionAuthorizationAndStopSafety()
     print("Tacua capture core policy tests passed")
+  }
+
+  private static func videoClockContinuity() throws {
+    try expect(
+      !TacuaCapturePolicy.videoClockHasDiscontinuity(
+        priorMediaPTSSeconds: 10,
+        currentMediaPTSSeconds: 16,
+        priorHostUptimeSeconds: 110,
+        currentHostUptimeSeconds: 116
+      ),
+      "A static-screen interval advancing equally in media and host clocks is continuous"
+    )
+    try expect(
+      TacuaCapturePolicy.videoClockHasDiscontinuity(
+        priorMediaPTSSeconds: 10,
+        currentMediaPTSSeconds: 16,
+        priorHostUptimeSeconds: 110,
+        currentHostUptimeSeconds: 111
+      ),
+      "A media jump not corroborated by the host clock must create a gap"
+    )
+    try expect(
+      TacuaCapturePolicy.videoClockHasDiscontinuity(
+        priorMediaPTSSeconds: 16,
+        currentMediaPTSSeconds: 15,
+        priorHostUptimeSeconds: 110,
+        currentHostUptimeSeconds: 111
+      ),
+      "A regressing media clock must create a gap"
+    )
   }
 
   private static func terminalClassification() throws {

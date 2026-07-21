@@ -1,0 +1,23 @@
+{
+  "expo": {
+    "name": "Tacua Capture Lab",
+    "slug": "tacua-capture-lab",
+    "scheme": "tacua-capture-lab",
+    "version": "0.0.1",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "bundleIdentifier": "com.tacua.capturelab",
+      "buildNumber": "1",
+      "deploymentTarget": "17.0",
+      "supportsTablet": false,
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "Tacua records your spoken QA narration alongside an in-app screen recording only after you start a test session."
+      }
+    },
+    "plugins": ["expo-dev-client"],
+    "extra": {
+      "tacuaExperiment": "EXP-001"
+    }
+  }
+}

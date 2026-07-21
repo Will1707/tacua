@@ -9,6 +9,7 @@ enum TacuaCapturePolicy {
   static let writerFinalizationWatchdogSeconds: Double = 15
   static let microphoneStartupWatchdogSeconds: Double = 8
   static let microphoneGapToleranceSeconds: Double = 3
+  static let videoClockDiscontinuityToleranceSeconds: Double = 0.5
   static let requiredConsentVersion = "tacua-local-capture-consent-v1"
 
   static func terminalState(
@@ -38,6 +39,20 @@ enum TacuaCapturePolicy {
     }
     return latestVideoPTSSeconds - latestMicrophonePTSSeconds > microphoneGapToleranceSeconds
       && latestVideoHostUptimeSeconds - latestMicrophoneHostUptimeSeconds > microphoneGapToleranceSeconds
+  }
+
+  static func videoClockHasDiscontinuity(
+    priorMediaPTSSeconds: Double,
+    currentMediaPTSSeconds: Double,
+    priorHostUptimeSeconds: Double,
+    currentHostUptimeSeconds: Double
+  ) -> Bool {
+    let mediaDelta = currentMediaPTSSeconds - priorMediaPTSSeconds
+    let hostDelta = currentHostUptimeSeconds - priorHostUptimeSeconds
+    guard mediaDelta.isFinite, hostDelta.isFinite, mediaDelta >= 0, hostDelta >= 0 else {
+      return true
+    }
+    return abs(mediaDelta - hostDelta) > videoClockDiscontinuityToleranceSeconds
   }
 
   static func recoverySource(finalExists: Bool, partialExists: Bool) -> RecoverySource? {

@@ -12,7 +12,7 @@ It is a candidate implementation, not the production Tacua SDK contract. Its sch
 - Requires microphone permission and at least one microphone sample. A video-only session cannot be classified as complete.
 - Writes independently finalized MOV segments. Before each partial-to-final rename, it atomically writes a sidecar containing size, SHA-256, timing, and sample counts.
 - Reconciles a finalized segment, or a sidecar-verified partial segment, after interruption. It never invents a segment from an unverified file.
-- Records host-clock/media-clock calibration, markers, explicit continuity gaps, stable public error codes, and truthful nullable status values.
+- Records host-clock/media-clock calibration, markers, dual-clock continuity gaps, stable public error codes, and truthful nullable status values. A long interval between ReplayKit video samples is not itself a gap when media time and host uptime advance together.
 - Applies bounded start, stop, microphone-startup, and writer-finalization watchdogs. A timed-out stop is retried once. If ReplayKit still reports that it is recording, the session remains installed in the nonterminal `stop_failed_capture_active` state and `stop()` rejects; it is never reported as stopped.
 - Uses iOS complete-unless-open file protection and excludes capture storage from device backup.
 

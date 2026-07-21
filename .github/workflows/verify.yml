@@ -69,6 +69,12 @@ jobs:
         working-directory: experiments/ios-capture-spike/package
         run: sh tests/run-core-tests.sh
 
+      - name: Type-check the physical-device harness
+        working-directory: experiments/ios-capture-spike/harness
+        run: |
+          npm ci --ignore-scripts --no-audit
+          npm run typecheck
+
       - name: Compile the ReplayKit API boundary
         run: |
           xcrun swiftc -typecheck \
