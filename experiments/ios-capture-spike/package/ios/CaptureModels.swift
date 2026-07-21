@@ -47,6 +47,18 @@ public struct TacuaBackendStartSessionNativeOptions: Record {
   public init() {}
 }
 
+/// RESUME derives remote session state and both credential identifiers from the committed queue;
+/// callers may provide only the same validated build/scope artifacts and an approved launch.
+public struct TacuaBackendResumeSessionNativeOptions: Record {
+  @Field public var approvedLaunchId: String = ""
+  @Field public var localSessionId: String = ""
+  @Field public var buildIdentityJson: String = ""
+  @Field public var scopeJson: String = ""
+  @Field public var requestedAt: String = ""
+
+  public init() {}
+}
+
 struct CaptureSegment: Codable {
   let index: Int
   let fileName: String

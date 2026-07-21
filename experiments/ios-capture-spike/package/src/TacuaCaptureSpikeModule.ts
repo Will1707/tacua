@@ -184,7 +184,23 @@ type BackendStartSessionOptions = {
   readonly requestedAt: string;
 };
 
+type BackendResumeSessionOptions = {
+  readonly approvedLaunchId: string;
+  readonly localSessionId: string;
+  readonly buildIdentity: BackendBuildIdentity;
+  readonly scope: BackendCaptureScope;
+  readonly requestedAt: string;
+};
+
 type BackendStartSessionNativeOptions = {
+  readonly approvedLaunchId: string;
+  readonly localSessionId: string;
+  readonly buildIdentityJson: string;
+  readonly scopeJson: string;
+  readonly requestedAt: string;
+};
+
+type BackendResumeSessionNativeOptions = {
   readonly approvedLaunchId: string;
   readonly localSessionId: string;
   readonly buildIdentityJson: string;
@@ -211,6 +227,42 @@ type BackendStartedSession = {
   readonly uploadsConnected: false;
   readonly completionConnected: false;
 };
+
+type BackendResumedSessionBase = {
+  readonly localSessionId: string;
+  readonly remoteSessionId: string;
+  readonly scopeDigest: string;
+  readonly credentialId: string;
+  readonly credentialExpiresAt: string;
+  readonly credentialAvailability:
+    | "available"
+    | "missing"
+    | "temporarily_unavailable"
+    | "unavailable";
+  readonly queueSchemaVersion: 3;
+  readonly resumeRequired: boolean;
+  readonly pendingRevokedCredentialRemovalCount: number;
+  /** Resume rotates backend authority; it does not start or reconnect capture transport. */
+  readonly captureStarted: false;
+  readonly uploadsConnected: false;
+  readonly completionConnected: false;
+};
+
+type BackendResumedReceivingSession = BackendResumedSessionBase & {
+  readonly backendSessionState: "receiving";
+  readonly credentialCapability: "active";
+  readonly replayCompletionId: null;
+};
+
+type BackendResumedCompletedSession = BackendResumedSessionBase & {
+  readonly backendSessionState: "completed";
+  readonly credentialCapability: "completion_replay_or_delete_only";
+  readonly replayCompletionId: string;
+};
+
+type BackendResumedSession =
+  | BackendResumedReceivingSession
+  | BackendResumedCompletedSession;
 
 type BackendStartRecoveryStatus = {
   readonly localSessionId: string;
@@ -245,6 +297,110 @@ type BackendStartRecoveryStatus = {
     | null;
 };
 
+type BackendResumeRecoveryStatus =
+  | {
+      readonly localSessionId: string;
+      readonly state: "none";
+      readonly remoteCredentialMayExist: false;
+      readonly queueUsable: false;
+      readonly canRecoverWithoutLaunch: false;
+      readonly canResetPreparedCredential: false;
+      readonly requiresReconciliation: false;
+    }
+  | {
+      readonly localSessionId: string;
+      readonly state:
+        | "credential_prepared"
+        | "credential_prepared_reset_pending";
+      readonly remoteCredentialMayExist: false;
+      readonly queueUsable: false;
+      readonly canRecoverWithoutLaunch: false;
+      readonly canResetPreparedCredential: true;
+      readonly requiresReconciliation: false;
+    }
+  | {
+      readonly localSessionId: string;
+      readonly state: "exchange_outcome_unknown";
+      /** The backend may have revoked the queued credential and accepted the candidate. */
+      readonly remoteCredentialMayExist: true;
+      /** The committed queue is quarantined until the exchange is reconciled. */
+      readonly queueUsable: false;
+      readonly canRecoverWithoutLaunch: false;
+      /** Unknown network outcomes can never be cleared by a local reset. */
+      readonly canResetPreparedCredential: false;
+      readonly requiresReconciliation: true;
+    }
+  | {
+      readonly localSessionId: string;
+      readonly state: "receipt_validated_queue_commit_pending";
+      readonly remoteCredentialMayExist: true;
+      readonly queueUsable: false;
+      readonly canRecoverWithoutLaunch: true;
+      readonly canResetPreparedCredential: false;
+      readonly requiresReconciliation: false;
+    }
+  | {
+      readonly localSessionId: string;
+      readonly state: "queue_committed";
+      /** Whether this queue still names a remotely issued credential authority. */
+      readonly remoteCredentialMayExist: boolean;
+      /** True only when the committed credential/configuration/time checks permit transport. */
+      readonly queueUsable: boolean;
+      readonly canRecoverWithoutLaunch: false;
+      readonly canResetPreparedCredential: false;
+      readonly requiresReconciliation: false;
+    }
+  | {
+      readonly localSessionId: string;
+      readonly state: "queue_conflict_requires_reconciliation";
+      readonly remoteCredentialMayExist: true;
+      readonly queueUsable: false;
+      readonly canRecoverWithoutLaunch: false;
+      readonly canResetPreparedCredential: false;
+      readonly requiresReconciliation: true;
+    };
+
+type BackendResumeRequirement =
+  | {
+      readonly kind: "none";
+      readonly reason:
+        | "ready"
+        | "credential_temporarily_unavailable"
+        | "credential_unavailable"
+        | "terminal_deletion";
+      readonly canConsumeApprovedLaunch: false;
+      readonly expectedSessionState: null;
+      readonly expectedCompletionId: null;
+    }
+  | ({
+      readonly kind: "resume_session";
+      readonly reason:
+        | "credential_missing"
+        | "credential_expired_or_clock_invalid"
+        | "transport_binding_missing";
+      readonly canConsumeApprovedLaunch: true;
+    } & (
+      | {
+          readonly expectedSessionState: "receiving";
+          readonly expectedCompletionId: null;
+        }
+      | {
+          readonly expectedSessionState: "completed";
+          readonly expectedCompletionId: string;
+        }
+    ))
+  | {
+      readonly kind: "blocked";
+      readonly reason:
+        | "transport_configuration_changed"
+        | "no_remote_session"
+        | "invalid_completion_binding"
+        | "launch_recovery_required";
+      readonly canConsumeApprovedLaunch: false;
+      readonly expectedSessionState: null;
+      readonly expectedCompletionId: null;
+    };
+
 type BackendQueueStatus = {
   readonly exists: boolean;
   readonly localSessionId: string;
@@ -252,7 +408,7 @@ type BackendQueueStatus = {
   readonly scopeDigest?: string | null;
   readonly currentCredentialId?: string | null;
   readonly currentCredentialExpiresAt?: string | null;
-  /** Recorded backend authority; gate sends on this together with resumeRequired. */
+  /** Recorded backend authority; gate sends on this together with resumeRequirement. */
   readonly credentialCapability?:
     | "requires_exchange"
     | "requires_transport_rebind"
@@ -266,6 +422,8 @@ type BackendQueueStatus = {
     | "unavailable"
     | "not_applicable";
   readonly credentialTimeValid?: boolean;
+  readonly resumeRequirement?: BackendResumeRequirement;
+  /** @deprecated Use `resumeRequirement.kind === "resume_session"`. */
   readonly resumeRequired?: boolean;
   readonly transportConfigurationMatchesBuild?: boolean;
   readonly operationCount?: number;
@@ -302,6 +460,16 @@ type NativeTacuaCaptureSpikeModule = {
   startBackendSession: (
     options: BackendStartSessionNativeOptions,
   ) => Promise<BackendStartedSession>;
+  resumeBackendSession: (
+    options: BackendResumeSessionNativeOptions,
+  ) => Promise<BackendResumedSession>;
+  getBackendResumeRecoveryStatus: (
+    localSessionId: string,
+  ) => Promise<BackendResumeRecoveryStatus>;
+  recoverBackendResume: (
+    localSessionId: string,
+  ) => Promise<BackendResumedSession>;
+  resetPreparedBackendResume: (localSessionId: string) => Promise<void>;
   getBackendStartRecoveryStatus: (
     localSessionId: string,
   ) => Promise<BackendStartRecoveryStatus>;
@@ -334,6 +502,10 @@ export type {
   BackendCaptureScope,
   BackendLaunchConsentRequest,
   BackendQueueStatus,
+  BackendResumedSession,
+  BackendResumeRecoveryStatus,
+  BackendResumeRequirement,
+  BackendResumeSessionOptions,
   BackendStartedSession,
   BackendStartRecoveryStatus,
   BackendStartSessionOptions,

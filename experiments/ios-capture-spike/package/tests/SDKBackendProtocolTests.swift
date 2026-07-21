@@ -32,6 +32,7 @@ enum SDKBackendProtocolTests {
     try deletionAuthorityComesFromExactTombstone(fixtureRoot)
     try exactWholeSecondTimestampsOnly(fixtureRoot)
     try launchRequestRejectsSameIdentifierRotation(fixtureRoot)
+    try resumeReceiptCannotPredatePriorAuthority(fixtureRoot)
     try resealedDiagnosticUnknownAndUnavailableFieldsAreRejected(fixtureRoot)
     try resealedManifestStreamsRangesAndRetentionAreRejected(fixtureRoot)
     try resealedProcessingJobNestedFieldsAreRejected(fixtureRoot)
@@ -122,6 +123,33 @@ enum SDKBackendProtocolTests {
     ) { $0["session_id"] = .string("session_other") }
     try expectFailure {
       _ = try TacuaSDKBackendProtocol.validateResponse(rebound, forCanonicalRequest: resumeRequest)
+    }
+  }
+
+  private static func resumeReceiptCannotPredatePriorAuthority(_ root: URL) throws {
+    let request = try canonicalFixture(root, "receiving-resume-request")
+    let response = try canonicalFixture(root, "receiving-resume-receipt")
+    _ = try TacuaSDKBackendProtocol.validateResponse(
+      response,
+      forCanonicalRequest: request,
+      minimumLaunchReceiptTimestamp: "2026-07-21T09:57:01Z"
+    )
+
+    let resealed = try replacingRoot(
+      response,
+      receiptDigestField: "exchange_receipt_digest"
+    ) { $0["received_at"] = .string("2026-07-21T09:00:00Z") }
+    // Pair-local validation still proves that the server received the request before issuing B.
+    _ = try TacuaSDKBackendProtocol.validateResponse(
+      resealed,
+      forCanonicalRequest: request
+    )
+    try expectFailure {
+      _ = try TacuaSDKBackendProtocol.validateResponse(
+        resealed,
+        forCanonicalRequest: request,
+        minimumLaunchReceiptTimestamp: "2026-07-21T09:57:01Z"
+      )
     }
   }
 

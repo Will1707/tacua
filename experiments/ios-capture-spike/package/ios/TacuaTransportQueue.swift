@@ -824,6 +824,94 @@ struct TacuaTransportQueueV3: Codable, Equatable {
     )
   }
 
+  /// Applies a validated RESUME receipt using the exact server-time anchor captured when that
+  /// receipt was observed. The caller supplies the credential that was current in its durable
+  /// baseline so recovery cannot rotate a stale queue. Unlike `applyExchange(...clock:)`, this
+  /// path never re-anchors an old `issued_at` value to recovery-time uptime.
+  ///
+  /// The queue remains the cleanup journal for the revoked credential: the prior current
+  /// credential is appended to `pendingRevokedCredentialRemovals` before the caller durably
+  /// compare-and-swaps this replacement into place. Immutable requests, responses, payload
+  /// bindings, and cleanup authorities are preserved byte-for-byte.
+  mutating func applyRecoveredResume(
+    expectedCurrentCredentialID: String,
+    newCredentialID: String,
+    transportConfigurationDigest: String,
+    expiresAt: String,
+    capability: TacuaTransportCredentialCapability,
+    replayCompletionID: String?,
+    timeAnchor: TacuaServerTimeAnchor
+  ) throws {
+    try validate()
+    guard let remoteSessionID, let scopeDigest, let currentCredentialID else {
+      throw TacuaTransportQueueError.invalidQueue
+    }
+    guard currentCredentialID == expectedCurrentCredentialID else {
+      throw TacuaTransportQueueError.credentialMismatch
+    }
+    guard newCredentialID != expectedCurrentCredentialID,
+      credentialExpiryLedger?[newCredentialID] == nil,
+      !pendingRevokedCredentialRemovals.contains(newCredentialID)
+    else { throw TacuaTransportQueueError.credentialMismatch }
+    if let existingTransportConfigurationDigest = self.transportConfigurationDigest,
+      existingTransportConfigurationDigest != transportConfigurationDigest
+    {
+      throw TacuaTransportQueueError.transportConfigurationMismatch
+    }
+    guard deletionCleanupAuthority == nil,
+      credentialCleanupState == .none,
+      credentialCapability != .requiresExchange,
+      credentialCapability != .deletionReplayOnly
+    else { throw TacuaTransportQueueError.operationNotAllowed }
+    if let previousAnchor = self.timeAnchor {
+      guard timeAnchor.issuedEpochMilliseconds >= previousAnchor.minimumEpochMilliseconds else {
+        throw TacuaTransportQueueError.invalidTimeAnchor
+      }
+    }
+
+    switch capability {
+    case .active:
+      guard replayCompletionID == nil, completionCleanupAuthority == nil else {
+        throw TacuaTransportQueueError.operationNotAllowed
+      }
+    case .completionReplayOrDeleteOnly:
+      guard let replayCompletionID,
+        let authority = completionCleanupAuthority,
+        authority.completionID == replayCompletionID,
+        let operation = operations.first(where: { $0.operationID == replayCompletionID }),
+        operation.kind == .completion,
+        operation.state == .responseStored,
+        operation.responseArtifactDigest == authority.completionReceiptDigest
+      else { throw TacuaTransportQueueError.cleanupNotAuthorized }
+    case .requiresExchange, .requiresTransportRebind, .deletionReplayOnly:
+      throw TacuaTransportQueueError.operationNotAllowed
+    }
+
+    let immutableOperations = operations
+    let immutableLocalPayloadPaths = localPayloadPaths
+    let immutableCompletionAuthority = completionCleanupAuthority
+    let immutablePayloadCleanupState = payloadCleanupState
+    var candidate = self
+    try candidate.applyExchange(
+      remoteSessionID: remoteSessionID,
+      scopeDigest: scopeDigest,
+      credentialID: newCredentialID,
+      transportConfigurationDigest: transportConfigurationDigest,
+      expiresAt: expiresAt,
+      previousCredentialID: expectedCurrentCredentialID,
+      capability: capability,
+      timeAnchor: timeAnchor
+    )
+    guard candidate.operations == immutableOperations,
+      candidate.localPayloadPaths == immutableLocalPayloadPaths,
+      candidate.completionCleanupAuthority == immutableCompletionAuthority,
+      candidate.payloadCleanupState == immutablePayloadCleanupState,
+      candidate.pendingRevokedCredentialRemovals.contains(expectedCurrentCredentialID)
+    else { throw TacuaTransportQueueError.invalidQueue }
+    try candidate.validate()
+    self = candidate
+  }
+
   private mutating func applyExchange(
     remoteSessionID: String,
     scopeDigest: String,
@@ -1560,7 +1648,7 @@ private struct TacuaLegacyUploadItem: Decodable {
   }
 }
 
-private enum TacuaProtocolTimestamp {
+enum TacuaProtocolTimestamp {
   static func parseMilliseconds(_ value: String) -> Int64? {
     guard value.utf8.count == TacuaQueueBounds.maximumTimestampBytes,
       value.range(

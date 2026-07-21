@@ -22,11 +22,11 @@ The package now also contains the native foundation for
 `tacua.sdk-backend@1.0.0`: canonical request builders, exhaustive local request
 and response validation, a build-pinned backend origin, a redirect-rejecting and
 response-bounded `URLSession` client, Keychain-backed credentials, immutable
-request replay, and a crash-safe queue. A native START-only lifecycle coordinator
-now consumes an approved launch exactly once, creates a device-only credential,
-validates and sends the frozen launch exchange, and commits the validated
-receiving-session binding to that queue. It does not start ReplayKit, enqueue or
-upload media, complete a session, or delete backend data. Automatic
+request replay, and a crash-safe queue. Native START and RESUME lifecycle
+coordinators consume approved launches exactly once, create device-only
+credentials, validate and send the frozen exchanges, and commit validated
+receiving or completion-replay authority to that queue. They do not start
+ReplayKit, enqueue or upload media, complete a session, or delete backend data. Automatic
 capture-manifest-to-protocol conversion and the upload/completion/deletion
 lifecycle are still implementation work; `stop()` does not upload by itself.
 
@@ -130,11 +130,11 @@ When its `canRecoverWithoutLaunch` field is true,
 `receipt_validated_queue_commit_pending` can be repaired with
 `recoverBackendStart(localSessionId)` without another launch. Queue recovery is
 structural: it remains available after a build transport change or missing
-Keychain item, and the returned `resumeRequired` flag then remains true. The
-public resume exchange that repairs that transport authority is a later slice;
-until it exists, retain the queue and keep uploads blocked. A new START cannot
-replace that committed queue, so do not request or consume another launch code
-for the same local session yet. An
+Keychain item. A new START cannot replace that committed queue. Use
+`getBackendQueueStatus(localSessionId).resumeRequirement` before requesting a
+reviewer launch: only `kind: "resume_session"` may consume a RESUME launch. A
+non-null transport configuration change is `blocked`, because frozen session
+authority remains pinned to the build that created it. An
 `exchange_outcome_unknown` state is deliberately **not** called remotely
 recoverable: the backend may have accepted the request, but the process lacks a
 validated remote session ID. It retains the Keychain credential and requires a
@@ -151,16 +151,56 @@ A crash/failure after receipt validation but before the receipt journal itself
 is durable remains conservatively indistinguishable from this unknown-outcome
 state. These APIs never claim that capture, uploads, or completion occurred.
 
+RESUME derives the remote session ID, previous credential ID, expected session
+state, and completion ID exclusively from the committed queue; JavaScript
+cannot choose or override them:
+
+```ts
+const resumed = await TacuaCapture.resumeBackendSession({
+  approvedLaunchId: approved.approvedLaunchId,
+  localSessionId: 'local_qa_001',
+  buildIdentity,
+  scope,
+  requestedAt: '2026-07-21T10:02:01Z',
+});
+// Credential rotation only: capture/upload/completion flags remain false.
+```
+
+Before launch consumption or network I/O, native code validates the scope/build
+binding, queue requirement, monotonic clock, credential history bounds, and
+resulting encoded queue capacity. RESUME publishes a secret-free credential
+journal before Keychain mutation and `exchange_outcome_unknown` before network
+I/O. A validated receipt records exact base/result queue digests and its
+original server-time anchor. Recovery accepts only those exact snapshots and
+never rewinds the prior authoritative time floor.
+
+Use `getBackendResumeRecoveryStatus(localSessionId)` after startup. A
+pre-network `credential_prepared` state can be cleared with
+`resetPreparedBackendResume(localSessionId)`. A validated
+`receipt_validated_queue_commit_pending` state can be completed without a new
+launch via `recoverBackendResume(localSessionId)`. An
+`exchange_outcome_unknown` state cannot be locally reset: the backend may have
+revoked credential A and installed B, so deleting B could destroy the only
+current authority. It quarantines the queue and reports
+`requiresReconciliation: true`; a third queue snapshot reports
+`queue_conflict_requires_reconciliation`. Backend-fenced reconciliation is
+future work, and neither state is released to uploads. A completed-session
+RESUME returns only `completion_replay_or_delete_only` with the exact stored
+completion ID and can never restore upload authority. Deleted sessions cannot
+resume.
+
 `credentialCapability` records the backend authority last established; it is
-not, by itself, a transport-usability signal. Even `active` is unsendable while
-`resumeRequired` is true (for example after expiry, reboot, build change, or
-Keychain loss). `requires_transport_rebind` is always blocked until the future
-resume API binds the current build. `completion_replay_or_delete_only` permits
+not, by itself, a transport-usability signal. Gate transport on the richer
+`resumeRequirement`: expiry, a reboot-invalid clock, a missing Keychain item,
+or a legacy nil binding returns `kind: "resume_session"`; a changed non-null
+binding returns `kind: "blocked"`. `requires_transport_rebind` stays blocked
+until RESUME binds the current build. `completion_replay_or_delete_only` permits
 only exact completion replay and deletion work, while `deletion_replay_only`
 permits only exact deletion replay and receipt-authorized local cleanup. A
 deletion-only queue therefore reports `resumeRequired: false` because it is
 terminal, not because uploads are allowed. New media uploads require all of
-`credentialCapability: "active"`, `resumeRequired: false`, and
+`credentialCapability: "active"`, `resumeRequirement.kind: "none"` with
+`reason: "ready"`, and
 `credentialAvailability: "available"`. A locked device can report
 `temporarily_unavailable`; retry after unlock instead of requesting a launch.
 Other Keychain failures report `unavailable` and require local diagnosis, not
@@ -173,7 +213,8 @@ revocation before removing A from Keychain. The host must call
 `getBackendQueueStatus(localSessionId)` for each known queue during startup; that
 explicit status read idempotently drains pending credential cleanup. Queue
 status and cleanup hold the same cross-process per-session lease as START and
-refuse to expose a queue while its receipt journal still requires recovery.
+RESUME and refuse to expose a queue while either receipt journal still requires
+recovery.
 Credential
 validity is the half-open interval ending at
 `expires_at`; an expired credential or a reboot-invalidated monotonic clock
@@ -255,7 +296,11 @@ queue/journal mismatch. It asserts journal-before-Keychain ordering and scans
 every durable START artifact for prohibited launch-code and secret material. It
 also covers missing-Keychain and changed-build receipt recovery, durable journal
 removal confirmation, duplicate-ID crash recovery, lifecycle-serialized queue
-status, stale queue CAS rejection, and private storage modes.
+status, stale queue CAS rejection, and private storage modes. RESUME coverage
+includes receiving and completed authority, V2 transport binding,
+deterministic pre-network rejection, non-abandonable unknown outcomes, exact
+base/result CAS recovery, server-time non-regression, credential cleanup,
+START/RESUME cross-gating, and secure canonical journal storage.
 
 They also cover fail-closed storage thresholds, lifecycle sample admission,
 multi-boundary catch-up, and the exact QA fault-plan parser/matchers. The test
@@ -294,8 +339,8 @@ SDK. Promotion requires all remaining gates below to close:
 - [x] Implement and fixture-test the canonical V1 backend requests, exhaustive
   receipt validation, Keychain credential abstraction, durable replay queue,
   bounded HTTP client, and integrity-checked segment upload snapshot.
-- [ ] Connect a stopped capture to the START-established queue. The START-only
-  lifecycle coordinator is implemented, but this candidate still only marks
+- [ ] Connect a stopped capture to the START/RESUME-established queue. The
+  credential lifecycle coordinators are implemented, but this candidate still only marks
   capture data `partial_ready_for_upload`; `stop()` does not enqueue or upload
   it, and completion/deletion are not orchestrated.
 - [ ] Verify protected-file behavior in the production integration and provide an

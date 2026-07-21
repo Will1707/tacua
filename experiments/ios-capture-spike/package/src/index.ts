@@ -7,6 +7,10 @@ import {
   type BackendCaptureScope,
   type BackendLaunchConsentRequest,
   type BackendQueueStatus,
+  type BackendResumedSession,
+  type BackendResumeRecoveryStatus,
+  type BackendResumeRequirement,
+  type BackendResumeSessionOptions,
   type BackendStartedSession,
   type BackendStartRecoveryStatus,
   type BackendStartSessionOptions,
@@ -30,6 +34,10 @@ export type {
   BackendCaptureScope,
   BackendLaunchConsentRequest,
   BackendQueueStatus,
+  BackendResumedSession,
+  BackendResumeRecoveryStatus,
+  BackendResumeRequirement,
+  BackendResumeSessionOptions,
   BackendStartedSession,
   BackendStartRecoveryStatus,
   BackendStartSessionOptions,
@@ -90,6 +98,37 @@ export function startBackendSession(
     scopeJson: JSON.stringify(options.scope),
     requestedAt: options.requestedAt,
   });
+}
+
+export function resumeBackendSession(
+  options: BackendResumeSessionOptions,
+): Promise<BackendResumedSession> {
+  return TacuaCaptureSpikeModule.resumeBackendSession({
+    approvedLaunchId: options.approvedLaunchId,
+    localSessionId: options.localSessionId,
+    buildIdentityJson: JSON.stringify(options.buildIdentity),
+    scopeJson: JSON.stringify(options.scope),
+    requestedAt: options.requestedAt,
+  });
+}
+
+export function getBackendResumeRecoveryStatus(
+  localSessionId: string,
+): Promise<BackendResumeRecoveryStatus> {
+  return TacuaCaptureSpikeModule.getBackendResumeRecoveryStatus(localSessionId);
+}
+
+/** Finishes a validated receipt/queue commit after a crash without consuming a launch code. */
+export function recoverBackendResume(
+  localSessionId: string,
+): Promise<BackendResumedSession> {
+  return TacuaCaptureSpikeModule.recoverBackendResume(localSessionId);
+}
+
+export function resetPreparedBackendResume(
+  localSessionId: string,
+): Promise<void> {
+  return TacuaCaptureSpikeModule.resetPreparedBackendResume(localSessionId);
 }
 
 export function getBackendStartRecoveryStatus(

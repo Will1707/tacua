@@ -88,6 +88,10 @@ enum TransportQueueTests {
     try timeAnchorSurvivesRestartAndRejectsReboot()
     try expiredCredentialsRequireResumeAtHalfOpenBoundary()
     try exactRetryKeepsHistoricalBodyCredentialAfterRotation()
+    try recoveredReceivingResumePreservesImmutableQueue()
+    try recoveredResumeRejectsAuthoritativeTimeRegression()
+    try recoveredCompletedResumeRequiresExactAuthority(fixtureRoot)
+    try recoveredResumeRejectsStaleAndConflictingBindings()
     try sameIdentifierRotationIsRejected()
     try rotationRemovalIsJournaledBeforeKeychainMutation()
     try completedCredentialsCannotRestartUploads()
@@ -223,16 +227,23 @@ enum TransportQueueTests {
       )
     }
 
-    try migrated.applyExchange(
-      remoteSessionID: "session_remote_001",
-      scopeDigest: digestA,
-      credentialID: "credential_rebound",
-      transportConfigurationDigest: transportDigest,
-      expiresAt: "2026-08-20T11:00:00Z",
-      previousCredentialID: "credential_first",
-      capability: .active,
+    let recoveredAnchor = try TacuaServerTimeAnchor.establish(
       issuedAt: "2026-07-21T10:05:00Z",
       clock: TestClock(uptimeMilliseconds: 400_000, bootSessionID: "boot_001")
+    )
+    try migrated.applyRecoveredResume(
+      expectedCurrentCredentialID: "credential_first",
+      newCredentialID: "credential_rebound",
+      transportConfigurationDigest: transportDigest,
+      expiresAt: "2026-08-20T11:00:00Z",
+      capability: .active,
+      replayCompletionID: nil,
+      timeAnchor: recoveredAnchor
+    )
+    try require(
+      migrated.transportConfigurationDigest == transportDigest
+        && migrated.timeAnchor == recoveredAnchor,
+      "A recovered V2 resume must bind the current transport and preserve its exact anchor"
     )
     let attempt = try migrated.attempt(
       operationID: "upload_migrated_001",
@@ -576,6 +587,276 @@ enum TransportQueueTests {
     try require(attempt.transportCredentialID == "credential_second", "Exact recovery authenticates with the current credential")
     let body = try TacuaCanonicalJSON.parse(attempt.canonicalRequest)
     try require(body.objectValue?["credential_id"]?.stringValue == "credential_first", "Historical request bytes must remain exact")
+  }
+
+  private static func recoveredReceivingResumePreservesImmutableQueue() throws {
+    var queue = try makeActiveQueue()
+    try enqueue(
+      .diagnostic,
+      id: "upload_resume_immutable",
+      credentialID: "credential_first",
+      queue: &queue
+    )
+    let originalOperations = queue.operations
+    let originalPayloadPaths = queue.localPayloadPaths
+    let anchor = try TacuaServerTimeAnchor.establish(
+      issuedAt: "2026-07-21T10:06:00Z",
+      clock: TestClock(uptimeMilliseconds: 460_000, bootSessionID: "boot_resume")
+    )
+
+    try queue.applyRecoveredResume(
+      expectedCurrentCredentialID: "credential_first",
+      newCredentialID: "credential_recovered",
+      transportConfigurationDigest: transportDigest,
+      expiresAt: "2026-08-21T10:06:00Z",
+      capability: .active,
+      replayCompletionID: nil,
+      timeAnchor: anchor
+    )
+
+    try require(queue.currentCredentialID == "credential_recovered", "Recovered resume did not install the validated credential")
+    try require(queue.credentialCapability == .active, "Receiving resume did not preserve active authority")
+    try require(queue.timeAnchor == anchor, "Recovery re-anchored the persisted server-time receipt")
+    try require(queue.operations == originalOperations, "Resume rewrote immutable queued operations")
+    try require(queue.localPayloadPaths == originalPayloadPaths, "Resume rewrote local payload inventory")
+    try require(
+      queue.pendingRevokedCredentialRemovals == ["credential_first"],
+      "Resume did not durably journal the revoked credential"
+    )
+
+    let recovered = try TacuaTransportQueueV3.decodeOrMigrate(queue.encoded())
+    try require(
+      recovered.pendingRevokedCredentialRemovals == ["credential_first"]
+        && recovered.timeAnchor == anchor,
+      "Encoded recovery lost credential cleanup or anchor state"
+    )
+    let attempt = try recovered.attempt(
+      operationID: "upload_resume_immutable",
+      expectedTransportConfigurationDigest: transportDigest,
+      clock: TestClock(uptimeMilliseconds: 461_000, bootSessionID: "boot_resume")
+    )
+    try require(
+      attempt.immutableRequestCredentialID == "credential_first"
+        && attempt.transportCredentialID == "credential_recovered",
+      "Recovered resume did not separate immutable request authority from current transport"
+    )
+    try require(
+      attempt.canonicalRequest == originalOperations[0].canonicalRequest,
+      "Recovered resume changed canonical request bytes"
+    )
+  }
+
+  private static func recoveredResumeRejectsAuthoritativeTimeRegression() throws {
+    var queue = try makeActiveQueue()
+    try queue.advanceTimeAnchor(
+      authoritativeServerTimestamp: "2026-07-21T10:10:00Z",
+      clock: TestClock(uptimeMilliseconds: 200_000, bootSessionID: "boot_001")
+    )
+    let baseline = queue
+    let regressed = try TacuaServerTimeAnchor.establish(
+      issuedAt: "2026-07-21T10:09:59Z",
+      clock: TestClock(uptimeMilliseconds: 1_000, bootSessionID: "boot_resume_new")
+    )
+    try expectQueueError(.invalidTimeAnchor) {
+      try queue.applyRecoveredResume(
+        expectedCurrentCredentialID: "credential_first",
+        newCredentialID: "credential_regressed",
+        transportConfigurationDigest: transportDigest,
+        expiresAt: "2026-08-21T10:09:59Z",
+        capability: .active,
+        replayCompletionID: nil,
+        timeAnchor: regressed
+      )
+    }
+    try require(queue == baseline, "Rejected time regression mutated the durable queue")
+  }
+
+  private static func recoveredCompletedResumeRequiresExactAuthority(_ root: URL) throws {
+    let completed = try fixtureQueue(
+      root,
+      requestName: "completion-request",
+      kind: .completion,
+      operationID: "completion_synthetic",
+      responseName: "completion-receipt"
+    )
+    let originalOperations = completed.operations
+    let originalAuthority = try requireValue(
+      completed.completionCleanupAuthority,
+      "Completed fixture did not establish cleanup authority"
+    )
+    let anchor = try TacuaServerTimeAnchor.establish(
+      issuedAt: "2026-07-21T10:03:00Z",
+      clock: TestClock(uptimeMilliseconds: 280_000, bootSessionID: "boot_completed_resume")
+    )
+
+    var wrongCompletion = completed
+    try expectQueueError(.cleanupNotAuthorized) {
+      try wrongCompletion.applyRecoveredResume(
+        expectedCurrentCredentialID: "credential_receiving_resume",
+        newCredentialID: "credential_wrong_completion",
+        transportConfigurationDigest: transportDigest,
+        expiresAt: "2026-08-21T10:03:00Z",
+        capability: .completionReplayOrDeleteOnly,
+        replayCompletionID: "completion_other",
+        timeAnchor: anchor
+      )
+    }
+    try require(wrongCompletion == completed, "Rejected completion binding mutated the queue")
+
+    var uploadReenabled = completed
+    try expectQueueError(.operationNotAllowed) {
+      try uploadReenabled.applyRecoveredResume(
+        expectedCurrentCredentialID: "credential_receiving_resume",
+        newCredentialID: "credential_upload_reenabled",
+        transportConfigurationDigest: transportDigest,
+        expiresAt: "2026-08-21T10:03:00Z",
+        capability: .active,
+        replayCompletionID: nil,
+        timeAnchor: anchor
+      )
+    }
+    try require(uploadReenabled == completed, "Completed resume restored receiving authority")
+
+    var queue = completed
+    try queue.applyRecoveredResume(
+      expectedCurrentCredentialID: "credential_receiving_resume",
+      newCredentialID: "credential_completed_recovered",
+      transportConfigurationDigest: transportDigest,
+      expiresAt: "2026-08-21T10:03:00Z",
+      capability: .completionReplayOrDeleteOnly,
+      replayCompletionID: "completion_synthetic",
+      timeAnchor: anchor
+    )
+    try require(
+      queue.credentialCapability == .completionReplayOrDeleteOnly,
+      "Completed resume restored upload authority"
+    )
+    try require(
+      queue.completionCleanupAuthority == originalAuthority,
+      "Completed resume changed exact cleanup authority"
+    )
+    try require(queue.operations == originalOperations, "Completed resume rewrote durable operations")
+    try require(
+      queue.pendingRevokedCredentialRemovals.contains("credential_receiving_resume"),
+      "Completed resume did not journal its prior credential"
+    )
+    let attempt = try queue.attempt(
+      operationID: "completion_synthetic",
+      expectedTransportConfigurationDigest: transportDigest,
+      clock: TestClock(
+        uptimeMilliseconds: 281_000,
+        bootSessionID: "boot_completed_resume"
+      )
+    )
+    try require(
+      attempt.immutableRequestCredentialID == "credential_receiving_resume"
+        && attempt.transportCredentialID == "credential_completed_recovered",
+      "Completed replay did not retain its historical request credential"
+    )
+    try expectQueueError(.operationNotAllowed) {
+      try enqueue(
+        .segment,
+        id: "upload_after_completed_resume",
+        credentialID: "credential_completed_recovered",
+        queue: &queue,
+        clock: TestClock(
+          uptimeMilliseconds: 281_000,
+          bootSessionID: "boot_completed_resume"
+        )
+      )
+    }
+  }
+
+  private static func recoveredResumeRejectsStaleAndConflictingBindings() throws {
+    let queue = try makeActiveQueue()
+    let anchor = try TacuaServerTimeAnchor.establish(
+      issuedAt: "2026-07-21T10:06:00Z",
+      clock: TestClock(uptimeMilliseconds: 460_000, bootSessionID: "boot_resume_errors")
+    )
+
+    var stale = queue
+    try expectQueueError(.credentialMismatch) {
+      try stale.applyRecoveredResume(
+        expectedCurrentCredentialID: "credential_stale",
+        newCredentialID: "credential_new",
+        transportConfigurationDigest: transportDigest,
+        expiresAt: "2026-08-21T10:06:00Z",
+        capability: .active,
+        replayCompletionID: nil,
+        timeAnchor: anchor
+      )
+    }
+    try require(stale == queue, "A stale resume baseline mutated the queue")
+
+    var transportChanged = queue
+    try expectQueueError(.transportConfigurationMismatch) {
+      try transportChanged.applyRecoveredResume(
+        expectedCurrentCredentialID: "credential_first",
+        newCredentialID: "credential_new",
+        transportConfigurationDigest: digestB,
+        expiresAt: "2026-08-21T10:06:00Z",
+        capability: .active,
+        replayCompletionID: nil,
+        timeAnchor: anchor
+      )
+    }
+    try require(transportChanged == queue, "A transport-origin change mutated the queue")
+
+    var unprovedCompletion = queue
+    try expectQueueError(.cleanupNotAuthorized) {
+      try unprovedCompletion.applyRecoveredResume(
+        expectedCurrentCredentialID: "credential_first",
+        newCredentialID: "credential_new",
+        transportConfigurationDigest: transportDigest,
+        expiresAt: "2026-08-21T10:06:00Z",
+        capability: .completionReplayOrDeleteOnly,
+        replayCompletionID: "completion_unproved",
+        timeAnchor: anchor
+      )
+    }
+    try require(unprovedCompletion == queue, "Unproved completion authority mutated the queue")
+
+    var activeWithCompletion = queue
+    try expectQueueError(.operationNotAllowed) {
+      try activeWithCompletion.applyRecoveredResume(
+        expectedCurrentCredentialID: "credential_first",
+        newCredentialID: "credential_new",
+        transportConfigurationDigest: transportDigest,
+        expiresAt: "2026-08-21T10:06:00Z",
+        capability: .active,
+        replayCompletionID: "completion_unexpected",
+        timeAnchor: anchor
+      )
+    }
+    try require(activeWithCompletion == queue, "An active resume with completion binding mutated the queue")
+
+    var rotated = queue
+    try rotated.applyRecoveredResume(
+      expectedCurrentCredentialID: "credential_first",
+      newCredentialID: "credential_second",
+      transportConfigurationDigest: transportDigest,
+      expiresAt: "2026-08-21T10:06:00Z",
+      capability: .active,
+      replayCompletionID: nil,
+      timeAnchor: anchor
+    )
+    let rotatedBaseline = rotated
+    let laterAnchor = try TacuaServerTimeAnchor.establish(
+      issuedAt: "2026-07-21T10:07:00Z",
+      clock: TestClock(uptimeMilliseconds: 520_000, bootSessionID: "boot_resume_errors")
+    )
+    try expectQueueError(.credentialMismatch) {
+      try rotated.applyRecoveredResume(
+        expectedCurrentCredentialID: "credential_second",
+        newCredentialID: "credential_first",
+        transportConfigurationDigest: transportDigest,
+        expiresAt: "2026-08-21T10:07:00Z",
+        capability: .active,
+        replayCompletionID: nil,
+        timeAnchor: laterAnchor
+      )
+    }
+    try require(rotated == rotatedBaseline, "A reused historical credential mutated the queue")
   }
 
   private static func expiredCredentialsRequireResumeAtHalfOpenBoundary() throws {

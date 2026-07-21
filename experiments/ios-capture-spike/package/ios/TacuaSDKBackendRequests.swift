@@ -69,6 +69,47 @@ enum TacuaSDKBackendRequests {
     }
   }
 
+  /// Validates every caller-controlled RESUME binding before consent can be consumed or a new
+  /// Keychain credential can be created. The synthetic credential and launch code exist only in
+  /// memory and make this preflight exercise the exact frozen launch-request validator.
+  static func validateResumeArtifacts(
+    expectedSessionID: String,
+    expectedSessionState: String,
+    expectedCompletionID: String?,
+    previousCredentialID: String,
+    buildIdentity: TacuaJSONValue,
+    scope: TacuaJSONValue,
+    requestedAt: String,
+    configuration: TacuaBackendConfiguration
+  ) throws {
+    let candidateCredentialID = previousCredentialID == "credential_resume_preflight"
+      ? "credential_resume_preflight_alternate"
+      : "credential_resume_preflight"
+    let preflight = try launchAfterConsent(
+      preparedCredential: TacuaPreparedCredential(
+        exchangeID: "exchange_resume_preflight",
+        credentialID: candidateCredentialID,
+        secret: Data(repeating: 0, count: TacuaKeychainCredentialStore.secretLength)
+      ),
+      launchCode: String(repeating: "R", count: 43),
+      exchangeKind: "resume_session",
+      expectedSessionID: expectedSessionID,
+      expectedSessionState: expectedSessionState,
+      expectedCompletionID: expectedCompletionID,
+      previousCredentialID: previousCredentialID,
+      buildIdentity: buildIdentity,
+      scope: scope,
+      requestedAt: requestedAt,
+      configuration: configuration
+    )
+    guard try TacuaSDKBackendProtocol.validateRequest(
+      preflight.canonicalData,
+      expectedTransportConfigurationDigest: configuration.configurationDigest
+    ) == .launch else {
+      throw TacuaSDKBackendRequestError.invalidArtifact
+    }
+  }
+
   static func launch(
     preparedCredential: TacuaPreparedCredential,
     approvedLaunchID: String,

@@ -11,7 +11,11 @@ public final class TacuaCaptureSpikeModule: Module {
   private let sessionLock = NSLock()
   private let launchConsentGate = TacuaLaunchConsentGate()
   private let backendCoordinatorLock = NSLock()
-  private var backendCoordinator: TacuaSDKStartLifecycleCoordinator?
+  private struct BackendLifecycleContext {
+    let start: TacuaSDKStartLifecycleCoordinator
+    let resume: TacuaSDKResumeLifecycleCoordinator
+  }
+  private var backendLifecycleContext: BackendLifecycleContext?
 
   public func definition() -> ModuleDefinition {
     Name("TacuaCaptureSpikeModule")
@@ -124,6 +128,65 @@ public final class TacuaCaptureSpikeModule: Module {
       }
     }
 
+    AsyncFunction("resumeBackendSession") {
+      (options: TacuaBackendResumeSessionNativeOptions, promise: Promise) in
+      do {
+        let coordinator = try self.resumeLifecycleCoordinator()
+        let input = TacuaSDKResumeSessionInput(
+          approvedLaunchID: options.approvedLaunchId,
+          localSessionID: options.localSessionId,
+          buildIdentityJSON: Data(options.buildIdentityJson.utf8),
+          scopeJSON: Data(options.scopeJson.utf8),
+          requestedAt: options.requestedAt
+        )
+        Task {
+          do {
+            let resumed = try await coordinator.resume(input)
+            promise.resolve(Self.backendResumedSessionValue(resumed))
+          } catch {
+            Self.rejectBackendResume(promise, error: error)
+          }
+        }
+      } catch {
+        Self.rejectBackendResume(promise, error: error)
+      }
+    }
+
+    AsyncFunction("getBackendResumeRecoveryStatus") {
+      (localSessionID: String, promise: Promise) in
+      do {
+        let status = try self.resumeLifecycleCoordinator().recoveryStatus(
+          localSessionID: localSessionID
+        )
+        promise.resolve(Self.backendResumeRecoveryStatusValue(status))
+      } catch {
+        Self.rejectBackendResume(promise, error: error)
+      }
+    }
+
+    AsyncFunction("recoverBackendResume") { (localSessionID: String, promise: Promise) in
+      do {
+        let resumed = try self.resumeLifecycleCoordinator().recover(
+          localSessionID: localSessionID
+        )
+        promise.resolve(Self.backendResumedSessionValue(resumed))
+      } catch {
+        Self.rejectBackendResume(promise, error: error)
+      }
+    }
+
+    AsyncFunction("resetPreparedBackendResume") {
+      (localSessionID: String, promise: Promise) in
+      do {
+        try self.resumeLifecycleCoordinator().resetPrepared(
+          localSessionID: localSessionID
+        )
+        promise.resolve()
+      } catch {
+        Self.rejectBackendResume(promise, error: error)
+      }
+    }
+
     AsyncFunction("recoverBackendStart") { (localSessionID: String, promise: Promise) in
       do {
         let started = try self.startLifecycleCoordinator().recover(
@@ -170,6 +233,9 @@ public final class TacuaCaptureSpikeModule: Module {
           "credentialAvailability": status.credentialAvailability.rawValue,
           "credentialTimeValid": status.credentialTimeValid,
           "resumeRequired": status.resumeRequired,
+          "resumeRequirement": Self.backendResumeRequirementValue(
+            status.resumeRequirement
+          ),
           "transportConfigurationMatchesBuild": status.transportConfigurationMatchesBuild,
           "operationCount": status.operationCount,
           "queuedOperationCount": status.queuedOperationCount,
@@ -418,26 +484,48 @@ public final class TacuaCaptureSpikeModule: Module {
   }
 
   private func startLifecycleCoordinator() throws -> TacuaSDKStartLifecycleCoordinator {
+    try backendLifecycleCoordinators().start
+  }
+
+  private func resumeLifecycleCoordinator() throws -> TacuaSDKResumeLifecycleCoordinator {
+    try backendLifecycleCoordinators().resume
+  }
+
+  private func backendLifecycleCoordinators() throws -> BackendLifecycleContext {
     backendCoordinatorLock.lock()
     defer { backendCoordinatorLock.unlock() }
-    if let backendCoordinator { return backendCoordinator }
+    if let backendLifecycleContext { return backendLifecycleContext }
     let configuration = try TacuaBackendConfiguration.fromBuildConfiguration()
     let credentialStore = TacuaKeychainCredentialStore()
+    let credentialFactory = TacuaCredentialFactory(store: credentialStore)
     let queueStore = try TacuaTransportQueueFileStore.applicationSupportStore()
-    let journalStore = try TacuaSDKStartJournalFileStore.applicationSupportStore()
-    let coordinator = TacuaSDKStartLifecycleCoordinator(
+    let startJournalStore = try TacuaSDKStartJournalFileStore.applicationSupportStore()
+    let resumeJournalStore = try TacuaSDKResumeJournalFileStore.applicationSupportStore()
+    let exchanger = TacuaSDKBackendClient(
+      configuration: configuration,
+      credentialStore: credentialStore
+    )
+    let start = TacuaSDKStartLifecycleCoordinator(
       configuration: configuration,
       consentGate: launchConsentGate,
-      credentialFactory: TacuaCredentialFactory(store: credentialStore),
-      exchanger: TacuaSDKBackendClient(
-        configuration: configuration,
-        credentialStore: credentialStore
-      ),
+      credentialFactory: credentialFactory,
+      exchanger: exchanger,
       queueStore: queueStore,
-      journalStore: journalStore
+      journalStore: startJournalStore,
+      resumeRecoveryInspector: resumeJournalStore
     )
-    backendCoordinator = coordinator
-    return coordinator
+    let resume = TacuaSDKResumeLifecycleCoordinator(
+      configuration: configuration,
+      consentGate: launchConsentGate,
+      credentialFactory: credentialFactory,
+      exchanger: exchanger,
+      queueStore: queueStore,
+      startJournalStore: startJournalStore,
+      journalStore: resumeJournalStore
+    )
+    let context = BackendLifecycleContext(start: start, resume: resume)
+    backendLifecycleContext = context
+    return context
   }
 
   private static func backendStartedSessionValue(
@@ -482,8 +570,62 @@ public final class TacuaCaptureSpikeModule: Module {
     ]
   }
 
+  private static func backendResumedSessionValue(
+    _ resumed: TacuaSDKResumedSession
+  ) -> [String: Any] {
+    [
+      "localSessionId": resumed.localSessionID,
+      "remoteSessionId": resumed.remoteSessionID,
+      "scopeDigest": resumed.scopeDigest,
+      "credentialId": resumed.credentialID,
+      "credentialExpiresAt": resumed.credentialExpiresAt,
+      "backendSessionState": resumed.backendSessionState.rawValue,
+      "credentialCapability": resumed.credentialCapability.rawValue,
+      "replayCompletionId": resumed.replayCompletionID ?? NSNull(),
+      "credentialAvailability": resumed.credentialAvailability.rawValue,
+      "queueSchemaVersion": resumed.queueSchemaVersion,
+      "pendingRevokedCredentialRemovalCount":
+        resumed.pendingRevokedCredentialRemovalCount,
+      "resumeRequired": resumed.resumeRequired,
+      "captureStarted": false,
+      "uploadsConnected": false,
+      "completionConnected": false,
+    ]
+  }
+
+  private static func backendResumeRecoveryStatusValue(
+    _ status: TacuaSDKResumeRecoveryStatus
+  ) -> [String: Any] {
+    [
+      "localSessionId": status.localSessionID,
+      "state": status.state.rawValue,
+      "remoteCredentialMayExist": status.remoteCredentialMayExist,
+      "queueUsable": status.queueUsable,
+      "canRecoverWithoutLaunch": status.canRecoverWithoutLaunch,
+      "canResetPreparedCredential": status.canResetPreparedCredential,
+      "requiresReconciliation": status.requiresReconciliation,
+    ]
+  }
+
+  private static func backendResumeRequirementValue(
+    _ requirement: TacuaSDKResumeRequirement
+  ) -> [String: Any] {
+    [
+      "kind": requirement.kind.rawValue,
+      "reason": requirement.reason.rawValue,
+      "canConsumeApprovedLaunch": requirement.canConsumeApprovedLaunch,
+      "expectedSessionState": requirement.expectedSessionState ?? NSNull(),
+      "expectedCompletionId": requirement.expectedCompletionID ?? NSNull(),
+    ]
+  }
+
   private static func rejectBackendStart(_ promise: Promise, error: Error) {
     let publicError = (error as? TacuaSDKStartLifecycleError) ?? .persistenceFailure
+    promise.reject(publicError.code, publicError.message)
+  }
+
+  private static func rejectBackendResume(_ promise: Promise, error: Error) {
+    let publicError = (error as? TacuaSDKResumeLifecycleError) ?? .persistenceFailure
     promise.reject(publicError.code, publicError.message)
   }
 

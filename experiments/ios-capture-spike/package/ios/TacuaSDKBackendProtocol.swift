@@ -92,7 +92,8 @@ enum TacuaSDKBackendProtocol {
     _ responseData: Data,
     forCanonicalRequest requestData: Data,
     maximumResponseBytes: Int = maximumResponseBytes,
-    expectedCurrentCredentialExpiry: String? = nil
+    expectedCurrentCredentialExpiry: String? = nil,
+    minimumLaunchReceiptTimestamp: String? = nil
   ) throws -> TacuaValidatedBackendReceipt {
     _ = try validateRequest(requestData)
     let requestValue = try TacuaCanonicalJSON.parse(requestData)
@@ -110,7 +111,12 @@ enum TacuaSDKBackendProtocol {
     let request = try object(requestValue)
     switch try string(request, "message_type") {
     case "launch_exchange_request":
-      return try validateLaunch(request: requestValue, response: responseValue, data: responseData)
+      return try validateLaunch(
+        request: requestValue,
+        response: responseValue,
+        data: responseData,
+        minimumReceiptTimestamp: minimumLaunchReceiptTimestamp
+      )
     case "segment_upload_intent":
       return try validateSegment(request: requestValue, response: responseValue, data: responseData)
     case "diagnostic_upload_request":
@@ -287,7 +293,8 @@ enum TacuaSDKBackendProtocol {
   private static func validateLaunch(
     request requestValue: TacuaJSONValue,
     response responseValue: TacuaJSONValue,
-    data: Data
+    data: Data,
+    minimumReceiptTimestamp: String?
   ) throws -> TacuaValidatedBackendReceipt {
     let request = try exactObject(requestValue, keys: [
       "protocol_version", "message_type", "exchange_kind", "exchange_id", "launch_code",
@@ -375,6 +382,13 @@ enum TacuaSDKBackendProtocol {
     let receivedAt = try timestamp(response, "received_at")
     let issuedAt = try timestamp(response, "issued_at")
     guard receivedAt <= issuedAt else { throw TacuaSDKBackendProtocolError.invalidChronology }
+    if let minimumReceiptTimestamp {
+      guard kind == "resume_session",
+        let minimum = parseTimestamp(minimumReceiptTimestamp),
+        receivedAt >= minimum,
+        issuedAt >= minimum
+      else { throw TacuaSDKBackendProtocolError.invalidChronology }
+    }
 
     let responseCredential = try exactObject(try required(response, "credential"), keys: [
       "credential_id", "authentication_scheme", "state", "replay_completion_id", "expires_at",

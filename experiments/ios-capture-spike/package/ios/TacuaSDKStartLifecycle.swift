@@ -7,6 +7,7 @@ enum TacuaSDKStartLifecycleError: Error, Equatable {
   case startAlreadyInProgress
   case queueAlreadyCommitted
   case recoveryActionRequired(TacuaSDKStartJournalState)
+  case resumeRecoveryActionRequired
   case credentialPreparationFailed
   case credentialCleanupRequired
   case launchRequestRejected
@@ -25,6 +26,7 @@ enum TacuaSDKStartLifecycleError: Error, Equatable {
     case .startAlreadyInProgress: return "ERR_TACUA_BACKEND_START_BUSY"
     case .queueAlreadyCommitted: return "ERR_TACUA_BACKEND_START_EXISTS"
     case .recoveryActionRequired: return "ERR_TACUA_BACKEND_START_RECOVERY_REQUIRED"
+    case .resumeRecoveryActionRequired: return "ERR_TACUA_BACKEND_RESUME_RECOVERY_REQUIRED"
     case .credentialPreparationFailed: return "ERR_TACUA_BACKEND_START_CREDENTIAL"
     case .credentialCleanupRequired: return "ERR_TACUA_BACKEND_START_CREDENTIAL_CLEANUP"
     case .launchRequestRejected: return "ERR_TACUA_BACKEND_START_REQUEST"
@@ -49,6 +51,8 @@ enum TacuaSDKStartLifecycleError: Error, Equatable {
       return "This local session already has a committed backend transport queue."
     case .recoveryActionRequired(let state):
       return "Resolve the existing backend START recovery state before trying another launch (\(state.rawValue))."
+    case .resumeRecoveryActionRequired:
+      return "Resolve the existing backend RESUME recovery state before reading or changing this transport queue."
     case .credentialPreparationFailed:
       return "Tacua could not prepare the device-only backend credential."
     case .credentialCleanupRequired:
@@ -125,6 +129,108 @@ struct TacuaSDKStartRecoveryStatus: Equatable {
   let credentialAvailability: TacuaCredentialAvailability?
 }
 
+enum TacuaSDKResumeRequirementKind: String, Equatable {
+  case none
+  case resumeSession = "resume_session"
+  case blocked
+}
+
+enum TacuaSDKResumeRequirementReason: String, Equatable {
+  case ready
+  case credentialTemporarilyUnavailable = "credential_temporarily_unavailable"
+  case credentialUnavailable = "credential_unavailable"
+  case terminalDeletion = "terminal_deletion"
+  case credentialMissing = "credential_missing"
+  case credentialExpiredOrClockInvalid = "credential_expired_or_clock_invalid"
+  case transportBindingMissing = "transport_binding_missing"
+  case transportConfigurationChanged = "transport_configuration_changed"
+  case noRemoteSession = "no_remote_session"
+  case invalidCompletionBinding = "invalid_completion_binding"
+  case launchRecoveryRequired = "launch_recovery_required"
+}
+
+struct TacuaSDKResumeRequirement: Equatable {
+  let kind: TacuaSDKResumeRequirementKind
+  let reason: TacuaSDKResumeRequirementReason
+  let expectedSessionState: String?
+  let expectedCompletionID: String?
+
+  var canConsumeApprovedLaunch: Bool { kind == .resumeSession }
+
+  static func evaluate(
+    queue: TacuaTransportQueueV3,
+    transportConfigurationDigest: String,
+    availability: TacuaCredentialAvailability,
+    clock: TacuaMonotonicClock
+  ) -> TacuaSDKResumeRequirement {
+    func terminal(
+      _ kind: TacuaSDKResumeRequirementKind,
+      _ reason: TacuaSDKResumeRequirementReason
+    ) -> TacuaSDKResumeRequirement {
+      TacuaSDKResumeRequirement(
+        kind: kind,
+        reason: reason,
+        expectedSessionState: nil,
+        expectedCompletionID: nil
+      )
+    }
+    func resumable(_ reason: TacuaSDKResumeRequirementReason)
+      -> TacuaSDKResumeRequirement
+    {
+      let completionID = queue.completionCleanupAuthority?.completionID
+      return TacuaSDKResumeRequirement(
+        kind: .resumeSession,
+        reason: reason,
+        expectedSessionState: completionID == nil ? "receiving" : "completed",
+        expectedCompletionID: completionID
+      )
+    }
+
+    guard queue.remoteSessionID != nil, queue.scopeDigest != nil,
+      queue.currentCredentialID != nil
+    else { return terminal(.blocked, .noRemoteSession) }
+    if let pinned = queue.transportConfigurationDigest,
+      pinned != transportConfigurationDigest
+    {
+      return terminal(.blocked, .transportConfigurationChanged)
+    }
+    switch queue.credentialCapability {
+    case .requiresExchange:
+      return terminal(.blocked, .noRemoteSession)
+    case .deletionReplayOnly:
+      return terminal(.none, .terminalDeletion)
+    case .requiresTransportRebind:
+      guard queue.transportConfigurationDigest == nil else {
+        return terminal(.blocked, .transportConfigurationChanged)
+      }
+      return resumable(.transportBindingMissing)
+    case .completionReplayOrDeleteOnly:
+      guard queue.completionCleanupAuthority?.completionID.isEmpty == false else {
+        return terminal(.blocked, .invalidCompletionBinding)
+      }
+    case .active:
+      guard queue.completionCleanupAuthority == nil else {
+        return terminal(.blocked, .invalidCompletionBinding)
+      }
+    }
+    guard queue.transportConfigurationDigest == transportConfigurationDigest else {
+      return terminal(.blocked, .transportConfigurationChanged)
+    }
+    switch availability {
+    case .missing: return resumable(.credentialMissing)
+    case .temporarilyUnavailable:
+      return terminal(.none, .credentialTemporarilyUnavailable)
+    case .unavailable: return terminal(.none, .credentialUnavailable)
+    case .notApplicable: return terminal(.blocked, .noRemoteSession)
+    case .available: break
+    }
+    guard (try? queue.timestampForNewOperation(clock: clock)) == nil else {
+      return terminal(.none, .ready)
+    }
+    return resumable(.credentialExpiredOrClockInvalid)
+  }
+}
+
 struct TacuaSDKBackendQueueStatus: Equatable {
   let localSessionID: String
   let remoteSessionID: String?
@@ -135,6 +241,7 @@ struct TacuaSDKBackendQueueStatus: Equatable {
   let credentialAvailability: TacuaCredentialAvailability
   let credentialTimeValid: Bool
   let resumeRequired: Bool
+  let resumeRequirement: TacuaSDKResumeRequirement
   let transportConfigurationMatchesBuild: Bool
   let operationCount: Int
   let queuedOperationCount: Int
@@ -167,6 +274,10 @@ protocol TacuaSDKStartQueueStoring: TacuaTransportQueuePersisting {
 
 extension TacuaTransportQueueFileStore: TacuaSDKStartQueueStoring {}
 
+protocol TacuaSDKResumeRecoveryInspecting {
+  func hasRecovery(localSessionID: String) throws -> Bool
+}
+
 final class TacuaSDKStartLifecycleCoordinator {
   private let configuration: TacuaBackendConfiguration
   private let consentGate: TacuaLaunchConsentGate
@@ -174,6 +285,7 @@ final class TacuaSDKStartLifecycleCoordinator {
   private let exchanger: TacuaSDKLaunchExchanging
   private let queueStore: TacuaSDKStartQueueStoring
   private let journalStore: TacuaSDKStartJournalPersisting
+  private let resumeRecoveryInspector: TacuaSDKResumeRecoveryInspecting?
   private let clock: TacuaMonotonicClock
   private let operationLock = NSLock()
   private var activeLocalSessionIDs = Set<String>()
@@ -185,6 +297,7 @@ final class TacuaSDKStartLifecycleCoordinator {
     exchanger: TacuaSDKLaunchExchanging,
     queueStore: TacuaSDKStartQueueStoring,
     journalStore: TacuaSDKStartJournalPersisting,
+    resumeRecoveryInspector: TacuaSDKResumeRecoveryInspecting? = nil,
     clock: TacuaMonotonicClock = TacuaSystemMonotonicClock()
   ) {
     self.configuration = configuration
@@ -193,6 +306,7 @@ final class TacuaSDKStartLifecycleCoordinator {
     self.exchanger = exchanger
     self.queueStore = queueStore
     self.journalStore = journalStore
+    self.resumeRecoveryInspector = resumeRecoveryInspector
     self.clock = clock
   }
 
@@ -204,6 +318,7 @@ final class TacuaSDKStartLifecycleCoordinator {
     let lifecycleLease = try acquireLifecycleLease(localSessionID: input.localSessionID)
     defer { lifecycleLease.release() }
     do {
+      try requireNoResumeRecovery(localSessionID: input.localSessionID)
       if try queueStore.load(localSessionID: input.localSessionID) != nil {
         throw TacuaSDKStartLifecycleError.queueAlreadyCommitted
       }
@@ -410,6 +525,7 @@ final class TacuaSDKStartLifecycleCoordinator {
     let lifecycleLease = try acquireLifecycleLease(localSessionID: localSessionID)
     defer { lifecycleLease.release() }
     do {
+      try requireNoResumeRecovery(localSessionID: localSessionID)
       // Read the journal first: queue publication is durable before that journal can disappear.
       // This order cannot observe the false-empty window created by queue-then-journal reads.
       var journal = try journalStore.load(localSessionID: localSessionID)
@@ -477,6 +593,7 @@ final class TacuaSDKStartLifecycleCoordinator {
     let lifecycleLease = try acquireLifecycleLease(localSessionID: localSessionID)
     defer { lifecycleLease.release() }
     do {
+      try requireNoResumeRecovery(localSessionID: localSessionID)
       // A queue is not released for transport until its receipt journal is durably absent.
       // Holding the same cross-process lease as START also prevents cleanup from racing a
       // just-published queue between its atomic install and journal removal.
@@ -495,6 +612,7 @@ final class TacuaSDKStartLifecycleCoordinator {
       let credentialTimeValid = (try? queue.timestampForNewOperation(clock: clock)) != nil
       let transportConfigurationMatchesBuild = queue.transportConfigurationDigest
         == configuration.configurationDigest
+      let resumeRequirement = resumeRequirement(queue, availability: availability)
       return TacuaSDKBackendQueueStatus(
         localSessionID: queue.localSessionID,
         remoteSessionID: queue.remoteSessionID,
@@ -504,7 +622,8 @@ final class TacuaSDKStartLifecycleCoordinator {
         credentialCapability: queue.credentialCapability,
         credentialAvailability: availability,
         credentialTimeValid: credentialTimeValid,
-        resumeRequired: credentialResumeRequired(queue, availability: availability),
+        resumeRequired: resumeRequirement.kind == .resumeSession,
+        resumeRequirement: resumeRequirement,
         transportConfigurationMatchesBuild: transportConfigurationMatchesBuild,
         operationCount: queue.operations.count,
         queuedOperationCount: queue.operations.filter { $0.state == .queued }.count,
@@ -534,6 +653,7 @@ final class TacuaSDKStartLifecycleCoordinator {
     let lifecycleLease = try acquireLifecycleLease(localSessionID: localSessionID)
     defer { lifecycleLease.release() }
     do {
+      try requireNoResumeRecovery(localSessionID: localSessionID)
       let journal = try journalStore.load(localSessionID: localSessionID)
       if let existing = try queueStore.load(localSessionID: localSessionID) {
         if let journal {
@@ -574,6 +694,7 @@ final class TacuaSDKStartLifecycleCoordinator {
     let lifecycleLease = try acquireLifecycleLease(localSessionID: localSessionID)
     defer { lifecycleLease.release() }
     do {
+      try requireNoResumeRecovery(localSessionID: localSessionID)
       guard try queueStore.load(localSessionID: localSessionID) == nil else {
         throw TacuaSDKStartLifecycleError.queueAlreadyCommitted
       }
@@ -652,6 +773,12 @@ final class TacuaSDKStartLifecycleCoordinator {
       _ = try TacuaTransportQueueV3(localSessionID: localSessionID)
     } catch {
       throw TacuaSDKStartLifecycleError.invalidInput
+    }
+  }
+
+  private func requireNoResumeRecovery(localSessionID: String) throws {
+    if try resumeRecoveryInspector?.hasRecovery(localSessionID: localSessionID) == true {
+      throw TacuaSDKStartLifecycleError.resumeRecoveryActionRequired
     }
   }
 
@@ -797,12 +924,14 @@ final class TacuaSDKStartLifecycleCoordinator {
     _ queue: TacuaTransportQueueV3,
     availability: TacuaCredentialAvailability
   ) -> Bool {
+    // START recovery keeps this legacy boolean broad for compatibility: `true` means the queue
+    // is not usable in this build, even when the richer queue requirement says a RESUME launch
+    // is blocked (for example, a non-nil transport binding changed). New callers must branch on
+    // `resumeRequirement` from queue status before consuming a launch.
     switch queue.credentialCapability {
     case .requiresExchange, .requiresTransportRebind:
       return true
     case .deletionReplayOnly:
-      // Deletion is terminal. Only receipt-authorized local cleanup remains, so there is no
-      // remote session authority to resume and no reviewer launch can restore this session.
       return false
     case .active, .completionReplayOrDeleteOnly:
       guard queue.transportConfigurationDigest == configuration.configurationDigest,
@@ -810,6 +939,18 @@ final class TacuaSDKStartLifecycleCoordinator {
       else { return true }
       return availability == .missing
     }
+  }
+
+  private func resumeRequirement(
+    _ queue: TacuaTransportQueueV3,
+    availability: TacuaCredentialAvailability
+  ) -> TacuaSDKResumeRequirement {
+    TacuaSDKResumeRequirement.evaluate(
+      queue: queue,
+      transportConfigurationDigest: configuration.configurationDigest,
+      availability: availability,
+      clock: clock
+    )
   }
 
   private func journalCredentialResumeRequired(

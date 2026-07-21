@@ -145,6 +145,53 @@ swiftc \
   "$REPO_ROOT/contracts/sdk-backend-protocol/fixtures/positive"
 
 swiftc \
+  -warnings-as-errors \
+  -module-cache-path "$TEST_TMP_DIR/module-cache" \
+  ios/CapturePolicy.swift \
+  ios/TacuaCanonicalJSON.swift \
+  ios/TacuaCredentialStore.swift \
+  ios/TacuaBackendConfiguration.swift \
+  ios/TacuaLaunchLink.swift \
+  ios/TacuaTransportQueue.swift \
+  ios/TacuaTransportQueueFileStore.swift \
+  ios/TacuaSDKBackendProtocol.swift \
+  ios/TacuaSDKBackendRequests.swift \
+  ios/TacuaSDKBackendClient.swift \
+  ios/TacuaSDKStartJournal.swift \
+  ios/TacuaSDKResumeJournal.swift \
+  ios/TacuaSDKStartLifecycle.swift \
+  ios/TacuaSDKResumeLifecycle.swift \
+  tests/SDKResumeJournalTests.swift \
+  -framework Security \
+  -o "$TEST_TMP_DIR/tacua-sdk-resume-journal-tests"
+
+"$TEST_TMP_DIR/tacua-sdk-resume-journal-tests"
+
+swiftc \
+  -warnings-as-errors \
+  -module-cache-path "$TEST_TMP_DIR/module-cache" \
+  ios/CapturePolicy.swift \
+  ios/TacuaCanonicalJSON.swift \
+  ios/TacuaCredentialStore.swift \
+  ios/TacuaBackendConfiguration.swift \
+  ios/TacuaLaunchLink.swift \
+  ios/TacuaTransportQueue.swift \
+  ios/TacuaTransportQueueFileStore.swift \
+  ios/TacuaSDKBackendProtocol.swift \
+  ios/TacuaSDKBackendRequests.swift \
+  ios/TacuaSDKBackendClient.swift \
+  ios/TacuaSDKStartJournal.swift \
+  ios/TacuaSDKResumeJournal.swift \
+  ios/TacuaSDKStartLifecycle.swift \
+  ios/TacuaSDKResumeLifecycle.swift \
+  tests/SDKResumeLifecycleTests.swift \
+  -framework Security \
+  -o "$TEST_TMP_DIR/tacua-sdk-resume-lifecycle-tests"
+
+"$TEST_TMP_DIR/tacua-sdk-resume-lifecycle-tests" \
+  "$REPO_ROOT/contracts/sdk-backend-protocol/fixtures/positive"
+
+swiftc \
   -D TACUA_CAPTURE_FAULT_INJECTION \
   -module-cache-path "$TEST_TMP_DIR/module-cache" \
   ios/CaptureFaultInjection.swift \
