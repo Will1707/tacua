@@ -3,9 +3,13 @@
 
 set -eu
 
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+PACKAGE_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(CDPATH= cd -- "$PACKAGE_ROOT/../../.." && pwd)"
+cd "$PACKAGE_ROOT"
+
 TEST_TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tacua-capture-tests.XXXXXX")"
 trap 'rm -rf "$TEST_TMP_DIR"' EXIT
-REPO_ROOT="$(cd ../../.. && pwd)"
 
 swiftc -parse ios/*.swift
 swiftc -D TACUA_CAPTURE_FAULT_INJECTION -parse ios/*.swift
