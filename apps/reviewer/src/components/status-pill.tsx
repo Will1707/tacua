@@ -14,7 +14,7 @@ export function StatusPill({ value }: Props) {
       ? colors.red
       : value === "queued" || value === "waiting_for_clarification" || value === "needs_clarification"
         ? colors.orange
-        : colors.blue;
+        : colors.primary;
   return (
     <View style={{ alignSelf: "flex-start", borderColor: tint, borderWidth: 1, borderRadius: 999, paddingHorizontal: 9, paddingVertical: 4 }}>
       <Text selectable style={{ color: tint, fontSize: 12, fontWeight: "600", textTransform: "capitalize" }}>{normalized}</Text>

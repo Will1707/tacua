@@ -9,7 +9,7 @@ type Props = PropsWithChildren<{ readonly title: string; readonly trailing?: Rea
 
 export function SectionCard({ title, trailing, children }: Props) {
   return (
-    <View style={{ backgroundColor: colors.secondaryBackground, borderRadius: 16, borderCurve: "continuous", padding: 16, gap: 12 }}>
+    <View style={{ backgroundColor: colors.secondaryBackground, borderColor: colors.separator, borderWidth: 1, borderRadius: 16, borderCurve: "continuous", padding: 16, gap: 12 }}>
       <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
         <Text selectable style={{ color: colors.label, fontSize: 17, fontWeight: "700", flex: 1 }}>{title}</Text>
         {trailing}

@@ -57,7 +57,7 @@ function Field(props: ComponentProps<typeof TextInput> & { readonly label: strin
   return (
     <View style={{ gap: 7 }}>
       <Text style={{ color: colors.label, fontWeight: "700" }}>{label}</Text>
-      <TextInput {...input} accessibilityLabel={label} autoCorrect={false} style={{ color: colors.label, backgroundColor: colors.secondaryBackground, minHeight: 48, borderRadius: 12, borderCurve: "continuous", paddingHorizontal: 13, fontSize: 16 }} />
+      <TextInput {...input} accessibilityLabel={label} autoCorrect={false} placeholderTextColor={colors.tertiaryLabel} selectionColor={colors.primary} style={{ color: colors.label, backgroundColor: colors.secondaryBackground, borderColor: colors.separator, borderWidth: 1, minHeight: 48, borderRadius: 12, borderCurve: "continuous", paddingHorizontal: 13, fontSize: 16 }} />
     </View>
   );
 }

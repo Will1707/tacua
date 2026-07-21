@@ -95,7 +95,7 @@ export default function CandidateRoute() {
       <SectionCard title="Reproduction">
         {candidate.content.reproduction_steps.map((step, index) => (
           <View key={step.step_id} style={{ flexDirection: "row", gap: 12 }}>
-            <Text selectable style={{ color: colors.blue, fontWeight: "800", fontVariant: ["tabular-nums"] }}>{index + 1}</Text>
+            <Text selectable style={{ color: colors.primary, fontWeight: "800", fontVariant: ["tabular-nums"] }}>{index + 1}</Text>
             <View style={{ flex: 1, gap: 4 }}>
               <Text selectable style={{ color: colors.label, lineHeight: 21 }}>{step.action}</Text>
               {step.actual_result ? <Text selectable style={{ color: colors.secondaryLabel }}>Actual: {step.actual_result}</Text> : null}

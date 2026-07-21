@@ -32,6 +32,7 @@ The first pilot targets an authorized private Expo/React Native iOS app. The V1 
 - [`contracts/approved-handoff`](contracts/approved-handoff/README.md): a strict candidate Markdown/JSON agent-handoff contract that separates offline structure from externally authenticated execution trust. [ADR-011](docs/decisions/ADR-011-approved-handoff.md) remains unaccepted until a trusted real-consumer trial passes.
 - [`contracts/runtime`](contracts/runtime/README.md): strict candidate contracts for the capture/upload manifest, sanitized SDK diagnostics, asynchronous processing jobs, and editable ticket lifecycle. Structural validation does not authorize capture, egress, or agent execution.
 - [`apps/reviewer`](apps/reviewer/README.md): an iOS-first Expo reviewer-app scaffold with secure self-hosted configuration, session/evidence/job views, clarification choices, and exact-version human approval controls. Launch orchestration and candidate APIs are not implemented yet.
+- [`docs/design/visual-direction.md`](docs/design/visual-direction.md): the adaptive, cicada-derived light and dark colour system used by the reviewer app.
 
 ## Local verification
 
