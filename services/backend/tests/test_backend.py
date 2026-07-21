@@ -48,6 +48,7 @@ from tacua_backend.handoff_export import (  # noqa: E402
     export_approved_candidate,
 )
 from tacua_backend.evidence_domain import (  # noqa: E402
+    EvidenceStore,
     ITEM_VERSION,
     MANIFEST_MEDIA_TYPE,
     MANIFEST_VERSION,
@@ -58,6 +59,7 @@ from tacua_backend.evidence_domain import (  # noqa: E402
 from tacua_backend.service import (  # noqa: E402
     ApiError,
     InvalidJSONValue,
+    MAX_CANDIDATE_EVIDENCE_VIEW_BYTES,
     PilotBackend,
     strict_json_loads,
 )
@@ -609,6 +611,478 @@ class BackendHarness(unittest.TestCase):
 
 
 class BackendProtocolTests(BackendHarness):
+
+    def _assert_deletion_waits_for_blocked_review_read(
+        self,
+        session_id: str,
+        reader,
+        entered: threading.Event,
+        release: threading.Event,
+    ) -> list[object]:
+        reader_results: list[object] = []
+        reader_errors: list[BaseException] = []
+        deletion_results: list[object] = []
+        deletion_errors: list[BaseException] = []
+        deletion_started = threading.Event()
+        deletion_done = threading.Event()
+
+        def run_reader() -> None:
+            try:
+                reader_results.append(reader())
+            except BaseException as error:  # pragma: no cover - asserted below
+                reader_errors.append(error)
+
+        def run_deletion() -> None:
+            deletion_started.set()
+            try:
+                deletion_results.append(self.backend.delete_session(session_id))
+            except BaseException as error:  # pragma: no cover - asserted below
+                deletion_errors.append(error)
+            finally:
+                deletion_done.set()
+
+        read_thread = threading.Thread(target=run_reader)
+        delete_thread = threading.Thread(target=run_deletion)
+        read_thread.start()
+        self.assertTrue(entered.wait(2), "review read did not reach its barrier")
+        delete_thread.start()
+        self.assertTrue(deletion_started.wait(1))
+        deletion_was_blocked = not deletion_done.wait(0.25)
+        with self.backend._connect() as connection:
+            pending_while_reading = connection.execute(
+                "SELECT COUNT(*) FROM pending_deletions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0]
+        release.set()
+        read_thread.join(5)
+        delete_thread.join(5)
+
+        self.assertTrue(deletion_was_blocked)
+        self.assertEqual(0, pending_while_reading)
+        self.assertFalse(read_thread.is_alive())
+        self.assertFalse(delete_thread.is_alive())
+        self.assertEqual([], reader_errors)
+        self.assertEqual([], deletion_errors)
+        self.assertEqual(1, len(deletion_results))
+        self.assert_api_error(
+            410,
+            "SESSION_DELETED",
+            lambda: self.backend.get_session(session_id),
+        )
+        return reader_results
+
+    def test_candidate_publication_and_deletion_are_one_process_critical_section(self) -> None:
+        lifecycle = self.full_completed_session()
+        session_id = lifecycle["launch_receipt"]["session_id"]
+        candidate, manifest, previews = self.candidate_bundle(session_id)
+        entered = threading.Event()
+        release = threading.Event()
+        publication_results: list[dict] = []
+        publication_errors: list[BaseException] = []
+        deletion_results: list[dict] = []
+        deletion_errors: list[BaseException] = []
+        deletion_started = threading.Event()
+        deletion_done = threading.Event()
+        original_put_preview = EvidenceStore.put_preview
+
+        def blocked_put_preview(store: EvidenceStore, **values: object) -> dict:
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("publication barrier timed out")
+            return original_put_preview(store, **values)
+
+        def publish() -> None:
+            try:
+                publication_results.append(
+                    self.backend.persist_candidate_bundle(
+                        candidate=candidate,
+                        evidence_manifest=manifest,
+                        previews=previews,
+                    )
+                )
+            except BaseException as error:  # pragma: no cover - asserted below
+                publication_errors.append(error)
+
+        def delete() -> None:
+            deletion_started.set()
+            try:
+                deletion_results.append(self.backend.delete_session(session_id))
+            except BaseException as error:  # pragma: no cover - asserted below
+                deletion_errors.append(error)
+            finally:
+                deletion_done.set()
+
+        with patch.object(EvidenceStore, "put_preview", new=blocked_put_preview):
+            publisher = threading.Thread(target=publish)
+            deleter = threading.Thread(target=delete)
+            publisher.start()
+            self.assertTrue(entered.wait(2), "publication did not reach its barrier")
+            deleter.start()
+            self.assertTrue(deletion_started.wait(1))
+            deletion_was_blocked = not deletion_done.wait(0.25)
+            with self.backend._connect() as connection:
+                pending_while_publishing = connection.execute(
+                    "SELECT COUNT(*) FROM pending_deletions WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()[0]
+            release.set()
+            publisher.join(5)
+            deleter.join(5)
+
+        self.assertTrue(deletion_was_blocked)
+        self.assertEqual(0, pending_while_publishing)
+        self.assertFalse(publisher.is_alive())
+        self.assertFalse(deleter.is_alive())
+        self.assertEqual([], publication_errors)
+        self.assertEqual([], deletion_errors)
+        self.assertEqual([candidate], publication_results)
+        self.assertEqual(1, len(deletion_results))
+        with self.backend._connect() as connection:
+            self.assertEqual(
+                0,
+                connection.execute(
+                    "SELECT COUNT(*) FROM candidate_versions WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()[0],
+            )
+
+    def test_candidate_read_finishes_before_deletion_is_accepted(self) -> None:
+        lifecycle = self.full_completed_session()
+        session_id = lifecycle["launch_receipt"]["session_id"]
+        candidate, manifest, previews = self.candidate_bundle(session_id)
+        self.backend.persist_candidate_bundle(
+            candidate=candidate, evidence_manifest=manifest, previews=previews
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        original = self.backend._candidate_from_connection
+
+        def blocked_candidate_read(
+            connection: sqlite3.Connection,
+            candidate_id: str,
+            version: int | None = None,
+        ) -> dict:
+            value = original(connection, candidate_id, version)
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("candidate read barrier timed out")
+            return value
+
+        with patch.object(
+            self.backend,
+            "_candidate_from_connection",
+            side_effect=blocked_candidate_read,
+        ):
+            results = self._assert_deletion_waits_for_blocked_review_read(
+                session_id,
+                lambda: self.backend.get_candidate(candidate["candidate_id"]),
+                entered,
+                release,
+            )
+        self.assertEqual([candidate], results)
+
+    def test_evidence_metadata_read_finishes_before_deletion_is_accepted(self) -> None:
+        lifecycle = self.full_completed_session()
+        session_id = lifecycle["launch_receipt"]["session_id"]
+        candidate, manifest, previews = self.candidate_bundle(session_id)
+        self.backend.persist_candidate_bundle(
+            candidate=candidate, evidence_manifest=manifest, previews=previews
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        original = EvidenceStore.get_candidate_evidence_view
+
+        def blocked_evidence_read(store: EvidenceStore, **values: object) -> dict:
+            value = original(store, **values)
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("evidence metadata read barrier timed out")
+            return value
+
+        with patch.object(
+            EvidenceStore,
+            "get_candidate_evidence_view",
+            new=blocked_evidence_read,
+        ):
+            results = self._assert_deletion_waits_for_blocked_review_read(
+                session_id,
+                lambda: self.backend.get_candidate_evidence(
+                    candidate["candidate_id"],
+                    candidate["candidate_version"],
+                    candidate_digest=candidate["candidate_digest"],
+                    manifest_digest=manifest["manifest_digest"],
+                ),
+                entered,
+                release,
+            )
+        self.assertEqual(candidate["candidate_id"], results[0]["candidate_id"])
+
+    def test_preview_bytes_finish_reading_before_deletion_is_accepted(self) -> None:
+        lifecycle = self.full_completed_session()
+        session_id = lifecycle["launch_receipt"]["session_id"]
+        candidate, manifest, previews = self.candidate_bundle(session_id)
+        self.backend.persist_candidate_bundle(
+            candidate=candidate, evidence_manifest=manifest, previews=previews
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        original = EvidenceStore.get_preview
+
+        def blocked_preview_read(store: EvidenceStore, **values: object) -> dict:
+            value = original(store, **values)
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("preview read barrier timed out")
+            return value
+
+        with patch.object(EvidenceStore, "get_preview", new=blocked_preview_read):
+            results = self._assert_deletion_waits_for_blocked_review_read(
+                session_id,
+                lambda: self.backend.get_candidate_preview(
+                    candidate["candidate_id"],
+                    candidate["candidate_version"],
+                    "evidence_frame",
+                    candidate_digest=candidate["candidate_digest"],
+                    manifest_digest=manifest["manifest_digest"],
+                ),
+                entered,
+                release,
+            )
+        self.assertEqual(previews[0]["body"], results[0]["body"])
+
+    def test_candidate_evidence_view_uses_a_deterministic_bounded_event_prefix(self) -> None:
+        lifecycle = self.full_completed_session()
+        session_id = lifecycle["launch_receipt"]["session_id"]
+        candidate, manifest, previews = self.candidate_bundle(session_id)
+        self.backend.persist_candidate_bundle(
+            candidate=candidate, evidence_manifest=manifest, previews=previews
+        )
+        events = [
+            {
+                "event_id": f"event_large_{index:04d}",
+                "event_type": "runtime_error",
+                "source": "mobile_sdk",
+                "sequence": index,
+                "elapsed_ms": index,
+                "occurred_at": "2026-07-21T10:00:20Z",
+                "evidence_refs": ["evidence_frame"],
+                "data": {"detail": "x" * 6_000},
+            }
+            for index in range(400)
+        ]
+        with patch.object(
+            self.backend,
+            "_candidate_diagnostic_events",
+            return_value=events,
+        ):
+            first = self.backend.get_candidate_evidence(
+                candidate["candidate_id"],
+                candidate["candidate_version"],
+                candidate_digest=candidate["candidate_digest"],
+                manifest_digest=manifest["manifest_digest"],
+            )
+            second = self.backend.get_candidate_evidence(
+                candidate["candidate_id"],
+                candidate["candidate_version"],
+                candidate_digest=candidate["candidate_digest"],
+                manifest_digest=manifest["manifest_digest"],
+            )
+        self.assertEqual(first, second)
+        encoded = canonical_json(first).encode("utf-8")
+        self.assertLessEqual(len(encoded), MAX_CANDIDATE_EVIDENCE_VIEW_BYTES)
+        returned = first["diagnostic_events"]
+        self.assertGreater(len(returned), 0)
+        self.assertLess(len(returned), len(events))
+        self.assertEqual(events[: len(returned)], returned)
+        self.assertEqual(
+            {
+                "contract_version",
+                "candidate_id",
+                "candidate_version",
+                "candidate_digest",
+                "evidence_manifest_digest",
+                "items",
+                "diagnostic_events",
+            },
+            set(first),
+        )
+
+    def test_diagnostic_projection_revalidates_canonical_outer_request_and_object(self) -> None:
+        lifecycle = self.full_completed_session()
+        session_id = lifecycle["launch_receipt"]["session_id"]
+        candidate, manifest, previews = self.candidate_bundle(session_id)
+        self.backend.persist_candidate_bundle(
+            candidate=candidate, evidence_manifest=manifest, previews=previews
+        )
+        with self.backend._connect() as connection:
+            connection.execute(
+                "UPDATE diagnostics SET request_json = ' ' || request_json WHERE session_id = ?",
+                (session_id,),
+            )
+        self.assert_api_error(
+            500,
+            "DIAGNOSTIC_STORAGE_CORRUPT",
+            lambda: self.backend.get_candidate_evidence(
+                candidate["candidate_id"],
+                candidate["candidate_version"],
+                candidate_digest=candidate["candidate_digest"],
+                manifest_digest=manifest["manifest_digest"],
+            ),
+        )
+
+        with self.backend._connect() as connection:
+            row = connection.execute(
+                "SELECT relative_path FROM diagnostics WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            connection.execute(
+                "UPDATE diagnostics SET request_json = ? WHERE session_id = ?",
+                (canonical_json(lifecycle["diagnostic_request"]), session_id),
+            )
+        (self.backend.state_dir / row["relative_path"]).write_bytes(b"{}")
+        self.assert_api_error(
+            500,
+            "STORAGE_INCONSISTENT",
+            lambda: self.backend.get_candidate_evidence(
+                candidate["candidate_id"],
+                candidate["candidate_version"],
+                candidate_digest=candidate["candidate_digest"],
+                manifest_digest=manifest["manifest_digest"],
+            ),
+        )
+
+    def test_diagnostic_projection_rejects_a_coherently_rewritten_build_scope(self) -> None:
+        lifecycle = self.full_completed_session()
+        session_id = lifecycle["launch_receipt"]["session_id"]
+        candidate, manifest, previews = self.candidate_bundle(session_id)
+        self.backend.persist_candidate_bundle(
+            candidate=candidate, evidence_manifest=manifest, previews=previews
+        )
+        request = copy.deepcopy(lifecycle["diagnostic_request"])
+        request["envelope"]["build_id"] = "build_rewritten"
+        request["envelope"]["build_identity_digest"] = "sha256:" + "a" * 64
+        request["envelope"] = runtime_seal(request["envelope"])
+        envelope_bytes = canonical_json(request["envelope"]).encode("utf-8")
+        request["transport"]["size_bytes"] = len(envelope_bytes)
+        request["transport"]["content_digest"] = digest(envelope_bytes)
+        request = seal(request)
+        response = copy.deepcopy(lifecycle["diagnostic_receipt"])
+        response["request_digest"] = request["request_digest"]
+        response["size_bytes"] = len(envelope_bytes)
+        response["transport_digest"] = digest(envelope_bytes)
+        response["envelope_digest"] = request["envelope"]["envelope_digest"]
+        response = seal(response)
+        validate_operation_pair(request, response)
+        with self.backend._connect() as connection:
+            row = connection.execute(
+                "SELECT relative_path FROM diagnostics WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            connection.execute(
+                """UPDATE diagnostics
+                      SET request_digest = ?, request_json = ?, response_bytes = ?,
+                          size_bytes = ?, content_digest = ?
+                    WHERE session_id = ?""",
+                (
+                    request["request_digest"],
+                    canonical_json(request),
+                    canonical_json(response).encode("utf-8"),
+                    len(envelope_bytes),
+                    digest(envelope_bytes),
+                    session_id,
+                ),
+            )
+        (self.backend.state_dir / row["relative_path"]).write_bytes(envelope_bytes)
+        self.assert_api_error(
+            500,
+            "DIAGNOSTIC_STORAGE_CORRUPT",
+            lambda: self.backend.get_candidate_evidence(
+                candidate["candidate_id"],
+                candidate["candidate_version"],
+                candidate_digest=candidate["candidate_digest"],
+                manifest_digest=manifest["manifest_digest"],
+            ),
+        )
+
+    def test_missing_committed_preview_is_server_corruption_not_not_found(self) -> None:
+        lifecycle = self.full_completed_session()
+        session_id = lifecycle["launch_receipt"]["session_id"]
+        candidate, manifest, previews = self.candidate_bundle(session_id)
+        self.backend.persist_candidate_bundle(
+            candidate=candidate, evidence_manifest=manifest, previews=previews
+        )
+        with self.backend._connect() as connection:
+            relative_path = connection.execute(
+                "SELECT relative_path FROM tacua_evidence_preview_revisions "
+                "WHERE relative_path IS NOT NULL"
+            ).fetchone()[0]
+        (self.backend.derived_evidence_dir / relative_path).unlink()
+        self.assert_api_error(
+            500,
+            "CANDIDATE_EVIDENCE_CORRUPT",
+            lambda: self.backend.get_candidate_preview(
+                candidate["candidate_id"],
+                candidate["candidate_version"],
+                "evidence_frame",
+                candidate_digest=candidate["candidate_digest"],
+                manifest_digest=manifest["manifest_digest"],
+            ),
+        )
+
+    def test_erased_object_count_uses_top_level_artifacts_and_physical_previews(self) -> None:
+        lifecycle = self.full_completed_session()
+        session_id = lifecycle["launch_receipt"]["session_id"]
+        candidate, manifest, previews = self.candidate_bundle(session_id)
+        self.backend.persist_candidate_bundle(
+            candidate=candidate, evidence_manifest=manifest, previews=previews
+        )
+        with self.backend._connect() as connection:
+            row = connection.execute(
+                """SELECT manifest_row_id,item_row_id
+                     FROM tacua_evidence_preview_revisions
+                    WHERE relative_path IS NOT NULL"""
+            ).fetchone()
+            connection.execute(
+                """INSERT INTO tacua_evidence_preview_revisions
+                   (manifest_row_id,item_row_id,preview_revision_id,availability,
+                    content_type,size_bytes,content_digest,relative_path,
+                    unavailable_reason,unavailable_detail,recorded_at)
+                   VALUES (?,?,'preview_metadata_only','unavailable',
+                           NULL,NULL,NULL,NULL,'outside_retention',
+                           'Metadata-only unavailable revision.',
+                           '2026-07-21T10:02:07Z')""",
+                (row["manifest_row_id"], row["item_row_id"]),
+            )
+            connection.execute(
+                """INSERT INTO tacua_evidence_audit
+                   (occurred_at,action,organization_id,project_id,session_id)
+                   VALUES ('2026-07-21T10:02:07Z','count_regression',?,?,?)""",
+                (self.config.organization_id, self.config.project_id, session_id),
+            )
+        tombstone = self.backend.delete_session(session_id)
+        # One segment, diagnostic envelope, completion artifact, processing
+        # job, and physical preview. Candidate/evidence metadata and audit rows
+        # are internal indexes, not independently erased top-level artifacts.
+        self.assertEqual(5, tombstone["erasure"]["erased_object_count"])
+
+    def test_deleting_summary_is_never_reported_as_active(self) -> None:
+        _request, receipt, _, _ = self.start_session()
+        session_id = receipt["session_id"]
+        with self.backend._connect() as connection:
+            connection.execute(
+                "UPDATE sessions SET state = 'deleting' WHERE session_id = ?",
+                (session_id,),
+            )
+            row = connection.execute(
+                "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            summary = self.backend._session_summary(row)
+        self.assertEqual("deleting", summary["retention"]["deletion_status"])
+        self.assert_api_error(
+            410,
+            "SESSION_DELETED",
+            lambda: self.backend.get_session(session_id),
+        )
 
     def test_exact_approved_candidate_exports_deterministic_structural_handoff(self) -> None:
         lifecycle = self.full_completed_session()
@@ -1257,7 +1731,11 @@ class BackendProtocolTests(BackendHarness):
             self.assertEqual("deleting", conn.execute("SELECT state FROM sessions").fetchone()[0])
             self.assertEqual(0, conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0])
         restarted = PilotBackend(self.config, self.admin_secret, clock=self.clock)
-        self.assertEqual("deleted", restarted.get_session(session_id)["state"])
+        self.assert_api_error(
+            410,
+            "SESSION_DELETED",
+            lambda: restarted.get_session(session_id),
+        )
         replay = restarted.delete_session_sdk(
             session_id, request["deletion_id"], lifecycle["secret"], request
         )

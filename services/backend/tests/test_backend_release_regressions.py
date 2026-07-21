@@ -176,7 +176,11 @@ class BackendReleaseRegressionTests(BackendHarness):
         self.assertEqual(410, captured.exception.status)
         self.assertEqual("SESSION_RETENTION_EXPIRED", captured.exception.code)
         self.assertFalse((self.backend.objects_dir / session_id).exists())
-        self.assertEqual("deleted", self.backend.get_session(session_id)["state"])
+        self.assert_api_error(
+            410,
+            "SESSION_DELETED",
+            lambda: self.backend.get_session(session_id),
+        )
 
     def test_admin_review_erases_before_returning_at_retention_boundary(self) -> None:
         lifecycle = self.full_completed_session()
@@ -203,7 +207,11 @@ class BackendReleaseRegressionTests(BackendHarness):
         self.assertEqual([], self.backend.list_sessions())
         self.assertEqual([], self.backend.list_jobs())
         self.assertFalse((self.backend.objects_dir / session_id).exists())
-        self.assertEqual("deleted", self.backend.get_session(session_id)["state"])
+        self.assert_api_error(
+            410,
+            "SESSION_DELETED",
+            lambda: self.backend.get_session(session_id),
+        )
 
     def test_expired_review_data_stays_hidden_when_physical_erasure_must_retry(self) -> None:
         _launch_request, launch_receipt, _, _ = self.start_session()
@@ -226,7 +234,11 @@ class BackendReleaseRegressionTests(BackendHarness):
 
         recovered = self.backend.sweep_expired_sessions(now=expiry)
         self.assertEqual([session_id], recovered["deleted_session_ids"])
-        self.assertEqual("deleted", self.backend.get_session(session_id)["state"])
+        self.assert_api_error(
+            410,
+            "SESSION_DELETED",
+            lambda: self.backend.get_session(session_id),
+        )
 
     def test_database_symlink_is_rejected_before_sqlite_connects(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

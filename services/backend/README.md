@@ -50,6 +50,17 @@ exchange must never be redirected.
   finishes filesystem erasure before success can be reported. The final
   transaction removes session metadata and retains only the exact tombstone
   plus its keyed replay verifier for the configured period (at most 30 days).
+- Candidate publication, reviewer candidate reads, evidence metadata reads,
+  preview byte reads, and deletion acceptance share one process-wide critical
+  section. Evidence responses also hold one SQLite `BEGIN IMMEDIATE`
+  transaction from the active-session recheck through metadata/byte integrity
+  verification. This is part of the V1 single-process invariant: deletion
+  cannot be accepted while a reviewer response is still being resolved.
+- A candidate evidence view is at most 1.5 MiB of canonical JSON and contains
+  at most 512 diagnostic events. Eligible events are sorted by monotonic time,
+  sequence, and event ID; the response contains the largest deterministic
+  prefix of whole events that fits. The frozen reviewer schema has no
+  truncation field, so no out-of-contract indicator is added.
 - At the exact raw-media expiry boundary, SDK capability checks and reviewer
   reads fail closed. HTTP SDK preauthorization and reviewer reads attempt
   scoped erasure outside their database transaction; the background worker
@@ -58,6 +69,14 @@ exchange must never be redirected.
   remains inaccessible throughout that retry window.
 - Audit events have fixed content-free columns. They cannot contain launch
   codes, bearer secrets, Authorization values, or request bodies.
+
+`deletion_tombstone.erasure.erased_object_count` counts top-level durable
+artifacts present when deletion is accepted: segment objects, diagnostic
+envelope objects, the completion artifact, processing-job artifacts, and
+derived preview revisions that have a non-null physical `relative_path`.
+Candidate/evidence binding rows, version heads, membership rows, indexes,
+content-free audits, credentials, and the retained tombstone are metadata and
+are deliberately not counted as separate erased objects.
 
 The admin secret also roots launch and credential verifiers. Back it up as a
 deployment secret. Rotating it invalidates outstanding launch codes and SDK
@@ -115,7 +134,10 @@ separately pinned instance or explicitly reset/reconfigure an empty instance.
 exactly. V1 requires the raw and derived periods to be equal because erasure is
 session-scoped; independently expiring those data classes is not represented as
 a capability. The in-process retention worker is single-process; do not run
-multiple backend replicas over one SQLite/state volume.
+multiple backend replicas over one SQLite/state volume. The candidate
+publication/deletion critical section relies on that same deployment rule;
+SQLite write-intent transactions provide an additional fail-closed boundary
+for reviewer evidence reads but do not make multi-replica operation supported.
 
 ## HTTP surface
 

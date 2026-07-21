@@ -60,6 +60,7 @@ from .evidence_domain import (
 
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 MAX_SEGMENTS = 2048
+MAX_CANDIDATE_EVIDENCE_VIEW_BYTES = 1_572_864
 SCHEMA_VERSION = 2
 INTERNAL_DELETION_RESOURCE = "tacua.internal-deletion-job@1.0.0"
 SCOPE_POLICY_CONTRACT = "tacua.capture-scope-policy@1.0.0"
@@ -2092,7 +2093,7 @@ class PilotBackend:
                               SELECT manifest_row_id FROM tacua_evidence_manifests
                                WHERE organization_id = ? AND project_id = ?
                                  AND session_id = ?
-                          ))""",
+                          ) AND relative_path IS NOT NULL)""",
                     (
                         session_id,
                         session_id,
@@ -2511,7 +2512,6 @@ class PilotBackend:
             "EVIDENCE_BINDING_NOT_FOUND",
             "EVIDENCE_ITEM_NOT_FOUND",
             "PREVIEW_NOT_FOUND",
-            "PREVIEW_FILE_MISSING",
         }:
             status = 404
             code = "CANDIDATE_EVIDENCE_NOT_FOUND"
@@ -2522,12 +2522,18 @@ class PilotBackend:
         }:
             status = 409
             code = "CANDIDATE_EVIDENCE_UNAVAILABLE"
+        elif error.code in {
+            "PREVIEW_FILE_MISSING",
+            "PREVIEW_PATH_ESCAPE",
+            "PREVIEW_PATH_INVALID",
+            "PREVIEW_PATH_SYMLINK",
+            "PREVIEW_READ_FAILED",
+        } or "TAMPER" in error.code or "DIGEST" in error.code:
+            status = 500
+            code = "CANDIDATE_EVIDENCE_CORRUPT"
         elif "SCOPE" in error.code or "BINDING" in error.code:
             status = 403
             code = "CANDIDATE_EVIDENCE_SCOPE_MISMATCH"
-        elif "TAMPER" in error.code or "DIGEST" in error.code:
-            status = 500
-            code = "CANDIDATE_EVIDENCE_CORRUPT"
         else:
             status = 409
             code = "CANDIDATE_EVIDENCE_INVALID"
@@ -2580,6 +2586,109 @@ class PilotBackend:
             "manifest_digest": candidate["evidence_manifest"]["manifest_digest"],
         }
 
+    @staticmethod
+    def _load_candidate_document(raw: Any) -> dict[str, Any]:
+        """Load one exact canonical candidate without opening another handle."""
+
+        try:
+            document = strict_json_loads(raw)
+            canonical = canonical_json(document)
+            stored = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+            if not isinstance(document, dict) or not isinstance(stored, str) or canonical != stored:
+                raise ValueError("candidate JSON is not canonical")
+            TICKET_CONTRACT.validate(document)
+            return document
+        except (UnicodeError, ValueError, CandidateContractError) as error:
+            raise ApiError(
+                500,
+                "CANDIDATE_STORAGE_CORRUPT",
+                "stored candidate failed validation",
+            ) from error
+
+    def _candidate_from_connection(
+        self,
+        connection: sqlite3.Connection,
+        candidate_id: str,
+        version: int | None = None,
+    ) -> dict[str, Any]:
+        """Resolve and verify a complete immutable chain on one transaction."""
+
+        rows = connection.execute(
+            """SELECT candidate_version,organization_id,project_id,session_id,state,
+                      candidate_digest,candidate_content_digest,
+                      evidence_manifest_digest,canonical_json,version_created_at
+                 FROM candidate_versions
+                WHERE candidate_id = ? AND organization_id = ? AND project_id = ?
+                ORDER BY candidate_version""",
+            (candidate_id, self.config.organization_id, self.config.project_id),
+        ).fetchall()
+        if not rows:
+            raise ApiError(404, "CANDIDATE_NOT_FOUND", "candidate was not found")
+        chain = [self._load_candidate_document(row["canonical_json"]) for row in rows]
+        try:
+            TICKET_CONTRACT.validate_chain(chain)
+        except CandidateContractError as error:
+            raise ApiError(
+                500,
+                "CANDIDATE_STORAGE_CORRUPT",
+                "stored candidate chain failed validation",
+            ) from error
+        for row, candidate in zip(rows, chain, strict=True):
+            projection = (
+                candidate["candidate_version"],
+                candidate["organization_id"],
+                candidate["project_id"],
+                candidate["session_id"],
+                candidate["state"],
+                candidate["candidate_digest"],
+                candidate["candidate_content_digest"],
+                candidate["evidence_manifest"]["manifest_digest"],
+                candidate["version_created_at"],
+            )
+            if tuple(row[field] for field in (
+                "candidate_version",
+                "organization_id",
+                "project_id",
+                "session_id",
+                "state",
+                "candidate_digest",
+                "candidate_content_digest",
+                "evidence_manifest_digest",
+                "version_created_at",
+            )) != projection:
+                raise ApiError(
+                    500,
+                    "CANDIDATE_STORAGE_CORRUPT",
+                    "stored candidate projection changed",
+                )
+        head = connection.execute(
+            """SELECT candidate_version,candidate_digest,organization_id,project_id,
+                      session_id,state
+                 FROM candidate_heads
+                WHERE candidate_id = ? AND organization_id = ? AND project_id = ?""",
+            (candidate_id, self.config.organization_id, self.config.project_id),
+        ).fetchone()
+        current = chain[-1]
+        if head is None or tuple(head) != (
+            current["candidate_version"],
+            current["candidate_digest"],
+            current["organization_id"],
+            current["project_id"],
+            current["session_id"],
+            current["state"],
+        ):
+            raise ApiError(
+                500,
+                "CANDIDATE_STORAGE_CORRUPT",
+                "stored candidate head changed",
+            )
+        if version is None:
+            return current
+        for candidate in chain:
+            if candidate["candidate_version"] == version:
+                return candidate
+        raise ApiError(404, "CANDIDATE_NOT_FOUND", "candidate version was not found")
+
     def persist_candidate_bundle(
         self,
         *,
@@ -2592,7 +2701,25 @@ class PilotBackend:
         This is an internal worker boundary, not an HTTP upload route. A crash
         before the final candidate insert can leave retention-scoped evidence,
         but can never expose a candidate whose required screenshot is missing.
+        V1 runs one backend process, so the same process lock that accepts
+        deletion covers every publication phase through the candidate insert.
         """
+
+        with self._lock:
+            return self._persist_candidate_bundle_locked(
+                candidate=candidate,
+                evidence_manifest=evidence_manifest,
+                previews=previews,
+            )
+
+    def _persist_candidate_bundle_locked(
+        self,
+        *,
+        candidate: dict[str, Any],
+        evidence_manifest: dict[str, Any],
+        previews: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Implementation covered end-to-end by ``self._lock``."""
 
         self._sweep_before_review_access()
         try:
@@ -2687,23 +2814,39 @@ class PilotBackend:
 
     def list_candidates(self, session_id: str) -> list[dict[str, Any]]:
         _require_id(session_id, "session_id")
-        self._sweep_before_review_access()
-        with self._connect() as connection:
-            self._require_review_session(connection, session_id)
-        try:
-            return self._candidate_store().list_current(session_id)
-        except CandidateStoreError as error:
-            self._raise_candidate_error(error)
+        with self._lock:
+            self._sweep_before_review_access()
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                self._require_review_session(connection, session_id)
+                rows = connection.execute(
+                    """SELECT candidate_id FROM candidate_heads
+                        WHERE organization_id = ? AND project_id = ? AND session_id = ?
+                        ORDER BY candidate_id""",
+                    (self.config.organization_id, self.config.project_id, session_id),
+                ).fetchall()
+                candidates = [
+                    self._candidate_from_connection(connection, row["candidate_id"])
+                    for row in rows
+                ]
+                candidates.sort(
+                    key=lambda item: (item["version_created_at"], item["candidate_id"])
+                )
+                return candidates
 
     def get_candidate(self, candidate_id: str, version: int | None = None) -> dict[str, Any]:
-        self._sweep_before_review_access()
-        try:
-            candidate = self._candidate_store().get(candidate_id, version)
-        except CandidateStoreError as error:
-            self._raise_candidate_error(error)
-        with self._connect() as connection:
-            self._require_review_session(connection, candidate["session_id"])
-        return candidate
+        _require_id(candidate_id, "candidate_id")
+        if version is not None and (
+            isinstance(version, bool) or not isinstance(version, int) or version < 1
+        ):
+            raise ApiError(400, "INVALID_CANDIDATE_VERSION", "candidate version is invalid")
+        with self._lock:
+            self._sweep_before_review_access()
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                candidate = self._candidate_from_connection(connection, candidate_id, version)
+                self._require_review_session(connection, candidate["session_id"])
+                return candidate
 
     def _candidate_diagnostic_events(
         self,
@@ -2719,25 +2862,94 @@ class PilotBackend:
             if item["time_range"] is not None
         ]
         selected: dict[str, dict[str, Any]] = {}
+        session = self._require_review_session(connection, session_id)
+        try:
+            scope = self._decode_protocol_object(session["scope_json"])
+            build = self._decode_protocol_object(session["build_identity_json"])
+            validate(scope)
+            validate(build)
+        except (ValueError, ContractError) as error:
+            raise ApiError(
+                500,
+                "DIAGNOSTIC_STORAGE_CORRUPT",
+                "stored diagnostic session binding failed validation",
+            ) from error
         rows = connection.execute(
-            "SELECT request_json FROM diagnostics WHERE session_id = ? ORDER BY accepted_at, upload_id",
+            "SELECT * FROM diagnostics WHERE session_id = ? ORDER BY accepted_at, upload_id",
             (session_id,),
-        ).fetchall()
+        )
         for row in rows:
             try:
+                raw_request = row["request_json"]
                 request = self._decode_protocol_object(row["request_json"])
+                if not isinstance(raw_request, str) or canonical_json(request) != raw_request:
+                    raise ValueError("stored diagnostic request is not canonical")
+                validate(request)
+                if request.get("message_type") != "diagnostic_upload_request":
+                    raise ValueError("stored request is not a diagnostic upload")
                 envelope = request["envelope"]
                 runtime_validate(envelope)
-            except (KeyError, TypeError, ContractError) as error:
+                raw_response = bytes(row["response_bytes"])
+                response = self._decode_protocol_object(raw_response)
+                if _canonical_bytes(response) != raw_response:
+                    raise ValueError("stored diagnostic response is not canonical")
+                validate_operation_pair(request, response)
+            except (KeyError, TypeError, ValueError, ContractError) as error:
                 raise ApiError(
                     500,
                     "DIAGNOSTIC_STORAGE_CORRUPT",
                     "stored diagnostic evidence failed validation",
                 ) from error
+
+            envelope_bytes = _canonical_bytes(envelope)
+            envelope_size = len(envelope_bytes)
+            envelope_digest = digest(envelope_bytes)
+            transport = request["transport"]
+            if (
+                request["session_id"] != session_id
+                or request["session_id"] != row["session_id"]
+                or request["upload_id"] != row["upload_id"]
+                or request["credential_id"] != row["source_credential_id"]
+                or request["scope_digest"] != session["scope_digest"]
+                or request["request_digest"] != row["request_digest"]
+                or envelope["envelope_id"] != row["envelope_id"]
+                or row["relative_path"]
+                != self._relative_object_path(
+                    session_id, "diagnostics", row["object_id"], "json"
+                )
+                or transport["content_type"]
+                != "application/vnd.tacua.diagnostic-envelope+json;version=1.0.0"
+                or transport["size_bytes"] != envelope_size
+                or transport["content_digest"] != envelope_digest
+                or row["size_bytes"] != envelope_size
+                or row["content_digest"] != envelope_digest
+                or response["object_id"] != row["object_id"]
+                or response["size_bytes"] != envelope_size
+                or response["transport_digest"] != envelope_digest
+                or response["envelope_id"] != envelope["envelope_id"]
+                or response["envelope_digest"] != envelope["envelope_digest"]
+            ):
+                raise ApiError(
+                    500,
+                    "DIAGNOSTIC_STORAGE_CORRUPT",
+                    "stored diagnostic transport bindings changed",
+                )
+            self._verify_row_object(row)
             if (
                 envelope["organization_id"] != self.config.organization_id
                 or envelope["project_id"] != self.config.project_id
                 or envelope["session_id"] != session_id
+                or envelope["build_id"] != self.config.build_id
+                or envelope["build_identity_digest"]
+                != self.config.build_identity_digest
+                or envelope["organization_id"] != scope["organization_id"]
+                or envelope["project_id"] != scope["project_id"]
+                or envelope["build_id"] != scope["build_id"]
+                or envelope["build_identity_digest"]
+                != scope["build_identity_digest"]
+                or envelope["build_id"] != build["build_id"]
+                or envelope["build_identity_digest"]
+                != build["build_identity_digest"]
             ):
                 raise ApiError(
                     500,
@@ -2766,6 +2978,32 @@ class PilotBackend:
             key=lambda event: (event["elapsed_ms"], event["sequence"], event["event_id"]),
         )[:512]
 
+    def _bounded_candidate_evidence_view(
+        self,
+        evidence: EvidenceStore,
+        *,
+        diagnostic_events: list[dict[str, Any]],
+        binding: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return the deterministic sorted event prefix that fits the HTTP cap."""
+
+        view = evidence.get_candidate_evidence_view(
+            diagnostic_events=[],
+            **binding,
+        )
+        if len(_canonical_bytes(view)) > MAX_CANDIDATE_EVIDENCE_VIEW_BYTES:
+            raise ApiError(
+                500,
+                "CANDIDATE_EVIDENCE_VIEW_TOO_LARGE",
+                "candidate evidence metadata exceeds the reviewer response limit",
+            )
+        for event in diagnostic_events[:512]:
+            view["diagnostic_events"].append(event)
+            if len(_canonical_bytes(view)) > MAX_CANDIDATE_EVIDENCE_VIEW_BYTES:
+                view["diagnostic_events"].pop()
+                break
+        return view
+
     def get_candidate_evidence(
         self,
         candidate_id: str,
@@ -2774,32 +3012,51 @@ class PilotBackend:
         candidate_digest: str,
         manifest_digest: str,
     ) -> dict[str, Any]:
-        candidate = self.get_candidate(candidate_id, candidate_version)
+        _require_id(candidate_id, "candidate_id")
+        _require_digest(candidate_digest, "candidate_digest")
+        _require_digest(manifest_digest, "manifest_digest")
         if (
-            candidate["candidate_digest"] != candidate_digest
-            or candidate["evidence_manifest"]["manifest_digest"] != manifest_digest
+            isinstance(candidate_version, bool)
+            or not isinstance(candidate_version, int)
+            or candidate_version < 1
         ):
-            raise ApiError(
-                412,
-                "CANDIDATE_PRECONDITION_FAILED",
-                "candidate version changed; reload before viewing evidence",
-            )
-        binding = self._candidate_binding(candidate)
-        with self._connect() as connection:
-            evidence = self._evidence_store(connection)
-            try:
-                manifest = evidence.get_manifest(**binding)
-                events = self._candidate_diagnostic_events(
-                    connection,
-                    session_id=candidate["session_id"],
-                    manifest=manifest,
+            raise ApiError(400, "INVALID_CANDIDATE_VERSION", "candidate version is invalid")
+        with self._lock:
+            self._sweep_before_review_access()
+            with self._connect() as connection:
+                # A write-intent transaction makes the read/delete exclusion
+                # true even if another V1 process is accidentally started.
+                connection.execute("BEGIN IMMEDIATE")
+                candidate = self._candidate_from_connection(
+                    connection, candidate_id, candidate_version
                 )
-                return evidence.get_candidate_evidence_view(
-                    diagnostic_events=events,
-                    **binding,
-                )
-            except EvidenceDomainError as error:
-                self._raise_evidence_error(error)
+                self._require_review_session(connection, candidate["session_id"])
+                if (
+                    candidate["candidate_digest"] != candidate_digest
+                    or candidate["evidence_manifest"]["manifest_digest"]
+                    != manifest_digest
+                ):
+                    raise ApiError(
+                        412,
+                        "CANDIDATE_PRECONDITION_FAILED",
+                        "candidate version changed; reload before viewing evidence",
+                    )
+                binding = self._candidate_binding(candidate)
+                evidence = self._evidence_store(connection)
+                try:
+                    manifest = evidence.get_manifest(**binding)
+                    events = self._candidate_diagnostic_events(
+                        connection,
+                        session_id=candidate["session_id"],
+                        manifest=manifest,
+                    )
+                    return self._bounded_candidate_evidence_view(
+                        evidence,
+                        diagnostic_events=events,
+                        binding=binding,
+                    )
+                except EvidenceDomainError as error:
+                    self._raise_evidence_error(error)
 
     def get_candidate_preview(
         self,
@@ -2810,24 +3067,41 @@ class PilotBackend:
         candidate_digest: str,
         manifest_digest: str,
     ) -> dict[str, Any]:
-        candidate = self.get_candidate(candidate_id, candidate_version)
+        _require_id(candidate_id, "candidate_id")
+        _require_id(evidence_id, "evidence_id")
+        _require_digest(candidate_digest, "candidate_digest")
+        _require_digest(manifest_digest, "manifest_digest")
         if (
-            candidate["candidate_digest"] != candidate_digest
-            or candidate["evidence_manifest"]["manifest_digest"] != manifest_digest
+            isinstance(candidate_version, bool)
+            or not isinstance(candidate_version, int)
+            or candidate_version < 1
         ):
-            raise ApiError(
-                412,
-                "CANDIDATE_PRECONDITION_FAILED",
-                "candidate version changed; reload before viewing evidence",
-            )
-        try:
-            with self._connect() as connection:
-                return self._evidence_store(connection).get_preview(
-                    evidence_id=evidence_id,
-                    **self._candidate_binding(candidate),
-                )
-        except EvidenceDomainError as error:
-            self._raise_evidence_error(error)
+            raise ApiError(400, "INVALID_CANDIDATE_VERSION", "candidate version is invalid")
+        with self._lock:
+            self._sweep_before_review_access()
+            try:
+                with self._connect() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    candidate = self._candidate_from_connection(
+                        connection, candidate_id, candidate_version
+                    )
+                    self._require_review_session(connection, candidate["session_id"])
+                    if (
+                        candidate["candidate_digest"] != candidate_digest
+                        or candidate["evidence_manifest"]["manifest_digest"]
+                        != manifest_digest
+                    ):
+                        raise ApiError(
+                            412,
+                            "CANDIDATE_PRECONDITION_FAILED",
+                            "candidate version changed; reload before viewing evidence",
+                        )
+                    return self._evidence_store(connection).get_preview(
+                        evidence_id=evidence_id,
+                        **self._candidate_binding(candidate),
+                    )
+            except EvidenceDomainError as error:
+                self._raise_evidence_error(error)
 
     def transition_candidate(
         self,
@@ -2879,7 +3153,9 @@ class PilotBackend:
                 "policy_version": scope["retention"]["policy_version"],
                 "raw_media_expires_at": row["raw_media_expires_at"],
                 "derived_data_expires_at": row["derived_data_expires_at"],
-                "deletion_status": "active",
+                "deletion_status": "deleting"
+                if row["state"] == "deleting"
+                else "active",
             },
         }
 
@@ -2903,6 +3179,12 @@ class PilotBackend:
 
     def get_session(self, session_id: str) -> dict[str, Any]:
         _require_id(session_id, "session_id")
+        with self._lock:
+            return self._get_session_locked(session_id)
+
+    def _get_session_locked(self, session_id: str) -> dict[str, Any]:
+        """Resolve one session while deletion acceptance is excluded."""
+
         self._sweep_before_review_access()
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
@@ -2912,11 +3194,7 @@ class PilotBackend:
                 ).fetchone()
                 if tombstone is None:
                     raise ApiError(404, "SESSION_NOT_FOUND", "session was not found")
-                return {
-                    "session_id": session_id,
-                    "state": "deleted",
-                    "tombstone": self._decode_protocol_object(bytes(tombstone["response_bytes"])),
-                }
+                raise ApiError(410, "SESSION_DELETED", "session was deleted")
             self._require_review_session(conn, session_id)
             completion = conn.execute(
                 "SELECT request_json,response_bytes FROM completions WHERE session_id = ?",
