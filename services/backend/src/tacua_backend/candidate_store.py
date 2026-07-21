@@ -54,6 +54,7 @@ class CandidateTransitionResponse:
 
 
 ApprovalGuard = Callable[[sqlite3.Connection, dict[str, Any]], None]
+GeneratedInsertGuard = Callable[[sqlite3.Connection, dict[str, Any]], None]
 VersionAppendGuard = Callable[
     [sqlite3.Connection, dict[str, Any], dict[str, Any]], None
 ]
@@ -97,9 +98,11 @@ class CandidateStore:
     method obtains and closes its own connection. Optional guards execute on
     that same connection while its ``BEGIN IMMEDIATE`` transaction is active.
     Approval verification runs after exact parent/request binding and before
-    transition construction. Version append integration runs after the sealed
-    child is constructed and before any candidate row or head is changed. Any
-    guard failure rolls back its writes and the entire candidate transition.
+    transition construction. Generated insertion verification runs after exact
+    idempotency handling and before the first candidate/head write. Version
+    append integration runs after the sealed child is constructed and before
+    any candidate row or head is changed. Any guard failure rolls back its
+    writes and the entire candidate mutation.
     """
 
     def __init__(
@@ -111,6 +114,7 @@ class CandidateStore:
         reviewer_id: str,
         clock: Callable[[], datetime],
         approval_guard: ApprovalGuard | None = None,
+        generated_insert_guard: GeneratedInsertGuard | None = None,
         version_append_guard: VersionAppendGuard | None = None,
     ):
         self._connect = connect
@@ -121,10 +125,13 @@ class CandidateStore:
             raise ValueError("clock must be callable")
         if approval_guard is not None and not callable(approval_guard):
             raise ValueError("approval_guard must be callable")
+        if generated_insert_guard is not None and not callable(generated_insert_guard):
+            raise ValueError("generated_insert_guard must be callable")
         if version_append_guard is not None and not callable(version_append_guard):
             raise ValueError("version_append_guard must be callable")
         self._clock = clock
         self._approval_guard = approval_guard
+        self._generated_insert_guard = generated_insert_guard
         self._version_append_guard = version_append_guard
 
     def initialize_schema(self) -> None:
@@ -206,6 +213,12 @@ class CandidateStore:
                 if len(existing) == 1 and existing[0]["canonical_json"] == _canonical_json(document):
                     return copy.deepcopy(document)
                 raise CandidateStoreError(409, "CANDIDATE_ALREADY_EXISTS", "candidate ID is already in use")
+            if self._generated_insert_guard is not None:
+                self._invoke_guard(
+                    self._generated_insert_guard,
+                    connection,
+                    copy.deepcopy(document),
+                )
             self._insert_version(connection, document)
             connection.execute(
                 """INSERT INTO candidate_heads

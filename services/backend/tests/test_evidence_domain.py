@@ -56,6 +56,10 @@ def available_item(
     description: str | None = None,
     start_ms: int | None = 100,
 ) -> dict:
+    reference_size = len(PNG) if evidence_type == "media.keyframe" else 123
+    reference_digest = (
+        sha256_digest(PNG) if evidence_type == "media.keyframe" else "sha256:" + "4" * 64
+    )
     raw = {
         "contract_version": ITEM_VERSION,
         "organization_id": ORG,
@@ -93,8 +97,8 @@ def available_item(
                 "revision_id": f"revision_{evidence_id.removeprefix('evidence_')}",
             },
             "content_type": content_type,
-            "size_bytes": 123,
-            "content_digest": "sha256:" + "4" * 64,
+            "size_bytes": reference_size,
+            "content_digest": reference_digest,
         },
         "unavailable": None,
         "evidence_item_digest": "sha256:" + "0" * 64,
@@ -355,6 +359,37 @@ class EvidenceDomainTests(unittest.TestCase):
             lambda: self.store.get_manifest(**self.binding),
         )
 
+    def test_coherent_preview_replacement_cannot_escape_manifest_binding(self) -> None:
+        self.put_manifest()
+        self.put_preview()
+        other_png = b"\x89PNG\r\n\x1a\ncoherent-replacement"
+        replacement_digest = sha256_digest(other_png)
+        relative_path = self.connection.execute(
+            "SELECT relative_path FROM tacua_evidence_preview_revisions"
+        ).fetchone()[0]
+        (self.root / relative_path).write_bytes(other_png)
+        with self.connection:
+            self.connection.execute(
+                """
+                UPDATE tacua_evidence_preview_revisions
+                   SET size_bytes = ?, content_digest = ?
+                """,
+                (len(other_png), replacement_digest),
+            )
+
+        self.assert_error(
+            "STORED_PREVIEW_TAMPERED",
+            lambda: self.store.get_preview(
+                evidence_id="evidence_keyframe", **self.binding
+            ),
+        )
+        self.assert_error(
+            "STORED_PREVIEW_TAMPERED",
+            lambda: self.store.get_verified_keyframes_for_approval(
+                evidence_ids=["evidence_keyframe"], **self.binding
+            ),
+        )
+
     def test_preview_traversal_and_symlink_paths_are_rejected(self) -> None:
         self.put_manifest()
         self.assert_error(
@@ -418,6 +453,165 @@ class EvidenceDomainTests(unittest.TestCase):
                 content_digest=sha256_digest(b"not a png"),
             ),
         )
+
+    def test_preview_must_match_the_sealed_keyframe_reference(self) -> None:
+        self.put_manifest()
+        other_png = b"\x89PNG\r\n\x1a\nother-keyframe"
+        self.assert_error(
+            "PREVIEW_REFERENCE_MISMATCH",
+            lambda: self.put_preview(
+                preview_revision_id="preview_other_keyframe",
+                body=other_png,
+                size_bytes=len(other_png),
+                content_digest=sha256_digest(other_png),
+            ),
+        )
+        jpeg = b"\xff\xd8\xffdifferent-keyframe\xff\xd9"
+        self.assert_error(
+            "PREVIEW_REFERENCE_MISMATCH",
+            lambda: self.put_preview(
+                preview_revision_id="preview_wrong_type",
+                content_type="image/jpeg",
+                body=jpeg,
+                size_bytes=len(jpeg),
+                content_digest=sha256_digest(jpeg),
+            ),
+        )
+        self.assertEqual(
+            0,
+            self.connection.execute(
+                "SELECT COUNT(*) FROM tacua_evidence_preview_revisions"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.connection.execute(
+                "SELECT COUNT(*) FROM tacua_evidence_file_journal"
+            ).fetchone()[0],
+        )
+
+    def test_preview_transaction_guard_runs_inside_both_durable_phases(self) -> None:
+        self.put_manifest()
+        observed: list[tuple[int, int]] = []
+
+        def guard(connection: sqlite3.Connection) -> None:
+            self.assertTrue(connection.in_transaction)
+            observed.append(
+                (
+                    connection.execute(
+                        "SELECT COUNT(*) FROM tacua_evidence_file_journal"
+                    ).fetchone()[0],
+                    connection.execute(
+                        "SELECT COUNT(*) FROM tacua_evidence_preview_revisions"
+                    ).fetchone()[0],
+                )
+            )
+
+        created = self.put_preview(transaction_guard=guard)
+        self.assertTrue(created["created"])
+        self.assertEqual([(0, 0), (1, 0)], observed)
+
+    def test_preview_transaction_guard_failures_are_atomic_and_recoverable(self) -> None:
+        self.put_manifest()
+
+        def reject_first_phase(connection: sqlite3.Connection) -> None:
+            self.assertTrue(connection.in_transaction)
+            raise EvidenceDomainError(
+                "SESSION_PUBLICATION_CLOSED",
+                "$.session_id",
+                "session no longer accepts evidence publication",
+            )
+
+        self.assert_error(
+            "SESSION_PUBLICATION_CLOSED",
+            lambda: self.put_preview(transaction_guard=reject_first_phase),
+        )
+        self.assertEqual([], [path for path in self.root.rglob("*") if path.is_file()])
+        for table in (
+            "tacua_evidence_file_journal",
+            "tacua_evidence_preview_revisions",
+        ):
+            self.assertEqual(
+                0,
+                self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0],
+            )
+
+        guard_calls = 0
+
+        def crash_second_phase(connection: sqlite3.Connection) -> None:
+            nonlocal guard_calls
+            self.assertTrue(connection.in_transaction)
+            guard_calls += 1
+            if guard_calls == 2:
+                raise SimulatedProcessCrash()
+
+        with self.assertRaises(SimulatedProcessCrash):
+            self.put_preview(transaction_guard=crash_second_phase)
+        self.assertEqual(2, guard_calls)
+        self.assertEqual(
+            1,
+            self.connection.execute(
+                "SELECT COUNT(*) FROM tacua_evidence_file_journal"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.connection.execute(
+                "SELECT COUNT(*) FROM tacua_evidence_preview_revisions"
+            ).fetchone()[0],
+        )
+        self.assertEqual(1, len([path for path in self.root.rglob("*") if path.is_file()]))
+
+        recovered = EvidenceStore(self.connection, self.root)
+        report = recovered.recover_file_journal()
+        self.assertEqual(1, report["journal_entries"])
+        self.assertEqual(1, report["preview_files_removed"])
+        self.assertEqual([], [path for path in self.root.rglob("*") if path.is_file()])
+
+    def test_preview_phase_two_rechecks_publication_guard_across_file_gap(self) -> None:
+        self.put_manifest()
+        with self.connection:
+            self.connection.execute(
+                "CREATE TABLE publication_lease (active INTEGER NOT NULL)"
+            )
+            self.connection.execute(
+                "INSERT INTO publication_lease (active) VALUES (1)"
+            )
+
+        def guard(connection: sqlite3.Connection) -> None:
+            self.assertTrue(connection.in_transaction)
+            active = connection.execute(
+                "SELECT active FROM publication_lease"
+            ).fetchone()[0]
+            if active != 1:
+                raise EvidenceDomainError(
+                    "SESSION_PUBLICATION_CLOSED",
+                    "$.session_id",
+                    "session stopped accepting evidence during publication",
+                )
+
+        original_write = self.store._write
+
+        def close_publication_after_write(relative_path, staging_relative_path, body):
+            target = original_write(relative_path, staging_relative_path, body)
+            with self.connection:
+                self.connection.execute("UPDATE publication_lease SET active = 0")
+            return target
+
+        self.store._write = close_publication_after_write
+        self.assert_error(
+            "SESSION_PUBLICATION_CLOSED",
+            lambda: self.put_preview(transaction_guard=guard),
+        )
+        self.assertEqual([], [path for path in self.root.rglob("*") if path.is_file()])
+        for table in (
+            "tacua_evidence_file_journal",
+            "tacua_evidence_preview_revisions",
+        ):
+            self.assertEqual(
+                0,
+                self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0],
+            )
 
     def test_manifest_and_item_revisions_are_append_only(self) -> None:
         self.put_manifest()
@@ -753,6 +947,11 @@ class EvidenceDomainTests(unittest.TestCase):
             candidate_digest="sha256:" + "8" * 64,
             manifest=self.manifest,
         )
+        session_root = self.root / "sessions" / SESSION
+        self.assertTrue(session_root.is_dir())
+        orphan = session_root / "orphaned-staging" / "partial-upload.bin"
+        orphan.parent.mkdir()
+        orphan.write_bytes(b"partial")
         report = self.store.delete_session(
             organization_id=ORG, project_id=PROJECT, session_id=SESSION
         )
@@ -767,6 +966,7 @@ class EvidenceDomainTests(unittest.TestCase):
             },
             report,
         )
+        self.assertFalse(session_root.exists())
         for table in (
             "tacua_candidate_evidence_bindings",
             "tacua_evidence_manifests",
@@ -790,6 +990,36 @@ class EvidenceDomainTests(unittest.TestCase):
             self.store.delete_session(
                 organization_id=ORG, project_id=PROJECT, session_id=SESSION
             ),
+        )
+        self.assertFalse(session_root.exists())
+        self.assertEqual(
+            0,
+            self.connection.execute(
+                "SELECT COUNT(*) FROM tacua_evidence_directory_journal"
+            ).fetchone()[0],
+        )
+
+    def test_session_tree_pruning_refuses_symlinks_without_following_them(self) -> None:
+        self.put_manifest()
+        self.put_preview()
+        outside = Path(self.temporary.name) / "outside-session-evidence.txt"
+        outside.write_text("must survive", encoding="utf-8")
+        session_root = self.root / "sessions" / SESSION
+        os.symlink(outside, session_root / "untrusted-link")
+
+        self.assert_error(
+            "SESSION_TREE_PATH_SYMLINK",
+            lambda: self.store.delete_session(
+                organization_id=ORG, project_id=PROJECT, session_id=SESSION
+            ),
+        )
+        self.assertEqual("must survive", outside.read_text(encoding="utf-8"))
+        self.assertTrue((session_root / "untrusted-link").is_symlink())
+        self.assertEqual(
+            1,
+            self.connection.execute(
+                "SELECT COUNT(*) FROM tacua_evidence_directory_journal"
+            ).fetchone()[0],
         )
 
     def test_session_deletion_crash_is_recoverable_after_metadata_commit(self) -> None:
@@ -817,12 +1047,136 @@ class EvidenceDomainTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM tacua_evidence_file_journal"
             ).fetchone()[0],
         )
+        self.assertEqual(
+            1,
+            self.connection.execute(
+                "SELECT COUNT(*) FROM tacua_evidence_directory_journal"
+            ).fetchone()[0],
+        )
         self.assertEqual(1, len([path for path in self.root.rglob("*") if path.is_file()]))
 
         self.store._drain_file_journal = original_drain
         report = self.store.recover_file_journal()
         self.assertEqual(1, report["preview_files_removed"])
         self.assertEqual([], [path for path in self.root.rglob("*") if path.is_file()])
+        self.assertFalse((self.root / "sessions" / SESSION).exists())
+        self.assertEqual(1, report["directory_journal_entries"])
+        self.assertEqual(1, report["session_trees_pruned"])
+
+    def test_session_tree_prune_journal_survives_database_restart(self) -> None:
+        database = Path(self.temporary.name) / "delete-restart.sqlite3"
+        root = Path(self.temporary.name) / "delete-restart-derived"
+        connection = sqlite3.connect(database)
+        initialize_schema(connection)
+        store = EvidenceStore(connection, root)
+        values = dict(self.binding)
+        values.pop("manifest_digest")
+        store.put_manifest(manifest=self.manifest, **values)
+        store.put_preview(
+            evidence_id="evidence_keyframe",
+            preview_revision_id="preview_restart_delete",
+            content_type="image/png",
+            size_bytes=len(PNG),
+            content_digest=sha256_digest(PNG),
+            body=PNG,
+            **self.binding,
+        )
+
+        def crash_before_file_cleanup(operation_id=None):
+            raise SimulatedProcessCrash()
+
+        store._drain_file_journal = crash_before_file_cleanup
+        with self.assertRaises(SimulatedProcessCrash):
+            store.delete_session(
+                organization_id=ORG, project_id=PROJECT, session_id=SESSION
+            )
+        connection.close()
+
+        recovered_connection = sqlite3.connect(database)
+        try:
+            recovered = EvidenceStore(recovered_connection, root)
+            report = recovered.recover_file_journal()
+            self.assertEqual(1, report["preview_files_removed"])
+            self.assertEqual(1, report["directory_journal_entries"])
+            self.assertEqual(1, report["session_trees_pruned"])
+            self.assertFalse((root / "sessions" / SESSION).exists())
+            for table in (
+                "tacua_evidence_file_journal",
+                "tacua_evidence_directory_journal",
+            ):
+                self.assertEqual(
+                    0,
+                    recovered_connection.execute(
+                        f"SELECT COUNT(*) FROM {table}"
+                    ).fetchone()[0],
+                )
+        finally:
+            recovered_connection.close()
+
+    def test_session_deletion_recovers_after_file_cleanup_before_tree_prune(self) -> None:
+        self.put_manifest()
+        self.put_preview()
+        original_drain = self.store._drain_directory_journal
+
+        def crash_before_tree_prune(operation_id=None):
+            raise SimulatedProcessCrash()
+
+        self.store._drain_directory_journal = crash_before_tree_prune
+        with self.assertRaises(SimulatedProcessCrash):
+            self.store.delete_session(
+                organization_id=ORG, project_id=PROJECT, session_id=SESSION
+            )
+        self.assertEqual(
+            0,
+            self.connection.execute(
+                "SELECT COUNT(*) FROM tacua_evidence_file_journal"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            self.connection.execute(
+                "SELECT COUNT(*) FROM tacua_evidence_directory_journal"
+            ).fetchone()[0],
+        )
+        self.assertTrue((self.root / "sessions" / SESSION).is_dir())
+
+        self.store._drain_directory_journal = original_drain
+        report = self.store.recover_file_journal()
+        self.assertEqual(1, report["directory_journal_entries"])
+        self.assertEqual(1, report["session_trees_pruned"])
+        self.assertFalse((self.root / "sessions" / SESSION).exists())
+
+    def test_session_deletion_recovers_after_tree_prune_before_journal_clear(self) -> None:
+        self.put_manifest()
+        self.put_preview()
+        original_clear = self.store._clear_directory_journal_row
+
+        def crash_before_tree_journal_clear(journal_row_id):
+            raise SimulatedProcessCrash()
+
+        self.store._clear_directory_journal_row = crash_before_tree_journal_clear
+        with self.assertRaises(SimulatedProcessCrash):
+            self.store.delete_session(
+                organization_id=ORG, project_id=PROJECT, session_id=SESSION
+            )
+        self.assertFalse((self.root / "sessions" / SESSION).exists())
+        self.assertEqual(
+            1,
+            self.connection.execute(
+                "SELECT COUNT(*) FROM tacua_evidence_directory_journal"
+            ).fetchone()[0],
+        )
+
+        self.store._clear_directory_journal_row = original_clear
+        report = self.store.recover_file_journal()
+        self.assertEqual(1, report["directory_journal_entries"])
+        self.assertEqual(0, report["session_trees_pruned"])
+        self.assertEqual(
+            0,
+            self.connection.execute(
+                "SELECT COUNT(*) FROM tacua_evidence_directory_journal"
+            ).fetchone()[0],
+        )
 
     def test_filesystem_operations_reject_caller_rollback_boundaries(self) -> None:
         self.put_manifest()

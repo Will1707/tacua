@@ -22,7 +22,7 @@ import sqlite3
 import stat
 import unicodedata
 import uuid
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 
 MANIFEST_VERSION = "tacua.candidate-evidence-manifest@1.0.0"
@@ -35,6 +35,7 @@ MAX_PREVIEW_BYTES = 2_097_152
 PREVIEW_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"})
 _JOURNAL_DISCARD_PREVIEW = "discard_uncommitted_preview"
 _JOURNAL_DELETE_PREVIEW = "delete_committed_preview"
+_JOURNAL_PRUNE_SESSION_TREE = "prune_session_tree"
 
 _ID = re.compile(r"^[a-z][a-z0-9_-]{2,63}$")
 _DIGEST = re.compile(r"^sha256:[a-f0-9]{64}$")
@@ -683,6 +684,21 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
         )
         """,
         """
+        CREATE TABLE IF NOT EXISTS tacua_evidence_directory_journal (
+            journal_row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation_id TEXT NOT NULL,
+            disposition TEXT NOT NULL CHECK (
+                disposition = 'prune_session_tree'
+            ),
+            organization_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            relative_path TEXT NOT NULL UNIQUE,
+            recorded_at TEXT NOT NULL,
+            UNIQUE (operation_id, relative_path)
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS tacua_evidence_audit (
             audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
             occurred_at TEXT NOT NULL,
@@ -703,6 +719,7 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS tacua_evidence_bindings_session_idx ON tacua_candidate_evidence_bindings (organization_id, project_id, session_id)",
         "CREATE INDEX IF NOT EXISTS tacua_evidence_previews_item_idx ON tacua_evidence_preview_revisions (manifest_row_id, item_row_id, preview_row_id)",
         "CREATE INDEX IF NOT EXISTS tacua_evidence_file_journal_operation_idx ON tacua_evidence_file_journal (operation_id, journal_row_id)",
+        "CREATE INDEX IF NOT EXISTS tacua_evidence_directory_journal_operation_idx ON tacua_evidence_directory_journal (operation_id, journal_row_id)",
     )
     with _savepoint(connection):
         for statement in statements:
@@ -1281,6 +1298,11 @@ class EvidenceStore:
             f"{preview_revision_id}.{self._extension(content_type)}",
         )
 
+    @staticmethod
+    def _session_relative_path(session_id: str) -> Path:
+        _identifier(session_id, "$.session_id")
+        return Path("sessions", session_id)
+
     def _path(self, relative_path: str | Path, *, create_parents: bool) -> Path:
         relative = Path(relative_path)
         _require(
@@ -1488,10 +1510,54 @@ class EvidenceStore:
                 "another durable file operation already owns this preview path",
             ) from error
 
+    def _journal_session_tree(
+        self,
+        *,
+        operation_id: str,
+        organization_id: str,
+        project_id: str,
+        session_id: str,
+    ) -> None:
+        _identifier(operation_id, "$.operation_id")
+        _identifier(organization_id, "$.organization_id")
+        _identifier(project_id, "$.project_id")
+        relative_path = self._session_relative_path(session_id).as_posix()
+        try:
+            self.connection.execute(
+                """
+                INSERT INTO tacua_evidence_directory_journal (
+                    operation_id, disposition, organization_id, project_id,
+                    session_id, relative_path, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    operation_id,
+                    _JOURNAL_PRUNE_SESSION_TREE,
+                    organization_id,
+                    project_id,
+                    session_id,
+                    relative_path,
+                    _now(),
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise EvidenceDomainError(
+                "EVIDENCE_DIRECTORY_OPERATION_CONFLICT",
+                "$.session_id",
+                "another durable operation already owns this session evidence tree",
+            ) from error
+
     def _clear_journal_row(self, journal_row_id: int) -> None:
         with _durable_transaction(self.connection):
             self.connection.execute(
                 "DELETE FROM tacua_evidence_file_journal WHERE journal_row_id = ?",
+                (journal_row_id,),
+            )
+
+    def _clear_directory_journal_row(self, journal_row_id: int) -> None:
+        with _durable_transaction(self.connection):
+            self.connection.execute(
+                "DELETE FROM tacua_evidence_directory_journal WHERE journal_row_id = ?",
                 (journal_row_id,),
             )
 
@@ -1601,12 +1667,240 @@ class EvidenceStore:
             self._clear_journal_row(int(journal_row_id))
         return report
 
+    def _prune_session_tree(self, session_id: str) -> bool:
+        relative_path = self._session_relative_path(session_id)
+        sessions_root = self.root / relative_path.parts[0]
+        try:
+            sessions_metadata = sessions_root.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError as error:
+            raise EvidenceDomainError(
+                "SESSION_TREE_PATH_INVALID",
+                "$.session_id",
+                "session evidence root cannot be inspected",
+            ) from error
+        _require(
+            stat.S_ISDIR(sessions_metadata.st_mode)
+            and not stat.S_ISLNK(sessions_metadata.st_mode),
+            "SESSION_TREE_PATH_SYMLINK",
+            "$.session_id",
+            "symbolic links are forbidden in the session evidence path",
+        )
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(
+            os, "O_NOFOLLOW", 0
+        )
+
+        def prune_contents(descriptor: int) -> None:
+            try:
+                names = os.listdir(descriptor)
+            except OSError as error:
+                raise EvidenceDomainError(
+                    "SESSION_TREE_PATH_INVALID",
+                    "$.session_id",
+                    "session evidence directory cannot be listed",
+                ) from error
+            for name in names:
+                try:
+                    child_metadata = os.stat(
+                        name, dir_fd=descriptor, follow_symlinks=False
+                    )
+                except OSError as error:
+                    raise EvidenceDomainError(
+                        "SESSION_TREE_PATH_INVALID",
+                        "$.session_id",
+                        "session evidence path cannot be inspected",
+                    ) from error
+                _require(
+                    not stat.S_ISLNK(child_metadata.st_mode),
+                    "SESSION_TREE_PATH_SYMLINK",
+                    "$.session_id",
+                    "symbolic links are forbidden in the session evidence tree",
+                )
+                if stat.S_ISREG(child_metadata.st_mode):
+                    try:
+                        os.unlink(name, dir_fd=descriptor)
+                        os.fsync(descriptor)
+                    except OSError as error:
+                        raise EvidenceDomainError(
+                            "SESSION_TREE_DELETE_FAILED",
+                            "$.session_id",
+                            "session evidence file could not be removed",
+                        ) from error
+                    continue
+                _require(
+                    stat.S_ISDIR(child_metadata.st_mode),
+                    "SESSION_TREE_PATH_INVALID",
+                    "$.session_id",
+                    "session evidence tree contains a non-file path",
+                )
+                try:
+                    child_descriptor = os.open(
+                        name, flags, dir_fd=descriptor
+                    )
+                except OSError as error:
+                    raise EvidenceDomainError(
+                        "SESSION_TREE_PATH_INVALID",
+                        "$.session_id",
+                        "session evidence directory cannot be opened safely",
+                    ) from error
+                try:
+                    prune_contents(child_descriptor)
+                finally:
+                    os.close(child_descriptor)
+                try:
+                    os.rmdir(name, dir_fd=descriptor)
+                    os.fsync(descriptor)
+                except OSError as error:
+                    raise EvidenceDomainError(
+                        "SESSION_TREE_DELETE_FAILED",
+                        "$.session_id",
+                        "session evidence directory could not be removed",
+                    ) from error
+
+        sessions_descriptor: int | None = None
+        session_descriptor: int | None = None
+        try:
+            sessions_descriptor = os.open(sessions_root, flags)
+            try:
+                session_metadata = os.stat(
+                    session_id,
+                    dir_fd=sessions_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return False
+            _require(
+                stat.S_ISDIR(session_metadata.st_mode)
+                and not stat.S_ISLNK(session_metadata.st_mode),
+                "SESSION_TREE_PATH_SYMLINK",
+                "$.session_id",
+                "session evidence path must be a real directory",
+            )
+            session_descriptor = os.open(
+                session_id, flags, dir_fd=sessions_descriptor
+            )
+            prune_contents(session_descriptor)
+            os.close(session_descriptor)
+            session_descriptor = None
+            os.rmdir(session_id, dir_fd=sessions_descriptor)
+            os.fsync(sessions_descriptor)
+            return True
+        except EvidenceDomainError:
+            raise
+        except OSError as error:
+            raise EvidenceDomainError(
+                "SESSION_TREE_DELETE_FAILED",
+                "$.session_id",
+                "session evidence tree could not be removed safely",
+            ) from error
+        finally:
+            if session_descriptor is not None:
+                os.close(session_descriptor)
+            if sessions_descriptor is not None:
+                os.close(sessions_descriptor)
+
+    def _drain_directory_journal(
+        self, operation_id: str | None = None
+    ) -> dict[str, int]:
+        parameters: tuple[Any, ...] = ()
+        where = ""
+        if operation_id is not None:
+            _identifier(operation_id, "$.operation_id")
+            where = " WHERE operation_id = ?"
+            parameters = (operation_id,)
+        rows = self.connection.execute(
+            """
+            SELECT journal_row_id, disposition, organization_id, project_id,
+                   session_id, relative_path
+              FROM tacua_evidence_directory_journal
+            """
+            + where
+            + " ORDER BY journal_row_id",
+            parameters,
+        ).fetchall()
+        report = {
+            "directory_journal_entries": len(rows),
+            "session_trees_pruned": 0,
+        }
+        for row in rows:
+            (
+                journal_row_id,
+                disposition,
+                organization_id,
+                project_id,
+                session_id,
+                relative_path,
+            ) = tuple(row)
+            _require(
+                disposition == _JOURNAL_PRUNE_SESSION_TREE,
+                "DIRECTORY_JOURNAL_INVALID",
+                "$.disposition",
+                "stored directory disposition is invalid",
+            )
+            _identifier(organization_id, "$.organization_id")
+            _identifier(project_id, "$.project_id")
+            expected_path = self._session_relative_path(session_id).as_posix()
+            _require(
+                relative_path == expected_path,
+                "DIRECTORY_JOURNAL_INVALID",
+                "$.relative_path",
+                "stored session directory is not exactly scope-bound",
+            )
+            for table in (
+                "tacua_evidence_manifests",
+                "tacua_evidence_items",
+                "tacua_candidate_evidence_bindings",
+            ):
+                remaining = self.connection.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()[0]
+                _require(
+                    remaining == 0,
+                    "DIRECTORY_JOURNAL_INVALID",
+                    "$.session_id",
+                    "session evidence metadata still references the directory",
+                )
+            pending_files = self.connection.execute(
+                """
+                SELECT COUNT(*) FROM tacua_evidence_file_journal
+                 WHERE relative_path = ? OR instr(relative_path, ? || '/') = 1
+                """,
+                (relative_path, relative_path),
+            ).fetchone()[0]
+            _require(
+                pending_files == 0,
+                "DIRECTORY_JOURNAL_INVALID",
+                "$.session_id",
+                "session preview cleanup must finish before directory pruning",
+            )
+            active_previews = self.connection.execute(
+                """
+                SELECT COUNT(*) FROM tacua_evidence_preview_revisions
+                 WHERE relative_path IS NOT NULL
+                   AND (relative_path = ? OR instr(relative_path, ? || '/') = 1)
+                """,
+                (relative_path, relative_path),
+            ).fetchone()[0]
+            _require(
+                active_previews == 0,
+                "DIRECTORY_JOURNAL_INVALID",
+                "$.session_id",
+                "preview metadata still references the session directory",
+            )
+            if self._prune_session_tree(session_id):
+                report["session_trees_pruned"] += 1
+            self._clear_directory_journal_row(int(journal_row_id))
+        return report
+
     def recover_file_journal(self) -> dict[str, int]:
         """Reconcile durable filesystem phases before accepting evidence writes.
 
         Call this once during process startup, before concurrent request handling.
-        Uncommitted preview bytes are discarded; deletion intents are completed;
-        an already committed, byte-verified preview is preserved.
+        Uncommitted preview bytes are discarded; deletion intents and session
+        directory pruning are completed; an already committed, byte-verified
+        preview is preserved.
         """
 
         self._schema()
@@ -1616,7 +1910,9 @@ class EvidenceStore:
             "$",
             "file recovery requires a standalone database boundary",
         )
-        return self._drain_file_journal()
+        report = self._drain_file_journal()
+        report.update(self._drain_directory_journal())
+        return report
 
     def _read(
         self,
@@ -1707,6 +2003,31 @@ class EvidenceStore:
             ) from error
         return body
 
+    @staticmethod
+    def _require_bound_preview_reference(
+        item: Mapping[str, Any],
+        *,
+        content_type: str,
+        size_bytes: int,
+        content_digest: str,
+        stored: bool = False,
+    ) -> None:
+        reference = item["reference"]
+        _require(
+            isinstance(reference, dict)
+            and (
+                reference["content_type"],
+                reference["size_bytes"],
+                reference["content_digest"],
+            )
+            == (content_type, size_bytes, content_digest),
+            "STORED_PREVIEW_TAMPERED" if stored else "PREVIEW_REFERENCE_MISMATCH",
+            "$.body",
+            "stored preview no longer matches the sealed keyframe reference"
+            if stored
+            else "preview bytes and metadata must exactly match the sealed keyframe reference",
+        )
+
     def put_preview(
         self,
         *,
@@ -1716,9 +2037,17 @@ class EvidenceStore:
         size_bytes: int,
         content_digest: str,
         body: bytes,
+        transaction_guard: Callable[[sqlite3.Connection], None] | None = None,
         **binding: Any,
     ) -> dict[str, Any]:
-        """Append one immutable, derived media.keyframe preview revision."""
+        """Append one immutable, manifest-bound media.keyframe preview.
+
+        When supplied, ``transaction_guard`` is the first callback in each of
+        the two durable database phases around the filesystem gap. It receives
+        only the active SQLite connection and must not commit or roll it back.
+        A failure rolls back that phase; a process failure in phase two leaves
+        the phase-one file intent for startup recovery.
+        """
 
         self._schema()
         _identifier(preview_revision_id, "$.preview_revision_id")
@@ -1755,6 +2084,12 @@ class EvidenceStore:
             "declared digest does not match bytes",
         )
         _signature(content_type, body)
+        _require(
+            transaction_guard is None or callable(transaction_guard),
+            "TRANSACTION_GUARD_INVALID",
+            "$.transaction_guard",
+            "transaction guard must be callable",
+        )
 
         _require(
             not self.connection.in_transaction,
@@ -1767,6 +2102,8 @@ class EvidenceStore:
         staging_relative_path: Path | None = None
         try:
             with _durable_transaction(self.connection):
+                if transaction_guard is not None:
+                    transaction_guard(self.connection)
                 manifest_row_id, manifest = self._resolve(**binding)
                 item_row_id, item = self._item(
                     manifest_row_id, manifest, evidence_id
@@ -1801,6 +2138,13 @@ class EvidenceStore:
                         "$.preview_revision_id",
                         "immutable preview revision has different metadata",
                     )
+                self._require_bound_preview_reference(
+                    item,
+                    content_type=content_type,
+                    size_bytes=size_bytes,
+                    content_digest=content_digest,
+                )
+                if existing is not None:
                     self._read(
                         existing[4], content_type, size_bytes, content_digest
                     )
@@ -1839,6 +2183,30 @@ class EvidenceStore:
                 relative_path.as_posix(), content_type, size_bytes, content_digest
             )
             with _durable_transaction(self.connection):
+                if transaction_guard is not None:
+                    transaction_guard(self.connection)
+                manifest_row_id, manifest = self._resolve(**binding)
+                item_row_id, item = self._item(
+                    manifest_row_id, manifest, evidence_id
+                )
+                _require(
+                    item["evidence_type"] == "media.keyframe",
+                    "PREVIEW_EVIDENCE_TYPE_INVALID",
+                    "$.evidence_id",
+                    "only media.keyframe evidence can have an image preview",
+                )
+                _require(
+                    item["availability"] == "available",
+                    "PREVIEW_EVIDENCE_UNAVAILABLE",
+                    "$.evidence_id",
+                    "unavailable keyframe evidence cannot have a preview",
+                )
+                self._require_bound_preview_reference(
+                    item,
+                    content_type=content_type,
+                    size_bytes=size_bytes,
+                    content_digest=content_digest,
+                )
                 journal = self.connection.execute(
                     """
                     SELECT disposition, relative_path, staging_relative_path,
@@ -1958,6 +2326,13 @@ class EvidenceStore:
                 "$.evidence_id",
                 f"preview is unavailable: {row[6]}",
             )
+        self._require_bound_preview_reference(
+            item,
+            content_type=row[2],
+            size_bytes=row[3],
+            content_digest=row[4],
+            stored=True,
+        )
         body = self._read(row[5], row[2], row[3], row[4])
         return {
             "evidence_id": evidence_id,
@@ -2024,6 +2399,13 @@ class EvidenceStore:
                     f"$.evidence_ids[{index}]",
                     f"approval keyframe preview is unavailable: {row[6]}",
                 )
+            self._require_bound_preview_reference(
+                item,
+                content_type=row[2],
+                size_bytes=row[3],
+                content_digest=row[4],
+                stored=True,
+            )
             body = self._read(row[5], row[2], row[3], row[4])
             verified.append(
                 {
@@ -2281,49 +2663,65 @@ class EvidenceStore:
         )
         operation_id = "session_delete_" + uuid.uuid4().hex
         with _durable_transaction(self.connection):
-            manifests = [
-                int(row[0])
-                for row in self.connection.execute(
-                    """
-                    SELECT manifest_row_id FROM tacua_evidence_manifests
-                     WHERE organization_id = ? AND project_id = ? AND session_id = ?
-                    """,
-                    (organization_id, project_id, session_id),
-                ).fetchall()
-            ]
-            items = [
-                int(row[0])
-                for row in self.connection.execute(
-                    """
-                    SELECT item_row_id FROM tacua_evidence_items
-                     WHERE organization_id = ? AND project_id = ? AND session_id = ?
-                    """,
-                    (organization_id, project_id, session_id),
-                ).fetchall()
-            ]
-            if manifests:
-                marks = ",".join("?" for _ in manifests)
-                preview_rows = self.connection.execute(
-                    f"SELECT relative_path, content_type, size_bytes, content_digest "
-                    f"FROM tacua_evidence_preview_revisions "
-                    f"WHERE manifest_row_id IN ({marks})",
-                    manifests,
-                ).fetchall()
-                membership_count = self.connection.execute(
-                    f"SELECT COUNT(*) FROM tacua_evidence_manifest_items "
-                    f"WHERE manifest_row_id IN ({marks})",
-                    manifests,
-                ).fetchone()[0]
-            else:
-                preview_rows = []
-                membership_count = 0
+            scope = (organization_id, project_id, session_id)
+            manifest_count = self.connection.execute(
+                """
+                SELECT COUNT(*) FROM tacua_evidence_manifests
+                 WHERE organization_id = ? AND project_id = ? AND session_id = ?
+                """,
+                scope,
+            ).fetchone()[0]
+            item_count = self.connection.execute(
+                """
+                SELECT COUNT(*) FROM tacua_evidence_items
+                 WHERE organization_id = ? AND project_id = ? AND session_id = ?
+                """,
+                scope,
+            ).fetchone()[0]
+            preview_rows = self.connection.execute(
+                """
+                SELECT previews.relative_path, previews.content_type,
+                       previews.size_bytes, previews.content_digest
+                  FROM tacua_evidence_preview_revisions AS previews
+                  JOIN tacua_evidence_manifests AS manifests
+                    ON manifests.manifest_row_id = previews.manifest_row_id
+                 WHERE manifests.organization_id = ?
+                   AND manifests.project_id = ? AND manifests.session_id = ?
+                """,
+                scope,
+            ).fetchall()
+            membership_count = self.connection.execute(
+                """
+                SELECT COUNT(*)
+                  FROM tacua_evidence_manifest_items AS membership
+                  JOIN tacua_evidence_manifests AS manifests
+                    ON manifests.manifest_row_id = membership.manifest_row_id
+                 WHERE manifests.organization_id = ?
+                   AND manifests.project_id = ? AND manifests.session_id = ?
+                """,
+                scope,
+            ).fetchone()[0]
             binding_count = self.connection.execute(
                 """
                 SELECT COUNT(*) FROM tacua_candidate_evidence_bindings
                  WHERE organization_id = ? AND project_id = ? AND session_id = ?
                 """,
-                (organization_id, project_id, session_id),
+                scope,
             ).fetchone()[0]
+            session_path = self._session_relative_path(session_id).as_posix()
+            pending_file_operations = self.connection.execute(
+                """
+                SELECT COUNT(*) FROM tacua_evidence_file_journal
+                 WHERE relative_path = ? OR instr(relative_path, ? || '/') = 1
+                """,
+                (session_path, session_path),
+            ).fetchone()[0]
+            _require(
+                pending_file_operations == 0,
+                "EVIDENCE_FILE_OPERATION_CONFLICT",
+                "$.session_id",
+                "session has an unfinished preview publication or retirement",
+            )
             preview_files = {
                 tuple(row)
                 for row in preview_rows
@@ -2339,40 +2737,56 @@ class EvidenceStore:
                     size_bytes=stored_size,
                     content_digest=stored_digest,
                 )
-            if manifests:
-                marks = ",".join("?" for _ in manifests)
-                self.connection.execute(
-                    f"DELETE FROM tacua_evidence_preview_revisions "
-                    f"WHERE manifest_row_id IN ({marks})",
-                    manifests,
-                )
-                self.connection.execute(
-                    f"DELETE FROM tacua_evidence_manifest_items "
-                    f"WHERE manifest_row_id IN ({marks})",
-                    manifests,
-                )
+            self._journal_session_tree(
+                operation_id=operation_id,
+                organization_id=organization_id,
+                project_id=project_id,
+                session_id=session_id,
+            )
+            self.connection.execute(
+                """
+                DELETE FROM tacua_evidence_preview_revisions
+                 WHERE manifest_row_id IN (
+                     SELECT manifest_row_id FROM tacua_evidence_manifests
+                      WHERE organization_id = ? AND project_id = ?
+                        AND session_id = ?
+                 )
+                """,
+                scope,
+            )
+            self.connection.execute(
+                """
+                DELETE FROM tacua_evidence_manifest_items
+                 WHERE manifest_row_id IN (
+                     SELECT manifest_row_id FROM tacua_evidence_manifests
+                      WHERE organization_id = ? AND project_id = ?
+                        AND session_id = ?
+                 )
+                """,
+                scope,
+            )
             self.connection.execute(
                 """
                 DELETE FROM tacua_candidate_evidence_bindings
                  WHERE organization_id = ? AND project_id = ? AND session_id = ?
                 """,
-                (organization_id, project_id, session_id),
+                scope,
             )
             self.connection.execute(
                 """
                 DELETE FROM tacua_evidence_manifests
                  WHERE organization_id = ? AND project_id = ? AND session_id = ?
                 """,
-                (organization_id, project_id, session_id),
+                scope,
             )
             self.connection.execute(
                 """
                 DELETE FROM tacua_evidence_items
                  WHERE organization_id = ? AND project_id = ? AND session_id = ?
                 """,
-                (organization_id, project_id, session_id),
+                scope,
             )
-            if manifests or items or binding_count or preview_rows:
+            if manifest_count or item_count or binding_count or preview_rows:
                 self._audit(
                     "session_evidence_deleted",
                     organization_id=organization_id,
@@ -2381,11 +2795,12 @@ class EvidenceStore:
                     reason_code="session_deletion",
                 )
         report = self._drain_file_journal(operation_id)
+        self._drain_directory_journal(operation_id)
         return {
             "candidate_bindings": int(binding_count),
-            "manifests": len(manifests),
+            "manifests": int(manifest_count),
             "manifest_items": int(membership_count),
-            "items": len(items),
+            "items": int(item_count),
             "preview_revisions": len(preview_rows),
             "preview_files": int(report["preview_files_removed"]),
         }

@@ -142,6 +142,78 @@ class CandidateStoreTests(unittest.TestCase):
             lambda: self.store.insert_generated(conflict),
         )
 
+    def test_generated_insert_guard_runs_atomically_before_candidate_writes(self) -> None:
+        with closing(self.connect()) as connection, connection:
+            connection.execute(
+                "CREATE TABLE generated_guard_probe (candidate_digest TEXT NOT NULL)"
+            )
+        observed: list[dict] = []
+
+        def guard(connection: sqlite3.Connection, document: dict) -> None:
+            self.assertTrue(connection.in_transaction)
+            self.assertEqual(
+                0,
+                connection.execute("SELECT COUNT(*) FROM candidate_versions").fetchone()[0],
+            )
+            self.assertEqual(
+                0,
+                connection.execute("SELECT COUNT(*) FROM candidate_heads").fetchone()[0],
+            )
+            observed.append(copy.deepcopy(document))
+            connection.execute(
+                "INSERT INTO generated_guard_probe (candidate_digest) VALUES (?)",
+                (document["candidate_digest"],),
+            )
+            document["state"] = "mutated_guard_copy"
+
+        guarded = self.store_with_hooks(generated_insert_guard=guard)
+        self.assertEqual(self.generated, guarded.insert_generated(self.generated))
+        self.assertEqual([self.generated], observed)
+        self.assertEqual(self.generated, guarded.get(self.generated["candidate_id"]))
+        with closing(self.connect()) as connection, connection:
+            self.assertEqual(
+                (self.generated["candidate_digest"],),
+                tuple(connection.execute("SELECT candidate_digest FROM generated_guard_probe").fetchone()),
+            )
+
+        self.assertEqual(self.generated, guarded.insert_generated(copy.deepcopy(self.generated)))
+        self.assertEqual([self.generated], observed)
+
+    def test_generated_insert_guard_failure_rolls_back_every_write(self) -> None:
+        with closing(self.connect()) as connection, connection:
+            connection.execute(
+                "CREATE TABLE generated_guard_probe (candidate_digest TEXT NOT NULL)"
+            )
+
+        def guard(connection: sqlite3.Connection, document: dict) -> None:
+            self.assertTrue(connection.in_transaction)
+            connection.execute(
+                "INSERT INTO generated_guard_probe (candidate_digest) VALUES (?)",
+                (document["candidate_digest"],),
+            )
+            raise CandidateStoreError(
+                409,
+                "SESSION_PUBLICATION_CLOSED",
+                "session no longer accepts generated candidates",
+            )
+
+        guarded = self.store_with_hooks(generated_insert_guard=guard)
+        self.assert_store_error(
+            409,
+            "SESSION_PUBLICATION_CLOSED",
+            lambda: guarded.insert_generated(self.generated),
+        )
+        with closing(self.connect()) as connection, connection:
+            for table in (
+                "candidate_versions",
+                "candidate_heads",
+                "generated_guard_probe",
+            ):
+                self.assertEqual(
+                    0,
+                    connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0],
+                )
+
     def test_draft_resolution_and_approval_are_durable_immutable_versions(self) -> None:
         self.insert()
         resolved_response = self.resolve()
