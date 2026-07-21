@@ -21,6 +21,7 @@ export default function CandidateRoute() {
   const [evidence, setEvidence] = useState<CandidateEvidenceView | null>(null);
   const [evidenceLoading, setEvidenceLoading] = useState(false);
   const [evidenceError, setEvidenceError] = useState<string | null>(null);
+  const [evidenceInspectionReady, setEvidenceInspectionReady] = useState(false);
   const [loading, setLoading] = useState(true);
   const [action, setAction] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -46,11 +47,13 @@ export default function CandidateRoute() {
     if (!client || !candidate) {
       setEvidence(null);
       setEvidenceLoading(false);
+      setEvidenceInspectionReady(false);
       return () => { active = false; };
     }
     setEvidence(null);
     setEvidenceError(null);
     setEvidenceLoading(true);
+    setEvidenceInspectionReady(false);
     void client.getCandidateEvidence(candidate)
       .then((loaded) => { if (active) setEvidence(loaded); })
       .catch((caught) => {
@@ -130,6 +133,7 @@ export default function CandidateRoute() {
         evidence={evidence}
         error={evidenceError}
         loading={evidenceLoading}
+        onInspectionStateChange={setEvidenceInspectionReady}
       />
 
       <SectionCard title="Observed">
@@ -273,12 +277,17 @@ export default function CandidateRoute() {
           <Text selectable style={{ color: colors.secondaryLabel, fontSize: 12 }}>{candidate.candidate_content_digest}</Text>
           <Text selectable style={{ color: colors.secondaryLabel, fontSize: 12 }}>Evidence {candidate.evidence_manifest.manifest_digest}</Text>
           <Text selectable style={{ color: colors.tertiaryLabel, fontSize: 12 }}>{candidate.evidence_manifest.evidence_ids.length} evidence items are bound to this version.</Text>
+          {!evidenceInspectionReady ? (
+            <Text selectable style={{ color: colors.orange, fontSize: 13, fontWeight: "700" }}>
+              Approval unlocks after the bound screenshot has loaded and passed its integrity checks.
+            </Text>
+          ) : null}
         </SectionCard>
       ) : null}
 
       <View style={{ gap: 10, paddingTop: 4 }}>
         {candidate.state === "draft" || candidate.state === "needs_clarification" ? <ActionButton label="Mark ready for review" disabled={unresolved.some((item) => item.impact === "blocking")} loading={action === "mark_ready"} onPress={() => void transition("mark_ready", "Reviewer completed candidate preparation.")} /> : null}
-        {candidate.state === "ready_for_review" ? <ActionButton label="Approve exact version" loading={action === "approve"} onPress={() => Alert.alert("Approve this ticket?", "Approval binds this exact candidate digest. It does not authorize a coding agent until an approved handoff is exported.", [{ text: "Cancel", style: "cancel" }, { text: "Approve", onPress: () => void transition("approve", "Reviewer approved the exact candidate version.") }])} /> : null}
+        {candidate.state === "ready_for_review" ? <ActionButton label="Approve exact version" disabled={!evidenceInspectionReady || evidenceLoading || evidenceError !== null} loading={action === "approve"} onPress={() => Alert.alert("Approve this ticket?", "Approval binds this exact candidate digest. It does not authorize a coding agent until an approved handoff is exported.", [{ text: "Cancel", style: "cancel" }, { text: "Approve", onPress: () => void transition("approve", "Reviewer approved the exact candidate version.") }])} /> : null}
         {candidate.state === "needs_clarification" || candidate.state === "ready_for_review" ? <ActionButton destructive label="Reject candidate" loading={action === "reject"} onPress={() => Alert.alert("Reject this candidate?", undefined, [{ text: "Cancel", style: "cancel" }, { text: "Reject", style: "destructive", onPress: () => void transition("reject", "Reviewer rejected the candidate.") }])} /> : null}
       </View>
     </ScrollView>

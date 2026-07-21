@@ -21,11 +21,19 @@ type Props = {
   readonly evidence: CandidateEvidenceView | null;
   readonly loading: boolean;
   readonly error: string | null;
+  readonly onInspectionStateChange?: (ready: boolean) => void;
 };
 
 const maximumVisibleEvents = 40;
 
-export function CandidateEvidencePanel({ candidate, client, evidence, loading, error }: Props) {
+export function CandidateEvidencePanel({
+  candidate,
+  client,
+  evidence,
+  loading,
+  error,
+  onInspectionStateChange,
+}: Props) {
   const referencedEvidence = useMemo(() => new Set([
     ...candidate.content.actual_behavior.evidence_refs,
     ...candidate.content.summary.evidence_refs,
@@ -57,7 +65,12 @@ export function CandidateEvidencePanel({ candidate, client, evidence, loading, e
         </View>
       ) : evidence ? (
         <View style={{ gap: 16 }}>
-          <KeyframePreview candidate={candidate} client={client} item={keyframe} />
+          <KeyframePreview
+            candidate={candidate}
+            client={client}
+            item={keyframe}
+            onInspectionStateChange={onInspectionStateChange}
+          />
 
           <View style={{ gap: 8 }}>
             <Text selectable style={{ color: colors.label, fontWeight: "800", fontSize: 15 }}>SDK timeline</Text>
@@ -87,10 +100,12 @@ function KeyframePreview({
   candidate,
   client,
   item,
+  onInspectionStateChange,
 }: {
   readonly candidate: TicketCandidate;
   readonly client: TacuaApiClient;
   readonly item: CandidateEvidenceItem | undefined;
+  readonly onInspectionStateChange?: (ready: boolean) => void;
 }) {
   const [preview, setPreview] = useState<EvidencePreview | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -100,14 +115,22 @@ function KeyframePreview({
     let active = true;
     setPreview(null);
     setError(null);
+    onInspectionStateChange?.(false);
     if (!item || !expectedDigest) return () => { active = false; };
     void client.getEvidencePreview(candidate, item.evidence_id, expectedDigest)
-      .then((loaded) => { if (active) setPreview(loaded); })
+      .then((loaded) => {
+        if (active) {
+          setPreview(loaded);
+        }
+      })
       .catch((caught) => {
-        if (active) setError(caught instanceof Error ? caught.message : "The screenshot could not be loaded.");
+        if (active) {
+          setError(caught instanceof Error ? caught.message : "The screenshot could not be loaded.");
+          onInspectionStateChange?.(false);
+        }
       });
     return () => { active = false; };
-  }, [candidate, client, expectedDigest, item]);
+  }, [candidate, client, expectedDigest, item, onInspectionStateChange]);
 
   if (!item) {
     return (
@@ -137,6 +160,11 @@ function KeyframePreview({
         <Image
           accessible
           accessibilityLabel={item.description}
+          onError={() => {
+            setError("The screenshot bytes passed transport checks but could not be decoded.");
+            onInspectionStateChange?.(false);
+          }}
+          onLoad={() => onInspectionStateChange?.(true)}
           resizeMode="contain"
           source={{ uri: preview.uri }}
           style={{ width: "100%", aspectRatio: 9 / 16, maxHeight: 560 }}
