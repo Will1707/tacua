@@ -142,6 +142,14 @@ class PositiveContractTests(ContractFixtureMixin, unittest.TestCase):
     def test_canonical_json_has_sorted_keys_and_no_insignificant_space(self) -> None:
         self.assertTrue(canonical_json({"z": 1, "a": 2}).startswith('{"a":2,"z":1}'))
 
+    def test_first_approved_export_preserves_later_candidate_version(self) -> None:
+        handoff = copy.deepcopy(self.handoff)
+        handoff["ticket"]["ticket_version"] = 3
+        handoff["approval"]["ticket_version"] = 3
+        handoff["supersession"]["supersedes_handoff_digest"] = None
+        handoff = seal_handoff(handoff)
+        validate_handoff(handoff, executable=False)
+
 
 class NegativeFixtureTests(ContractFixtureMixin, unittest.TestCase):
     def test_negative_handoff_fixtures(self) -> None:

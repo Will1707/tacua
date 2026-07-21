@@ -26,6 +26,10 @@ ticket version. The candidate contract keeps two checks separate:
 A reviewer approval changes candidate state; it does not mint execution trust.
 Implementations must not treat an offline fixture key, `structural_only` result,
 or the presence of an `approved` string as authority to modify a repository.
+The exported `ticket_version` is the immutable candidate version reviewed by
+the backend. Draft and clarification transitions can make the first approved
+export greater than version one, so handoff supersession is indicated only by
+an explicit prior `handoff_digest`, not inferred from a version number.
 
 ## Consequences
 

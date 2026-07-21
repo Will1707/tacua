@@ -42,6 +42,11 @@ from tacua_backend.contracts import (  # noqa: E402
     validate_operation_pair,
 )
 from tacua_backend.http_api import PilotRequestHandler, create_server  # noqa: E402
+from tacua_backend.handoff_export import (  # noqa: E402
+    HANDOFF,
+    HandoffExportError,
+    export_approved_candidate,
+)
 from tacua_backend.evidence_domain import (  # noqa: E402
     ITEM_VERSION,
     MANIFEST_MEDIA_TYPE,
@@ -141,8 +146,13 @@ class BackendHarness(unittest.TestCase):
             }
         )
         request = fixture("launch-exchange-request")
+        consent_at = self.clock().strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.scope["consent"]["granted_at"] = consent_at
+        self.scope = seal(self.scope)
         request["exchange_id"] = exchange_id
         request["launch_code"] = grant["launch_code"]
+        request["scope"] = copy.deepcopy(self.scope)
+        request["requested_at"] = consent_at
         request["credential"]["credential_id"] = credential_id
         request["credential"]["secret"] = secret
         request = seal(request)
@@ -482,7 +492,9 @@ class BackendHarness(unittest.TestCase):
                 "source": {
                     "component": component,
                     "source_id": "repo_mobile" if component == "repository" else "sdk_session",
-                    "snapshot_revision": f"snapshot_{evidence_id}",
+                    "snapshot_revision": self.build["source"]["git_revision"]
+                    if component == "repository"
+                    else f"snapshot_{evidence_id}",
                     "captured_at": "2026-07-21T10:00:20Z",
                 },
                 "reference": {
@@ -554,8 +566,124 @@ class BackendHarness(unittest.TestCase):
         body.update(changes)
         return body
 
+    def handoff_build_identity(self) -> dict:
+        return HANDOFF.seal_build_identity(
+            {
+                "contract_version": "tacua.build-identity@1.0.0",
+                "media_type": "application/vnd.tacua.build-identity+json;version=1.0.0",
+                "organization_id": self.config.organization_id,
+                "project_id": self.config.project_id,
+                "build_id": self.config.build_id,
+                "mobile": {
+                    "platform": self.build["platform"],
+                    "application_id": self.build["bundle_identifier"],
+                    "app_version": self.build["native_version"],
+                    "build_number": self.build["native_build"],
+                    "distribution": self.build["distribution"],
+                    "source": {
+                        "repository_id": "repo_mobile",
+                        "revision": self.build["source"]["git_revision"],
+                        "dirty": False,
+                    },
+                    "native_binary_digest": "sha256:" + "b" * 64,
+                },
+                "backend": {
+                    "availability": "unavailable",
+                    "environment": "self_hosted_qa",
+                    "deployment_id": None,
+                    "image_digest": None,
+                    "deployed_at": None,
+                    "sources": [],
+                    "unavailable_reason": "deployment_identity_unavailable",
+                },
+                "sdk": {
+                    "package_name": "@tacua/mobile-sdk",
+                    "package_version": "0.1.0",
+                    "source_revision": "c" * 40,
+                    "capture_schema_version": "tacua.sdk-evidence@1.0.0",
+                    "configuration_digest": self.build["transport_configuration_digest"],
+                },
+                "build_identity_digest": "sha256:" + "0" * 64,
+            }
+        )
+
 
 class BackendProtocolTests(BackendHarness):
+
+    def test_exact_approved_candidate_exports_deterministic_structural_handoff(self) -> None:
+        lifecycle = self.full_completed_session()
+        session_id = lifecycle["launch_receipt"]["session_id"]
+        candidate, manifest, previews = self.candidate_bundle(session_id)
+        self.backend.persist_candidate_bundle(
+            candidate=candidate,
+            evidence_manifest=manifest,
+            previews=previews,
+        )
+        resolved = json.loads(
+            self.backend.transition_candidate(
+                candidate["candidate_id"],
+                if_match=candidate["candidate_digest"],
+                idempotency_key="candidate:handoff:resolve",
+                body=self.candidate_transition_body(
+                    candidate, "resolve_clarification"
+                ),
+            ).body
+        )
+        approved = json.loads(
+            self.backend.transition_candidate(
+                resolved["candidate_id"],
+                if_match=resolved["candidate_digest"],
+                idempotency_key="candidate:handoff:approve",
+                body=self.candidate_transition_body(resolved, "approve"),
+            ).body
+        )
+        self.clock.set(approved["approval"]["approved_at"])
+        artifacts = export_approved_candidate(
+            candidate=approved,
+            evidence_manifest=manifest,
+            sdk_build_identity=self.build,
+            handoff_build_identity=self.handoff_build_identity(),
+            authority={
+                "purpose": "implement_approved_ticket",
+                "allowed_repositories": ["repo_mobile"],
+                "read_authorized_evidence": True,
+                "modify_code": True,
+                "run_tests": True,
+                "external_writes": False,
+                "merge": False,
+                "deploy": False,
+            },
+            registry_revision="registry_local_001",
+            checked_at=self.clock(),
+        )
+        self.assertEqual(3, artifacts.handoff["ticket"]["ticket_version"])
+        self.assertIsNone(
+            artifacts.handoff["supersession"]["supersedes_handoff_digest"]
+        )
+        self.assertTrue(artifacts.json_bytes.endswith(b"\n"))
+        self.assertIn(b"## Canonical JSON", artifacts.markdown_bytes)
+        self.assertEqual(sha256_digest(artifacts.json_bytes), artifacts.json_digest)
+        self.assertEqual(
+            sha256_digest(artifacts.markdown_bytes), artifacts.markdown_digest
+        )
+        HANDOFF.validate_handoff(artifacts.handoff, executable=False)
+        with self.assertRaises(HANDOFF.ContractError) as captured:
+            HANDOFF.validate_handoff(artifacts.handoff, executable=True)
+        self.assertEqual("TRUST_INPUT_REQUIRED", captured.exception.code)
+
+        missing_binary_identity = self.handoff_build_identity()
+        missing_binary_identity["mobile"].pop("native_binary_digest")
+        with self.assertRaises(HandoffExportError) as captured:
+            export_approved_candidate(
+                candidate=approved,
+                evidence_manifest=manifest,
+                sdk_build_identity=self.build,
+                handoff_build_identity=missing_binary_identity,
+                authority=artifacts.handoff["authority"],
+                registry_revision="registry_local_001",
+                checked_at=self.clock(),
+            )
+        self.assertEqual("HANDOFF_BUILD_INVALID", captured.exception.code)
 
     def test_candidate_review_is_bound_to_verified_screenshot_bytes(self) -> None:
         lifecycle = self.full_completed_session()

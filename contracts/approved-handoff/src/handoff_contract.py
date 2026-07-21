@@ -823,19 +823,12 @@ def _validate_handoff_at_time(
         "$.supersession.checked_at",
         "registry observation cannot precede ticket approval",
     )
-    if ticket["ticket_version"] == 1:
+    if supersession["supersedes_handoff_digest"] is not None:
         _require(
-            supersession["supersedes_handoff_digest"] is None,
+            ticket["ticket_version"] > 1,
             "INVALID_SUPERSESSION_CHAIN",
-            "$.supersession.supersedes_handoff_digest",
-            "version 1 cannot supersede another handoff",
-        )
-    else:
-        _require(
-            supersession["supersedes_handoff_digest"] is not None,
-            "INVALID_SUPERSESSION_CHAIN",
-            "$.supersession.supersedes_handoff_digest",
-            "later versions must identify the handoff they supersede",
+            "$.ticket.ticket_version",
+            "a superseding handoff must identify a later ticket version",
         )
 
     _validate_digest(handoff["handoff_digest"], digest_without(handoff, "handoff_digest"), "$.handoff_digest")
