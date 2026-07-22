@@ -10,7 +10,7 @@ not a production SDK feature.
 Fault injection exists only when all four gates agree:
 
 1. Swift is compiled with `TACUA_CAPTURE_FAULT_INJECTION`.
-2. The bundle identifier is exactly `com.tacua.capturelab`.
+2. The bundle identifier is exactly `com.tacua.capturelab.acceptance`.
 3. `TacuaCaptureFaultInjectionEnabled` is `true` in the harness Info.plist.
 4. `TACUA_CAPTURE_TEST_FAULT` contains one exact supported value.
 
@@ -66,7 +66,7 @@ xcrun devicectl device process launch \
   --terminate-existing \
   --environment-variables '{"TACUA_CAPTURE_TEST_FAULT":"low_storage_start"}' \
   --payload-url '<development-client URL printed by Expo>' \
-  com.tacua.capturelab
+  com.tacua.capturelab.acceptance
 ```
 
 The Recorder card must display the armed plan before the operator starts. The

@@ -117,7 +117,7 @@ final class TacuaCaptureFaultLeaseSource: @unchecked Sendable {
 }
 
 enum TacuaCaptureFaultRuntime {
-  static let requiredBundleIdentifier = "com.tacua.capturelab"
+  static let requiredBundleIdentifier = "com.tacua.capturelab.acceptance"
   static let enablementInfoKey = "TacuaCaptureFaultInjectionEnabled"
   static let environmentKey = "TACUA_CAPTURE_TEST_FAULT"
 

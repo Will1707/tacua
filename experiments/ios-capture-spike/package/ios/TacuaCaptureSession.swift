@@ -2138,6 +2138,7 @@ final class TacuaCaptureSession {
     [
       "sessionId": manifest.sessionId,
       "state": manifest.state,
+      "rawMediaExpiresAt": manifest.rawMediaExpiresAt ?? NSNull(),
       "segmentCount": manifest.segments.count,
       "gapCount": manifest.gaps.count,
       "partialFileCount": partialFileCount(in: directory),

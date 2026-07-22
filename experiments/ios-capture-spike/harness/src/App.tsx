@@ -15,7 +15,7 @@ import {
   View,
 } from 'react-native';
 
-const APPLICATION_ID = 'com.tacua.capturelab';
+const APPLICATION_ID = 'com.tacua.capturelab.acceptance';
 const BUILD_NUMBER = '1';
 
 type LogEntry = Readonly<{ id: string; message: string }>;
@@ -129,6 +129,8 @@ export default function App(): React.JSX.Element {
   const [cleanupPollingExpired, setCleanupPollingExpired] = useState(false);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const capabilities = useMemo(() => TacuaCapture.getCapabilities(), []);
+  const localHarnessReady =
+    capabilities.localHarnessRetentionBypassEnabled === true;
   const faultPlan = capabilities.testFaultPlan ?? null;
   const initiallyConsumed = capabilities.testFaultLeaseConsumed === true;
   const [faultLeaseConsumed, setFaultLeaseConsumed] = useState(initiallyConsumed);
@@ -144,7 +146,10 @@ export default function App(): React.JSX.Element {
   }, []);
 
   const options = useCallback(
-    (sessionId: string): TacuaCapture.CaptureStartOptions => ({
+    (
+      sessionId: string,
+      storedRawMediaExpiresAt?: string,
+    ): TacuaCapture.CaptureStartOptions => ({
       sessionId,
       segmentDurationSeconds: faultSegmentDurationSeconds(faultPlan),
       organizationId: 'org_local',
@@ -153,11 +158,13 @@ export default function App(): React.JSX.Element {
       handoffId: `handoff_${sessionId}`,
       handoffTokenIdentifier: `opaque_${sessionId}`,
       expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
-      // Synthetic fault-campaign input only. Supported host capture uses the exact value returned
-      // by createCaptureSessionPlan/resumeCaptureSessionPlan, backed by a committed START queue.
-      rawMediaExpiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000)
-        .toISOString()
-        .replace(/\.\d{3}Z$/u, 'Z'),
+      // Repository-local acceptance input only. Resume passes the exact immutable value returned
+      // from the stored manifest; a fresh Start creates the value once.
+      rawMediaExpiresAt:
+        storedRawMediaExpiresAt ??
+        new Date(Date.now() + 24 * 60 * 60 * 1000)
+          .toISOString()
+          .replace(/\.\d{3}Z$/u, 'Z'),
       consentVersion: 'tacua-local-capture-consent-v1',
       expectedApplicationId: APPLICATION_ID,
       expectedBuildNumber: BUILD_NUMBER,
@@ -166,6 +173,10 @@ export default function App(): React.JSX.Element {
   );
 
   const refreshRecovery = useCallback(async () => {
+    if (!localHarnessReady) {
+      setRecoveryBusy(false);
+      return;
+    }
     if (activeRecoveryScansRef.current > 0) {
       return;
     }
@@ -185,7 +196,7 @@ export default function App(): React.JSX.Element {
         setRecoveryBusy(false);
       }
     }
-  }, [log]);
+  }, [localHarnessReady, log]);
 
   const stop = useCallback(async () => {
     setBusy(true);
@@ -218,7 +229,10 @@ export default function App(): React.JSX.Element {
       faultLeaseConsumedRef.current = true;
       setFaultLeaseConsumed(true);
     }
-    if (initialStatus.state !== 'process_cleanup_pending') {
+    if (!localHarnessReady) {
+      setRecoveryBusy(false);
+      log('Local harness gate is inactive; rebuild and install the fresh acceptance bundle');
+    } else if (initialStatus.state !== 'process_cleanup_pending') {
       void refreshRecovery().catch((error: unknown) => {
         log(`Initial recovery scan failed: ${safeMessage(error)}`);
       });
@@ -240,7 +254,14 @@ export default function App(): React.JSX.Element {
       TacuaCapture.subscribe('onError', (event) => log(`${event.code}: ${event.reason}`)),
     ];
     return () => subscriptions.forEach((subscription) => subscription.remove());
-  }, [capabilities.testFaultLeaseConsumed, faultPlan, log, refreshRecovery, stop]);
+  }, [
+    capabilities.testFaultLeaseConsumed,
+    faultPlan,
+    localHarnessReady,
+    log,
+    refreshRecovery,
+    stop,
+  ]);
 
   useEffect(() => {
     if (
@@ -309,6 +330,10 @@ export default function App(): React.JSX.Element {
 
   const start = async () => {
     if (!consented) return;
+    if (!localHarnessReady) {
+      log('Start blocked because the exact local harness gate is inactive');
+      return;
+    }
     if (activeRecoveryScansRef.current > 0) {
       log('Wait for the local recovery scan to finish before starting');
       return;
@@ -347,16 +372,28 @@ export default function App(): React.JSX.Element {
     }
   };
 
-  const resumeSession = async (sessionId: string) => {
+  const resumeSession = async (
+    session: TacuaCapture.RecoverableSession,
+  ) => {
+    if (!localHarnessReady) {
+      log('Resume blocked because the exact local harness gate is inactive');
+      return;
+    }
     if (faultPlan) {
       log('Resume is disabled in a fault-injection process; relaunch first');
       return;
     }
+    if (!session.rawMediaExpiresAt) {
+      log(`Resume unavailable for ${session.sessionId}: stored retention metadata is missing`);
+      return;
+    }
     setBusy(true);
     try {
-      const next = await TacuaCapture.resume(options(sessionId));
+      const next = await TacuaCapture.resume(
+        options(session.sessionId, session.rawMediaExpiresAt),
+      );
       setStatus(next);
-      log(`Resumed ${sessionId}`);
+      log(`Resumed ${session.sessionId}`);
     } catch (error) {
       log(`Resume failed: ${safeMessage(error)}`);
     } finally {
@@ -365,6 +402,10 @@ export default function App(): React.JSX.Element {
   };
 
   const keepPartial = async (sessionId: string) => {
+    if (!localHarnessReady) {
+      log('Keep partial blocked because the exact local harness gate is inactive');
+      return;
+    }
     setBusy(true);
     try {
       const next = await TacuaCapture.markPartialReadyForUpload(
@@ -384,6 +425,10 @@ export default function App(): React.JSX.Element {
   };
 
   const deleteSession = async (sessionId: string) => {
+    if (!localHarnessReady) {
+      log('Delete blocked because the exact local harness gate is inactive');
+      return;
+    }
     setBusy(true);
     try {
       await TacuaCapture.deleteSession(options(sessionId));
@@ -458,6 +503,12 @@ export default function App(): React.JSX.Element {
           <Text style={styles.metric}>
             Microphone: {capabilities.microphonePermission}
           </Text>
+          {!localHarnessReady ? (
+            <Text style={styles.faultWarning}>
+              Local harness gate inactive. Install a freshly prebuilt acceptance
+              bundle; recovery scanning is disabled to protect older app data.
+            </Text>
+          ) : null}
           {faultPlan ? (
             <>
               <Text style={styles.faultWarning}>
@@ -501,6 +552,7 @@ export default function App(): React.JSX.Element {
               onPress={() => void start()}
               disabled={
                 !consented ||
+                !localHarnessReady ||
                 busy ||
                 recoveryBusy ||
                 processCleanupPending ||
@@ -536,7 +588,11 @@ export default function App(): React.JSX.Element {
                 });
               }}
               disabled={
-                busy || recoveryBusy || activeSession || processCleanupPending
+                !localHarnessReady ||
+                busy ||
+                recoveryBusy ||
+                activeSession ||
+                processCleanupPending
               }
             />
           </View>
@@ -576,7 +632,7 @@ export default function App(): React.JSX.Element {
                   {RESUMABLE_STATES.has(session.state) ? (
                     <Button
                       title="Resume"
-                      onPress={() => void resumeSession(session.sessionId)}
+                      onPress={() => void resumeSession(session)}
                       disabled={
                         busy ||
                         recoveryBusy ||

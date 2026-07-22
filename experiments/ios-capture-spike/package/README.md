@@ -121,6 +121,13 @@ capture data. They perform no network I/O themselves. The returned plan is the
 authenticated bridge between those local functions and the backend lifecycle;
 hand-writing its fields is unsupported.
 
+The repository's physical acceptance harness is the sole exception. A native
+policy permits its local-only legacy start, resume, discovery, keep, and delete
+flow without backend retention authority only when a Debug build, the exact
+`com.tacua.capturelab.acceptance` bundle, the local-development QA settings, and
+the separate `TacuaLocalHarnessRetentionBypassEnabled` Boolean all agree.
+Release builds and every other bundle retain the backend-enforced behavior.
+
 ## Backend launch and transport foundation
 
 The host QA target must pin these values in its built `Info.plist`:
@@ -525,8 +532,9 @@ After interruption, the host UI can offer exactly three local actions:
 2. `markPartialReadyForUpload(options)` reconciles verified media and changes only the local manifest state to `partial_ready_for_upload`. It requires at least one verified segment and a fresh matching handoff. It does **not** upload, enqueue, transmit, or delete anything.
 3. `deleteSession(options)` removes the local session directory. Erasure remains available after handoff expiry, consent-contract changes, and app upgrades. It validates the safe session ID, stored organization/project/handoff identity, and current application identifier, but intentionally does not require the original build number to equal the currently installed build.
 
-`listRecoverableSessions()` returns metadata only and does not expose handoff
-identifiers. If a manifest is unreadable it reports `manifest_unreadable`; the
+`listRecoverableSessions()` returns metadata, including the immutable raw-media
+deadline required for exact Resume, but does not expose handoff identifiers. If
+a manifest is unreadable it reports `manifest_unreadable`; the
 local-only `deleteSession(options)` path still refuses identity-blind deletion.
 When a committed backend queue and usable credential exist,
 `deleteBackendSession` is the authenticated scoped fallback and does not trust

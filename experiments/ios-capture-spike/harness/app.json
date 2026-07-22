@@ -7,12 +7,13 @@
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "ios": {
-      "bundleIdentifier": "com.tacua.capturelab",
+      "bundleIdentifier": "com.tacua.capturelab.acceptance",
       "buildNumber": "1",
       "deploymentTarget": "17.0",
       "supportsTablet": false,
       "infoPlist": {
-        "TacuaCaptureFaultInjectionEnabled": true
+        "TacuaCaptureFaultInjectionEnabled": true,
+        "TacuaLocalHarnessRetentionBypassEnabled": true
       }
     },
     "plugins": [
