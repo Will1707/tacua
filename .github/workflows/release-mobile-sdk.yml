@@ -16,6 +16,8 @@ jobs:
   release:
     runs-on: macos-15
     timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
     permissions:
       actions: read
       contents: write
@@ -25,6 +27,13 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Require the Xcode 26.3 toolchain
+        run: |
+          set -euo pipefail
+          expected_xcode="$(printf 'Xcode 26.3\nBuild version 17C529')"
+          test "$(xcodebuild -version)" = "$expected_xcode"
+          xcrun swiftc --version | grep -Eq 'Apple Swift version 6\.2([. ]|$)'
 
       - name: Set up Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0

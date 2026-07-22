@@ -196,7 +196,8 @@ enum SDKBackendClientTests {
       try await Task.sleep(nanoseconds: 1_000_000)
     }
     try require(!MockURLProtocol.requests().isEmpty, "Cancellation test never registered a task")
-    let cancellationStartedAt = Date()
+    let clock = ContinuousClock()
+    let cancellationStartedAt = clock.now
     registered.cancel()
     do {
       _ = try await registered.value
@@ -205,9 +206,17 @@ enum SDKBackendClientTests {
       throw ClientTestFailure.assertion("Cancelled URLSession transport returned success")
     } catch {}
     try require(
-      Date().timeIntervalSince(cancellationStartedAt) < 0.5,
+      cancellationStartedAt.duration(to: clock.now) < .milliseconds(500),
       "Task cancellation waited for the delayed URLProtocol response"
     )
+
+    // URLProtocol.stopLoading() may be dispatched after URLSession has resumed the
+    // cancelled continuation. Give that concrete transport callback its own bounded
+    // observation window without including the wait in the cancellation latency check.
+    let stopLoadingDeadline = clock.now.advanced(by: .milliseconds(500))
+    while MockURLProtocol.observedStopLoadingCount() < 1 && clock.now < stopLoadingDeadline {
+      try await Task.sleep(nanoseconds: 1_000_000)
+    }
     try require(
       MockURLProtocol.observedStopLoadingCount() >= 1,
       "Task cancellation did not reach the concrete URLSession task"
