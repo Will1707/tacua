@@ -7,7 +7,7 @@ from __future__ import annotations
 import copy
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import re
@@ -17,7 +17,7 @@ from typing import Any, Callable
 import unicodedata
 
 from .candidate_domain import ContractError, TICKET_CONTRACT, apply_transition
-from .evidence_domain import EvidenceDomainError
+from .evidence_domain import EvidenceDomainError, validate_manifest
 
 
 _ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{2,63}$")
@@ -35,16 +35,27 @@ _CONFLICT_ERRORS = {
     "UNRESOLVED_BLOCKING_CLARIFICATION",
     "CLARIFICATION_ALREADY_RESOLVED",
 }
+_REPLACEMENT_OPERATIONS = {"split", "merge"}
+_MAX_REPLACEMENT_BODY_BYTES = 16_777_216
+_MAX_REPLACEMENT_RESPONSE_BYTES = 16_777_216
 
 
 class CandidateStoreError(Exception):
     """Safe API-facing failure from candidate persistence."""
 
-    def __init__(self, status: int, code: str, message: str):
+    def __init__(
+        self,
+        status: int,
+        code: str,
+        message: str,
+        *,
+        details: dict[str, Any] | None = None,
+    ):
         super().__init__(message)
         self.status = status
         self.code = code
         self.message = message
+        self.details = copy.deepcopy(details)
 
 
 @dataclass(frozen=True)
@@ -55,10 +66,30 @@ class CandidateTransitionResponse:
     candidate_digest: str
 
 
+@dataclass(frozen=True)
+class CandidateReplacementResponse:
+    status: int
+    body: bytes
+    body_digest: str
+
+
 ApprovalGuard = Callable[[sqlite3.Connection, dict[str, Any]], None]
 GeneratedInsertGuard = Callable[[sqlite3.Connection, dict[str, Any]], None]
 VersionAppendGuard = Callable[
     [sqlite3.Connection, dict[str, Any], dict[str, Any]], None
+]
+ReplacementManifestFactory = Callable[
+    [sqlite3.Connection, str, list[dict[str, Any]]], dict[str, Any]
+]
+ReplacementResultGuard = Callable[
+    [
+        sqlite3.Connection,
+        str,
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        dict[str, Any],
+    ],
+    None,
 ]
 
 
@@ -118,6 +149,8 @@ class CandidateStore:
         approval_guard: ApprovalGuard | None = None,
         generated_insert_guard: GeneratedInsertGuard | None = None,
         version_append_guard: VersionAppendGuard | None = None,
+        replacement_manifest_factory: ReplacementManifestFactory | None = None,
+        replacement_result_guard: ReplacementResultGuard | None = None,
     ):
         self._connect = connect
         self.organization_id = _require_id(organization_id, "organization_id")
@@ -131,10 +164,20 @@ class CandidateStore:
             raise ValueError("generated_insert_guard must be callable")
         if version_append_guard is not None and not callable(version_append_guard):
             raise ValueError("version_append_guard must be callable")
+        if replacement_manifest_factory is not None and not callable(
+            replacement_manifest_factory
+        ):
+            raise ValueError("replacement_manifest_factory must be callable")
+        if replacement_result_guard is not None and not callable(
+            replacement_result_guard
+        ):
+            raise ValueError("replacement_result_guard must be callable")
         self._clock = clock
         self._approval_guard = approval_guard
         self._generated_insert_guard = generated_insert_guard
         self._version_append_guard = version_append_guard
+        self._replacement_manifest_factory = replacement_manifest_factory
+        self._replacement_result_guard = replacement_result_guard
 
     def initialize_schema(self) -> None:
         schema = """
@@ -175,12 +218,45 @@ class CandidateStore:
             created_at TEXT NOT NULL,
             PRIMARY KEY (reviewer_id, idempotency_key)
         );
+        CREATE TABLE IF NOT EXISTS candidate_replacement_operations (
+            operation_id TEXT PRIMARY KEY,
+            reviewer_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            operation TEXT NOT NULL CHECK (operation IN ('split','merge')),
+            organization_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            request_digest TEXT NOT NULL,
+            operation_json TEXT NOT NULL,
+            response_status INTEGER NOT NULL CHECK (response_status = 201),
+            response_body BLOB NOT NULL,
+            response_digest TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            UNIQUE (reviewer_id, idempotency_key)
+        );
+        CREATE TABLE IF NOT EXISTS candidate_supersessions (
+            source_candidate_id TEXT PRIMARY KEY,
+            source_candidate_version INTEGER NOT NULL,
+            source_candidate_digest TEXT NOT NULL UNIQUE,
+            operation_id TEXT NOT NULL,
+            organization_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            FOREIGN KEY (operation_id)
+              REFERENCES candidate_replacement_operations(operation_id)
+              ON DELETE CASCADE
+        );
         CREATE INDEX IF NOT EXISTS candidate_heads_session_idx
           ON candidate_heads(organization_id, project_id, session_id, candidate_id);
         CREATE INDEX IF NOT EXISTS candidate_versions_session_idx
           ON candidate_versions(organization_id, project_id, session_id, candidate_id, candidate_version);
         CREATE INDEX IF NOT EXISTS candidate_operations_candidate_idx
           ON candidate_operations(candidate_id, created_at);
+        CREATE INDEX IF NOT EXISTS candidate_replacements_session_idx
+          ON candidate_supersessions(organization_id, project_id, session_id, source_candidate_id);
+        CREATE INDEX IF NOT EXISTS candidate_replacement_operations_session_idx
+          ON candidate_replacement_operations(organization_id, project_id, session_id, operation_id);
         """
         with closing(self._connection()) as connection, connection:
             connection.executescript(schema)
@@ -357,6 +433,10 @@ class CandidateStore:
                     AND versions.candidate_version = heads.candidate_version
                    WHERE heads.organization_id = ? AND heads.project_id = ?
                      AND heads.session_id = ?
+                     AND NOT EXISTS (
+                         SELECT 1 FROM candidate_supersessions AS superseded
+                          WHERE superseded.source_candidate_id = heads.candidate_id
+                     )
                    ORDER BY versions.version_created_at, versions.candidate_id""",
                 (self.organization_id, self.project_id, session_id),
             ).fetchall()
@@ -439,7 +519,8 @@ class CandidateStore:
                     candidate_digest=prior_candidate["candidate_digest"],
                 )
 
-            chain = self._load_chain(connection, candidate_id)
+            self._raise_if_superseded(connection, candidate_id)
+            chain = self._load_current_chain(connection, candidate_id)
             parent = chain[-1]
             if parent["candidate_digest"] != if_match:
                 raise CandidateStoreError(412, "CANDIDATE_PRECONDITION_FAILED", "candidate version changed; reload before reviewing")
@@ -521,6 +602,1080 @@ class CandidateStore:
                 candidate_digest=candidate["candidate_digest"],
             )
 
+    def replace(
+        self,
+        *,
+        idempotency_key: str,
+        body: Any,
+    ) -> CandidateReplacementResponse:
+        """Atomically replace exact candidate heads with split or merge results."""
+
+        if (
+            not isinstance(idempotency_key, str)
+            or _IDEMPOTENCY_PATTERN.fullmatch(idempotency_key) is None
+        ):
+            raise CandidateStoreError(
+                400, "INVALID_IDEMPOTENCY_KEY", "Idempotency-Key is invalid"
+            )
+        public_body = self._validate_replacement_body(body)
+        request_digest = _digest(public_body)
+
+        with closing(self._connection()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            prior = connection.execute(
+                """SELECT operation_id, reviewer_id, operation, organization_id,
+                          project_id, session_id, request_digest, operation_json,
+                          response_status, response_body, response_digest, occurred_at
+                     FROM candidate_replacement_operations
+                    WHERE reviewer_id = ? AND idempotency_key = ?""",
+                (self.reviewer_id, idempotency_key),
+            ).fetchone()
+            if prior is not None:
+                if prior["request_digest"] != request_digest:
+                    raise CandidateStoreError(
+                        409,
+                        "IDEMPOTENCY_CONFLICT",
+                        "Idempotency-Key was already used for another candidate replacement",
+                    )
+                response_body = bytes(prior["response_body"])
+                self._verify_replacement_response(
+                    connection,
+                    response_body=response_body,
+                    response_digest=prior["response_digest"],
+                    operation_id=prior["operation_id"],
+                    operation_json=prior["operation_json"],
+                    stored_operation=prior["operation"],
+                    stored_reviewer_id=prior["reviewer_id"],
+                    stored_organization_id=prior["organization_id"],
+                    stored_project_id=prior["project_id"],
+                    stored_session_id=prior["session_id"],
+                    stored_occurred_at=prior["occurred_at"],
+                    response_status=prior["response_status"],
+                )
+                return CandidateReplacementResponse(
+                    status=prior["response_status"],
+                    body=response_body,
+                    body_digest=prior["response_digest"],
+                )
+
+            sources: list[dict[str, Any]] = []
+            for binding in public_body["sources"]:
+                self._raise_if_superseded(connection, binding["candidate_id"])
+                chain = self._load_current_chain(
+                    connection, binding["candidate_id"]
+                )
+                source = chain[-1]
+                self._require_replacement_source_binding(source, binding)
+                if source["state"] in {"approved", "rejected"}:
+                    raise CandidateStoreError(
+                        409,
+                        "CANDIDATE_NOT_REPLACEABLE",
+                        "terminal candidates cannot be split or merged",
+                    )
+                sources.append(source)
+
+            fixed_scope = (
+                "organization_id",
+                "project_id",
+                "session_id",
+                "build_id",
+                "build_identity_digest",
+            )
+            first_source = sources[0]
+            if any(
+                any(source[field] != first_source[field] for field in fixed_scope)
+                for source in sources[1:]
+            ):
+                raise CandidateStoreError(
+                    409,
+                    "CANDIDATE_REPLACEMENT_SCOPE_MISMATCH",
+                    "replacement sources must belong to one exact capture and build",
+                )
+
+            if self._replacement_manifest_factory is None:
+                raise CandidateStoreError(
+                    500,
+                    "CANDIDATE_REPLACEMENT_UNAVAILABLE",
+                    "candidate replacement evidence is unavailable",
+                )
+            manifest = self._invoke_manifest_factory(
+                connection,
+                public_body["operation"],
+                copy.deepcopy(sources),
+            )
+            evidence_binding = self._validate_replacement_manifest(
+                manifest,
+                operation=public_body["operation"],
+                sources=sources,
+            )
+            occurred_at = self._replacement_timestamp(sources)
+            lineage_operation = (
+                "split" if public_body["operation"] == "split" else "merged"
+            )
+            parents = [self._candidate_reference(source) for source in sources]
+            candidates = [
+                self._build_replacement_candidate(
+                    first_source,
+                    result,
+                    evidence_binding=evidence_binding,
+                    lineage_operation=lineage_operation,
+                    parents=parents,
+                    reason=public_body["reason"],
+                    occurred_at=occurred_at,
+                )
+                for result in public_body["results"]
+            ]
+            if public_body["operation"] == "split":
+                content_documents = [
+                    _canonical_json(candidate["content"]) for candidate in candidates
+                ]
+                source_content = _canonical_json(first_source["content"])
+                if (
+                    source_content in content_documents
+                    or len(set(content_documents)) != len(content_documents)
+                ):
+                    raise CandidateStoreError(
+                        409,
+                        "SPLIT_CONTENT_NOT_DISTINCT",
+                        "split results must differ from the source and every sibling",
+                    )
+
+            identifiers = [candidate["candidate_id"] for candidate in candidates]
+            placeholders = ",".join("?" for _ in identifiers)
+            existing = connection.execute(
+                f"""SELECT candidate_id FROM candidate_versions
+                      WHERE candidate_id IN ({placeholders}) LIMIT 1""",
+                identifiers,
+            ).fetchone()
+            if existing is not None:
+                raise CandidateStoreError(
+                    409,
+                    "CANDIDATE_ALREADY_EXISTS",
+                    "a replacement candidate ID is already in use",
+                )
+
+            if self._replacement_result_guard is None:
+                raise CandidateStoreError(
+                    500,
+                    "CANDIDATE_REPLACEMENT_UNAVAILABLE",
+                    "candidate replacement evidence binding is unavailable",
+                )
+            self._invoke_replacement_result_guard(
+                connection,
+                public_body["operation"],
+                copy.deepcopy(sources),
+                copy.deepcopy(candidates),
+                copy.deepcopy(manifest),
+            )
+
+            for candidate in candidates:
+                self._insert_version(connection, candidate)
+                connection.execute(
+                    """INSERT INTO candidate_heads
+                       (candidate_id, candidate_version, candidate_digest,
+                        organization_id, project_id, session_id, state)
+                       VALUES (?, 1, ?, ?, ?, ?, 'draft')""",
+                    (
+                        candidate["candidate_id"],
+                        candidate["candidate_digest"],
+                        candidate["organization_id"],
+                        candidate["project_id"],
+                        candidate["session_id"],
+                    ),
+                )
+
+            operation_id = "candidate_operation_" + secrets.token_hex(12)
+            source_bindings = [self._exact_binding(source) for source in sources]
+            result_bindings = [self._exact_binding(candidate) for candidate in candidates]
+            projection = {
+                "operation_id": operation_id,
+                "operation": public_body["operation"],
+                "actor_id": self.reviewer_id,
+                "occurred_at": occurred_at,
+                "sources": source_bindings,
+                "results": result_bindings,
+            }
+            response_document = {
+                "operation": projection,
+                "candidates": copy.deepcopy(candidates),
+            }
+            response_body = _canonical_json(response_document).encode("utf-8")
+            if len(response_body) > _MAX_REPLACEMENT_RESPONSE_BYTES:
+                raise CandidateStoreError(
+                    413,
+                    "CANDIDATE_REPLACEMENT_RESPONSE_TOO_LARGE",
+                    "candidate replacement response exceeds 16 MiB",
+                )
+            response_digest = "sha256:" + hashlib.sha256(response_body).hexdigest()
+            operation_json = _canonical_json(projection)
+            connection.execute(
+                """INSERT INTO candidate_replacement_operations
+                   (operation_id, reviewer_id, idempotency_key, operation,
+                    organization_id, project_id, session_id, request_digest,
+                    operation_json, response_status,
+                    response_body, response_digest, occurred_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 201, ?, ?, ?)""",
+                (
+                    operation_id,
+                    self.reviewer_id,
+                    idempotency_key,
+                    public_body["operation"],
+                    first_source["organization_id"],
+                    first_source["project_id"],
+                    first_source["session_id"],
+                    request_digest,
+                    operation_json,
+                    response_body,
+                    response_digest,
+                    occurred_at,
+                ),
+            )
+            for source in sources:
+                connection.execute(
+                    """INSERT INTO candidate_supersessions
+                       (source_candidate_id, source_candidate_version,
+                        source_candidate_digest, operation_id, organization_id,
+                        project_id, session_id, recorded_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        source["candidate_id"],
+                        source["candidate_version"],
+                        source["candidate_digest"],
+                        operation_id,
+                        source["organization_id"],
+                        source["project_id"],
+                        source["session_id"],
+                        occurred_at,
+                    ),
+                )
+            return CandidateReplacementResponse(
+                status=201,
+                body=response_body,
+                body_digest=response_digest,
+            )
+
+    def get_supersession(self, candidate_id: str) -> dict[str, Any]:
+        """Return the immutable replacement operation for one source candidate."""
+
+        candidate_id = _require_id(candidate_id, "candidate_id")
+        with closing(self._connection()) as connection, connection:
+            # Preserve candidate existence/scope semantics for guessed IDs.
+            self._load_current_chain(connection, candidate_id)
+            projection = self._supersession_projection(connection, candidate_id)
+            if projection is None:
+                raise CandidateStoreError(
+                    404,
+                    "SUPERSESSION_NOT_FOUND",
+                    "candidate has not been superseded",
+                )
+            return {"operation": projection}
+
+    def require_not_superseded(self, candidate_id: str) -> None:
+        """Fail with the stable replacement projection before a forbidden action."""
+
+        candidate_id = _require_id(candidate_id, "candidate_id")
+        with closing(self._connection()) as connection, connection:
+            self._raise_if_superseded(connection, candidate_id)
+
+    def _validate_replacement_body(self, body: Any) -> dict[str, Any]:
+        if not isinstance(body, dict):
+            raise CandidateStoreError(
+                400,
+                "INVALID_CANDIDATE_REPLACEMENT_BODY",
+                "candidate replacement body must be an object",
+            )
+        try:
+            encoded = _canonical_json(body)
+        except (TypeError, ValueError) as exc:
+            raise CandidateStoreError(
+                400,
+                "INVALID_CANDIDATE_REPLACEMENT_BODY",
+                "candidate replacement body is not canonical JSON data",
+            ) from exc
+        if len(encoded.encode("utf-8")) > _MAX_REPLACEMENT_BODY_BYTES:
+            raise CandidateStoreError(
+                413,
+                "CANDIDATE_REPLACEMENT_BODY_TOO_LARGE",
+                "candidate replacement body exceeds 16 MiB",
+            )
+        if unicodedata.normalize("NFC", encoded) != encoded or "\x00" in encoded:
+            raise CandidateStoreError(
+                400,
+                "INVALID_CANDIDATE_REPLACEMENT_BODY",
+                "candidate replacement text must be NFC-normalized and contain no NUL",
+            )
+        if set(body) != {"operation", "actor_id", "reason", "sources", "results"}:
+            raise CandidateStoreError(
+                400,
+                "INVALID_CANDIDATE_REPLACEMENT_FIELDS",
+                "candidate replacement fields are invalid",
+            )
+        operation = body["operation"]
+        if not isinstance(operation, str) or operation not in _REPLACEMENT_OPERATIONS:
+            raise CandidateStoreError(
+                400,
+                "INVALID_CANDIDATE_REPLACEMENT_OPERATION",
+                "candidate replacement operation is invalid",
+            )
+        if body["actor_id"] != self.reviewer_id:
+            raise CandidateStoreError(
+                403,
+                "REVIEWER_MISMATCH",
+                "candidate replacement actor does not match the authenticated reviewer",
+            )
+        if not isinstance(body["reason"], str) or not 1 <= len(body["reason"]) <= 256:
+            raise CandidateStoreError(
+                400,
+                "INVALID_CANDIDATE_REPLACEMENT_REASON",
+                "candidate replacement reason is invalid",
+            )
+        sources = body["sources"]
+        results = body["results"]
+        source_bounds = (1, 1) if operation == "split" else (2, 16)
+        result_bounds = (2, 16) if operation == "split" else (1, 1)
+        if not isinstance(sources, list) or not (
+            source_bounds[0] <= len(sources) <= source_bounds[1]
+        ):
+            raise CandidateStoreError(
+                400,
+                "INVALID_CANDIDATE_REPLACEMENT_SOURCES",
+                "candidate replacement source count is invalid",
+            )
+        if not isinstance(results, list) or not (
+            result_bounds[0] <= len(results) <= result_bounds[1]
+        ):
+            raise CandidateStoreError(
+                400,
+                "INVALID_CANDIDATE_REPLACEMENT_RESULTS",
+                "candidate replacement result count is invalid",
+            )
+
+        source_fields = {
+            "candidate_id",
+            "candidate_version",
+            "candidate_digest",
+            "candidate_content_digest",
+            "evidence_manifest_digest",
+        }
+        source_ids: set[str] = set()
+        source_digests: set[str] = set()
+        for source in sources:
+            if not isinstance(source, dict) or set(source) != source_fields:
+                raise CandidateStoreError(
+                    400,
+                    "INVALID_CANDIDATE_REPLACEMENT_SOURCE",
+                    "candidate replacement source binding is invalid",
+                )
+            candidate_id = _require_id(source["candidate_id"], "source.candidate_id")
+            if candidate_id in source_ids:
+                raise CandidateStoreError(
+                    400,
+                    "DUPLICATE_CANDIDATE_REPLACEMENT_SOURCE",
+                    "candidate replacement sources must be distinct",
+                )
+            source_ids.add(candidate_id)
+            version = source["candidate_version"]
+            if (
+                isinstance(version, bool)
+                or not isinstance(version, int)
+                or not 1 <= version <= 9_007_199_254_740_991
+            ):
+                raise CandidateStoreError(
+                    400,
+                    "INVALID_CANDIDATE_VERSION",
+                    "candidate replacement source version is invalid",
+                )
+            for field in (
+                "candidate_digest",
+                "candidate_content_digest",
+                "evidence_manifest_digest",
+            ):
+                _require_digest(source[field], f"source.{field}")
+            if source["candidate_digest"] in source_digests:
+                raise CandidateStoreError(
+                    400,
+                    "DUPLICATE_CANDIDATE_REPLACEMENT_SOURCE",
+                    "candidate replacement source digests must be distinct",
+                )
+            source_digests.add(source["candidate_digest"])
+
+        result_ids: set[str] = set()
+        for result in results:
+            if not isinstance(result, dict) or set(result) != {"candidate_id", "content"}:
+                raise CandidateStoreError(
+                    400,
+                    "INVALID_CANDIDATE_REPLACEMENT_RESULT",
+                    "candidate replacement result is invalid",
+                )
+            candidate_id = _require_id(result["candidate_id"], "result.candidate_id")
+            if candidate_id in result_ids or candidate_id in source_ids:
+                raise CandidateStoreError(
+                    400,
+                    "DUPLICATE_CANDIDATE_REPLACEMENT_RESULT",
+                    "replacement result IDs must be unique and distinct from sources",
+                )
+            result_ids.add(candidate_id)
+            if not isinstance(result["content"], dict):
+                raise CandidateStoreError(
+                    400,
+                    "INVALID_CANDIDATE_REPLACEMENT_CONTENT",
+                    "replacement result content must be an object",
+                )
+        return copy.deepcopy(body)
+
+    @staticmethod
+    def _candidate_reference(candidate: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "candidate_id": candidate["candidate_id"],
+            "candidate_version": candidate["candidate_version"],
+            "candidate_digest": candidate["candidate_digest"],
+        }
+
+    @staticmethod
+    def _exact_binding(candidate: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "candidate_id": candidate["candidate_id"],
+            "candidate_version": candidate["candidate_version"],
+            "candidate_digest": candidate["candidate_digest"],
+            "candidate_content_digest": candidate["candidate_content_digest"],
+            "evidence_manifest_digest": candidate["evidence_manifest"]["manifest_digest"],
+        }
+
+    @staticmethod
+    def _require_replacement_source_binding(
+        source: dict[str, Any], binding: dict[str, Any]
+    ) -> None:
+        if CandidateStore._exact_binding(source) != binding:
+            raise CandidateStoreError(
+                412,
+                "CANDIDATE_PRECONDITION_FAILED",
+                "replacement source does not identify the exact current candidate",
+            )
+
+    def _replacement_timestamp(self, sources: list[dict[str, Any]]) -> str:
+        current = self._now().replace(microsecond=0)
+        source_floor = max(
+            TICKET_CONTRACT.parse_time(
+                source["version_created_at"], "$.source.version_created_at"
+            )
+            for source in sources
+        ) + timedelta(seconds=1)
+        occurred = max(current, source_floor)
+        return occurred.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _validate_replacement_manifest(
+        self,
+        manifest: Any,
+        *,
+        operation: str,
+        sources: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        try:
+            validate_manifest(manifest)
+        except EvidenceDomainError as exc:
+            raise CandidateStoreError(
+                409,
+                exc.code,
+                "candidate replacement evidence manifest is invalid",
+            ) from exc
+        first = sources[0]
+        if any(
+            manifest[field] != first[field]
+            for field in ("organization_id", "project_id", "session_id")
+        ):
+            raise CandidateStoreError(
+                409,
+                "CANDIDATE_REPLACEMENT_SCOPE_MISMATCH",
+                "replacement evidence escaped its source capture",
+            )
+        manifest_ids = [item["evidence_id"] for item in manifest["items"]]
+        binding = {
+            "manifest_id": manifest["manifest_id"],
+            "manifest_digest": manifest["manifest_digest"],
+            "evidence_ids": sorted(manifest_ids),
+        }
+        if operation == "split":
+            if (
+                binding["manifest_id"]
+                != first["evidence_manifest"]["manifest_id"]
+                or binding["manifest_digest"]
+                != first["evidence_manifest"]["manifest_digest"]
+                or set(manifest_ids)
+                != set(first["evidence_manifest"]["evidence_ids"])
+            ):
+                raise CandidateStoreError(
+                    409,
+                    "SPLIT_EVIDENCE_CHANGED",
+                    "split results must reuse the exact source evidence manifest",
+                )
+            return copy.deepcopy(first["evidence_manifest"])
+        return binding
+
+    def _build_replacement_candidate(
+        self,
+        source: dict[str, Any],
+        result: dict[str, Any],
+        *,
+        evidence_binding: dict[str, Any],
+        lineage_operation: str,
+        parents: list[dict[str, Any]],
+        reason: str,
+        occurred_at: str,
+    ) -> dict[str, Any]:
+        candidate = {
+            "contract_version": source["contract_version"],
+            "media_type": source["media_type"],
+            "organization_id": source["organization_id"],
+            "project_id": source["project_id"],
+            "build_id": source["build_id"],
+            "build_identity_digest": source["build_identity_digest"],
+            "session_id": source["session_id"],
+            "candidate_id": result["candidate_id"],
+            "candidate_version": 1,
+            "candidate_created_at": occurred_at,
+            "version_created_at": occurred_at,
+            "previous_candidate_digest": None,
+            "evidence_manifest": copy.deepcopy(evidence_binding),
+            "lineage": {
+                "operation": lineage_operation,
+                "parents": copy.deepcopy(parents),
+            },
+            "state": "draft",
+            "transition": {
+                "from_state": None,
+                "to_state": "draft",
+                "actor": {"actor_type": "human", "actor_id": self.reviewer_id},
+                "occurred_at": occurred_at,
+                "reason": reason,
+            },
+            "review": {
+                "status": "in_review",
+                "reviewer_action_required": True,
+                "last_human_actor_id": self.reviewer_id,
+                "last_reviewed_at": occurred_at,
+                "notes": [],
+            },
+            "content": copy.deepcopy(result["content"]),
+            "approval": None,
+            "rejection": None,
+        }
+        try:
+            candidate = TICKET_CONTRACT.seal(candidate)
+            TICKET_CONTRACT.validate_chain([candidate])
+        except ContractError as exc:
+            raise CandidateStoreError(
+                400,
+                "INVALID_CANDIDATE_REPLACEMENT_CONTENT",
+                "replacement result content is not a valid ticket candidate",
+            ) from exc
+        return candidate
+
+    def _invoke_manifest_factory(
+        self,
+        connection: sqlite3.Connection,
+        operation: str,
+        sources: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        assert self._replacement_manifest_factory is not None
+        try:
+            manifest = self._replacement_manifest_factory(
+                connection, operation, sources
+            )
+        except CandidateStoreError:
+            raise
+        except EvidenceDomainError as exc:
+            raise CandidateStoreError(409, exc.code, exc.detail) from exc
+        except ContractError as exc:
+            raise CandidateStoreError(400, exc.code, exc.detail) from exc
+        if not isinstance(manifest, dict):
+            raise CandidateStoreError(
+                500,
+                "CANDIDATE_REPLACEMENT_EVIDENCE_INVALID",
+                "replacement evidence factory returned an invalid manifest",
+            )
+        return copy.deepcopy(manifest)
+
+    def _invoke_replacement_result_guard(
+        self,
+        connection: sqlite3.Connection,
+        operation: str,
+        sources: list[dict[str, Any]],
+        results: list[dict[str, Any]],
+        manifest: dict[str, Any],
+    ) -> None:
+        assert self._replacement_result_guard is not None
+        try:
+            self._replacement_result_guard(
+                connection, operation, sources, results, manifest
+            )
+        except CandidateStoreError:
+            raise
+        except EvidenceDomainError as exc:
+            raise CandidateStoreError(409, exc.code, exc.detail) from exc
+        except ContractError as exc:
+            raise CandidateStoreError(400, exc.code, exc.detail) from exc
+
+    def _load_current_chain(
+        self, connection: sqlite3.Connection, candidate_id: str
+    ) -> list[dict[str, Any]]:
+        chain = self._load_chain(connection, candidate_id)
+        current = chain[-1]
+        row = connection.execute(
+            """SELECT candidate_version, candidate_digest, organization_id,
+                      project_id, session_id, state
+                 FROM candidate_heads
+                WHERE candidate_id = ?""",
+            (candidate_id,),
+        ).fetchone()
+        if row is None or tuple(row) != (
+            current["candidate_version"],
+            current["candidate_digest"],
+            current["organization_id"],
+            current["project_id"],
+            current["session_id"],
+            current["state"],
+        ):
+            raise CandidateStoreError(
+                500,
+                "CANDIDATE_STORAGE_CORRUPT",
+                "stored candidate head failed integrity verification",
+            )
+        return chain
+
+    def _raise_if_superseded(
+        self, connection: sqlite3.Connection, candidate_id: str
+    ) -> None:
+        projection = self._supersession_projection(connection, candidate_id)
+        if projection is None:
+            return
+        raise CandidateStoreError(
+            409,
+            "CANDIDATE_SUPERSEDED",
+            "candidate was replaced by a reviewer operation",
+            details={
+                "operation_id": projection["operation_id"],
+                "operation": projection["operation"],
+                "replacements": copy.deepcopy(projection["results"]),
+            },
+        )
+
+    def _supersession_projection(
+        self, connection: sqlite3.Connection, candidate_id: str
+    ) -> dict[str, Any] | None:
+        row = connection.execute(
+            """SELECT superseded.source_candidate_version,
+                      superseded.source_candidate_digest,
+                      superseded.organization_id, superseded.project_id,
+                      superseded.session_id, superseded.operation_id,
+                      operations.organization_id AS operation_organization_id,
+                      operations.project_id AS operation_project_id,
+                      operations.session_id AS operation_session_id,
+                      operations.reviewer_id AS operation_reviewer_id,
+                      operations.operation AS stored_operation,
+                      operations.occurred_at AS operation_occurred_at,
+                      operations.operation_json, operations.response_status,
+                      operations.response_body, operations.response_digest
+                 FROM candidate_supersessions AS superseded
+                 JOIN candidate_replacement_operations AS operations
+                   ON operations.operation_id = superseded.operation_id
+                WHERE superseded.source_candidate_id = ?""",
+            (candidate_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if (
+            row["organization_id"] != self.organization_id
+            or row["project_id"] != self.project_id
+            or row["operation_organization_id"] != row["organization_id"]
+            or row["operation_project_id"] != row["project_id"]
+            or row["operation_session_id"] != row["session_id"]
+        ):
+            raise CandidateStoreError(
+                500,
+                "CANDIDATE_STORAGE_CORRUPT",
+                "stored candidate supersession scope changed",
+            )
+        projection = self._verify_replacement_response(
+            connection,
+            response_body=bytes(row["response_body"]),
+            response_digest=row["response_digest"],
+            operation_id=row["operation_id"],
+            operation_json=row["operation_json"],
+            stored_operation=row["stored_operation"],
+            stored_reviewer_id=row["operation_reviewer_id"],
+            stored_organization_id=row["operation_organization_id"],
+            stored_project_id=row["operation_project_id"],
+            stored_session_id=row["operation_session_id"],
+            stored_occurred_at=row["operation_occurred_at"],
+            response_status=row["response_status"],
+        )
+        if projection["operation_id"] != row["operation_id"]:
+            raise CandidateStoreError(
+                500,
+                "CANDIDATE_STORAGE_CORRUPT",
+                "stored candidate replacement identity changed",
+            )
+        matching_sources = [
+            source
+            for source in projection["sources"]
+            if source["candidate_id"] == candidate_id
+        ]
+        if len(matching_sources) != 1 or (
+            matching_sources[0]["candidate_version"],
+            matching_sources[0]["candidate_digest"],
+        ) != (row["source_candidate_version"], row["source_candidate_digest"]):
+            raise CandidateStoreError(
+                500,
+                "CANDIDATE_STORAGE_CORRUPT",
+                "stored candidate supersession binding changed",
+            )
+        return projection
+
+    def _load_operation_projection(self, raw: Any) -> dict[str, Any]:
+        if not isinstance(raw, (str, bytes)):
+            raise CandidateStoreError(
+                500,
+                "CANDIDATE_STORAGE_CORRUPT",
+                "stored candidate replacement is invalid",
+            )
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        try:
+            projection = json.loads(text)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CandidateStoreError(
+                500,
+                "CANDIDATE_STORAGE_CORRUPT",
+                "stored candidate replacement is invalid",
+            ) from exc
+        if not isinstance(projection, dict) or _canonical_json(projection) != text:
+            raise CandidateStoreError(
+                500,
+                "CANDIDATE_STORAGE_CORRUPT",
+                "stored candidate replacement is not canonical",
+            )
+        fields = {
+            "operation_id",
+            "operation",
+            "actor_id",
+            "occurred_at",
+            "sources",
+            "results",
+        }
+        binding_fields = {
+            "candidate_id",
+            "candidate_version",
+            "candidate_digest",
+            "candidate_content_digest",
+            "evidence_manifest_digest",
+        }
+        try:
+            valid = (
+                set(projection) == fields
+                and _ID_PATTERN.fullmatch(projection["operation_id"]) is not None
+                and projection["operation"] in _REPLACEMENT_OPERATIONS
+                and projection["actor_id"] == self.reviewer_id
+                and isinstance(projection["occurred_at"], str)
+                and isinstance(projection["sources"], list)
+                and isinstance(projection["results"], list)
+            )
+        except (KeyError, TypeError):
+            valid = False
+        if not valid:
+            raise CandidateStoreError(
+                500,
+                "CANDIDATE_STORAGE_CORRUPT",
+                "stored candidate replacement projection is invalid",
+            )
+        try:
+            TICKET_CONTRACT.parse_time(projection["occurred_at"], "$.occurred_at")
+        except ContractError as exc:
+            raise CandidateStoreError(
+                500,
+                "CANDIDATE_STORAGE_CORRUPT",
+                "stored candidate replacement time is invalid",
+            ) from exc
+        source_bounds = (1, 1) if projection["operation"] == "split" else (2, 16)
+        result_bounds = (2, 16) if projection["operation"] == "split" else (1, 1)
+        if not (
+            source_bounds[0] <= len(projection["sources"]) <= source_bounds[1]
+            and result_bounds[0] <= len(projection["results"]) <= result_bounds[1]
+        ):
+            raise CandidateStoreError(
+                500,
+                "CANDIDATE_STORAGE_CORRUPT",
+                "stored candidate replacement cardinality is invalid",
+            )
+        identifiers: set[str] = set()
+        for binding in [*projection["sources"], *projection["results"]]:
+            if not isinstance(binding, dict) or set(binding) != binding_fields:
+                raise CandidateStoreError(
+                    500,
+                    "CANDIDATE_STORAGE_CORRUPT",
+                    "stored candidate replacement binding is invalid",
+                )
+            try:
+                _require_id(binding["candidate_id"], "candidate_id")
+                if (
+                    isinstance(binding["candidate_version"], bool)
+                    or not isinstance(binding["candidate_version"], int)
+                    or binding["candidate_version"] < 1
+                ):
+                    raise CandidateStoreError(400, "INVALID", "invalid")
+                for field in (
+                    "candidate_digest",
+                    "candidate_content_digest",
+                    "evidence_manifest_digest",
+                ):
+                    _require_digest(binding[field], field)
+            except CandidateStoreError as exc:
+                raise CandidateStoreError(
+                    500,
+                    "CANDIDATE_STORAGE_CORRUPT",
+                    "stored candidate replacement binding is invalid",
+                ) from exc
+            if binding["candidate_id"] in identifiers:
+                raise CandidateStoreError(
+                    500,
+                    "CANDIDATE_STORAGE_CORRUPT",
+                    "stored candidate replacement identities overlap",
+                )
+            identifiers.add(binding["candidate_id"])
+        if len(
+            {binding["candidate_digest"] for binding in projection["sources"]}
+        ) != len(projection["sources"]):
+            raise CandidateStoreError(
+                500,
+                "CANDIDATE_STORAGE_CORRUPT",
+                "stored candidate replacement source digests overlap",
+            )
+        return projection
+
+    def _verify_operation_projection(
+        self, connection: sqlite3.Connection, projection: dict[str, Any]
+    ) -> tuple[str, str, str, str, str]:
+        scope: tuple[str, str, str, str, str] | None = None
+        source_documents: list[dict[str, Any]] = []
+        for source in projection["sources"]:
+            row = connection.execute(
+                """SELECT versions.candidate_content_digest,
+                          versions.evidence_manifest_digest,
+                          superseded.operation_id
+                     FROM candidate_versions AS versions
+                     JOIN candidate_heads AS heads
+                       ON heads.candidate_id = versions.candidate_id
+                      AND heads.candidate_version = versions.candidate_version
+                      AND heads.candidate_digest = versions.candidate_digest
+                     JOIN candidate_supersessions AS superseded
+                       ON superseded.source_candidate_id = versions.candidate_id
+                      AND superseded.source_candidate_version = versions.candidate_version
+                      AND superseded.source_candidate_digest = versions.candidate_digest
+                    WHERE versions.candidate_id = ?
+                      AND versions.candidate_version = ?
+                      AND versions.candidate_digest = ?
+                      AND versions.organization_id = ? AND versions.project_id = ?""",
+                (
+                    source["candidate_id"],
+                    source["candidate_version"],
+                    source["candidate_digest"],
+                    self.organization_id,
+                    self.project_id,
+                ),
+            ).fetchone()
+            if row is None or tuple(row) != (
+                source["candidate_content_digest"],
+                source["evidence_manifest_digest"],
+                projection["operation_id"],
+            ):
+                raise CandidateStoreError(
+                    500,
+                    "CANDIDATE_STORAGE_CORRUPT",
+                    "stored supersession source projection changed",
+                )
+            chain = self._load_current_chain(connection, source["candidate_id"])
+            document = chain[source["candidate_version"] - 1]
+            if (
+                self._exact_binding(document) != source
+                or document["state"] in {"approved", "rejected"}
+            ):
+                raise CandidateStoreError(
+                    500,
+                    "CANDIDATE_STORAGE_CORRUPT",
+                    "stored replacement source candidate changed",
+                )
+            document_scope = tuple(
+                document[field]
+                for field in (
+                    "organization_id",
+                    "project_id",
+                    "session_id",
+                    "build_id",
+                    "build_identity_digest",
+                )
+            )
+            if scope is not None and document_scope != scope:
+                raise CandidateStoreError(
+                    500,
+                    "CANDIDATE_STORAGE_CORRUPT",
+                    "stored replacement source scope changed",
+                )
+            scope = document_scope
+            source_documents.append(document)
+        parent_refs = [self._candidate_reference(source) for source in source_documents]
+        lineage_operation = "split" if projection["operation"] == "split" else "merged"
+        for result in projection["results"]:
+            row = connection.execute(
+                """SELECT versions.candidate_content_digest,
+                          versions.evidence_manifest_digest
+                     FROM candidate_versions AS versions
+                    WHERE versions.candidate_id = ?
+                      AND versions.candidate_version = ?
+                      AND versions.candidate_digest = ?
+                      AND versions.organization_id = ? AND versions.project_id = ?""",
+                (
+                    result["candidate_id"],
+                    result["candidate_version"],
+                    result["candidate_digest"],
+                    self.organization_id,
+                    self.project_id,
+                ),
+            ).fetchone()
+            if row is None or tuple(row) != (
+                result["candidate_content_digest"],
+                result["evidence_manifest_digest"],
+            ):
+                raise CandidateStoreError(
+                    500,
+                    "CANDIDATE_STORAGE_CORRUPT",
+                    "stored replacement result projection changed",
+                )
+            chain = self._load_chain(connection, result["candidate_id"])
+            document = chain[result["candidate_version"] - 1]
+            document_scope = tuple(
+                document[field]
+                for field in (
+                    "organization_id",
+                    "project_id",
+                    "session_id",
+                    "build_id",
+                    "build_identity_digest",
+                )
+            )
+            if (
+                self._exact_binding(document) != result
+                or result["candidate_version"] != 1
+                or document_scope != scope
+                or document["lineage"]
+                != {"operation": lineage_operation, "parents": parent_refs}
+                or document["transition"]["actor"]
+                != {"actor_type": "human", "actor_id": projection["actor_id"]}
+                or document["transition"]["occurred_at"]
+                != projection["occurred_at"]
+                or document["candidate_created_at"] != projection["occurred_at"]
+                or document["version_created_at"] != projection["occurred_at"]
+            ):
+                raise CandidateStoreError(
+                    500,
+                    "CANDIDATE_STORAGE_CORRUPT",
+                    "stored replacement result candidate changed",
+                )
+        assert scope is not None
+        return scope
+
+    def _verify_replacement_response(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        response_body: bytes,
+        response_digest: str,
+        operation_id: str,
+        operation_json: Any,
+        stored_operation: Any,
+        stored_reviewer_id: Any,
+        stored_organization_id: Any,
+        stored_project_id: Any,
+        stored_session_id: Any,
+        stored_occurred_at: Any,
+        response_status: Any,
+    ) -> dict[str, Any]:
+        if (
+            len(response_body) > _MAX_REPLACEMENT_RESPONSE_BYTES
+            or "sha256:" + hashlib.sha256(response_body).hexdigest()
+            != response_digest
+        ):
+            raise CandidateStoreError(
+                500,
+                "CANDIDATE_STORAGE_CORRUPT",
+                "stored candidate replacement response failed integrity verification",
+            )
+        try:
+            document = json.loads(response_body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CandidateStoreError(
+                500,
+                "CANDIDATE_STORAGE_CORRUPT",
+                "stored candidate replacement response is invalid",
+            ) from exc
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"operation", "candidates"}
+            or not isinstance(document["candidates"], list)
+            or _canonical_json(document).encode("utf-8") != response_body
+        ):
+            raise CandidateStoreError(
+                500,
+                "CANDIDATE_STORAGE_CORRUPT",
+                "stored candidate replacement response is not canonical",
+            )
+        projection = self._load_operation_projection(operation_json)
+        if (
+            document["operation"] != projection
+            or projection["operation_id"] != operation_id
+            or stored_operation != projection["operation"]
+            or stored_reviewer_id != projection["actor_id"]
+            or stored_occurred_at != projection["occurred_at"]
+            or response_status != 201
+        ):
+            raise CandidateStoreError(
+                500,
+                "CANDIDATE_STORAGE_CORRUPT",
+                "stored candidate replacement response changed",
+            )
+        if len(document["candidates"]) != len(projection["results"]):
+            raise CandidateStoreError(
+                500,
+                "CANDIDATE_STORAGE_CORRUPT",
+                "stored candidate replacement results changed",
+            )
+        for candidate, binding in zip(
+            document["candidates"], projection["results"], strict=True
+        ):
+            try:
+                TICKET_CONTRACT.validate_chain([candidate])
+            except ContractError as exc:
+                raise CandidateStoreError(
+                    500,
+                    "CANDIDATE_STORAGE_CORRUPT",
+                    "stored replacement candidate failed validation",
+                ) from exc
+            if self._exact_binding(candidate) != binding:
+                raise CandidateStoreError(
+                    500,
+                    "CANDIDATE_STORAGE_CORRUPT",
+                    "stored replacement candidate binding changed",
+                )
+        scope = self._verify_operation_projection(connection, projection)
+        if (
+            stored_organization_id,
+            stored_project_id,
+            stored_session_id,
+        ) != scope[:3]:
+            raise CandidateStoreError(
+                500,
+                "CANDIDATE_STORAGE_CORRUPT",
+                "stored candidate replacement scope changed",
+            )
+        return projection
+
     def delete_session(self, session_id: str) -> dict[str, int]:
         session_id = _require_id(session_id, "session_id")
         with closing(self._connection()) as connection, connection:
@@ -534,6 +1689,12 @@ class CandidateStore:
                     )""",
                 (self.organization_id, self.project_id, session_id),
             ).rowcount
+            connection.execute(
+                """DELETE FROM candidate_replacement_operations
+                    WHERE organization_id = ? AND project_id = ?
+                      AND session_id = ?""",
+                (self.organization_id, self.project_id, session_id),
+            )
             heads = connection.execute(
                 """DELETE FROM candidate_heads
                    WHERE organization_id = ? AND project_id = ? AND session_id = ?""",

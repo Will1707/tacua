@@ -23,6 +23,15 @@ swiftc \
 "$TEST_TMP_DIR/tacua-capture-policy-tests"
 
 swiftc \
+  -warnings-as-errors \
+  -module-cache-path "$TEST_TMP_DIR/module-cache" \
+  ios/AppAudioAppendAccounting.swift \
+  tests/AppAudioAppendAccountingTests.swift \
+  -o "$TEST_TMP_DIR/tacua-app-audio-append-accounting-tests"
+
+"$TEST_TMP_DIR/tacua-app-audio-append-accounting-tests"
+
+swiftc \
   -module-cache-path "$TEST_TMP_DIR/module-cache" \
   ios/CaptureTransportPolicy.swift \
   tests/CaptureTransportPolicyTests.swift \
@@ -361,6 +370,7 @@ for plugin_file in plugin/*.js; do
   node --check "$plugin_file"
 done
 node --test tests/config-plugin.test.mjs
+node --test tests/app-audio-generator.test.mjs
 
 npm --prefix "$PACKAGE_ROOT/../harness" run typecheck
 

@@ -6,6 +6,16 @@ import CryptoKit
 import Foundation
 import ReplayKit
 
+enum TacuaSegmentAppendResult: Equatable {
+  case appended
+  /// The sample was rejected and its stream-specific dropped count was updated exactly once.
+  case recordedDrop
+  /// The writer could not bind this rejection to durable accounting; callers must fail closed.
+  case fatalUnaccounted
+
+  var wasAppended: Bool { self == .appended }
+}
+
 final class SegmentWriter {
   private typealias FinishCompletion = (Result<CaptureSegment, Error>) -> Void
 
@@ -35,6 +45,8 @@ final class SegmentWriter {
   private let microphoneInput: AVAssetWriterInput
   private let firstHostUptimeSeconds: Double
   private let videoDimensions: CMVideoDimensions
+  private let appAudioAppendAttemptStartIndex: Int
+  private let maximumTrackedAppAudioDrops: Int
 
   private var lastPTS: CMTime
   private var lastHostUptimeSeconds: Double
@@ -47,6 +59,8 @@ final class SegmentWriter {
   private var droppedVideoSamples = 0
   private var droppedAppAudioSamples = 0
   private var droppedMicrophoneSamples = 0
+  private var appAudioAppendAttempts = 0
+  private var appAudioAppendDrops: [TacuaAppAudioAppendDrop] = []
   private var finished = false
   private(set) var fatalError: Error?
   private let finishLock = NSLock()
@@ -62,7 +76,9 @@ final class SegmentWriter {
     index: Int,
     directory: URL,
     firstVideoSample: CMSampleBuffer,
-    hostUptimeSeconds: Double
+    hostUptimeSeconds: Double,
+    appAudioAppendAttemptStartIndex: Int,
+    maximumTrackedAppAudioDrops: Int
   ) throws {
     guard let formatDescription = CMSampleBufferGetFormatDescription(firstVideoSample) else {
       throw TacuaCaptureSpikeError.writerCreation("The first video sample has no format description.")
@@ -80,6 +96,8 @@ final class SegmentWriter {
     self.firstHostUptimeSeconds = hostUptimeSeconds
     self.lastHostUptimeSeconds = hostUptimeSeconds
     self.videoDimensions = dimensions
+    self.appAudioAppendAttemptStartIndex = appAudioAppendAttemptStartIndex
+    self.maximumTrackedAppAudioDrops = maximumTrackedAppAudioDrops
 
     let stem = String(format: "segment-%06d", index)
     partialURL = directory.appendingPathComponent("\(stem).partial.mov")
@@ -193,13 +211,13 @@ final class SegmentWriter {
     _ sampleBuffer: CMSampleBuffer,
     hostUptimeSeconds: Double
   ) -> Bool {
-    let appended = append(
+    let result = append(
       sampleBuffer,
       type: .video,
       hostUptimeSeconds: hostUptimeSeconds
     )
-    if appended { heldVideoSamples += 1 }
-    return appended
+    if result.wasAppended { heldVideoSamples += 1 }
+    return result.wasAppended
   }
 
   func extendVideoToLatestPTS(hostUptimeSeconds: Double) throws {
@@ -222,24 +240,57 @@ final class SegmentWriter {
   func append(
     _ sampleBuffer: CMSampleBuffer,
     type: RPSampleBufferType,
-    hostUptimeSeconds: Double
-  ) -> Bool {
-    guard !finished, CMSampleBufferDataIsReady(sampleBuffer) else {
-      incrementDropped(type)
-      return false
+    hostUptimeSeconds: Double,
+    appAudioAttemptIndex: Int? = nil
+  ) -> TacuaSegmentAppendResult {
+    if type == .audioApp {
+      let expectedIndex = appAudioAppendAttemptStartIndex + appAudioAppendAttempts
+      guard appAudioAttemptIndex == expectedIndex else {
+        fatalError = TacuaCaptureSpikeError.writerFailed(
+          "Segment \(index) received non-contiguous app-audio append accounting."
+        )
+        return .fatalUnaccounted
+      }
+      appAudioAppendAttempts += 1
+    } else if appAudioAttemptIndex != nil {
+      fatalError = TacuaCaptureSpikeError.writerFailed(
+        "Segment \(index) received app-audio accounting for another media stream."
+      )
+      return .fatalUnaccounted
+    }
+
+    guard !finished else {
+      return recordDrop(
+        type,
+        appAudioAttemptIndex: appAudioAttemptIndex,
+        cause: .writerFinished
+      ) ? .recordedDrop : .fatalUnaccounted
+    }
+    guard CMSampleBufferDataIsReady(sampleBuffer) else {
+      return recordDrop(
+        type,
+        appAudioAttemptIndex: appAudioAttemptIndex,
+        cause: .sampleDataNotReady
+      ) ? .recordedDrop : .fatalUnaccounted
     }
 
     guard writer.status == .writing else {
       let code = writer.error?.tacuaStableCode ?? "AVAssetWriter:\(writer.status.rawValue)"
       fatalError = TacuaCaptureSpikeError.writerFailed("Segment \(index) stopped accepting media (\(code)).")
-      incrementDropped(type)
-      return false
+      return recordDrop(
+        type,
+        appAudioAttemptIndex: appAudioAttemptIndex,
+        cause: .writerNotWriting
+      ) ? .recordedDrop : .fatalUnaccounted
     }
 
     let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
     guard pts.isValid, CMTimeCompare(pts, startedAtPTS) >= 0 else {
-      incrementDropped(type)
-      return false
+      return recordDrop(
+        type,
+        appAudioAttemptIndex: appAudioAttemptIndex,
+        cause: .timestampInvalid
+      ) ? .recordedDrop : .fatalUnaccounted
     }
 
     let input: AVAssetWriterInput
@@ -251,17 +302,27 @@ final class SegmentWriter {
     case .audioMic:
       input = microphoneInput
     @unknown default:
-      incrementDropped(type)
-      return false
+      incrementNonAppAudioDrop(type)
+      return .fatalUnaccounted
     }
 
-    guard input.isReadyForMoreMediaData, input.append(sampleBuffer) else {
+    guard input.isReadyForMoreMediaData else {
+      return recordDrop(
+        type,
+        appAudioAttemptIndex: appAudioAttemptIndex,
+        cause: .inputBackpressure
+      ) ? .recordedDrop : .fatalUnaccounted
+    }
+    guard input.append(sampleBuffer) else {
       if writer.status == .failed || writer.status == .cancelled {
         let code = writer.error?.tacuaStableCode ?? "AVAssetWriter:\(writer.status.rawValue)"
         fatalError = TacuaCaptureSpikeError.writerFailed("Segment \(index) failed while appending media (\(code)).")
       }
-      incrementDropped(type)
-      return false
+      return recordDrop(
+        type,
+        appAudioAttemptIndex: appAudioAttemptIndex,
+        cause: .appendRejected
+      ) ? .recordedDrop : .fatalUnaccounted
     }
 
     if CMTimeCompare(pts, lastPTS) > 0 {
@@ -284,7 +345,7 @@ final class SegmentWriter {
     case .audioMic: microphoneSamples += 1
     @unknown default: break
     }
-    return true
+    return .appended
   }
 
   func finish(completion: @escaping (Result<CaptureSegment, Error>) -> Void) {
@@ -391,7 +452,10 @@ final class SegmentWriter {
           microphoneSamples: microphoneSamples,
           droppedVideoSamples: droppedVideoSamples,
           droppedAppAudioSamples: droppedAppAudioSamples,
-          droppedMicrophoneSamples: droppedMicrophoneSamples
+          droppedMicrophoneSamples: droppedMicrophoneSamples,
+          appAudioAppendAttemptStartIndex: appAudioAppendAttemptStartIndex,
+          appAudioAppendAttempts: appAudioAppendAttempts,
+          appAudioAppendDrops: appAudioAppendDrops
         )
 
         let encoder = JSONEncoder()
@@ -579,11 +643,49 @@ final class SegmentWriter {
     return input
   }
 
-  private func incrementDropped(_ type: RPSampleBufferType) {
+  @discardableResult
+  private func recordDrop(
+    _ type: RPSampleBufferType,
+    appAudioAttemptIndex: Int?,
+    cause: TacuaAppAudioAppendDropCause
+  ) -> Bool {
+    switch type {
+    case .video:
+      droppedVideoSamples += 1
+      return true
+    case .audioApp:
+      guard let appAudioAttemptIndex else {
+        fatalError = TacuaCaptureSpikeError.writerFailed(
+          "Segment \(index) could not bind an app-audio drop to its append attempt."
+        )
+        return false
+      }
+      guard appAudioAppendDrops.count < maximumTrackedAppAudioDrops else {
+        fatalError = TacuaCaptureSpikeError.appAudioAccountingLimitExceeded
+        return false
+      }
+      droppedAppAudioSamples += 1
+      appAudioAppendDrops.append(TacuaAppAudioAppendDrop(
+        attemptIndex: appAudioAttemptIndex,
+        cause: cause
+      ))
+      return true
+    case .audioMic:
+      droppedMicrophoneSamples += 1
+      return true
+    @unknown default:
+      return false
+    }
+  }
+
+  private func incrementNonAppAudioDrop(_ type: RPSampleBufferType) {
     switch type {
     case .video: droppedVideoSamples += 1
-    case .audioApp: droppedAppAudioSamples += 1
     case .audioMic: droppedMicrophoneSamples += 1
+    case .audioApp:
+      fatalError = TacuaCaptureSpikeError.writerFailed(
+        "Segment \(index) reached an unknown app-audio sample type."
+      )
     @unknown default: break
     }
   }

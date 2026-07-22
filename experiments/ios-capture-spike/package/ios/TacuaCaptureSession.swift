@@ -3,6 +3,7 @@
 import AVFAudio
 import CoreMedia
 import CryptoKit
+import Darwin
 import Foundation
 import ReplayKit
 import UIKit
@@ -67,6 +68,8 @@ final class TacuaCaptureSession {
   private let rawMediaStopHostUptimeSeconds: Double
   private var writer: SegmentWriter?
   private var nextSegmentIndex = 0
+  private var nextAppAudioAppendAttemptIndex = 1
+  private var trackedAppAudioDropCount = 0
   private var latestVideoPTS: CMTime?
   private var latestVideoHostUptimeSeconds: Double?
   private var latestMicrophonePTS: CMTime?
@@ -204,6 +207,35 @@ final class TacuaCaptureSession {
         throw TacuaCaptureSpikeError.sessionNotRecoverable
       }
       _ = Self.reconcileFinalizedSegments(in: directory, manifest: &manifest)
+      do {
+        let accounting = Self.appAudioAccountingSegments(manifest.segments)
+        if manifest.schemaVersion == 4 {
+          guard manifest.appAudioAppendAccountingVersion
+            == TacuaAppAudioAppendAccounting.version
+          else {
+            throw TacuaAppAudioAppendAccountingError.legacyFieldsMissing
+          }
+          let recovery = try Self.prepareSchema4AppAudioRecovery(
+            manifest: &manifest,
+            accounting: accounting
+          )
+          nextAppAudioAppendAttemptIndex = recovery.nextIndex
+          trackedAppAudioDropCount = recovery.droppedCount
+        } else {
+          nextAppAudioAppendAttemptIndex = try TacuaAppAudioAppendAccounting
+            .legacyNextAttemptIndex(for: accounting)
+          trackedAppAudioDropCount = manifest.segments.reduce(0) {
+            $0 + $1.droppedAppAudioSamples
+          }
+        }
+        guard trackedAppAudioDropCount <= TacuaAppAudioAppendAccounting.maximumTrackedDrops else {
+          throw TacuaAppAudioAppendAccountingError.dropLimitExceeded
+        }
+      } catch {
+        throw TacuaCaptureSpikeError.recoveryIO(
+          "The stored app-audio append accounting is inconsistent."
+        )
+      }
       let recordedDuration = manifest.segments.reduce(0) { $0 + max(0, $1.durationSeconds) }
       guard recordedDuration < TacuaCapturePolicy.maximumDurationSeconds else {
         throw TacuaCaptureSpikeError.sessionNotRecoverable
@@ -249,7 +281,7 @@ final class TacuaCaptureSession {
       try Self.protectAndExcludeFromBackup(directory)
 
       manifest = CaptureManifest(
-        schemaVersion: 3,
+        schemaVersion: 4,
         bootSessionId: bootSessionID,
         sessionId: options.sessionId,
         organizationId: options.organizationId,
@@ -282,7 +314,12 @@ final class TacuaCaptureSession {
         droppedBeforeFirstVideo: ["appAudio": 0, "microphone": 0],
         droppedDuringBackground: ["appAudio": 0, "microphone": 0],
         microphoneSamplesObserved: 0,
-        appAudioSamplesObserved: 0
+        appAudioSamplesObserved: 0,
+        appAudioAppendAccountingVersion: TacuaAppAudioAppendAccounting.version,
+        appAudioAppendAccountingComplete: true,
+        appAudioAppendAttemptsObserved: 0,
+        appAudioAppendReservedThroughIndex: 0,
+        appAudioAppendUnknownRanges: []
       )
       try persistManifest()
     }
@@ -492,7 +529,17 @@ final class TacuaCaptureSession {
         ]
       }
       let recoveredSegmentCount = reconcileFinalizedSegments(in: directory, manifest: &manifest)
-      markInterruptedStateIfNeeded(manifest: &manifest)
+      do {
+        try markInterruptedStateIfNeeded(manifest: &manifest)
+      } catch {
+        manifest.appAudioAppendAccountingComplete = false
+        if !manifest.errorCodes.contains("ERR_TACUA_CAPTURE_RECOVERY_IO") {
+          manifest.errorCodes.append("ERR_TACUA_CAPTURE_RECOVERY_IO")
+        }
+        manifest.state = manifest.segments.isEmpty
+          ? "failed_no_verified_segments"
+          : "recoverable_partial"
+      }
       try? persist(manifest: manifest, to: manifestURL)
       return recoverySnapshot(
         manifest: manifest,
@@ -517,7 +564,13 @@ final class TacuaCaptureSession {
     try validateStoredSessionId(manifest: manifest, expected: options.sessionId)
     try validateStoredIdentity(manifest: manifest, handoff: handoff)
     let recovered = reconcileFinalizedSegments(in: directory, manifest: &manifest)
-    markInterruptedStateIfNeeded(manifest: &manifest)
+    do {
+      try markInterruptedStateIfNeeded(manifest: &manifest)
+    } catch {
+      throw TacuaCaptureSpikeError.recoveryIO(
+        "The stored app-audio append reservation could not be reconciled."
+      )
+    }
     guard !manifest.segments.isEmpty else {
       throw TacuaCaptureSpikeError.sessionHasNoVerifiedSegments
     }
@@ -1212,8 +1265,40 @@ final class TacuaCaptureSession {
     }
 
     guard let writer else { return }
-    let appended = writer.append(sampleBuffer, type: type, hostUptimeSeconds: hostUptimeSeconds)
-    if appended {
+    let appAudioAttemptIndex: Int?
+    if type == .audioApp {
+      guard nextAppAudioAppendAttemptIndex <= TacuaAppAudioAppendAccounting.maximumAttempts else {
+        failAndStopOnQueue(
+          error: TacuaCaptureSpikeError.appAudioAccountingLimitExceeded,
+          gapReason: "app_audio_accounting_limit"
+        )
+        return
+      }
+      do {
+        try ensureAppAudioIndexReservationOnQueue()
+      } catch {
+        failAndStopOnQueue(
+          error: TacuaCaptureSpikeError.storageIO(
+            "Tacua could not durably reserve app-audio append indexes."
+          ),
+          gapReason: "app_audio_accounting_reservation_failed"
+        )
+        return
+      }
+      appAudioAttemptIndex = nextAppAudioAppendAttemptIndex
+      nextAppAudioAppendAttemptIndex += 1
+      manifest.appAudioAppendAttemptsObserved =
+        (manifest.appAudioAppendAttemptsObserved ?? 0) + 1
+    } else {
+      appAudioAttemptIndex = nil
+    }
+    let appendResult = writer.append(
+      sampleBuffer,
+      type: type,
+      hostUptimeSeconds: hostUptimeSeconds,
+      appAudioAttemptIndex: appAudioAttemptIndex
+    )
+    if appendResult.wasAppended {
       switch type {
       case .audioMic:
         manifest.microphoneSamplesObserved = (manifest.microphoneSamplesObserved ?? 0) + 1
@@ -1229,8 +1314,46 @@ final class TacuaCaptureSession {
       @unknown default:
         break
       }
-    } else if let fatalError = writer.fatalError {
-      failAndStopOnQueue(error: fatalError, gapReason: "writer_append_failed")
+    } else {
+      if type == .audioApp, appendResult == .recordedDrop {
+        trackedAppAudioDropCount += 1
+      }
+      if type == .audioApp, appendResult == .fatalUnaccounted {
+        manifest.appAudioAppendAccountingComplete = false
+      }
+      if let fatalError = writer.fatalError {
+        let reason = fatalError.tacuaStableCode
+          == TacuaCaptureSpikeError.appAudioAccountingLimitExceeded.code
+          ? "app_audio_accounting_limit"
+          : "writer_append_failed"
+        failAndStopOnQueue(error: fatalError, gapReason: reason)
+      }
+    }
+  }
+
+  /// Extends the inclusive index lease durably before an index from that lease can be issued.
+  /// A crash may waste the uncommitted tail of a lease, but recovery will skip it rather than
+  /// assign the same logical-run identity to a different ReplayKit callback.
+  private func ensureAppAudioIndexReservationOnQueue() throws {
+    guard manifest.schemaVersion == 4 else { return }
+    let reservedThrough = manifest.appAudioAppendReservedThroughIndex ?? 0
+    guard nextAppAudioAppendAttemptIndex > reservedThrough else { return }
+    let remaining = TacuaAppAudioAppendAccounting.maximumAttempts
+      - nextAppAudioAppendAttemptIndex
+    guard remaining >= 0 else {
+      throw TacuaCaptureSpikeError.appAudioAccountingLimitExceeded
+    }
+    let extensionCount = min(
+      TacuaAppAudioAppendAccounting.reservationSize - 1,
+      remaining
+    )
+    let prior = manifest.appAudioAppendReservedThroughIndex
+    manifest.appAudioAppendReservedThroughIndex = nextAppAudioAppendAttemptIndex + extensionCount
+    do {
+      try persistManifest()
+    } catch {
+      manifest.appAudioAppendReservedThroughIndex = prior
+      throw error
     }
   }
 
@@ -1256,7 +1379,12 @@ final class TacuaCaptureSession {
       index: nextSegmentIndex,
       directory: directory,
       firstVideoSample: firstVideoSample,
-      hostUptimeSeconds: hostUptimeSeconds
+      hostUptimeSeconds: hostUptimeSeconds,
+      appAudioAppendAttemptStartIndex: nextAppAudioAppendAttemptIndex,
+      maximumTrackedAppAudioDrops: max(
+        0,
+        TacuaAppAudioAppendAccounting.maximumTrackedDrops - trackedAppAudioDropCount
+      )
     )
 #if TACUA_CAPTURE_FAULT_INJECTION
     nextWriter.configureFaultInjection(
@@ -1361,9 +1489,19 @@ final class TacuaCaptureSession {
               "byteLength": segment.byteLength,
               "durationSeconds": segment.durationSeconds,
               "heldVideoSamples": segment.heldVideoSamples ?? 0,
+              "appAudioAppendAttemptStartIndex": segment.appAudioAppendAttemptStartIndex
+                ?? NSNull(),
+              "appAudioAppendAttempts": segment.appAudioAppendAttempts ?? NSNull(),
+              "droppedAppAudioSamples": segment.droppedAppAudioSamples,
+              "appAudioAppendDrops": (segment.appAudioAppendDrops ?? []).map { drop in
+                ["attemptIndex": drop.attemptIndex, "cause": drop.cause] as [String: Any]
+              },
             ]
           )
         case .failure(let error):
+          if self.manifest.schemaVersion == 4 {
+            self.manifest.appAudioAppendAccountingComplete = false
+          }
           self.recordError(error.tacuaStableCode, gapReason: "segment_finalization_failed")
           if self.manifest.state == "recording", !self.isStopping {
             self.requestStopOnQueue(reason: "segment_finalization_failed")
@@ -1405,6 +1543,14 @@ final class TacuaCaptureSession {
     }
     if manifest.segments.isEmpty {
       appendErrorCode("ERR_TACUA_CAPTURE_NO_VERIFIED_SEGMENTS")
+    }
+    if manifest.schemaVersion == 4 {
+      // ReplayKit is stopped and every writer callback has settled. Unused indexes in the final
+      // lease were never issued, so the durable watermark can now be narrowed without reuse risk.
+      manifest.appAudioAppendReservedThroughIndex = max(
+        0,
+        nextAppAudioAppendAttemptIndex - 1
+      )
     }
     manifest.stoppedHostUptimeSeconds = ProcessInfo.processInfo.systemUptime
     manifest.state = TacuaCapturePolicy.terminalState(
@@ -1782,6 +1928,18 @@ final class TacuaCaptureSession {
       "microphoneSamplesObserved": manifest.microphoneSamplesObserved ?? 0,
       "appAudioSamplesObserved": manifest.appAudioSamplesObserved ?? 0,
       "appAudioAvailable": (manifest.appAudioSamplesObserved ?? 0) > 0,
+      "appAudioAppendAttemptsObserved": manifest.appAudioAppendAttemptsObserved ?? 0,
+      "droppedAppAudioAppendAttempts": trackedAppAudioDropCount,
+      "appAudioAppendAccountingComplete": manifest.appAudioAppendAccountingComplete ?? false,
+      "appAudioAppendAccountingVersion": manifest.appAudioAppendAccountingVersion ?? 0,
+      "appAudioAppendReservedThroughIndex": manifest.appAudioAppendReservedThroughIndex ?? 0,
+      "appAudioAppendUnknownRanges": (manifest.appAudioAppendUnknownRanges ?? []).map { range in
+        [
+          "startIndex": range.startIndex,
+          "endIndex": range.endIndex,
+          "reason": range.reason,
+        ] as [String: Any]
+      },
       "diagnosticEventCount": diagnosticEventCount,
       "diagnosticContainsCollectionGap": diagnosticContainsCollectionGap,
     ]
@@ -1943,7 +2101,7 @@ final class TacuaCaptureSession {
     }
   }
 
-  private static func markInterruptedStateIfNeeded(manifest: inout CaptureManifest) {
+  private static func markInterruptedStateIfNeeded(manifest: inout CaptureManifest) throws {
     let interruptedState = [
       "prepared",
       "recording",
@@ -1951,6 +2109,17 @@ final class TacuaCaptureSession {
       "stop_failed_capture_active",
       "start_cleanup_pending",
     ].contains(manifest.state)
+    if manifest.schemaVersion == 4,
+      interruptedState || manifest.appAudioAppendAccountingComplete != true
+    {
+      guard manifest.appAudioAppendAccountingVersion
+        == TacuaAppAudioAppendAccounting.version
+      else { throw TacuaAppAudioAppendAccountingError.legacyFieldsMissing }
+      _ = try prepareSchema4AppAudioRecovery(
+        manifest: &manifest,
+        accounting: appAudioAccountingSegments(manifest.segments)
+      )
+    }
     guard interruptedState else { return }
     let code = "ERR_TACUA_CAPTURE_INTERRUPTED"
     if !manifest.errorCodes.contains(code) {
@@ -2085,11 +2254,89 @@ final class TacuaCaptureSession {
     return recovered
   }
 
+  /// Seals every crash-reserved hole around surviving sidecars as explicit unknown history. The
+  /// returned next index is strictly greater than every index the prior process could issue.
+  private static func prepareSchema4AppAudioRecovery(
+    manifest: inout CaptureManifest,
+    accounting: [TacuaAppAudioSegmentAccounting]
+  ) throws -> TacuaAppAudioAppendCoverage {
+    let existingUnknownRanges = manifest.appAudioAppendUnknownRanges ?? []
+    if manifest.appAudioAppendAccountingComplete == true, !existingUnknownRanges.isEmpty {
+      throw TacuaAppAudioAppendAccountingError.invalidUnknownRange
+    }
+    guard let reservedThrough = manifest.appAudioAppendReservedThroughIndex else {
+      throw TacuaAppAudioAppendAccountingError.legacyFieldsMissing
+    }
+    let unknownRanges = try TacuaAppAudioAppendAccounting.reconciledRecoveryUnknownRanges(
+      for: accounting,
+      existingUnknownRanges: existingUnknownRanges,
+      reservedThrough: reservedThrough
+    )
+    let coverage = try TacuaAppAudioAppendAccounting.validatedCoverage(
+      for: accounting,
+      unknownRanges: unknownRanges
+    )
+    manifest.appAudioAppendUnknownRanges = unknownRanges
+    manifest.appAudioAppendReservedThroughIndex = coverage.nextIndex - 1
+    manifest.appAudioAppendAttemptsObserved = coverage.actualAttemptCount
+    manifest.appAudioSamplesObserved = coverage.appendedCount
+    manifest.appAudioAppendAccountingComplete = false
+    return coverage
+  }
+
+  private static func appAudioAccountingSegments(
+    _ segments: [CaptureSegment]
+  ) -> [TacuaAppAudioSegmentAccounting] {
+    segments.map { segment in
+      TacuaAppAudioSegmentAccounting(
+        segmentIndex: segment.index,
+        attemptStartIndex: segment.appAudioAppendAttemptStartIndex,
+        attemptCount: segment.appAudioAppendAttempts,
+        appendedCount: segment.appAudioSamples,
+        droppedCount: segment.droppedAppAudioSamples,
+        drops: segment.appAudioAppendDrops
+      )
+    }
+  }
+
   private static func persist(manifest: CaptureManifest, to url: URL) throws {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     let data = try encoder.encode(manifest)
-    try data.write(to: url, options: [.atomic, .completeFileProtectionUnlessOpen])
+    let directory = url.deletingLastPathComponent()
+    let temporary = directory.appendingPathComponent(
+      ".\(url.lastPathComponent).\(UUID().uuidString).tmp"
+    )
+    var published = false
+    defer {
+      if !published { try? FileManager.default.removeItem(at: temporary) }
+    }
+    try data.write(to: temporary, options: [.completeFileProtectionUnlessOpen])
+    let fileDescriptor = open(temporary.path, O_RDONLY | O_CLOEXEC)
+    guard fileDescriptor >= 0 else {
+      throw TacuaCaptureSpikeError.storageIO("Tacua could not open its staged manifest.")
+    }
+    defer { close(fileDescriptor) }
+    guard fsync(fileDescriptor) == 0 else {
+      throw TacuaCaptureSpikeError.storageIO("Tacua could not synchronize its staged manifest.")
+    }
+    let renameResult = temporary.path.withCString { temporaryPath in
+      url.path.withCString { manifestPath in
+        Darwin.rename(temporaryPath, manifestPath)
+      }
+    }
+    guard renameResult == 0 else {
+      throw TacuaCaptureSpikeError.storageIO("Tacua could not atomically publish its manifest.")
+    }
+    published = true
+    let directoryDescriptor = open(directory.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+    guard directoryDescriptor >= 0 else {
+      throw TacuaCaptureSpikeError.storageIO("Tacua could not open its manifest directory.")
+    }
+    defer { close(directoryDescriptor) }
+    guard fsync(directoryDescriptor) == 0 else {
+      throw TacuaCaptureSpikeError.storageIO("Tacua could not synchronize its manifest directory.")
+    }
   }
 
   private static func sha256(url: URL) throws -> String {

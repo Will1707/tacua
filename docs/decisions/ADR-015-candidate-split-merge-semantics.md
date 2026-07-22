@@ -2,8 +2,9 @@
 
 # ADR-015: reviewer candidate split and merge semantics
 
-- Status: proposed — product decision required
+- Status: accepted
 - Date: 2026-07-22
+- Accepted by: product owner
 - Scope: Tacua V1 candidate review
 
 ## Context
@@ -26,9 +27,9 @@ The standalone contract can validate the shape of parent references, but only
 the backend can prove that they identify exact, current, same-scope stored
 versions.
 
-## Fixed preparation
+## Fixed invariants
 
-Regardless of the final operation semantics:
+The accepted operation semantics preserve these pre-existing invariants:
 
 - `split` and `merged` creation is a human review action; a system or model actor
   is rejected by both authoritative candidate validators;
@@ -40,11 +41,12 @@ Regardless of the final operation semantics:
 - all parent counts, identifiers, versions, digests, request sizes, canonical
   JSON, idempotency, and stale-head preconditions fail closed.
 
-These rules do not decide the source disposition or evidence-union behavior.
+The decision below additionally fixes source disposition and evidence-union
+behavior.
 
-## Recommended decision
+## Decision
 
-Accept **atomic replacement with an external supersession projection** for V1:
+Use **atomic replacement with an external supersession projection** for V1:
 
 1. A split binds one exact current non-terminal source head and creates two
    through sixteen new draft candidates. Each result reuses the source's exact
@@ -78,14 +80,12 @@ Accept **atomic replacement with an external supersession projection** for V1:
    or agent-execution authority. Only the existing exact-version approval and
    handoff guards can grant a structural handoff.
 
-## Smallest remaining product decision
+## Decision record
 
-Accept or reject the recommended atomic-replacement semantics above. If it is
-rejected, the decision must instead state exactly one source disposition
-(`remain active`, `auto-reject`, a new candidate `superseded` state, or another
-named behavior) and one merge evidence rule (`exact union`, `same-manifest only`,
-or another lossless rule). Backend endpoints and reviewer controls must remain
-absent until both are fixed.
+The product owner accepted the decision above on 2026-07-22. The portable
+candidate-replacement request/response contract, backend transaction, and
+reviewer controls must implement these semantics without weakening the frozen
+ticket-candidate contract or treating supersession as approval.
 
 ## Alternatives considered
 

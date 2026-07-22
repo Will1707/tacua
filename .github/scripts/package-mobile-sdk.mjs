@@ -34,6 +34,7 @@ const allowedRuntimePaths = new Set([
   "README.md",
   "app.plugin.js",
   "expo-module.config.json",
+  "ios/AppAudioAppendAccounting.swift",
   "ios/CaptureFaultInjection.swift",
   "ios/CaptureModels.swift",
   "ios/CapturePolicy.swift",

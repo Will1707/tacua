@@ -18,6 +18,8 @@
     "json_artifact_digest",
     "markdown_artifact_digest",
     "registry_assertion_digest",
+    "execution_assertion_digest",
+    "execution_revocations_digest",
     "consumer",
     "started_at",
     "completed_at",
@@ -44,6 +46,8 @@
     "json_artifact_digest": { "$ref": "#/$defs/digest" },
     "markdown_artifact_digest": { "$ref": "#/$defs/digest" },
     "registry_assertion_digest": { "$ref": "#/$defs/digest" },
+    "execution_assertion_digest": { "$ref": "#/$defs/digest" },
+    "execution_revocations_digest": { "$ref": "#/$defs/digest" },
     "consumer": { "$ref": "#/$defs/consumer" },
     "started_at": { "$ref": "#/$defs/timestamp" },
     "completed_at": { "$ref": "#/$defs/timestamp" },
@@ -96,7 +100,7 @@
       "additionalProperties": false,
       "required": ["agent_name", "agent_version", "model_id"],
       "properties": {
-        "agent_name": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "agent_name": { "const": "openai_codex" },
         "agent_version": { "type": "string", "minLength": 1, "maxLength": 64 },
         "model_id": { "type": "string", "minLength": 1, "maxLength": 128 }
       }

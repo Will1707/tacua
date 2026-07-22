@@ -1318,12 +1318,16 @@ enum TacuaSDKBackendProtocol {
     let sessionID = try identifier(request, "session_id")
     let scopeDigest = try digest(request, "scope_digest")
     let manifestValue = try required(request, "capture_manifest")
-    let manifest = try exactObject(manifestValue, keys: [
+    let manifest = try object(manifestValue)
+    let legacyManifestKeys: Set<String> = [
       "contract_version", "media_type", "manifest_version", "organization_id", "project_id",
       "build_id", "build_identity_digest", "session_id", "capture_scope", "started_at",
       "ended_at", "monotonic_duration_ms", "capture_state", "streams", "segments", "gaps",
       "upload", "retention", "manifest_digest",
-    ])
+    ]
+    guard Set(manifest.keys) == legacyManifestKeys
+      || Set(manifest.keys) == legacyManifestKeys.union(["app_audio_accounting"])
+    else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
     try validateArtifactDigest(manifestValue, field: "manifest_digest")
     try constant(manifest, "contract_version", "tacua.capture-upload-manifest@1.0.0")
     try constant(
@@ -1424,6 +1428,9 @@ enum TacuaSDKBackendProtocol {
     guard !availableSegments.isEmpty else {
       throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
     }
+    try validateRuntimeAppAudioAccounting(
+      manifest["app_audio_accounting"], runtimeSegments: segmentValues
+    )
 
     let gapValues = try array(try required(manifest, "gaps"))
     guard gapValues.count <= 2_048 else {
@@ -1580,6 +1587,147 @@ enum TacuaSDKBackendProtocol {
       runtimeReceipt: runtimeValue,
       runtimeReceivedAt: try timestamp(runtime, "received_at")
     )
+  }
+
+  /// Validates the optional exact schema-4 app-audio projection shared by admission, queue replay,
+  /// and completion. A missing or null value is the truthful legacy schema-3 representation.
+  static func validateRuntimeAppAudioAccounting(
+    _ value: TacuaJSONValue?,
+    runtimeSegments: [TacuaJSONValue]
+  ) throws {
+    guard let value else { return }
+    if value == .null { return }
+    let accounting = try exactObject(value, keys: [
+      "append_attempts", "complete", "reserved_through_index", "segments",
+      "unknown_ranges", "version",
+    ])
+    guard try integer(accounting, "version") == 1,
+      let complete = accounting["complete"].flatMap({ candidate -> Bool? in
+        if case .bool(let result) = candidate { return result }
+        return nil
+      }),
+      let appendAttempts = accounting["append_attempts"]?.integerValue,
+      let reservedThroughIndex = accounting["reserved_through_index"]?.integerValue,
+      (0...10_000_000).contains(appendAttempts),
+      (0...10_000_000).contains(reservedThroughIndex)
+    else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+
+    let unknownValues = try array(try required(accounting, "unknown_ranges"))
+    guard unknownValues.count <= 2_048 else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+    var unknownRanges: [(start: Int64, end: Int64)] = []
+    unknownRanges.reserveCapacity(unknownValues.count)
+    var previousUnknownStart: Int64 = 0
+    var previousUnknownEnd: Int64 = 0
+    for (offset, unknownValue) in unknownValues.enumerated() {
+      let unknown = try exactObject(unknownValue, keys: [
+        "end_index", "reason", "start_index",
+      ])
+      let start = try integer(unknown, "start_index")
+      let end = try integer(unknown, "end_index")
+      guard (1...10_000_000).contains(start),
+        end >= start, end <= 10_000_000,
+        try string(unknown, "reason") == "process_recovery_reservation",
+        offset == 0 || start > previousUnknownStart
+          || (start == previousUnknownStart && end > previousUnknownEnd)
+      else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+      unknownRanges.append((start: start, end: end))
+      previousUnknownStart = start
+      previousUnknownEnd = end
+    }
+    guard complete == unknownRanges.isEmpty else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+
+    var availableBindings: [String] = []
+    for runtimeValue in runtimeSegments {
+      let runtime = try object(runtimeValue)
+      if try string(runtime, "availability") == "available" {
+        availableBindings.append(
+          "\(try identifier(runtime, "segment_id")):\(try integer(runtime, "sequence"))"
+        )
+      }
+    }
+
+    let segmentValues = try array(try required(accounting, "segments"))
+    guard segmentValues.count <= 2_048 else {
+      throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+    }
+    var accountingBindings: [String] = []
+    accountingBindings.reserveCapacity(segmentValues.count)
+    var nextIndex: Int64 = 1
+    var unknownOffset = 0
+    var actualAttempts: Int64 = 0
+    var totalDrops = 0
+    var seenDropIndexes = Set<Int64>()
+    let allowedCauses: Set<String> = [
+      "sample_data_not_ready", "writer_finished", "writer_not_writing",
+      "timestamp_invalid", "input_backpressure", "append_rejected",
+    ]
+
+    func consumeUnknownRanges(before limit: Int64) throws {
+      while unknownOffset < unknownRanges.count {
+        let range = unknownRanges[unknownOffset]
+        guard range.start >= nextIndex else {
+          throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+        }
+        guard range.start == nextIndex else { return }
+        guard range.end < limit else { return }
+        nextIndex = range.end + 1
+        unknownOffset += 1
+      }
+    }
+
+    for segmentValue in segmentValues {
+      let segment = try exactObject(segmentValue, keys: [
+        "append_attempts", "appended_samples", "attempt_start_index", "drops",
+        "segment_id", "sequence",
+      ])
+      let segmentID = try identifier(segment, "segment_id")
+      let sequence = try integer(segment, "sequence")
+      guard (0...2_047).contains(sequence) else {
+        throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact
+      }
+      accountingBindings.append("\(segmentID):\(sequence)")
+      let start = try integer(segment, "attempt_start_index")
+      let attempts = try integer(segment, "append_attempts")
+      let appended = try integer(segment, "appended_samples")
+      guard (1...10_000_000).contains(start),
+        (0...10_000_000).contains(attempts),
+        (0...10_000_000).contains(appended)
+      else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+      try consumeUnknownRanges(before: start)
+      guard start == nextIndex,
+        attempts <= 10_000_000 - (start - 1)
+      else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+      let endExclusive = start + attempts
+      let dropValues = try array(try required(segment, "drops"))
+      guard dropValues.count <= 2_048,
+        appended + Int64(dropValues.count) == attempts,
+        totalDrops <= 2_048 - dropValues.count
+      else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+      var previousDropIndex: Int64 = 0
+      for dropValue in dropValues {
+        let drop = try exactObject(dropValue, keys: ["attempt_index", "cause"])
+        let dropIndex = try integer(drop, "attempt_index")
+        guard start <= dropIndex, dropIndex < endExclusive,
+          dropIndex > previousDropIndex,
+          seenDropIndexes.insert(dropIndex).inserted,
+          allowedCauses.contains(try string(drop, "cause"))
+        else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
+        previousDropIndex = dropIndex
+      }
+      totalDrops += dropValues.count
+      actualAttempts += attempts
+      nextIndex = endExclusive
+    }
+    try consumeUnknownRanges(before: 10_000_001)
+    guard accountingBindings == availableBindings,
+      unknownOffset == unknownRanges.count,
+      reservedThroughIndex == nextIndex - 1,
+      appendAttempts == actualAttempts
+    else { throw TacuaSDKBackendProtocolError.invalidRuntimeArtifact }
   }
 
   private static func validateRuntimeReceipt(_ value: TacuaJSONValue) throws

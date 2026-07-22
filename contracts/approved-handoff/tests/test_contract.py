@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -16,18 +17,25 @@ sys.path.insert(0, str(ROOT / "src"))
 from handoff_contract import (  # noqa: E402
     TICKET_CANDIDATE,
     ContractError,
+    MAX_SAFE_INTEGER,
     canonical_json,
+    issue_execution_assertion,
+    load_execution_key,
     load_json,
     load_registry_key,
     parse_source_candidate,
     project_source_candidate_ticket,
     render_markdown,
+    seal_build_identity,
     seal_handoff,
+    seal_execution_assertion,
+    seal_execution_revocations,
     seal_registry_assertion,
     seal_trial,
     validate_build_identity,
     validate_authority,
     validate_evidence_manifest,
+    validate_execution_authorization,
     validate_handoff,
     validate_markdown,
     validate_registry_assertion,
@@ -69,6 +77,9 @@ class ContractFixtureMixin:
         )
         cls.assertion = load_json(POSITIVE / "registry-assertion.json", require_canonical=True)
         cls.registry_key = load_registry_key(POSITIVE / "registry-key.synthetic.hex")
+        cls.execution_assertion = load_json(POSITIVE / "execution-assertion.json", require_canonical=True)
+        cls.execution_revocations = load_json(POSITIVE / "execution-revocations.json", require_canonical=True)
+        cls.execution_key = load_execution_key(POSITIVE / "execution-key.synthetic.hex")
         cls.trial = load_json(POSITIVE / "agent-trial.json", require_canonical=True)
         cls.markdown = (POSITIVE / "approved-handoff.md").read_text(encoding="utf-8")
 
@@ -78,6 +89,10 @@ class ContractFixtureMixin:
             assertion or self.assertion,
             self.registry_key,
             POSITIVE / "registry-key.synthetic.hex",
+            self.execution_assertion,
+            self.execution_revocations,
+            self.execution_key,
+            POSITIVE / "execution-key.synthetic.hex",
         )
 
     def validate_trial_fixture(self, trial: dict) -> None:
@@ -87,6 +102,9 @@ class ContractFixtureMixin:
             self.markdown,
             registry_assertion=self.assertion,
             registry_key=self.registry_key,
+            execution_assertion=self.execution_assertion,
+            execution_revocations=self.execution_revocations,
+            execution_key=self.execution_key,
             json_artifact_bytes=self.handoff_path.read_bytes(),
         )
 
@@ -100,6 +118,8 @@ class PositiveContractTests(ContractFixtureMixin, unittest.TestCase):
             "approved-handoff.schema.json",
             "agent-trial.schema.json",
             "registry-assertion.schema.json",
+            "execution-assertion.schema.json",
+            "execution-revocations.schema.json",
         }
         for name in schema_names:
             schema = json.loads((ROOT / "schemas" / name).read_text(encoding="utf-8"))
@@ -183,6 +203,10 @@ class PositiveContractTests(ContractFixtureMixin, unittest.TestCase):
 
     def test_canonical_json_has_sorted_keys_and_no_insignificant_space(self) -> None:
         self.assertTrue(canonical_json({"z": 1, "a": 2}).startswith('{"a":2,"z":1}'))
+        for invalid in ({"value": 1.5}, {"value": MAX_SAFE_INTEGER + 1}):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ContractError):
+                    canonical_json(invalid)
 
     def test_first_approved_export_preserves_later_candidate_version(self) -> None:
         self.assertGreater(self.handoff["ticket"]["ticket_version"], 1)
@@ -202,7 +226,11 @@ class NegativeFixtureTests(ContractFixtureMixin, unittest.TestCase):
         for path in fixture_paths:
             with self.subTest(path=path.name):
                 descriptor = json.loads(path.read_text(encoding="utf-8"))
-                candidate = mutate(self.handoff, descriptor)
+                try:
+                    candidate = mutate(self.handoff, descriptor)
+                except ContractError as error:
+                    self.assertEqual(descriptor["expected_error"], error.code)
+                    continue
                 with self.assertRaises(ContractError) as raised:
                     if descriptor["expected_error"] == "STALE_HANDOFF":
                         self.validate_executable(candidate)
@@ -233,6 +261,24 @@ class NegativeFixtureTests(ContractFixtureMixin, unittest.TestCase):
         missing_source = seal_registry_assertion(missing_source, self.registry_key)
         cases.append((missing_source, "UNTRUSTED_EVIDENCE_SOURCE", TRUST_TIME))
 
+        extra_source = copy.deepcopy(self.assertion)
+        extra_source["authorized_sources"].append(
+            {
+                "component": "repository",
+                "source_id": "repo-unrelated-synthetic",
+                "snapshot_revision": "fedcba9876543210fedcba9876543210fedcba98",
+            }
+        )
+        extra_source["authorized_sources"].sort(
+            key=lambda source: (
+                source["component"],
+                source["source_id"],
+                source["snapshot_revision"],
+            )
+        )
+        extra_source = seal_registry_assertion(extra_source, self.registry_key)
+        cases.append((extra_source, "UNTRUSTED_EVIDENCE_SOURCE", TRUST_TIME))
+
         long_lived = copy.deepcopy(self.assertion)
         long_lived["expires_at"] = "2026-07-22T10:16:01Z"
         long_lived = seal_registry_assertion(long_lived, self.registry_key)
@@ -251,6 +297,143 @@ class NegativeFixtureTests(ContractFixtureMixin, unittest.TestCase):
                     )
                 self.assertEqual(expected, raised.exception.code)
 
+    def test_registry_and_execution_authorities_require_distinct_key_ids_and_material(self) -> None:
+        reused_key_id = copy.deepcopy(self.assertion)
+        reused_key_id["execution_authority"]["key_id"] = reused_key_id["signature"]["key_id"]
+        reused_key_id = seal_registry_assertion(reused_key_id, self.registry_key)
+        with self.assertRaises(ContractError) as raised:
+            validate_registry_assertion(
+                reused_key_id,
+                self.registry_key,
+                self.handoff,
+                at_time=TRUST_TIME,
+            )
+        self.assertEqual("TRUST_KEY_ID_REUSE", raised.exception.code)
+
+        with self.assertRaises(ContractError) as raised:
+            validate_handoff(
+                self.handoff,
+                executable=True,
+                registry_assertion=self.assertion,
+                registry_key=self.registry_key,
+                execution_assertion=self.execution_assertion,
+                execution_revocations=self.execution_revocations,
+                execution_key=self.registry_key,
+            )
+        self.assertEqual("TRUST_KEY_MATERIAL_REUSE", raised.exception.code)
+
+        issue_arguments = {
+            "assertion_id": "execution-synthetic-separation-test",
+            "instance_id": "codex-task-synthetic-separation-test",
+            "nonce": "c3ludGhldGljLXNlcGFyYXRpb24tdGVzdA",
+            "issued_at": TRUST_TIME,
+            "lifetime_seconds": 60,
+        }
+        with self.assertRaises(ContractError) as raised:
+            issue_execution_assertion(
+                self.handoff,
+                reused_key_id,
+                self.registry_key,
+                self.execution_key,
+                **issue_arguments,
+            )
+        self.assertEqual("TRUST_KEY_ID_REUSE", raised.exception.code)
+        with self.assertRaises(ContractError) as raised:
+            issue_execution_assertion(
+                self.handoff,
+                self.assertion,
+                self.registry_key,
+                self.registry_key,
+                **issue_arguments,
+            )
+        self.assertEqual("TRUST_KEY_MATERIAL_REUSE", raised.exception.code)
+
+    def test_execution_issuance_authenticates_current_registry_and_structural_handoff(self) -> None:
+        issue_arguments = {
+            "assertion_id": "execution-synthetic-issuance-test",
+            "instance_id": "codex-task-synthetic-issuance-test",
+            "nonce": "c3ludGhldGljLWlzc3VhbmNlLXRlc3Q",
+            "issued_at": TRUST_TIME,
+            "lifetime_seconds": 60,
+        }
+        cases = []
+
+        forged_signature = copy.deepcopy(self.assertion)
+        forged_signature["signature"]["value"] = "hmac-sha256:" + "0" * 64
+        cases.append((self.handoff, forged_signature, TRUST_TIME, "REGISTRY_SIGNATURE_MISMATCH"))
+
+        wrong_scope = copy.deepcopy(self.assertion)
+        wrong_scope["project_id"] = "project-foreign-synthetic"
+        wrong_scope = seal_registry_assertion(wrong_scope, self.registry_key)
+        cases.append((self.handoff, wrong_scope, TRUST_TIME, "REGISTRY_ASSERTION_SCOPE_MISMATCH"))
+
+        cases.append(
+            (
+                self.handoff,
+                self.assertion,
+                datetime(2028, 1, 1, tzinfo=timezone.utc),
+                "REGISTRY_ASSERTION_EXPIRED",
+            )
+        )
+
+        malformed_handoff = copy.deepcopy(self.handoff)
+        malformed_handoff["ticket"]["ticket_id"] = "ticket-forged-synthetic"
+        cases.append((malformed_handoff, self.assertion, TRUST_TIME, "DIGEST_MISMATCH"))
+
+        for handoff, registry_assertion, issued_at, expected in cases:
+            with self.subTest(expected=expected):
+                with self.assertRaises(ContractError) as raised:
+                    issue_execution_assertion(
+                        handoff,
+                        registry_assertion,
+                        self.registry_key,
+                        self.execution_key,
+                        **{**issue_arguments, "issued_at": issued_at},
+                    )
+                self.assertEqual(expected, raised.exception.code)
+
+    def test_execution_repository_ids_bind_exactly_one_immutable_revision(self) -> None:
+        for conflicting_revision in (False, True):
+            build = copy.deepcopy(self.build)
+            duplicate = copy.deepcopy(build["backend"]["sources"][0])
+            if conflicting_revision:
+                duplicate["revision"] = "fedcba9876543210fedcba9876543210fedcba98"
+            build["backend"]["sources"].append(duplicate)
+            build = seal_build_identity(build)
+            with self.subTest(location="build", conflicting=conflicting_revision):
+                with self.assertRaises(ContractError) as raised:
+                    validate_build_identity(build)
+                self.assertIn(
+                    raised.exception.code,
+                    {"DUPLICATE_REPOSITORY_ID", "SCHEMA_UNIQUE_ITEMS"},
+                )
+
+        for conflicting_revision in (False, True):
+            assertion = copy.deepcopy(self.execution_assertion)
+            duplicate = copy.deepcopy(assertion["repositories"][0])
+            if conflicting_revision:
+                duplicate["revision"] = "fedcba9876543210fedcba9876543210fedcba98"
+            assertion["repositories"].append(duplicate)
+            assertion["repositories"].sort(
+                key=lambda item: (item["repository_id"], item["revision"])
+            )
+            assertion = seal_execution_assertion(assertion, self.execution_key)
+            with self.subTest(location="assertion", conflicting=conflicting_revision):
+                with self.assertRaises(ContractError) as raised:
+                    validate_execution_authorization(
+                        assertion,
+                        self.execution_revocations,
+                        self.execution_key,
+                        self.assertion,
+                        self.handoff,
+                        registry_key=self.registry_key,
+                        at_time=TRUST_TIME,
+                    )
+                self.assertIn(
+                    raised.exception.code,
+                    {"DUPLICATE_REPOSITORY_ID", "SCHEMA_UNIQUE_ITEMS"},
+                )
+
     def test_fixture_clock_is_restricted_and_real_executable_api_has_no_clock_override(self) -> None:
         non_synthetic = copy.deepcopy(self.assertion)
         non_synthetic["issuer_id"] = "registry-production-001"
@@ -261,6 +444,10 @@ class NegativeFixtureTests(ContractFixtureMixin, unittest.TestCase):
                 non_synthetic,
                 self.registry_key,
                 POSITIVE / "registry-key.synthetic.hex",
+                self.execution_assertion,
+                self.execution_revocations,
+                self.execution_key,
+                POSITIVE / "execution-key.synthetic.hex",
             )
         self.assertEqual("SYNTHETIC_FIXTURE_IDENTITY_REQUIRED", raised.exception.code)
 
@@ -270,8 +457,67 @@ class NegativeFixtureTests(ContractFixtureMixin, unittest.TestCase):
                 self.assertion,
                 self.registry_key,
                 POSITIVE / "production-key.hex",
+                self.execution_assertion,
+                self.execution_revocations,
+                self.execution_key,
+                POSITIVE / "execution-key.synthetic.hex",
             )
         self.assertEqual("SYNTHETIC_FIXTURE_IDENTITY_REQUIRED", raised.exception.code)
+
+    def test_codex_execution_assertion_scope_expiry_signature_and_revocation_are_required(self) -> None:
+        cases = []
+
+        wrong_build = copy.deepcopy(self.execution_assertion)
+        wrong_build["build_id"] = "build-foreign-synthetic"
+        wrong_build = seal_execution_assertion(wrong_build, self.execution_key)
+        cases.append((wrong_build, self.execution_revocations, "EXECUTION_SCOPE_MISMATCH"))
+
+        wrong_consumer = copy.deepcopy(self.execution_assertion)
+        wrong_consumer["consumer"]["agent"] = "other_agent"
+        wrong_consumer = seal_execution_assertion(wrong_consumer, self.execution_key)
+        cases.append((wrong_consumer, self.execution_revocations, "SCHEMA_CONST"))
+
+        too_long = copy.deepcopy(self.execution_assertion)
+        too_long["expires_at"] = "2026-07-20T11:15:01Z"
+        too_long = seal_execution_assertion(too_long, self.execution_key)
+        cases.append((too_long, self.execution_revocations, "EXECUTION_WINDOW_TOO_LONG"))
+
+        revoked = copy.deepcopy(self.execution_revocations)
+        revoked["revoked_nonces"] = [self.execution_assertion["nonce"]]
+        revoked = seal_execution_revocations(revoked, self.execution_key)
+        cases.append((self.execution_assertion, revoked, "EXECUTION_ASSERTION_REVOKED"))
+
+        bad_revocations = copy.deepcopy(self.execution_revocations)
+        bad_revocations["revoked_assertion_ids"] = ["execution-unrelated-001"]
+        cases.append((self.execution_assertion, bad_revocations, "REVOCATION_SIGNATURE_MISMATCH"))
+
+        for assertion, revocations, expected in cases:
+            with self.subTest(expected=expected):
+                with self.assertRaises(ContractError) as raised:
+                    validate_execution_authorization(
+                        assertion,
+                        revocations,
+                        self.execution_key,
+                        self.assertion,
+                        self.handoff,
+                        registry_key=self.registry_key,
+                        at_time=TRUST_TIME,
+                    )
+                self.assertEqual(expected, raised.exception.code)
+
+        forged_registry = copy.deepcopy(self.assertion)
+        forged_registry["signature"]["value"] = "hmac-sha256:" + "0" * 64
+        with self.assertRaises(ContractError) as raised:
+            validate_execution_authorization(
+                self.execution_assertion,
+                self.execution_revocations,
+                self.execution_key,
+                forged_registry,
+                self.handoff,
+                registry_key=self.registry_key,
+                at_time=TRUST_TIME,
+            )
+        self.assertEqual("REGISTRY_SIGNATURE_MISMATCH", raised.exception.code)
 
         with self.assertRaises(TypeError):
             validate_handoff(
@@ -291,7 +537,105 @@ class NegativeFixtureTests(ContractFixtureMixin, unittest.TestCase):
         validate_handoff(forged, executable=False)
         with self.assertRaises(ContractError) as raised:
             validate_handoff(forged, executable=True)
-        self.assertEqual("TRUST_INPUT_REQUIRED", raised.exception.code)
+            self.assertEqual("TRUST_INPUT_REQUIRED", raised.exception.code)
+
+    def test_expiry_is_exclusive_for_every_execution_trust_artifact_and_trial(self) -> None:
+        registry_expiry = datetime(2026, 7, 21, 10, 16, 1, tzinfo=timezone.utc)
+        with self.assertRaises(ContractError) as raised:
+            validate_registry_assertion(
+                self.assertion,
+                self.registry_key,
+                self.handoff,
+                at_time=registry_expiry,
+            )
+        self.assertEqual("REGISTRY_ASSERTION_EXPIRED", raised.exception.code)
+
+        execution_expiry = datetime(2026, 7, 20, 11, 14, 0, tzinfo=timezone.utc)
+        with self.assertRaises(ContractError) as raised:
+            validate_execution_authorization(
+                self.execution_assertion,
+                self.execution_revocations,
+                self.execution_key,
+                self.assertion,
+                self.handoff,
+                registry_key=self.registry_key,
+                at_time=execution_expiry,
+            )
+        self.assertEqual("EXECUTION_ASSERTION_EXPIRED", raised.exception.code)
+
+        early_expiry_revocations = copy.deepcopy(self.execution_revocations)
+        early_expiry_revocations["expires_at"] = "2026-07-20T11:01:00Z"
+        early_expiry_revocations = seal_execution_revocations(
+            early_expiry_revocations,
+            self.execution_key,
+        )
+        with self.assertRaises(ContractError) as raised:
+            validate_execution_authorization(
+                self.execution_assertion,
+                early_expiry_revocations,
+                self.execution_key,
+                self.assertion,
+                self.handoff,
+                registry_key=self.registry_key,
+                at_time=datetime(2026, 7, 20, 11, 1, 0, tzinfo=timezone.utc),
+            )
+        self.assertEqual("REVOCATION_LIST_EXPIRED", raised.exception.code)
+
+        trial = copy.deepcopy(self.trial)
+        trial["completed_at"] = self.execution_assertion["expires_at"]
+        trial["acceptance"]["decided_at"] = self.execution_assertion["expires_at"]
+        trial = seal_trial(trial)
+        with self.assertRaises(ContractError) as raised:
+            self.validate_trial_fixture(trial)
+        self.assertEqual("TRIAL_OUTLIVES_EXECUTION_AUTHORIZATION", raised.exception.code)
+
+    def test_registry_and_issuance_reject_a_handoff_already_marked_superseded(self) -> None:
+        handoff = copy.deepcopy(self.handoff)
+        handoff["supersession"]["status"] = "superseded"
+        handoff["supersession"]["superseded_by_handoff_digest"] = "sha256:" + "f" * 64
+        handoff = seal_handoff(handoff)
+        assertion = copy.deepcopy(self.assertion)
+        assertion["current_handoff_digest"] = handoff["handoff_digest"]
+        assertion = seal_registry_assertion(assertion, self.registry_key)
+
+        with self.assertRaises(ContractError) as raised:
+            validate_registry_assertion(
+                assertion,
+                self.registry_key,
+                handoff,
+                at_time=TRUST_TIME,
+            )
+        self.assertEqual("STALE_HANDOFF", raised.exception.code)
+        with self.assertRaises(ContractError) as raised:
+            issue_execution_assertion(
+                handoff,
+                assertion,
+                self.registry_key,
+                self.execution_key,
+                assertion_id="execution-stale-test",
+                instance_id="codex-stale-test",
+                nonce="c3RhbGUtaGFuZG9mZi10ZXN0",
+                issued_at=TRUST_TIME,
+                lifetime_seconds=60,
+            )
+        self.assertEqual("STALE_HANDOFF", raised.exception.code)
+
+    def test_execution_issuance_requires_an_integer_lifetime(self) -> None:
+        for invalid in (True, 1.5):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ContractError) as raised:
+                    issue_execution_assertion(
+                        self.handoff,
+                        self.assertion,
+                        self.registry_key,
+                        self.execution_key,
+                        assertion_id="execution-lifetime-test",
+                        instance_id="codex-lifetime-test",
+                        nonce="aW52YWxpZC1saWZldGltZS10ZXN0",
+                        issued_at=TRUST_TIME,
+                        lifetime_seconds=invalid,
+                    )
+                self.assertEqual("INVALID_EXECUTION_LIFETIME", raised.exception.code)
 
     def test_duplicate_keys_and_noncanonical_download_bytes_are_rejected(self) -> None:
         canonical = self.handoff_path.read_text(encoding="utf-8")
@@ -312,6 +656,94 @@ class NegativeFixtureTests(ContractFixtureMixin, unittest.TestCase):
             with self.assertRaises(ContractError) as raised:
                 load_json(noncanonical_path, require_canonical=True)
             self.assertEqual("NON_CANONICAL_JSON_ARTIFACT", raised.exception.code)
+
+            non_finite_path = Path(directory) / "non-finite.json"
+            non_finite_path.write_text('{"value":NaN}', encoding="utf-8")
+            for require_canonical in (False, True):
+                with self.subTest(require_canonical=require_canonical):
+                    with self.assertRaises(ContractError) as raised:
+                        load_json(non_finite_path, require_canonical=require_canonical)
+                    self.assertEqual("NON_FINITE_JSON_NUMBER", raised.exception.code)
+
+            for filename, contents in (
+                ("finite-float.json", '{"value":1.5}'),
+                ("overflow-float.json", '{"value":1e309}'),
+            ):
+                float_path = Path(directory) / filename
+                float_path.write_text(contents, encoding="utf-8")
+                for require_canonical in (False, True):
+                    with self.subTest(filename=filename, require_canonical=require_canonical):
+                        with self.assertRaises(ContractError) as raised:
+                            load_json(float_path, require_canonical=require_canonical)
+                        self.assertEqual("FLOAT_FORBIDDEN", raised.exception.code)
+
+            cli = ROOT / "scripts" / "handoff.py"
+            commands = [
+                ["validate", str(non_finite_path)],
+                [
+                    "validate-executable",
+                    str(non_finite_path),
+                    "--markdown",
+                    str(POSITIVE / "approved-handoff.md"),
+                    "--registry-assertion",
+                    str(POSITIVE / "registry-assertion.json"),
+                    "--registry-key-file",
+                    str(POSITIVE / "registry-key.synthetic.hex"),
+                    "--execution-assertion",
+                    str(POSITIVE / "execution-assertion.json"),
+                    "--execution-revocations",
+                    str(POSITIVE / "execution-revocations.json"),
+                    "--execution-key-file",
+                    str(POSITIVE / "execution-key.synthetic.hex"),
+                ],
+                [
+                    "issue-execution",
+                    str(non_finite_path),
+                    "--registry-assertion",
+                    str(POSITIVE / "registry-assertion.json"),
+                    "--registry-key-file",
+                    str(POSITIVE / "registry-key.synthetic.hex"),
+                    "--execution-key-file",
+                    str(POSITIVE / "execution-key.synthetic.hex"),
+                    "--assertion-id",
+                    "execution-non-finite-test",
+                    "--instance-id",
+                    "codex-non-finite-test",
+                    "--nonce",
+                    "bm9uLWZpbml0ZS10ZXN0",
+                ],
+            ]
+            for arguments in commands:
+                with self.subTest(command=arguments[0]):
+                    result = subprocess.run(
+                        [sys.executable, "-B", str(cli), *arguments],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=10,
+                        check=False,
+                    )
+                    self.assertEqual(1, result.returncode)
+                    self.assertIn(b"NON_FINITE_JSON_NUMBER", result.stderr)
+                    self.assertNotIn(b"Traceback", result.stderr)
+
+            overflow_result = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(cli),
+                    "validate",
+                    str(Path(directory) / "overflow-float.json"),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(1, overflow_result.returncode)
+            self.assertIn(b"FLOAT_FORBIDDEN", overflow_result.stderr)
+            self.assertNotIn(b"Traceback", overflow_result.stderr)
 
     def test_missing_source_and_old_v1_0_documents_are_rejected(self) -> None:
         missing = copy.deepcopy(self.handoff)

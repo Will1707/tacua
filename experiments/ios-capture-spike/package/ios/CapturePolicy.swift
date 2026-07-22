@@ -11,6 +11,10 @@ enum TacuaCaptureGapInsertionDisposition: Equatable {
 
 enum TacuaCapturePolicy {
   static let maximumDurationSeconds: Double = 1_800
+  /// Admission timestamps are persisted after ReplayKit stop and writer-finalization callbacks.
+  /// The 30-minute media budget therefore needs the two 15-second watchdog envelopes plus one
+  /// second of conservative millisecond rounding/dispatch tolerance.
+  static let maximumAdmissionDurationMilliseconds: Int64 = 1_831_000
   /// The runtime envelope has 10,000 slots. Capture reserves one terminal-summary slot and one
   /// projection-overflow slot so a late manifest marker or gap can never make admission fail.
   static let maximumDiagnosticJournalEvents = 9_998
@@ -26,6 +30,10 @@ enum TacuaCapturePolicy {
   static let microphoneGapToleranceSeconds: Double = 3
   static let videoClockDiscontinuityToleranceSeconds: Double = 0.5
   static let requiredConsentVersion = "tacua-local-capture-consent-v1"
+
+  static func isAdmissionDurationValid(_ durationMilliseconds: Int64) -> Bool {
+    (0...maximumAdmissionDurationMilliseconds).contains(durationMilliseconds)
+  }
 
   static func captureGapInsertionDisposition(
     existingCount: Int,
@@ -72,7 +80,7 @@ enum TacuaCapturePolicy {
     storedBootSessionID: String?,
     currentBootSessionID: String
   ) -> Bool {
-    schemaVersion == 3
+    (schemaVersion == 3 || schemaVersion == 4)
       && !currentBootSessionID.isEmpty
       && storedBootSessionID == currentBootSessionID
   }

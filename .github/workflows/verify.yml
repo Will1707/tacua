@@ -46,8 +46,13 @@ jobs:
           python3 -B scripts/handoff.py validate fixtures/positive/approved-handoff.json --markdown fixtures/positive/approved-handoff.md
           python3 -B scripts/handoff.py validate-executable-fixture
           python3 -B scripts/handoff.py verify fixtures/positive/approved-handoff.json fixtures/positive/approved-handoff.md
-          python3 -B scripts/handoff.py validate-trial fixtures/positive/agent-trial.json fixtures/positive/approved-handoff.json fixtures/positive/approved-handoff.md --registry-assertion fixtures/positive/registry-assertion.json --registry-key-file fixtures/positive/registry-key.synthetic.hex
+          python3 -B scripts/handoff.py validate-trial fixtures/positive/agent-trial.json fixtures/positive/approved-handoff.json fixtures/positive/approved-handoff.md --registry-assertion fixtures/positive/registry-assertion.json --registry-key-file fixtures/positive/registry-key.synthetic.hex --execution-assertion fixtures/positive/execution-assertion.json --execution-revocations fixtures/positive/execution-revocations.json --execution-key-file fixtures/positive/execution-key.synthetic.hex
           python3 -B -m unittest discover -s tests -v
+
+      - name: Validate the V1 app-audio acceptance gate
+        run: |
+          python3 -B experiments/ios-capture-spike/scripts/validate_app_audio_acceptance.py experiments/ios-capture-spike/fixtures/app-audio-acceptance/synthetic-passing.json --conformance
+          python3 -B -m unittest discover -s experiments/ios-capture-spike/tests -p 'test_app_audio_acceptance*.py' -v
 
       - name: Validate runtime contract candidates
         working-directory: contracts/runtime
@@ -69,6 +74,15 @@ jobs:
 
       - name: Validate the pilot backend boundary
         run: PYTHONWARNINGS=error python3 -B -m unittest discover -s services/backend/tests -v
+
+      - name: Resolve and verify the isolated private-pilot processor profile
+        env:
+          TACUA_PROCESSOR_IMAGE: registry.invalid/tacua-processor@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          TACUA_PROCESSOR_MODEL_ID: synthetic-ci-model
+          TACUA_PROCESSOR_EXECUTABLE: /opt/tacua/processor
+        run: |
+          docker compose -f services/backend/compose.processor.yaml --profile private-pilot config --format json > "$RUNNER_TEMP/tacua-processor-compose.json"
+          python3 -B services/backend/scripts/verify_isolated_processor_profile.py "$RUNNER_TEMP/tacua-processor-compose.json"
 
       - name: Verify the sealed backend config example
         run: >-

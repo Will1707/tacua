@@ -27,6 +27,7 @@ enum CapturePolicyTests {
   static func main() throws {
     try boundedArtifactCapacity()
     try terminalClassification()
+    try admissionDurationEnvelope()
     try storageAndLifecycleAdmission()
     try sessionOriginSurvivesResume()
     try deadlineAndMicrophoneContinuity()
@@ -36,6 +37,17 @@ enum CapturePolicyTests {
     try candidateHandoffValidation()
     try deletionAuthorizationAndStopSafety()
     print("Tacua capture core policy tests passed")
+  }
+
+  private static func admissionDurationEnvelope() throws {
+    try expect(
+      TacuaCapturePolicy.isAdmissionDurationValid(1_831_000),
+      "The exact ReplayKit stop/finalization envelope was rejected"
+    )
+    try expect(
+      !TacuaCapturePolicy.isAdmissionDurationValid(1_831_001),
+      "A capture beyond the bounded stop/finalization envelope was admitted"
+    )
   }
 
   private static func boundedArtifactCapacity() throws {
@@ -110,6 +122,14 @@ enum CapturePolicyTests {
         currentBootSessionID: "boot_current"
       ),
       "Schema-3 capture from the current boot was not resumable"
+    )
+    try expect(
+      TacuaCapturePolicy.canResumeStoredSession(
+        schemaVersion: 4,
+        storedBootSessionID: "boot_current",
+        currentBootSessionID: "boot_current"
+      ),
+      "Schema-4 capture from the current boot was not resumable"
     )
     try expect(
       !TacuaCapturePolicy.canResumeStoredSession(

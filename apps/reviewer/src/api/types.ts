@@ -96,6 +96,49 @@ export type CandidatePage = {
   readonly next_cursor: string | null;
 };
 
+export type CandidateReplacementOperation = "split" | "merge";
+
+export type CandidateExactBinding = {
+  readonly candidate_id: string;
+  readonly candidate_version: number;
+  readonly candidate_digest: string;
+  readonly candidate_content_digest: string;
+  readonly evidence_manifest_digest: string;
+};
+
+export type CandidateReplacementDraft = {
+  readonly candidate_id: string;
+  readonly content: TicketCandidate["content"];
+};
+
+export type CandidateReplacementRequest = {
+  readonly operation: CandidateReplacementOperation;
+  readonly actor_id: string;
+  readonly reason: string;
+  readonly sources: readonly CandidateExactBinding[];
+  readonly results: readonly CandidateReplacementDraft[];
+};
+
+export type CandidateReplacementOperationProjection = {
+  readonly operation_id: string;
+  readonly operation: CandidateReplacementOperation;
+  readonly actor_id: string;
+  readonly occurred_at: string;
+  readonly sources: readonly CandidateExactBinding[];
+  readonly results: readonly CandidateExactBinding[];
+};
+
+export type CandidateReplacementResponse = {
+  readonly operation: CandidateReplacementOperationProjection;
+  readonly candidates: readonly TicketCandidate[];
+};
+
+export type CandidateSupersededDetails = {
+  readonly operation_id: string;
+  readonly operation: CandidateReplacementOperation;
+  readonly replacements: readonly CandidateExactBinding[];
+};
+
 export type RegisteredBuild = {
   readonly build_id: string;
   readonly application_id: string;

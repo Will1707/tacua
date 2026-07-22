@@ -17,6 +17,7 @@
     "current_handoff_digest",
     "registry_revision",
     "authorized_sources",
+    "execution_authority",
     "issued_at",
     "expires_at",
     "signature"
@@ -38,6 +39,24 @@
       "maxItems": 100,
       "uniqueItems": true,
       "items": { "$ref": "#/$defs/source" }
+    },
+    "execution_authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "consumer",
+        "issuer_id",
+        "key_id",
+        "revocation_list_id",
+        "revocation_revision"
+      ],
+      "properties": {
+        "consumer": { "const": "openai_codex" },
+        "issuer_id": { "$ref": "#/$defs/id" },
+        "key_id": { "$ref": "#/$defs/id" },
+        "revocation_list_id": { "$ref": "#/$defs/id" },
+        "revocation_revision": { "$ref": "#/$defs/id" }
+      }
     },
     "issued_at": { "$ref": "#/$defs/timestamp" },
     "expires_at": { "$ref": "#/$defs/timestamp" },

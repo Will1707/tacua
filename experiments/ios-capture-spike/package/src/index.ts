@@ -2,6 +2,9 @@
 
 import {
   TacuaCaptureSpikeModule,
+  type AppAudioAppendDrop,
+  type AppAudioAppendDropCause,
+  type AppAudioAppendUnknownRange,
   type ApprovedBackendLaunch,
   type BackendAdmitFinalizedCaptureOptions,
   type BackendBuildIdentity,
@@ -50,6 +53,9 @@ import {
 import { type EventSubscription } from "expo-modules-core";
 
 export type {
+  AppAudioAppendDrop,
+  AppAudioAppendDropCause,
+  AppAudioAppendUnknownRange,
   ApprovedBackendLaunch,
   BackendAdmitFinalizedCaptureOptions,
   BackendBuildIdentity,

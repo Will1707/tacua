@@ -29,6 +29,17 @@ def main() -> None:
         "started_at": "2026-07-21T10:00:00Z", "ended_at": "2026-07-21T10:01:00Z",
         "monotonic_duration_ms": 60000, "capture_scope": "app_only",
         "streams": {"app_video": "enabled", "app_audio": "enabled", "microphone": "enabled", "diagnostics": "enabled"},
+        "app_audio_accounting": {
+            "version": 1, "complete": True, "append_attempts": 4,
+            "reserved_through_index": 4,
+            "segments": [{
+                "segment_id": "segment_synthetic", "sequence": 0,
+                "attempt_start_index": 1, "append_attempts": 4,
+                "appended_samples": 3,
+                "drops": [{"attempt_index": 3, "cause": "input_backpressure"}],
+            }],
+            "unknown_ranges": [],
+        },
         "segments": [{
             "segment_id": "segment_synthetic", "sequence": 0,
             "time_range": {"start_ms": 0, "end_ms": 60000, "clock": "session_monotonic"},

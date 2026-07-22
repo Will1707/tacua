@@ -75,6 +75,12 @@ The validator checks the bundled Draft 2020-12 subset plus cross-artifact scope,
 
 For the V1 narrated-capture boundary, a `complete` capture must contain at
 least one verified media segment and declare the microphone stream enabled.
+The optional closed `app_audio_accounting` projection is `null` or absent for
+legacy schema-3 captures. Schema-4 admission binds every available runtime
+segment to its exact append-attempt range and ordered drop indexes/causes,
+records any ordered crash-reservation ranges, and seals the aggregate attempt
+total plus reserved high-watermark. Semantic validation requires those known
+and explicitly unknown ranges to cover every reserved index exactly once.
 Raw-media expiry must be after capture start and no later than 30 days after
 it; an operator may choose a shorter deployment policy. Receipt object IDs and
 receipt digests are unique within a manifest, and every direct or inferred

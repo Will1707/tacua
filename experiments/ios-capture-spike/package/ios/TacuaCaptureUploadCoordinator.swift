@@ -897,15 +897,19 @@ final class TacuaCaptureUploadCoordinator {
       sourceJournalDigest = digest
     }
 
-    let manifestSeedObject: [String: TacuaJSONValue]
-    do {
-      manifestSeedObject = try captureManifestSeed.requiringObject(keys: [
-        "build_id", "build_identity_digest", "capture_scope", "capture_state",
-        "contract_version", "ended_at", "gaps", "manifest_version", "media_type",
-        "monotonic_duration_ms", "organization_id", "project_id", "retention", "segments",
-        "session_id", "started_at", "streams",
-      ])
-    } catch { throw TacuaCaptureUploadError.admissionConflict }
+    guard let manifestSeedObject = captureManifestSeed.objectValue else {
+      throw TacuaCaptureUploadError.admissionConflict
+    }
+    let legacyManifestSeedKeys: Set<String> = [
+      "build_id", "build_identity_digest", "capture_scope", "capture_state",
+      "contract_version", "ended_at", "gaps", "manifest_version", "media_type",
+      "monotonic_duration_ms", "organization_id", "project_id", "retention", "segments",
+      "session_id", "started_at", "streams",
+    ]
+    guard Set(manifestSeedObject.keys) == legacyManifestSeedKeys
+      || Set(manifestSeedObject.keys)
+        == legacyManifestSeedKeys.union(["app_audio_accounting"])
+    else { throw TacuaCaptureUploadError.admissionConflict }
     guard manifestSeedObject["contract_version"]?.stringValue
         == "tacua.capture-upload-manifest@1.0.0",
       manifestSeedObject["media_type"]?.stringValue
@@ -923,6 +927,11 @@ final class TacuaCaptureUploadCoordinator {
       let runtimeSegments = manifestSeedObject["segments"]?.arrayValue,
       runtimeSegments.count == segmentValues.count
     else { throw TacuaCaptureUploadError.admissionConflict }
+    do {
+      try TacuaSDKBackendProtocol.validateRuntimeAppAudioAccounting(
+        manifestSeedObject["app_audio_accounting"], runtimeSegments: runtimeSegments
+      )
+    } catch { throw TacuaCaptureUploadError.admissionConflict }
 
     let segments: [TacuaCaptureTransportPlan.Segment] = try segmentValues.enumerated().map {
       index, segmentValue in
@@ -1151,8 +1160,9 @@ final class TacuaCaptureUploadCoordinator {
   ) -> Bool {
     guard let summary,
       (try? summary.requiringObject(keys: [
-        "app_audio_available", "error_count", "gap_count", "marker_count",
-        "microphone_available", "segment_count",
+        "app_audio_accounting_complete", "app_audio_append_attempts",
+        "app_audio_append_drops", "app_audio_available", "app_audio_unknown_range_count",
+        "error_count", "gap_count", "marker_count", "microphone_available", "segment_count",
       ])) != nil,
       let root = try? envelope.requiringObject(keys: [
         "build_id", "build_identity_digest", "collection_gaps", "contract_version",

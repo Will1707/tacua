@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { createHash } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { readFile, readdir, writeFile, mkdir } from 'node:fs/promises';
 import { extname, join, resolve } from 'node:path';
 
@@ -29,6 +29,529 @@ function sortValue(value) {
 
 export function stableStringify(value, spaces = 0) {
   return JSON.stringify(sortValue(value), null, spaces);
+}
+
+function hmacSubject(document) {
+  const subject = structuredClone(document);
+  delete subject.signature.value;
+  return subject;
+}
+
+export function signSyntheticHmacArtifact(document, keyHex) {
+  const signed = structuredClone(document);
+  signed.signature.value = `hmac-sha256:${createHmac('sha256', Buffer.from(keyHex, 'hex'))
+    .update(stableStringify(hmacSubject(signed)))
+    .digest('hex')}`;
+  return signed;
+}
+
+function signatureMatches(document, keyHex) {
+  if (!isHmacKeyHex(keyHex) || typeof document?.signature?.value !== 'string') return false;
+  try {
+    const expected = signSyntheticHmacArtifact(document, keyHex).signature.value;
+    const supplied = document.signature.value;
+    if (Buffer.byteLength(expected) !== Buffer.byteLength(supplied)) return false;
+    return timingSafeEqual(Buffer.from(expected), Buffer.from(supplied));
+  } catch {
+    return false;
+  }
+}
+
+const CODEX_RUNTIME_PROFILE = Object.freeze({
+  authentication_scope: 'single_invocation',
+  command: 'codex_exec',
+  ephemeral: true,
+  network_access: false,
+  non_interactive: true,
+  sandbox: 'workspace-write',
+  structured_output: true,
+});
+
+const ID_PATTERN = /^[a-z][a-z0-9_-]{2,63}$/;
+const DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/;
+const HMAC_PATTERN = /^hmac-sha256:[a-f0-9]{64}$/;
+const REVISION_PATTERN = /^[a-f0-9]{40}$/;
+const NONCE_PATTERN = /^[A-Za-z0-9_-]{22,128}$/;
+const UTC_SECOND_PATTERN = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/;
+const SOURCE_COMPONENTS = new Set(['mobile_sdk', 'backend', 'repository', 'sentry', 'posthog']);
+
+function isRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function hasExactKeys(value, keys) {
+  if (!isRecord(value)) return false;
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+function isIdentifier(value) {
+  return typeof value === 'string' && ID_PATTERN.test(value);
+}
+
+function isDigest(value) {
+  return typeof value === 'string' && DIGEST_PATTERN.test(value);
+}
+
+function isSafePositiveInteger(value) {
+  return Number.isSafeInteger(value) && value >= 1;
+}
+
+function isHmacKeyHex(value) {
+  return typeof value === 'string' && /^(?:[A-Fa-f0-9]{2}){32,}$/.test(value);
+}
+
+function isUtcSecond(value) {
+  if (typeof value !== 'string' || !UTC_SECOND_PATTERN.test(value) || value.startsWith('0000-')) return false;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === `${value.slice(0, -1)}.000Z`;
+}
+
+function uniqueBy(values, projection = (value) => value) {
+  // Do not pass Array.map's index/array arguments into projections such as
+  // stableStringify(value, spaces); doing so can make equal values serialize
+  // differently solely because they occupy different array positions.
+  return new Set(values.map((value) => projection(value))).size === values.length;
+}
+
+function canonicalDigest(value) {
+  return `sha256:${sha256(stableStringify(value))}`;
+}
+
+function digestWithout(value, field) {
+  const subject = structuredClone(value);
+  delete subject[field];
+  return canonicalDigest(subject);
+}
+
+function handoffIntegrityIsValid(handoff) {
+  try {
+    if (handoff.handoff_digest !== digestWithout(handoff, 'handoff_digest')) return false;
+    if (handoff.build_identity.build_identity_digest
+        !== digestWithout(handoff.build_identity, 'build_identity_digest')) return false;
+    if (handoff.evidence_manifest.items.some((item) => item.evidence_item_digest
+        !== digestWithout(item, 'evidence_item_digest'))) return false;
+    if (handoff.evidence_manifest.evidence_manifest_digest
+        !== digestWithout(handoff.evidence_manifest, 'evidence_manifest_digest')) return false;
+
+    const ticket = structuredClone(handoff.ticket);
+    delete ticket.ticket_content_digest;
+    const approvalSubject = {
+      contract_version: handoff.contract_version,
+      organization_id: handoff.organization_id,
+      project_id: handoff.project_id,
+      source_candidate: handoff.source_candidate,
+      ticket,
+      build_identity_digest: handoff.build_identity.build_identity_digest,
+      evidence_manifest_digest: handoff.evidence_manifest.evidence_manifest_digest,
+      authority: handoff.authority,
+    };
+    const approvedContentDigest = canonicalDigest(approvalSubject);
+    if (handoff.ticket.ticket_content_digest !== approvedContentDigest
+        || handoff.approval.ticket_content_digest !== approvedContentDigest) return false;
+
+    const source = handoff.source_candidate;
+    if (!hasExactKeys(source, [
+      'contract_version', 'candidate_id', 'candidate_version', 'candidate_digest',
+      'candidate_content_digest', 'canonical_json',
+    ]) || typeof source.canonical_json !== 'string') return false;
+    const candidate = JSON.parse(source.canonical_json);
+    if (!isRecord(candidate) || stableStringify(candidate) !== source.canonical_json
+        || candidate.state !== 'approved'
+        || candidate.approval?.immutable !== true
+        || source.contract_version !== candidate.contract_version
+        || source.candidate_id !== candidate.candidate_id
+        || source.candidate_version !== candidate.candidate_version
+        || source.candidate_digest !== candidate.candidate_digest
+        || source.candidate_content_digest !== candidate.candidate_content_digest) return false;
+    const candidateContentSubject = {
+      contract_version: candidate.contract_version,
+      organization_id: candidate.organization_id,
+      project_id: candidate.project_id,
+      build_id: candidate.build_id,
+      build_identity_digest: candidate.build_identity_digest,
+      session_id: candidate.session_id,
+      evidence_manifest: candidate.evidence_manifest,
+      candidate_id: candidate.candidate_id,
+      content: candidate.content,
+    };
+    return candidate.candidate_content_digest === canonicalDigest(candidateContentSubject)
+      && candidate.candidate_digest === digestWithout(candidate, 'candidate_digest');
+  } catch {
+    return false;
+  }
+}
+
+function validSignature(value) {
+  return hasExactKeys(value, ['algorithm', 'key_id', 'value'])
+    && value.algorithm === 'hmac-sha256'
+    && isIdentifier(value.key_id)
+    && typeof value.value === 'string'
+    && HMAC_PATTERN.test(value.value);
+}
+
+function validSource(value) {
+  return hasExactKeys(value, ['component', 'source_id', 'snapshot_revision'])
+    && SOURCE_COMPONENTS.has(value.component)
+    && isIdentifier(value.source_id)
+    && typeof value.snapshot_revision === 'string'
+    && Array.from(value.snapshot_revision).length >= 1
+    && Array.from(value.snapshot_revision).length <= 128;
+}
+
+function validEvidenceSource(value) {
+  return hasExactKeys(value, ['component', 'source_id', 'snapshot_revision', 'captured_at'])
+    && isUtcSecond(value.captured_at)
+    && validSource({
+      component: value.component,
+      source_id: value.source_id,
+      snapshot_revision: value.snapshot_revision,
+    });
+}
+
+function validRegistryAssertion(value) {
+  if (!hasExactKeys(value, [
+    'contract_version', 'media_type', 'assertion_id', 'issuer_id', 'organization_id',
+    'project_id', 'ticket_id', 'ticket_version', 'current_handoff_digest',
+    'registry_revision', 'authorized_sources', 'execution_authority', 'issued_at',
+    'expires_at', 'signature',
+  ])) return false;
+  if (value.contract_version !== 'tacua.registry-assertion@1.0.0'
+      || value.media_type !== 'application/vnd.tacua.registry-assertion+json;version=1.0.0'
+      || ![value.assertion_id, value.issuer_id, value.organization_id, value.project_id,
+        value.ticket_id, value.registry_revision].every(isIdentifier)
+      || !isSafePositiveInteger(value.ticket_version)
+      || !isDigest(value.current_handoff_digest)
+      || !isUtcSecond(value.issued_at)
+      || !isUtcSecond(value.expires_at)
+      || !validSignature(value.signature)) return false;
+  if (!Array.isArray(value.authorized_sources)
+      || value.authorized_sources.length < 1
+      || value.authorized_sources.length > 100
+      || !value.authorized_sources.every(validSource)
+      || !uniqueBy(value.authorized_sources, stableStringify)) return false;
+  const authority = value.execution_authority;
+  return hasExactKeys(authority, ['consumer', 'issuer_id', 'key_id', 'revocation_list_id', 'revocation_revision'])
+    && authority.consumer === 'openai_codex'
+    && [authority.issuer_id, authority.key_id, authority.revocation_list_id,
+      authority.revocation_revision].every(isIdentifier);
+}
+
+function validExecutionAssertion(value) {
+  if (!hasExactKeys(value, [
+    'contract_version', 'media_type', 'assertion_id', 'issuer_id', 'consumer',
+    'organization_id', 'project_id', 'ticket_id', 'ticket_version', 'repositories',
+    'build_id', 'build_identity_digest', 'current_handoff_digest',
+    'evidence_manifest_digest', 'evidence_item_digests', 'allowed_actions',
+    'issued_at', 'expires_at', 'nonce', 'revocation_list_id', 'revocation_revision',
+    'signature',
+  ])) return false;
+  if (value.contract_version !== 'tacua.execution-assertion@1.0.0'
+      || value.media_type !== 'application/vnd.tacua.execution-assertion+json;version=1.0.0'
+      || ![value.assertion_id, value.issuer_id, value.organization_id, value.project_id,
+        value.ticket_id, value.build_id, value.revocation_list_id,
+        value.revocation_revision].every(isIdentifier)
+      || !isSafePositiveInteger(value.ticket_version)
+      || ![value.build_identity_digest, value.current_handoff_digest,
+        value.evidence_manifest_digest].every(isDigest)
+      || !isUtcSecond(value.issued_at)
+      || !isUtcSecond(value.expires_at)
+      || typeof value.nonce !== 'string'
+      || !NONCE_PATTERN.test(value.nonce)
+      || !validSignature(value.signature)) return false;
+
+  const consumer = value.consumer;
+  if (!hasExactKeys(consumer, ['kind', 'agent', 'instance_id', 'runtime_profile'])
+      || typeof consumer.kind !== 'string'
+      || typeof consumer.agent !== 'string'
+      || !isIdentifier(consumer.instance_id)
+      || !hasExactKeys(consumer.runtime_profile, Object.keys(CODEX_RUNTIME_PROFILE))) return false;
+
+  if (!Array.isArray(value.repositories)
+      || value.repositories.length < 1
+      || value.repositories.length > 16
+      || !value.repositories.every((repository) => hasExactKeys(repository, ['repository_id', 'revision'])
+        && isIdentifier(repository.repository_id)
+        && typeof repository.revision === 'string'
+        && REVISION_PATTERN.test(repository.revision))
+      || !uniqueBy(value.repositories, stableStringify)) return false;
+  if (!Array.isArray(value.evidence_item_digests)
+      || value.evidence_item_digests.length < 1
+      || value.evidence_item_digests.length > 100
+      || !value.evidence_item_digests.every((item) => hasExactKeys(item, ['evidence_id', 'evidence_item_digest'])
+        && isIdentifier(item.evidence_id)
+        && isDigest(item.evidence_item_digest))
+      || !uniqueBy(value.evidence_item_digests, stableStringify)) return false;
+  return Array.isArray(value.allowed_actions)
+    && value.allowed_actions.length >= 1
+    && value.allowed_actions.length <= 3
+    && uniqueBy(value.allowed_actions)
+    && value.allowed_actions.every((action) => ['modify_code', 'read_authorized_evidence', 'run_tests'].includes(action));
+}
+
+function validExecutionRevocations(value) {
+  if (!hasExactKeys(value, [
+    'contract_version', 'media_type', 'list_id', 'issuer_id', 'revision', 'issued_at',
+    'expires_at', 'revoked_assertion_ids', 'revoked_nonces', 'revoked_key_ids', 'signature',
+  ])) return false;
+  if (value.contract_version !== 'tacua.execution-revocations@1.0.0'
+      || value.media_type !== 'application/vnd.tacua.execution-revocations+json;version=1.0.0'
+      || ![value.list_id, value.issuer_id, value.revision].every(isIdentifier)
+      || !isUtcSecond(value.issued_at)
+      || !isUtcSecond(value.expires_at)
+      || !validSignature(value.signature)) return false;
+  const listRules = [
+    [value.revoked_assertion_ids, 1000, isIdentifier],
+    [value.revoked_nonces, 1000, (nonce) => typeof nonce === 'string' && NONCE_PATTERN.test(nonce)],
+    [value.revoked_key_ids, 100, isIdentifier],
+  ];
+  return listRules.every(([items, maximum, validator]) => Array.isArray(items)
+    && items.length <= maximum
+    && items.every(validator)
+    && uniqueBy(items));
+}
+
+function handoffBoundaryIsValid(handoff) {
+  if (!isRecord(handoff)
+      || handoff.contract_version !== 'tacua.approved-handoff@1.1.0'
+      || handoff.media_type !== 'application/vnd.tacua.approved-handoff+json;version=1.1.0'
+      || !isIdentifier(handoff.organization_id)
+      || !isIdentifier(handoff.project_id)
+      || !isDigest(handoff.handoff_digest)) return false;
+  const ticket = handoff.ticket;
+  const approval = handoff.approval;
+  const supersession = handoff.supersession;
+  const build = handoff.build_identity;
+  const manifest = handoff.evidence_manifest;
+  const authority = handoff.authority;
+  if (!isRecord(ticket) || ticket.state !== 'approved' || !isIdentifier(ticket.ticket_id)
+      || !isSafePositiveInteger(ticket.ticket_version)
+      || !isRecord(approval) || approval.immutable !== true
+      || !isUtcSecond(approval.approved_at)
+      || approval.organization_id !== handoff.organization_id
+      || approval.project_id !== handoff.project_id
+      || approval.ticket_id !== ticket.ticket_id
+      || approval.ticket_version !== ticket.ticket_version) return false;
+  if (!isRecord(supersession) || !['current', 'superseded'].includes(supersession.status)
+      || !(supersession.superseded_by_handoff_digest === null
+        || isDigest(supersession.superseded_by_handoff_digest))
+      || !isUtcSecond(supersession.checked_at)
+      || !isIdentifier(supersession.registry_revision)) return false;
+  if (!isRecord(build) || !isIdentifier(build.build_id) || !isDigest(build.build_identity_digest)
+      || build.organization_id !== handoff.organization_id
+      || build.project_id !== handoff.project_id
+      || !isRecord(build.mobile) || !isRecord(build.mobile.source)
+      || !isIdentifier(build.mobile.source.repository_id)
+      || typeof build.mobile.source.revision !== 'string'
+      || !REVISION_PATTERN.test(build.mobile.source.revision)
+      || !isRecord(build.backend)
+      || !['available', 'unavailable'].includes(build.backend.availability)) return false;
+  if (build.backend.availability === 'available'
+      && (!Array.isArray(build.backend.sources)
+        || build.backend.sources.length < 1
+        || build.backend.sources.length > 16
+        || !build.backend.sources.every((source) => isRecord(source)
+          && isIdentifier(source.repository_id)
+          && typeof source.revision === 'string'
+          && REVISION_PATTERN.test(source.revision)))) return false;
+  if (build.backend.availability === 'unavailable'
+      && (!Array.isArray(build.backend.sources) || build.backend.sources.length !== 0)) return false;
+  if (!isRecord(manifest) || !isDigest(manifest.evidence_manifest_digest)
+      || manifest.organization_id !== handoff.organization_id
+      || manifest.project_id !== handoff.project_id
+      || !Array.isArray(manifest.items)
+      || manifest.items.length < 1
+      || manifest.items.length > 100
+      || !manifest.items.every((item) => isRecord(item)
+        && isIdentifier(item.evidence_id)
+        && isDigest(item.evidence_item_digest)
+        && validEvidenceSource(item.source))
+      || !uniqueBy(manifest.items, (item) => item.evidence_id)) return false;
+  return isRecord(authority)
+    && authority.purpose === 'implement_approved_ticket'
+    && Array.isArray(authority.allowed_repositories)
+    && authority.allowed_repositories.length >= 1
+    && authority.allowed_repositories.length <= 16
+    && authority.allowed_repositories.every(isIdentifier)
+    && uniqueBy(authority.allowed_repositories)
+    && authority.read_authorized_evidence === true
+    && authority.modify_code === true
+    && authority.run_tests === true
+    && authority.external_writes === false
+    && authority.merge === false
+    && authority.deploy === false;
+}
+
+function compareRepository(left, right) {
+  if (left.repository_id !== right.repository_id) return left.repository_id < right.repository_id ? -1 : 1;
+  if (left.revision === right.revision) return 0;
+  return left.revision < right.revision ? -1 : 1;
+}
+
+function denied(reasonCode) {
+  return { allowed: false, reasonCode };
+}
+
+export function authorizeCodexExecution(input = {}) {
+  const {
+    handoff,
+    registryAssertion,
+    registryKeyHex,
+    executionAssertion,
+    executionRevocations,
+    executionKeyHex,
+    atTime,
+  } = isRecord(input) ? input : {};
+  if (!handoffBoundaryIsValid(handoff)) {
+    return denied('STRUCTURAL_APPROVAL_REQUIRED');
+  }
+  if (!handoffIntegrityIsValid(handoff)) return denied('STRUCTURAL_APPROVAL_REQUIRED');
+  if (handoff.supersession.status !== 'current'
+      || handoff.supersession.superseded_by_handoff_digest !== null) {
+    return denied('STALE_HANDOFF');
+  }
+  if (!registryAssertion || !registryKeyHex) return denied('REGISTRY_ASSERTION_REQUIRED');
+  if (!executionAssertion || !executionRevocations || !executionKeyHex) {
+    return denied('EXECUTION_ASSERTION_REQUIRED');
+  }
+  if (!validRegistryAssertion(registryAssertion)
+      || !validExecutionAssertion(executionAssertion)
+      || !validExecutionRevocations(executionRevocations)) {
+    return denied('MALFORMED_TRUST_ARTIFACT');
+  }
+  const authority = registryAssertion.execution_authority;
+  if (registryAssertion.signature?.key_id === authority.key_id) return denied('TRUST_KEY_ID_REUSE');
+  if (isHmacKeyHex(registryKeyHex) && isHmacKeyHex(executionKeyHex)) {
+    const registryKey = Buffer.from(registryKeyHex, 'hex');
+    const executionKey = Buffer.from(executionKeyHex, 'hex');
+    if (registryKey.length === executionKey.length && timingSafeEqual(registryKey, executionKey)) {
+      return denied('TRUST_KEY_MATERIAL_REUSE');
+    }
+  }
+  if (!isHmacKeyHex(registryKeyHex)) return denied('REGISTRY_SIGNATURE_MISMATCH');
+  if (!isHmacKeyHex(executionKeyHex)) return denied('EXECUTION_SIGNATURE_MISMATCH');
+  if (registryAssertion.signature.key_id === executionAssertion.signature.key_id) {
+    return denied('TRUST_KEY_ID_REUSE');
+  }
+  if (!signatureMatches(registryAssertion, registryKeyHex)) return denied('REGISTRY_SIGNATURE_MISMATCH');
+  if (!signatureMatches(executionAssertion, executionKeyHex)) return denied('EXECUTION_SIGNATURE_MISMATCH');
+  if (!signatureMatches(executionRevocations, executionKeyHex)) return denied('REVOCATION_SIGNATURE_MISMATCH');
+
+  if (!isUtcSecond(atTime)) return denied('INVALID_TRUST_TIME');
+  const now = new Date(atTime);
+  const registryIssued = new Date(registryAssertion.issued_at);
+  const registryExpires = new Date(registryAssertion.expires_at);
+  const executionIssued = new Date(executionAssertion.issued_at);
+  const executionExpires = new Date(executionAssertion.expires_at);
+  const revocationsIssued = new Date(executionRevocations.issued_at);
+  const revocationsExpires = new Date(executionRevocations.expires_at);
+  if (!(registryIssued < registryExpires)) return denied('INVALID_ASSERTION_WINDOW');
+  if (registryExpires - registryIssued > 24 * 60 * 60 * 1000) return denied('ASSERTION_WINDOW_TOO_LONG');
+  if (!(registryIssued <= now && now < registryExpires)) return denied('REGISTRY_ASSERTION_EXPIRED');
+  const approvalTime = new Date(handoff.approval.approved_at);
+  const registryChecked = new Date(handoff.supersession.checked_at);
+  if (!(approvalTime <= registryIssued && registryChecked <= registryIssued)) {
+    return denied('REGISTRY_ASSERTION_PRECEDES_HANDOFF_STATE');
+  }
+  if (!(executionIssued < executionExpires)) return denied('INVALID_EXECUTION_WINDOW');
+  if (!(executionIssued <= now && now < executionExpires)) return denied('EXECUTION_ASSERTION_EXPIRED');
+  if (executionExpires - executionIssued > 15 * 60 * 1000) return denied('EXECUTION_WINDOW_TOO_LONG');
+  if (!(registryIssued <= executionIssued && executionExpires <= registryExpires)) {
+    return denied('EXECUTION_OUTSIDE_REGISTRY_WINDOW');
+  }
+  if (!(revocationsIssued < revocationsExpires)) return denied('INVALID_REVOCATION_WINDOW');
+  if (revocationsExpires - revocationsIssued > 24 * 60 * 60 * 1000) return denied('REVOCATION_WINDOW_TOO_LONG');
+  if (!(revocationsIssued <= now && now < revocationsExpires)) return denied('REVOCATION_LIST_EXPIRED');
+
+  const ticket = handoff.ticket;
+  const registryScope = [
+    ['organization_id', handoff.organization_id],
+    ['project_id', handoff.project_id],
+    ['ticket_id', ticket.ticket_id],
+    ['ticket_version', ticket.ticket_version],
+    ['current_handoff_digest', handoff.handoff_digest],
+    ['registry_revision', handoff.supersession.registry_revision],
+  ];
+  if (registryScope.some(([field, expected]) => registryAssertion[field] !== expected)) {
+    return denied('REGISTRY_SCOPE_MISMATCH');
+  }
+  const trustedSources = new Set(
+    registryAssertion.authorized_sources.map((source) => stableStringify(source)),
+  );
+  const manifestSources = new Set(handoff.evidence_manifest.items
+    .map(({ source }) => stableStringify({
+      component: source.component,
+      source_id: source.source_id,
+      snapshot_revision: source.snapshot_revision,
+    })));
+  const untrustedSource = [...manifestSources]
+    .some((source) => !trustedSources.has(source));
+  if (untrustedSource || trustedSources.size !== manifestSources.size) {
+    return denied('UNTRUSTED_EVIDENCE_SOURCE');
+  }
+  const authorityScope = [
+    [executionAssertion.issuer_id, authority.issuer_id],
+    [executionAssertion.signature.key_id, authority.key_id],
+    [executionAssertion.revocation_list_id, authority.revocation_list_id],
+    [executionAssertion.revocation_revision, authority.revocation_revision],
+    [executionRevocations.issuer_id, authority.issuer_id],
+    [executionRevocations.signature.key_id, authority.key_id],
+    [executionRevocations.list_id, authority.revocation_list_id],
+    [executionRevocations.revision, authority.revocation_revision],
+  ];
+  if (authorityScope.some(([supplied, expected]) => supplied !== expected)) {
+    return denied('EXECUTION_AUTHORITY_MISMATCH');
+  }
+  if (executionAssertion.consumer.kind !== 'execution_agent'
+      || executionAssertion.consumer.agent !== 'openai_codex'
+      || stableStringify(executionAssertion.consumer.runtime_profile)
+        !== stableStringify(CODEX_RUNTIME_PROFILE)) {
+    return denied('EXECUTION_PROFILE_MISMATCH');
+  }
+  const build = handoff.build_identity;
+  const manifest = handoff.evidence_manifest;
+  const exactScope = [
+    ['organization_id', handoff.organization_id],
+    ['project_id', handoff.project_id],
+    ['ticket_id', ticket.ticket_id],
+    ['ticket_version', ticket.ticket_version],
+    ['build_id', build.build_id],
+    ['build_identity_digest', build.build_identity_digest],
+    ['current_handoff_digest', handoff.handoff_digest],
+    ['evidence_manifest_digest', manifest.evidence_manifest_digest],
+  ];
+  if (exactScope.some(([field, expected]) => executionAssertion[field] !== expected)) {
+    return denied('EXECUTION_SCOPE_MISMATCH');
+  }
+  const repositories = [build.mobile.source, ...(build.backend.availability === 'available' ? build.backend.sources : [])]
+    .map(({ repository_id, revision }) => ({ repository_id, revision }))
+    .sort(compareRepository);
+  const repositoryIds = new Set(repositories.map(({ repository_id }) => repository_id));
+  const assertedRepositoryIds = new Set(
+    executionAssertion.repositories.map(({ repository_id }) => repository_id),
+  );
+  if (repositoryIds.size !== repositories.length
+      || assertedRepositoryIds.size !== executionAssertion.repositories.length
+      || repositoryIds.size !== handoff.authority.allowed_repositories.length
+      || handoff.authority.allowed_repositories.some((repositoryId) => !repositoryIds.has(repositoryId))) {
+    return denied('EXECUTION_SCOPE_MISMATCH');
+  }
+  const evidence = manifest.items
+    .map(({ evidence_id, evidence_item_digest }) => ({ evidence_id, evidence_item_digest }))
+    .sort((left, right) => (left.evidence_id === right.evidence_id ? 0 : left.evidence_id < right.evidence_id ? -1 : 1));
+  if (stableStringify(executionAssertion.repositories) !== stableStringify(repositories)
+      || stableStringify(executionAssertion.evidence_item_digests) !== stableStringify(evidence)
+      || stableStringify(executionAssertion.allowed_actions)
+        !== stableStringify(['modify_code', 'read_authorized_evidence', 'run_tests'])) {
+    return denied('EXECUTION_SCOPE_MISMATCH');
+  }
+  if (executionRevocations.revoked_assertion_ids.includes(executionAssertion.assertion_id)
+      || executionRevocations.revoked_nonces.includes(executionAssertion.nonce)
+      || executionRevocations.revoked_key_ids.includes(executionAssertion.signature.key_id)) {
+    return denied('EXECUTION_REVOKED');
+  }
+  return { allowed: true, reasonCode: 'CODEX_EXECUTION_AUTHORIZED' };
 }
 
 export async function loadJson(path) {
@@ -794,6 +1317,13 @@ export async function generateResults({ harnessRoot, outputRoot }) {
   const authCorpus = await loadJson(join(harnessRoot, 'fixtures/auth-cases.json'));
   const deletionGraph = await loadJson(join(harnessRoot, 'fixtures/deletion-graph.json'));
   const exportCase = await loadJson(join(harnessRoot, 'fixtures/export-case.json'));
+  const handoffFixtureRoot = resolve(harnessRoot, '../../contracts/approved-handoff/fixtures/positive');
+  const handoff = await loadJson(join(handoffFixtureRoot, 'approved-handoff.json'));
+  const registryAssertion = await loadJson(join(handoffFixtureRoot, 'registry-assertion.json'));
+  const executionAssertion = await loadJson(join(handoffFixtureRoot, 'execution-assertion.json'));
+  const executionRevocations = await loadJson(join(handoffFixtureRoot, 'execution-revocations.json'));
+  const registryKeyHex = (await readFile(join(handoffFixtureRoot, 'registry-key.synthetic.hex'), 'utf8')).trim();
+  const executionKeyHex = (await readFile(join(handoffFixtureRoot, 'execution-key.synthetic.hex'), 'utf8')).trim();
   validatePolicy(policy);
   validateCanaries(catalogue);
   validateCorpus(corpus, catalogue, policy);
@@ -820,12 +1350,111 @@ export async function generateResults({ harnessRoot, outputRoot }) {
     { caseId: 'RETENTION-002', currentDays: 14, requestedDays: 30, ...applyRetentionChange(14, 30), expectedAllowed: false },
     { caseId: 'RETENTION-003', currentDays: 30, requestedDays: 30, ...applyRetentionChange(30, 30), expectedAllowed: true },
   ].map((result) => ({ ...result, passed: result.allowed === result.expectedAllowed }));
+  const executionBase = {
+    handoff,
+    registryAssertion,
+    registryKeyHex,
+    executionAssertion,
+    executionRevocations,
+    executionKeyHex,
+    atTime: '2026-07-20T11:00:00Z',
+  };
+  const dangerousAssertion = structuredClone(executionAssertion);
+  dangerousAssertion.consumer.runtime_profile.sandbox = 'danger-full-access';
+  const revoked = structuredClone(executionRevocations);
+  revoked.revoked_nonces = [executionAssertion.nonce];
+  const reusedKeyId = structuredClone(registryAssertion);
+  reusedKeyId.execution_authority.key_id = reusedKeyId.signature.key_id;
+  const missingEvidenceSource = structuredClone(registryAssertion);
+  missingEvidenceSource.authorized_sources = missingEvidenceSource.authorized_sources.slice(1);
+  const malformedExecution = structuredClone(executionAssertion);
+  malformedExecution.contract_version = 'tacua.execution-assertion@999.0.0';
+  const staleHandoff = structuredClone(handoff);
+  staleHandoff.supersession.status = 'superseded';
+  staleHandoff.supersession.superseded_by_handoff_digest = `sha256:${'f'.repeat(64)}`;
+  staleHandoff.handoff_digest = digestWithout(staleHandoff, 'handoff_digest');
+  const tamperedHandoff = structuredClone(handoff);
+  tamperedHandoff.ticket.summary += ' tampered after approval';
+  const executionCases = [
+    { caseId: 'EXECUTION-001', input: executionBase, expected: 'CODEX_EXECUTION_AUTHORIZED' },
+    { caseId: 'EXECUTION-002', input: { ...executionBase, executionAssertion: null }, expected: 'EXECUTION_ASSERTION_REQUIRED' },
+    {
+      caseId: 'EXECUTION-003',
+      input: {
+        ...executionBase,
+        executionAssertion: signSyntheticHmacArtifact(dangerousAssertion, executionKeyHex),
+      },
+      expected: 'EXECUTION_PROFILE_MISMATCH',
+    },
+    {
+      caseId: 'EXECUTION-004',
+      input: {
+        ...executionBase,
+        executionRevocations: signSyntheticHmacArtifact(revoked, executionKeyHex),
+      },
+      expected: 'EXECUTION_REVOKED',
+    },
+    {
+      caseId: 'EXECUTION-005',
+      input: {
+        ...executionBase,
+        registryAssertion: signSyntheticHmacArtifact(reusedKeyId, registryKeyHex),
+      },
+      expected: 'TRUST_KEY_ID_REUSE',
+    },
+    {
+      caseId: 'EXECUTION-006',
+      input: {
+        ...executionBase,
+        executionAssertion: signSyntheticHmacArtifact(executionAssertion, registryKeyHex),
+        executionRevocations: signSyntheticHmacArtifact(executionRevocations, registryKeyHex),
+        executionKeyHex: registryKeyHex,
+      },
+      expected: 'TRUST_KEY_MATERIAL_REUSE',
+    },
+    {
+      caseId: 'EXECUTION-007',
+      input: {
+        ...executionBase,
+        registryAssertion: signSyntheticHmacArtifact(missingEvidenceSource, registryKeyHex),
+      },
+      expected: 'UNTRUSTED_EVIDENCE_SOURCE',
+    },
+    {
+      caseId: 'EXECUTION-008',
+      input: { ...executionBase, atTime: executionAssertion.expires_at },
+      expected: 'EXECUTION_ASSERTION_EXPIRED',
+    },
+    {
+      caseId: 'EXECUTION-009',
+      input: {
+        ...executionBase,
+        executionAssertion: signSyntheticHmacArtifact(malformedExecution, executionKeyHex),
+      },
+      expected: 'MALFORMED_TRUST_ARTIFACT',
+    },
+    {
+      caseId: 'EXECUTION-010',
+      input: { ...executionBase, handoff: staleHandoff },
+      expected: 'STALE_HANDOFF',
+    },
+    {
+      caseId: 'EXECUTION-011',
+      input: { ...executionBase, handoff: tamperedHandoff },
+      expected: 'STRUCTURAL_APPROVAL_REQUIRED',
+    },
+  ];
+  const executionResults = executionCases.map(({ caseId, input, expected }) => {
+    const decision = authorizeCodexExecution(input);
+    return { caseId, ...decision, expectedReasonCode: expected, passed: decision.reasonCode === expected };
+  });
 
   const allPassed =
     egressResults.every(({ passed }) => passed) &&
     authResults.every(({ passed }) => passed) &&
     deletionResults.every(({ passed }) => passed) &&
     retentionResults.every(({ passed }) => passed) &&
+    executionResults.every(({ passed }) => passed) &&
     exportScans.json.length === 0 &&
     exportScans.markdown.length === 0;
 
@@ -856,6 +1485,8 @@ export async function generateResults({ harnessRoot, outputRoot }) {
       deletionPassed: deletionResults.filter(({ passed }) => passed).length,
       retentionCases: retentionResults.length,
       retentionPassed: retentionResults.filter(({ passed }) => passed).length,
+      executionAuthorizationCases: executionResults.length,
+      executionAuthorizationPassed: executionResults.filter(({ passed }) => passed).length,
       completeMatrixCells: matrix.length,
       prohibitedCanariesAtSimulatedEgressSinks: egressResults.reduce(
         (sum, result) => sum + result.actualProhibitedCanariesAtSink,
@@ -868,6 +1499,7 @@ export async function generateResults({ harnessRoot, outputRoot }) {
     authorizationResults: authResults,
     deletionResults,
     retentionResults,
+    executionAuthorizationResults: executionResults,
     exportResults: {
       canonicalTicketDigest: bundle.canonicalTicketDigest,
       jsonHash: sha256(bundle.json),
@@ -900,6 +1532,7 @@ export async function generateResults({ harnessRoot, outputRoot }) {
         'hostile Markdown/JSON serialization',
         'retention shortening and prohibited silent lengthening',
         'local deletion lineage with visible partial failure',
+        'short-lived exact-scope Codex execution profile and revocation failures using synthetic keys',
       ],
       unverified: [
         'runtime SDK, API, worker, connector, model, UI, object store, database and queue controls',
@@ -908,11 +1541,12 @@ export async function generateResults({ harnessRoot, outputRoot }) {
         'backup deletion and restore behavior',
         'binary media OCR/audio redaction effectiveness',
         'deployment hardening and compromised-operator resistance',
+        'real nonce-consuming Codex launcher, monotonic registry freshness, effective config/authentication isolation and consumer trial',
       ],
       blocked: [
         'EXP-004 completion pending built runtime boundaries and representative runtime fixtures',
         'pilot-ready status pending qualified security/privacy review',
-        'runtime egress schema, project authorization, model/connector broker and approved-handoff trust policy pending owner/reviewer decisions',
+        'runtime egress schema and selected model/connector broker pending deployment overlays',
       ],
     },
   };

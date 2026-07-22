@@ -1,19 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { useLocalSearchParams } from "expo-router";
+import { Link, useLocalSearchParams } from "expo-router";
 import * as Crypto from "expo-crypto";
 import type { File } from "expo-file-system";
 import * as Sharing from "expo-sharing";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Alert, Pressable, RefreshControl, ScrollView, Text, TextInput, View } from "react-native";
 
-import { TacuaApiError } from "@/api/client";
-import type { CandidateEvidenceView, Clarification, ClarificationChoice, TicketCandidate } from "@/api/types";
+import { CandidateSupersededApiError, TacuaApiError } from "@/api/client";
+import type {
+  CandidateEvidenceView,
+  CandidateReplacementDraft,
+  CandidateReplacementOperationProjection,
+  Clarification,
+  ClarificationChoice,
+  TicketCandidate,
+} from "@/api/types";
 import { cleanupApprovedHandoffShareCache, createApprovedHandoffShareFile } from "@/approved-handoff/share-cache";
 import type { KeyframePreviewState, KeyframePreviewStates } from "@/candidates/keyframe-gallery-state";
 import { ActionButton } from "@/components/action-button";
 import { CandidateEvidencePanel } from "@/components/candidate-evidence-panel";
 import { CandidateEditCard } from "@/components/candidate-edit-card";
+import { CandidateSplitCard } from "@/components/candidate-split-card";
 import { MessageState } from "@/components/message-state";
 import { SectionCard } from "@/components/section-card";
 import { StatusPill } from "@/components/status-pill";
@@ -38,6 +46,8 @@ export default function CandidateRoute() {
   const { "candidate-id": candidateId } = useLocalSearchParams<{ "candidate-id": string }>();
   const { client, config } = useBackend();
   const [candidate, setCandidate] = useState<TicketCandidate | null>(null);
+  const [supersession, setSupersession] = useState<CandidateReplacementOperationProjection | null>(null);
+  const [supersessionChecked, setSupersessionChecked] = useState(false);
   const [evidence, setEvidence] = useState<CandidateEvidenceView | null>(null);
   const [evidenceLoading, setEvidenceLoading] = useState(false);
   const [evidenceError, setEvidenceError] = useState<string | null>(null);
@@ -70,8 +80,8 @@ export default function CandidateRoute() {
   const candidateBinding = candidate
     ? `${candidateId ?? "missing-route"}:${candidate.candidate_id}:${candidate.candidate_version}:${candidate.candidate_digest}`
     : null;
-  const currentContextRef = useRef({ candidate, candidateId, candidateStale, client });
-  currentContextRef.current = { candidate, candidateId, candidateStale, client };
+  const currentContextRef = useRef({ candidate, candidateId, candidateStale, client, supersession, supersessionChecked });
+  currentContextRef.current = { candidate, candidateId, candidateStale, client, supersession, supersessionChecked };
   const {
     activeIndex: activeKeyframeIndex,
     activePreviewState,
@@ -93,6 +103,8 @@ export default function CandidateRoute() {
     const current = currentContextRef.current;
     return mountedRef.current
       && !current.candidateStale
+      && current.supersessionChecked
+      && current.supersession === null
       && current.client === requestClient
       && current.candidateId === routeId
       && current.candidate?.candidate_id === snapshot.candidate_id
@@ -114,13 +126,17 @@ export default function CandidateRoute() {
     loadingRef.current = true;
     setLoading(true);
     setCandidateStale(true);
+    setSupersessionChecked(false);
     setError(null);
     try {
       const loaded = await client.getCandidate(candidateId);
+      const loadedSupersession = await client.getCandidateSupersession(loaded);
       if (loadRequestSequence.current !== requestId) {
         return { ok: false, message: "A newer ticket refresh replaced this request." };
       }
       setCandidate(loaded);
+      setSupersession(loadedSupersession);
+      setSupersessionChecked(true);
       setCandidateStale(false);
       setError(null);
       return { ok: true };
@@ -128,6 +144,7 @@ export default function CandidateRoute() {
       const message = caught instanceof Error ? caught.message : "Tacua could not load this candidate.";
       if (loadRequestSequence.current === requestId) {
         setCandidateStale(true);
+        setSupersessionChecked(false);
         setError(message);
       }
       return { ok: false, message };
@@ -199,7 +216,12 @@ export default function CandidateRoute() {
       const refresh = await load();
       if (!shouldReport()) return;
       if (refresh.ok) {
-        Alert.alert("Ticket refreshed", "This ticket changed while you were reviewing it. Tacua loaded the current version; please check it before trying again.");
+        Alert.alert(
+          caught instanceof CandidateSupersededApiError ? "Ticket was replaced" : "Ticket refreshed",
+          caught instanceof CandidateSupersededApiError
+            ? "CANDIDATE_SUPERSEDED: this source left the active queue. Tacua loaded its immutable history and replacement links."
+            : "This ticket changed while you were reviewing it. Tacua loaded the current version; please check it before trying again.",
+        );
       } else {
         Alert.alert("Refresh failed", `${refresh.message}\n\nActions remain locked until Tacua successfully refreshes this ticket.`);
       }
@@ -326,6 +348,68 @@ export default function CandidateRoute() {
     } catch (caught) {
       if (!isCurrentOperation()) return false;
       await handleTransitionError("Candidate edits were not saved", caught, isCurrentContext);
+      return false;
+    } finally {
+      if (actionRef.current === operation) {
+        actionRef.current = null;
+        setAction(null);
+      }
+    }
+  }
+
+  async function splitCandidate(drafts: readonly CandidateReplacementDraft[]): Promise<boolean> {
+    const operation = "split";
+    if (
+      !client
+      || !config
+      || !candidate
+      || candidateStale
+      || !supersessionChecked
+      || supersession !== null
+      || loadingRef.current
+      || actionRef.current !== null
+      || !isCurrentDisplayedCandidate(client, candidate, candidateId)
+    ) return false;
+    const parent = candidate;
+    const requestClient = client;
+    const requestRouteId = candidateId;
+    actionRef.current = operation;
+    setAction(operation);
+    const isCurrentContext = () => {
+      const current = currentContextRef.current;
+      return mountedRef.current
+        && actionRef.current === operation
+        && current.client === requestClient
+        && current.candidateId === requestRouteId;
+    };
+    const isCurrentOperation = () => {
+      const current = currentContextRef.current;
+      return isCurrentContext()
+        && current.candidate?.candidate_id === parent.candidate_id
+        && current.candidate.candidate_version === parent.candidate_version
+        && current.candidate.candidate_digest === parent.candidate_digest;
+    };
+    try {
+      const response = await requestClient.replaceCandidates({
+        operation: "split",
+        actorId: config.reviewerId,
+        reason: "Reviewer split one candidate finding into distinct result drafts.",
+        sources: [parent],
+        results: drafts,
+      });
+      if (!isCurrentOperation()) return false;
+      setSupersession(response.operation);
+      setSupersessionChecked(true);
+      setCandidateStale(false);
+      setError(null);
+      Alert.alert(
+        "Split drafts created",
+        `${response.candidates.length} unapproved drafts are now active. This source remains available below as non-actionable history.`,
+      );
+      return true;
+    } catch (caught) {
+      if (!isCurrentOperation()) return false;
+      await handleTransitionError("Ticket was not split", caught, isCurrentContext);
       return false;
     } finally {
       if (actionRef.current === operation) {
@@ -483,7 +567,11 @@ export default function CandidateRoute() {
   );
   const unresolved = candidate.content.clarifications.filter((item) => item.status === "unresolved");
   const resolved = candidate.content.clarifications.filter((item) => item.status === "resolved");
-  const actionsDisabled = candidateStale || loading || action !== null;
+  const actionsDisabled = candidateStale
+    || !supersessionChecked
+    || supersession !== null
+    || loading
+    || action !== null;
 
   return (
     <ScrollView
@@ -517,12 +605,93 @@ export default function CandidateRoute() {
         </SectionCard>
       ) : null}
 
-      <CandidateEditCard
-        candidate={candidate}
-        disabled={actionsDisabled}
-        saving={action === "edit_content"}
-        onSave={editContent}
-      />
+      {supersession ? (
+        <SectionCard title="Replaced ticket history">
+          <Text selectable accessibilityRole="alert" style={{ color: colors.orange, fontWeight: "800", lineHeight: 20 }}>
+            CANDIDATE_SUPERSEDED
+          </Text>
+          <Text selectable style={{ color: colors.secondaryLabel, lineHeight: 20 }}>
+            This source left the active queue in a reviewer-confirmed {supersession.operation}. It remains readable, but cannot be edited, approved, rejected, split, merged, or exported.
+          </Text>
+          <Text selectable style={{ color: colors.tertiaryLabel, fontSize: 12 }}>Operation {supersession.operation_id} · {supersession.occurred_at}</Text>
+          <Text selectable style={{ color: colors.label, fontWeight: "700" }}>Exact source tickets</Text>
+          {supersession.sources.map((source, index) => (
+            <Link
+              key={`${source.candidate_id}:${source.candidate_version}:${source.candidate_digest}`}
+              href={{ pathname: "/candidates/[candidate-id]", params: { "candidate-id": source.candidate_id } }}
+              asChild
+            >
+              <Pressable
+                accessibilityLabel={`Open exact source ${index + 1}, ${source.candidate_id}, version ${source.candidate_version}`}
+                accessibilityRole="link"
+                style={{ minHeight: 44, justifyContent: "center", borderTopColor: colors.separator, borderTopWidth: 1, paddingVertical: 8, gap: 2 }}
+              >
+                <Text selectable style={{ color: colors.primary, fontWeight: "800" }}>Open source {index + 1}</Text>
+                <Text selectable style={{ color: colors.tertiaryLabel, fontSize: 12 }}>{source.candidate_id} · version {source.candidate_version}</Text>
+                <Text selectable style={{ color: colors.tertiaryLabel, fontSize: 12 }}>{source.candidate_digest}</Text>
+              </Pressable>
+            </Link>
+          ))}
+          <Text selectable style={{ color: colors.label, fontWeight: "700" }}>Replacement drafts</Text>
+          {supersession.results.map((replacement, index) => (
+            <Link
+              key={replacement.candidate_id}
+              href={{ pathname: "/candidates/[candidate-id]", params: { "candidate-id": replacement.candidate_id } }}
+              asChild
+            >
+              <Pressable
+                accessibilityRole="link"
+                style={{ minHeight: 44, justifyContent: "center", borderTopColor: colors.separator, borderTopWidth: 1, paddingVertical: 8 }}
+              >
+                <Text selectable style={{ color: colors.primary, fontWeight: "800" }}>Open replacement {index + 1}</Text>
+                <Text selectable style={{ color: colors.tertiaryLabel, fontSize: 12 }}>{replacement.candidate_id} · version {replacement.candidate_version}</Text>
+              </Pressable>
+            </Link>
+          ))}
+        </SectionCard>
+      ) : null}
+
+      {["split", "merged"].includes(candidate.lineage.operation) && candidate.lineage.parents.length ? (
+        <SectionCard title="Source history">
+          <Text selectable style={{ color: colors.secondaryLabel, lineHeight: 20 }}>
+            This {candidate.lineage.operation === "merged" ? "combined" : candidate.lineage.operation} candidate was created from these exact historical versions.
+          </Text>
+          {candidate.lineage.parents.map((parent, index) => (
+            <Link
+              key={`${parent.candidate_id}:${parent.candidate_version}:${parent.candidate_digest}`}
+              href={{ pathname: "/candidates/[candidate-id]", params: { "candidate-id": parent.candidate_id } }}
+              asChild
+            >
+              <Pressable
+                accessibilityRole="link"
+                style={{ minHeight: 44, justifyContent: "center", borderTopColor: colors.separator, borderTopWidth: 1, paddingVertical: 8 }}
+              >
+                <Text selectable style={{ color: colors.primary, fontWeight: "800" }}>Open source {index + 1}</Text>
+                <Text selectable style={{ color: colors.tertiaryLabel, fontSize: 12 }}>{parent.candidate_id} · version {parent.candidate_version}</Text>
+              </Pressable>
+            </Link>
+          ))}
+        </SectionCard>
+      ) : null}
+
+      {supersession === null ? (
+        <>
+          <CandidateEditCard
+            candidate={candidate}
+            disabled={actionsDisabled}
+            saving={action === "edit_content"}
+            onSave={editContent}
+          />
+
+          <CandidateSplitCard
+            actorId={config?.reviewerId ?? ""}
+            candidate={candidate}
+            disabled={actionsDisabled}
+            saving={action === "split"}
+            onSubmit={splitCandidate}
+          />
+        </>
+      ) : null}
 
       <CandidateEvidencePanel
         activeKeyframeIndex={activeKeyframeIndex}
@@ -532,8 +701,8 @@ export default function CandidateRoute() {
         inspectedKeyframeCount={inspectedKeyframeCount}
         keyframes={keyframes}
         loading={evidenceLoading || loading}
-        retryDisabled={actionsDisabled}
-        onRetry={() => { if (actionRef.current === null) void load(); }}
+        retryDisabled={loading || evidenceLoading}
+        onRetry={() => { if (actionRef.current === null && !loadingRef.current && !evidenceLoading) void load(); }}
         onRetryActivePreview={retryActivePreview}
         onShowNextKeyframe={showNextKeyframe}
         onShowPreviousKeyframe={showPreviousKeyframe}
@@ -706,7 +875,7 @@ export default function CandidateRoute() {
         </SectionCard>
       ) : null}
 
-      {candidate.state === "ready_for_review" ? (
+      {candidate.state === "ready_for_review" && supersession === null ? (
         <SectionCard title="Exact version to approve">
           <Text selectable style={{ color: colors.label, fontVariant: ["tabular-nums"] }}>Candidate version {candidate.candidate_version}</Text>
           <Text selectable style={{ color: colors.secondaryLabel, fontSize: 12 }}>{candidate.candidate_content_digest}</Text>
@@ -726,7 +895,7 @@ export default function CandidateRoute() {
             This exact approved version has immutable Markdown and JSON handoffs ready to pass to an implementation agent.
           </Text>
           <Text selectable style={{ color: colors.secondaryLabel, fontSize: 13, lineHeight: 18 }}>
-            The files are structural artifacts. An agent must still validate execution authority against a separately trusted registry before changing code.
+            The files are structural artifacts. Before changing code, a launcher must also validate current registry trust, a short-lived exact-scope execution assertion, and the registry-current signed revocation list.
           </Text>
           {handoffVerification ? (
             <View style={{ gap: 4 }}>
@@ -752,11 +921,13 @@ export default function CandidateRoute() {
         </SectionCard>
       ) : null}
 
-      <View style={{ gap: 10, paddingTop: 4 }}>
-        {candidate.state === "draft" || candidate.state === "needs_clarification" ? <ActionButton label="Mark ready for review" disabled={actionsDisabled || unresolved.some((item) => item.impact === "blocking")} loading={action === "mark_ready"} onPress={() => void transition("mark_ready", "Reviewer completed candidate preparation.")} /> : null}
-        {candidate.state === "ready_for_review" ? <ActionButton label="Approve exact version" disabled={actionsDisabled || !evidenceInspectionReady || evidenceLoading || evidenceError !== null} loading={action === "approve"} onPress={() => Alert.alert("Approve this ticket?", "Approval binds this exact candidate and evidence and atomically creates its immutable handoff. The handoff is not authenticated execution trust by itself.", [{ text: "Cancel", style: "cancel" }, { text: "Approve", onPress: () => void transition("approve", "Reviewer approved the exact candidate version.") }])} /> : null}
-        {candidate.state === "needs_clarification" || candidate.state === "ready_for_review" ? <ActionButton destructive label="Reject candidate" disabled={actionsDisabled} loading={action === "reject"} onPress={() => Alert.alert("Reject this candidate?", undefined, [{ text: "Cancel", style: "cancel" }, { text: "Reject", style: "destructive", onPress: () => void transition("reject", "Reviewer rejected the candidate.") }])} /> : null}
-      </View>
+      {supersession === null ? (
+        <View style={{ gap: 10, paddingTop: 4 }}>
+          {candidate.state === "draft" || candidate.state === "needs_clarification" ? <ActionButton label="Mark ready for review" disabled={actionsDisabled || unresolved.some((item) => item.impact === "blocking")} loading={action === "mark_ready"} onPress={() => void transition("mark_ready", "Reviewer completed candidate preparation.")} /> : null}
+          {candidate.state === "ready_for_review" ? <ActionButton label="Approve exact version" disabled={actionsDisabled || !evidenceInspectionReady || evidenceLoading || evidenceError !== null} loading={action === "approve"} onPress={() => Alert.alert("Approve this ticket?", "Approval binds this exact candidate and evidence and atomically creates its immutable handoff. The handoff is not authenticated execution trust by itself.", [{ text: "Cancel", style: "cancel" }, { text: "Approve", onPress: () => void transition("approve", "Reviewer approved the exact candidate version.") }])} /> : null}
+          {candidate.state === "needs_clarification" || candidate.state === "ready_for_review" ? <ActionButton destructive label="Reject candidate" disabled={actionsDisabled} loading={action === "reject"} onPress={() => Alert.alert("Reject this candidate?", undefined, [{ text: "Cancel", style: "cancel" }, { text: "Reject", style: "destructive", onPress: () => void transition("reject", "Reviewer rejected the candidate.") }])} /> : null}
+        </View>
+      ) : null}
     </ScrollView>
   );
 }

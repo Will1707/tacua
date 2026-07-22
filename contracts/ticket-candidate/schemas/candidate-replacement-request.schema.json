@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tacua.invalid/schemas/ticket-candidate/1.0.0/candidate-replacement-request.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "Tacua atomic candidate-replacement request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["operation", "actor_id", "reason", "sources", "results"],
+  "properties": {
+    "operation": { "enum": ["split", "merge"] },
+    "actor_id": { "$ref": "common.schema.json#/$defs/id" },
+    "reason": { "$ref": "common.schema.json#/$defs/shortText" },
+    "sources": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/exactCandidateBinding" }
+    },
+    "results": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/resultInput" }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "operation": { "const": "split" } } },
+      "then": {
+        "properties": {
+          "sources": { "minItems": 1, "maxItems": 1 },
+          "results": { "minItems": 2, "maxItems": 16 }
+        }
+      },
+      "else": {
+        "properties": {
+          "sources": { "minItems": 2, "maxItems": 16 },
+          "results": { "minItems": 1, "maxItems": 1 }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "exactCandidateBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_id",
+        "candidate_version",
+        "candidate_digest",
+        "candidate_content_digest",
+        "evidence_manifest_digest"
+      ],
+      "properties": {
+        "candidate_id": { "$ref": "common.schema.json#/$defs/id" },
+        "candidate_version": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "candidate_digest": { "$ref": "common.schema.json#/$defs/digest" },
+        "candidate_content_digest": { "$ref": "common.schema.json#/$defs/digest" },
+        "evidence_manifest_digest": { "$ref": "common.schema.json#/$defs/digest" }
+      }
+    },
+    "resultInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_id", "content"],
+      "properties": {
+        "candidate_id": { "$ref": "common.schema.json#/$defs/id" },
+        "content": { "$ref": "ticket-candidate.schema.json#/$defs/content" }
+      }
+    }
+  }
+}

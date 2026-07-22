@@ -167,6 +167,10 @@ struct CaptureSegment: Codable {
   let droppedVideoSamples: Int
   let droppedAppAudioSamples: Int
   let droppedMicrophoneSamples: Int
+  /// Present on schema-4 captures. Schema-3 sidecars intentionally decode these as nil.
+  let appAudioAppendAttemptStartIndex: Int?
+  let appAudioAppendAttempts: Int?
+  let appAudioAppendDrops: [TacuaAppAudioAppendDrop]?
 }
 
 struct CaptureGap: Codable {
@@ -228,6 +232,16 @@ struct CaptureManifest: Codable {
   var droppedDuringBackground: [String: Int]?
   var microphoneSamplesObserved: Int?
   var appAudioSamplesObserved: Int?
+  /// Schema-4 app-audio accounting is optional only so existing schema-3 captures remain
+  /// recoverable. Acceptance evidence requires all three fields and `complete == true`.
+  var appAudioAppendAccountingVersion: Int?
+  var appAudioAppendAccountingComplete: Bool?
+  var appAudioAppendAttemptsObserved: Int?
+  /// Inclusive crash-durable lease high-watermark. No index at or below this value may be
+  /// reissued after process recovery, even when its writer tail never committed a sidecar.
+  var appAudioAppendReservedThroughIndex: Int?
+  /// Reserved indexes skipped after recovery because their append outcome cannot be reconstructed.
+  var appAudioAppendUnknownRanges: [TacuaAppAudioAppendUnknownRange]?
 }
 
 enum TacuaCaptureSpikeError: Error {
@@ -249,6 +263,7 @@ enum TacuaCaptureSpikeError: Error {
   case noCaptureRunning
   case microphonePermissionDenied
   case microphoneSamplesMissing
+  case appAudioAccountingLimitExceeded
   case captureStartFailed(String)
   case captureStartCancelled
   case captureHandlerFailed
@@ -291,6 +306,7 @@ enum TacuaCaptureSpikeError: Error {
     case .noCaptureRunning: return "ERR_TACUA_CAPTURE_NOT_RUNNING"
     case .microphonePermissionDenied: return "ERR_TACUA_CAPTURE_MICROPHONE_DENIED"
     case .microphoneSamplesMissing: return "ERR_TACUA_CAPTURE_MICROPHONE_MISSING"
+    case .appAudioAccountingLimitExceeded: return "ERR_TACUA_CAPTURE_APP_AUDIO_ACCOUNTING_LIMIT"
     case .captureStartFailed: return "ERR_TACUA_CAPTURE_START_FAILED"
     case .captureStartCancelled: return "ERR_TACUA_CAPTURE_START_CANCELLED"
     case .captureHandlerFailed: return "ERR_TACUA_CAPTURE_HANDLER_FAILED"
@@ -353,6 +369,8 @@ enum TacuaCaptureSpikeError: Error {
       return "Microphone permission is required before Tacua can start this narrated capture."
     case .microphoneSamplesMissing:
       return "Tacua did not receive microphone samples and stopped the capture."
+    case .appAudioAccountingLimitExceeded:
+      return "Tacua reached its bounded app-audio drop-accounting limit and stopped the capture."
     case .captureStartFailed(let detail):
       return "ReplayKit could not start the candidate capture (\(detail))."
     case .captureStartCancelled:

@@ -9,6 +9,11 @@ The current scaffold can connect to the pilot backend's session/job endpoints.
 Its ticket UI is typed against the standalone `tacua.ticket-candidate@1.0.0`
 contract and shows grounded behavior, reproduction, scope, uncertainty, visual
 clarification choices, and the exact candidate/evidence digests being approved.
+The reviewer can atomically split one exact current source into two through
+sixteen drafts or merge two through sixteen exact current sources into one
+draft. It shows the complete resulting content before confirmation, removes
+superseded sources from the active queue, and keeps their immutable history and
+evidence available without treating replacement as approval.
 An approved version exposes its immutable `tacua.approved-handoff@1.1.0`
 Markdown and JSON files through the native share sheet. Before sharing, the app
 hashes the exact bounded response bytes, validates canonical JSON and the
@@ -16,8 +21,11 @@ embedded exact source candidate, then writes a uniquely named file in a
 dedicated share cache. The cache keeps at most ten files, removes entries older
 than one hour on route mount and before sharing, and retains a just-shared file
 long enough for the receiving app to consume it. These are structural exports;
-execution trust remains a separate authenticated registry decision. A failed
-candidate or handoff request is intentionally not treated as an empty approval.
+execution additionally requires current authenticated registry trust, a
+short-lived exact-scope execution assertion, and the registry-current signed
+revocation list. This app neither issues that authority nor launches Codex. A
+failed candidate or handoff request is intentionally not treated as an empty
+approval.
 
 ## Local development
 

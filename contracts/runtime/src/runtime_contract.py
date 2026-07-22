@@ -301,6 +301,7 @@ def validate_capture(value: dict[str, Any]) -> None:
         previous_end = segment["time_range"]["end_ms"]
         if segment["availability"] == "available":
             available[segment["segment_id"]] = segment["content"]
+    validate_app_audio_accounting(value.get("app_audio_accounting"), segments)
     unique([gap["gap_id"] for gap in value["gaps"]], "$.gaps")
     for index, gap in enumerate(value["gaps"]):
         validate_range(gap["time_range"], duration, f"$.gaps[{index}].time_range")
@@ -324,6 +325,149 @@ def validate_capture(value: dict[str, Any]) -> None:
     raw_expiry = parse_time(value["retention"]["raw_media_expires_at"], "$.retention.raw_media_expires_at")
     require(raw_expiry > start, "INVALID_RETENTION", "$.retention", "raw-media expiry must follow capture")
     require(raw_expiry <= start + timedelta(days=30), "MAX_RAW_RETENTION_EXCEEDED", "$.retention.raw_media_expires_at", "raw media may not silently exceed the 30-day V1 default")
+
+
+def validate_app_audio_accounting(
+    accounting: dict[str, Any] | None,
+    runtime_segments: list[dict[str, Any]],
+) -> None:
+    """Bind exact schema-4 append history to the persisted runtime segment projection."""
+
+    if accounting is None:
+        return
+    path = "$.app_audio_accounting"
+    available_bindings = [
+        (segment["segment_id"], segment["sequence"])
+        for segment in runtime_segments
+        if segment["availability"] == "available"
+    ]
+    segment_accounting = accounting["segments"]
+    require(
+        [(segment["segment_id"], segment["sequence"]) for segment in segment_accounting]
+        == available_bindings,
+        "APP_AUDIO_SEGMENT_BINDING_MISMATCH",
+        f"{path}.segments",
+        "accounting must bind every available segment in runtime sequence order",
+    )
+
+    unknown_ranges = accounting["unknown_ranges"]
+    require(
+        accounting["complete"] == (not unknown_ranges),
+        "APP_AUDIO_COMPLETENESS_MISMATCH",
+        f"{path}.complete",
+        "complete is true exactly when no reserved range is unknown",
+    )
+    require(
+        unknown_ranges
+        == sorted(unknown_ranges, key=lambda item: (item["start_index"], item["end_index"])),
+        "APP_AUDIO_UNKNOWN_RANGE_ORDER",
+        f"{path}.unknown_ranges",
+        "unknown ranges must be ordered",
+    )
+
+    next_index = 1
+    unknown_offset = 0
+    actual_attempts = 0
+    total_drops = 0
+    seen_drop_indexes: set[int] = set()
+
+    def consume_unknown_ranges(before: int) -> None:
+        nonlocal next_index, unknown_offset
+        while unknown_offset < len(unknown_ranges):
+            unknown = unknown_ranges[unknown_offset]
+            unknown_path = f"{path}.unknown_ranges[{unknown_offset}]"
+            require(
+                unknown["end_index"] >= unknown["start_index"],
+                "INVALID_APP_AUDIO_UNKNOWN_RANGE",
+                unknown_path,
+                "end precedes start",
+            )
+            if unknown["start_index"] != next_index:
+                require(
+                    unknown["start_index"] > next_index,
+                    "INVALID_APP_AUDIO_UNKNOWN_RANGE",
+                    unknown_path,
+                    "unknown ranges overlap known or prior ranges",
+                )
+                return
+            if unknown["end_index"] >= before:
+                return
+            next_index = unknown["end_index"] + 1
+            unknown_offset += 1
+
+    for offset, segment in enumerate(segment_accounting):
+        segment_path = f"{path}.segments[{offset}]"
+        start_index = segment["attempt_start_index"]
+        attempts = segment["append_attempts"]
+        consume_unknown_ranges(start_index)
+        require(
+            start_index == next_index,
+            "NONCONTIGUOUS_APP_AUDIO_ACCOUNTING",
+            f"{segment_path}.attempt_start_index",
+            "known and explicitly unknown ranges must cover every reserved index from one",
+        )
+        require(
+            attempts <= 10_000_000 - (start_index - 1),
+            "APP_AUDIO_ATTEMPT_LIMIT_EXCEEDED",
+            f"{segment_path}.append_attempts",
+            "segment range exceeds the V1 attempt bound",
+        )
+        end_exclusive = start_index + attempts
+        drops = segment["drops"]
+        require(
+            segment["appended_samples"] + len(drops) == attempts,
+            "APP_AUDIO_APPEND_TOTAL_MISMATCH",
+            segment_path,
+            "appended samples plus exact drops must equal append attempts",
+        )
+        previous_drop_index = 0
+        for drop_offset, drop in enumerate(drops):
+            drop_path = f"{segment_path}.drops[{drop_offset}].attempt_index"
+            attempt_index = drop["attempt_index"]
+            require(
+                start_index <= attempt_index < end_exclusive
+                and attempt_index > previous_drop_index,
+                "INVALID_APP_AUDIO_DROP_INDEX",
+                drop_path,
+                "drop indexes must be unique, ordered, and inside the segment range",
+            )
+            require(
+                attempt_index not in seen_drop_indexes,
+                "DUPLICATE_APP_AUDIO_DROP_INDEX",
+                drop_path,
+                "one append attempt cannot be dropped more than once",
+            )
+            seen_drop_indexes.add(attempt_index)
+            previous_drop_index = attempt_index
+        total_drops += len(drops)
+        require(
+            total_drops <= 2_048,
+            "APP_AUDIO_DROP_LIMIT_EXCEEDED",
+            f"{path}.segments",
+            "exact drop records exceed the V1 bound",
+        )
+        actual_attempts += attempts
+        next_index = end_exclusive
+
+    consume_unknown_ranges(10_000_001)
+    require(
+        unknown_offset == len(unknown_ranges),
+        "INVALID_APP_AUDIO_UNKNOWN_RANGE",
+        f"{path}.unknown_ranges",
+        "unknown ranges leave an unrepresented hole or overlap known history",
+    )
+    require(
+        accounting["reserved_through_index"] == next_index - 1,
+        "APP_AUDIO_RESERVATION_MISMATCH",
+        f"{path}.reserved_through_index",
+        "reserved high-watermark must equal the exact known and unknown coverage",
+    )
+    require(
+        accounting["append_attempts"] == actual_attempts,
+        "APP_AUDIO_ATTEMPT_TOTAL_MISMATCH",
+        f"{path}.append_attempts",
+        "aggregate attempts must equal known per-segment attempts",
+    )
 
 
 def validate_diagnostics(value: dict[str, Any]) -> None:

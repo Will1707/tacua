@@ -75,6 +75,10 @@ const preview = {
   release() {},
 };
 let inspectionReady = false;
+let supersession = null;
+let replacementCalls = 0;
+let evidenceFailure = false;
+let evidenceCalls = 0;
 const client = {
   async getCandidate(candidateId) {
     assert.equal(candidateId, candidate.candidate_id);
@@ -82,11 +86,22 @@ const client = {
   },
   async getCandidateEvidence(requestedCandidate) {
     assert.equal(requestedCandidate.candidate_digest, candidate.candidate_digest);
+    evidenceCalls += 1;
+    if (evidenceFailure) throw new Error("temporary historical evidence failure");
     return evidence;
+  },
+  async getCandidateSupersession(requestedCandidate) {
+    assert.equal(requestedCandidate.candidate_digest, candidate.candidate_digest);
+    return supersession;
+  },
+  async replaceCandidates() {
+    replacementCalls += 1;
+    throw new Error("not exercised past confirmation");
   },
 };
 const config = { reviewerId: "reviewer_owner" };
 const alerts = [];
+let randomSequence = 0;
 
 const reactNative = {
   ActivityIndicator: "ActivityIndicator",
@@ -139,9 +154,11 @@ Module._load = function load(request, parent, isMain) {
     };
   }
   if (request === "expo-router") {
-    return { useLocalSearchParams: () => ({ "candidate-id": candidate.candidate_id }) };
+    return { Link: "Link", useLocalSearchParams: () => ({ "candidate-id": candidate.candidate_id }) };
   }
-  if (request === "expo-crypto") return { randomUUID: () => "00000000-0000-4000-8000-000000000000" };
+  if (request === "expo-crypto") {
+    return { randomUUID: () => `${String(++randomSequence).padStart(32, "0")}` };
+  }
   if (request === "expo-file-system") return {};
   if (request === "expo-sharing") {
     return { isAvailableAsync: async () => true, shareAsync: async () => undefined };
@@ -201,6 +218,9 @@ async function settle() {
 
 test("renders ticket, verified screenshot, SDK timeline, and a fail-closed approval together", async () => {
   inspectionReady = false;
+  supersession = null;
+  replacementCalls = 0;
+  evidenceFailure = false;
   let renderer;
   await TestRenderer.act(async () => {
     renderer = TestRenderer.create(React.createElement(CandidateRoute));
@@ -219,6 +239,8 @@ test("renders ticket, verified screenshot, SDK timeline, and a fail-closed appro
     assert.match(texts, /Expected/u);
     assert.match(texts, /Exact version to approve/u);
     assert.match(texts, /Approval unlocks after every content-referenced available screenshot/u);
+    assert.match(texts, /Split ticket/u);
+    assert.match(texts, /Prepare split drafts/u);
 
     const images = renderer.root.findAllByType("Image");
     assert.equal(images.length, 1);
@@ -238,6 +260,9 @@ test("renders ticket, verified screenshot, SDK timeline, and a fail-closed appro
 
 test("unlocks the exact-version action only after the screenshot inspection gate", async () => {
   inspectionReady = true;
+  supersession = null;
+  replacementCalls = 0;
+  evidenceFailure = false;
   let renderer;
   await TestRenderer.act(async () => {
     renderer = TestRenderer.create(React.createElement(CandidateRoute));
@@ -253,6 +278,149 @@ test("unlocks the exact-version action only after the screenshot inspection gate
     assert.doesNotMatch(texts, /Approval unlocks after/u);
   } finally {
     await TestRenderer.act(async () => renderer.unmount());
+  }
+});
+
+test("split suggestions remain local until one explicit source-disposition confirmation", async () => {
+  inspectionReady = true;
+  supersession = null;
+  replacementCalls = 0;
+  evidenceFailure = false;
+  alerts.length = 0;
+  let renderer;
+  await TestRenderer.act(async () => {
+    renderer = TestRenderer.create(React.createElement(CandidateRoute));
+  });
+  try {
+    await settle();
+    const prepare = renderer.root.findAllByType("Pressable").find(
+      (node) => node.props.accessibilityLabel === "Prepare split drafts",
+    );
+    assert.ok(prepare);
+    await TestRenderer.act(async () => prepare.props.onPress());
+    assert.equal(replacementCalls, 0);
+    let texts = renderer.root.findAllByType("Text").map(nodeText).join("\n");
+    assert.match(texts, /Result draft 1/u);
+    assert.match(texts, /Result draft 2/u);
+    assert.match(texts, /editable suggestions/u);
+    assert.equal((texts.match(/Complete result content/gu) ?? []).length, 1);
+    assert.match(texts, /1 of 2 complete results opened for review/u);
+    assert.match(texts, /Claims and grounding/u);
+    assert.match(texts, /The tested build renders Save draft on the profile action/u);
+    assert.match(texts, /Reproduction details/u);
+    assert.match(texts, /The enabled profile action reads Save profile in the tested locale/u);
+    assert.match(texts, /Correct the profile action copy in the tested iOS build/u);
+    assert.match(texts, /Copy for locales outside the tested English build was not inspected/u);
+    assert.match(texts, /Which label should the enabled profile action use/u);
+
+    let review = renderer.root.findAllByType("Pressable").find(
+      (node) => node.props.accessibilityLabel === "Review and create 2 drafts",
+    );
+    assert.ok(review);
+    assert.equal(review.props.disabled, true);
+    const openSecond = renderer.root.findAllByType("Pressable").find(
+      (node) => node.props.accessibilityLabel === "Open complete result draft 2",
+    );
+    assert.ok(openSecond);
+    assert.equal(openSecond.props.accessibilityState.expanded, false);
+    await TestRenderer.act(async () => openSecond.props.onPress());
+    texts = renderer.root.findAllByType("Text").map(nodeText).join("\n");
+    assert.equal((texts.match(/Complete result content/gu) ?? []).length, 1);
+    assert.match(texts, /2 of 2 complete results opened for review/u);
+    assert.match(texts, /Part 2/u);
+    assert.equal(renderer.root.findAllByType("TextInput").filter(
+      (node) => /^Result draft [12] title$/u.test(node.props.accessibilityLabel ?? ""),
+    ).length, 1);
+    review = renderer.root.findAllByType("Pressable").find(
+      (node) => node.props.accessibilityLabel === "Review and create 2 drafts",
+    );
+    assert.equal(review.props.disabled, false);
+    await TestRenderer.act(async () => review.props.onPress());
+    assert.equal(replacementCalls, 0);
+    assert.equal(alerts.length, 1);
+    assert.match(alerts[0][0], /Replace 1 active ticket with 2 drafts/u);
+    assert.match(alerts[0][1], /will leave the active queue/u);
+    assert.equal(alerts[0][2][0].text, "Cancel");
+    assert.equal(alerts[0][2][1].text, "Create 2 drafts");
+  } finally {
+    await TestRenderer.act(async () => renderer.unmount());
+  }
+});
+
+test("renders exact ordered merge history and keeps superseded evidence retryable", async () => {
+  inspectionReady = true;
+  replacementCalls = 0;
+  evidenceFailure = true;
+  evidenceCalls = 0;
+  const secondSourceDigest = `sha256:${"9".repeat(64)}`;
+  supersession = {
+    operation_id: "operation_merge_001",
+    operation: "merge",
+    actor_id: "reviewer_owner",
+    occurred_at: "2026-07-21T10:08:00Z",
+    sources: [
+      {
+        candidate_id: candidate.candidate_id,
+        candidate_version: candidate.candidate_version,
+        candidate_digest: candidate.candidate_digest,
+        candidate_content_digest: candidate.candidate_content_digest,
+        evidence_manifest_digest: candidate.evidence_manifest.manifest_digest,
+      },
+      {
+        candidate_id: "candidate_other_source",
+        candidate_version: 4,
+        candidate_digest: secondSourceDigest,
+        candidate_content_digest: `sha256:${"8".repeat(64)}`,
+        evidence_manifest_digest: `sha256:${"7".repeat(64)}`,
+      },
+    ],
+    results: [{
+      candidate_id: "candidate_merged_result",
+      candidate_version: 1,
+      candidate_digest: `sha256:${"6".repeat(64)}`,
+      candidate_content_digest: `sha256:${"5".repeat(64)}`,
+      evidence_manifest_digest: `sha256:${"4".repeat(64)}`,
+    }],
+  };
+  let renderer;
+  await TestRenderer.act(async () => {
+    renderer = TestRenderer.create(React.createElement(CandidateRoute));
+  });
+  try {
+    await settle();
+    const texts = renderer.root.findAllByType("Text").map(nodeText).join("\n");
+    assert.match(texts, /CANDIDATE_SUPERSEDED/u);
+    assert.match(texts, /cannot be edited, approved, rejected, split, merged, or exported/u);
+    assert.match(texts, /Exact source tickets/u);
+    assert.match(texts, new RegExp(candidate.candidate_digest, "u"));
+    assert.match(texts, /candidate_other_source · version 4/u);
+    assert.match(texts, new RegExp(secondSourceDigest, "u"));
+    assert.match(texts, /Open replacement 1/u);
+    const sourceLinks = renderer.root.findAllByType("Pressable").filter(
+      (node) => /^Open exact source/u.test(node.props.accessibilityLabel ?? ""),
+    );
+    assert.deepEqual(sourceLinks.map((node) => node.props.accessibilityLabel), [
+      `Open exact source 1, ${candidate.candidate_id}, version ${candidate.candidate_version}`,
+      "Open exact source 2, candidate_other_source, version 4",
+    ]);
+    const retryEvidence = renderer.root.findAllByType("Pressable").find(
+      (node) => node.props.accessibilityLabel === "Retry evidence check",
+    );
+    assert.ok(retryEvidence);
+    assert.equal(retryEvidence.props.disabled, false);
+    assert.equal(evidenceCalls, 1);
+    const approval = renderer.root.findAllByType("Pressable").find(
+      (node) => node.props.accessibilityLabel === "Approve exact version",
+    );
+    const split = renderer.root.findAllByType("Pressable").find(
+      (node) => node.props.accessibilityLabel === "Prepare split drafts",
+    );
+    assert.equal(approval, undefined);
+    assert.equal(split, undefined);
+  } finally {
+    await TestRenderer.act(async () => renderer.unmount());
+    supersession = null;
+    evidenceFailure = false;
   }
 });
 

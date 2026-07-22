@@ -230,9 +230,12 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
     def _send_api_error(self, error: ApiError) -> None:
         reconciliation = error.sdk_reconciliation
         if reconciliation is None:
+            serialized = {"code": error.code, "message": error.message}
+            if error.details is not None:
+                serialized["details"] = error.details
             self._send_json(
                 error.status,
-                {"error": {"code": error.code, "message": error.message}},
+                {"error": serialized},
             )
             return
         document = {
@@ -511,6 +514,34 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
                     "ETag": f'"{response.candidate_digest}"',
                     "Tacua-Body-Digest": response.body_digest,
                 },
+            )
+            return
+
+        if self.command == "POST" and path == "/v1/admin/candidate-replacements":
+            self._admin()
+            response = self.backend.replace_candidates(
+                idempotency_key=self._single_header(
+                    "Idempotency-Key", "IDEMPOTENCY_KEY_REQUIRED"
+                ),
+                body=self._read_json(16_777_216),
+            )
+            self._send_bytes(
+                response.status,
+                response.body,
+                headers={"Tacua-Body-Digest": response.body_digest},
+            )
+            return
+
+        candidate_supersession = re.fullmatch(
+            rf"/v1/admin/candidates/(?P<candidate_id>{ID})/supersession", path
+        )
+        if candidate_supersession and self.command == "GET":
+            self._admin()
+            self._send_json(
+                200,
+                self.backend.get_candidate_supersession(
+                    candidate_supersession.group("candidate_id")
+                ),
             )
             return
 
