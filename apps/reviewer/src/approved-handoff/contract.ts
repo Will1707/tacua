@@ -397,6 +397,44 @@ function uniqueField(items: readonly JsonObject[], field: string, path: string):
   uniqueStrings(values, path);
 }
 
+/**
+ * Validate a human-edited replacement content document before it leaves the
+ * reviewer. This is the content-only subset of the immutable candidate
+ * validator; the backend remains responsible for creating and sealing the new
+ * candidate envelope.
+ */
+export function validateTicketCandidateContentDocument(
+  value: unknown,
+  permittedEvidenceIds: readonly string[],
+): void {
+  validateJsonValues(value);
+  requireValue(encoder.encode(`${canonicalJson(value)}\n`).byteLength <= 1_048_576, "ARTIFACT_TOO_LARGE", "$", "candidate content exceeds 1 MiB");
+  const content = validateCandidateContent(value, "$");
+  const manifestIds = idList(permittedEvidenceIds, "$.permitted_evidence_ids", 1, 128);
+  const claims = content.claims as JsonObject[];
+  const claimIds = claims.map((claim) => claim.claim_id as string);
+  uniqueStrings(claimIds, "$.claims");
+  uniqueField(content.reproduction.preconditions, "precondition_id", "$.reproduction.preconditions");
+  uniqueField(content.reproduction.steps, "step_id", "$.reproduction.steps");
+  uniqueField(content.acceptance_criteria, "criterion_id", "$.acceptance_criteria");
+  uniqueField(content.uncertainty.items, "uncertainty_id", "$.uncertainty.items");
+  uniqueField(content.clarifications, "clarification_id", "$.clarifications");
+  claims.forEach((claim, index) => {
+    if (claim.support === "direct" || claim.support === "inferred") {
+      requireValue(claim.evidence_refs.length > 0, "SUPPORTED_CLAIM_REQUIRES_EVIDENCE", `$.claims[${index}].evidence_refs`, "supported claim requires evidence");
+    }
+  });
+  for (const ref of collectClaimRefs(content)) requireValue(claimIds.includes(ref), "UNKNOWN_CLAIM_REFERENCE", "$", ref);
+  const usedEvidence = collectEvidenceRefs(content);
+  requireValue([...usedEvidence].every((ref) => manifestIds.includes(ref)), "UNKNOWN_EVIDENCE_REFERENCE", "$", "content cites evidence outside the permitted source manifest union");
+  for (const [index, clarification] of (content.clarifications as JsonObject[]).entries()) {
+    if (clarification.status !== "resolved") continue;
+    const selected = (clarification.choices as JsonObject[]).find((choice) => choice.choice_id === clarification.selected_choice_id);
+    requireValue(selected, "UNKNOWN_CLARIFICATION_CHOICE", `$.clarifications[${index}].selected_choice_id`, "resolved choice is missing");
+    if (selected.requires_note) requireValue(typeof clarification.resolution_note === "string", "CLARIFICATION_NOTE_REQUIRED", `$.clarifications[${index}].resolution_note`, "selected choice requires a note");
+  }
+}
+
 function validateCandidateApproval(value: unknown, path: string): JsonObject {
   const approval = exactObject(value, path, [
     "approval_id", "actor_type", "actor_id", "approved_at", "reviewed_candidate_version", "reviewed_candidate_digest",
@@ -1240,7 +1278,7 @@ export function renderApprovedHandoffMarkdown(handoff: JsonObject): string {
   }
   lines.push(
     "## Structural scope — not execution authority", "",
-    "- This file is not execution authorization. Before acting, obtain and verify a current trusted registry assertion for this exact handoff digest.",
+    "- This file is not execution authorization. Before acting, verify the current trusted registry assertion and its authorized, short-lived, unrevoked OpenAI Codex execution assertion for this exact handoff.",
     "- Only after that independent authorization, the requested scope permits reading the authorized evidence references, modifying code in the listed repositories, and running tests.",
     "- This structural scope never permits external writes, merge, or deploy.",
     `- Repositories: ${handoff.authority.allowed_repositories.map((repository: string) => `\`${repository}\``).join(", ")}`,

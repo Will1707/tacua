@@ -15,7 +15,7 @@
   },
   "failure": null,
   "inputs": {
-    "capture_manifest_digest": "sha256:ed29d84bd1ce896057b6b5bd8e5b7d0207ef65482ad9a2b00673a644020716bc",
+    "capture_manifest_digest": "sha256:f8492d3b6e6a6ed169766992a0f74529b76de1c23fb046ac04d4109c3bf00181",
     "context_sources": [
       {
         "access": "read_only",
@@ -41,7 +41,7 @@
       "sha256:08915b84578c23976d30bd5ac70429c570e28a43988161512949de07e78752c6"
     ]
   },
-  "job_digest": "sha256:97f16381272e341b718210b3378bb8ee65bf8737e7e6817464ac59a786dc38bd",
+  "job_digest": "sha256:ca312fc8be2f10a9ebd0638d16607a02259fc395a09ce27ed9423ae733e8cfc8",
   "job_id": "job_synthetic",
   "job_version": 1,
   "media_type": "application/vnd.tacua.processing-job+json;version=1.0.0",

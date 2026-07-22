@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tacua.invalid/schemas/ticket-candidate/1.0.0/candidate-replacement-response.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "Tacua atomic candidate-replacement response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["operation", "candidates"],
+  "properties": {
+    "operation": { "$ref": "#/$defs/operationRecord" },
+    "candidates": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "items": { "$ref": "ticket-candidate.schema.json" }
+    }
+  },
+  "$defs": {
+    "operationRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id",
+        "operation",
+        "actor_id",
+        "occurred_at",
+        "sources",
+        "results"
+      ],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/id" },
+        "operation": { "enum": ["split", "merge"] },
+        "actor_id": { "$ref": "common.schema.json#/$defs/id" },
+        "occurred_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "candidate-replacement-request.schema.json#/$defs/exactCandidateBinding"
+          }
+        },
+        "results": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "candidate-replacement-request.schema.json#/$defs/exactCandidateBinding"
+          }
+        }
+      }
+    }
+  }
+}

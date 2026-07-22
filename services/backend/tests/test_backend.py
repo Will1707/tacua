@@ -395,6 +395,7 @@ class BackendHarness(unittest.TestCase):
         manifest["upload"]["remote_session_id"] = session_id
         manifest["segments"] = []
         manifest["upload"]["receipts"] = []
+        accounting_segments = []
         for index, receipt in enumerate(segment_receipts):
             runtime_receipt = copy.deepcopy(receipt["runtime_receipt"])
             manifest["segments"].append(
@@ -418,6 +419,24 @@ class BackendHarness(unittest.TestCase):
                 }
             )
             manifest["upload"]["receipts"].append(runtime_receipt)
+            accounting_segments.append(
+                {
+                    "segment_id": receipt["segment_id"],
+                    "sequence": receipt["sequence"],
+                    "attempt_start_index": index + 1,
+                    "append_attempts": 1,
+                    "appended_samples": 1,
+                    "drops": [],
+                }
+            )
+        manifest["app_audio_accounting"] = {
+            "version": 1,
+            "complete": True,
+            "append_attempts": len(accounting_segments),
+            "reserved_through_index": len(accounting_segments),
+            "segments": accounting_segments,
+            "unknown_ranges": [],
+        }
         # Keep the frozen fixture's one-minute capture/gap chronology while
         # replacing only its available segment set.
         manifest["monotonic_duration_ms"] = 60_000

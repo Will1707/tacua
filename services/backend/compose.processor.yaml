@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: Apache-2.0
+# Optional V1 private-pilot topology. The host runner is the execution gate and
+# enforces a 150-second container ceiling inside a 210-second whole-runner
+# budget, leaving 30 seconds before the parent's exact 240-second deadline.
+# This file has
+# no image, model, input, or executable defaults: the operator must select each.
+
+services:
+  private-pilot-processor:
+    profiles:
+      - private-pilot
+    image: ${TACUA_PROCESSOR_IMAGE:?set a preloaded immutable image@sha256 digest}
+    pull_policy: never
+    restart: "no"
+    init: true
+    user: "10002:10002"
+    read_only: true
+    network_mode: none
+    ipc: none
+    pids_limit: 64
+    cpus: 2.0
+    mem_limit: 4g
+    memswap_limit: 4g
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 1024
+    logging:
+      driver: none
+    environment:
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      TACUA_PROCESSOR_MODEL_ID: ${TACUA_PROCESSOR_MODEL_ID:?set the operator-selected model ID}
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=268435456,uid=10002,gid=10002,mode=0700
+    entrypoint:
+      - ${TACUA_PROCESSOR_EXECUTABLE:?set the absolute executable inside the selected image}
+    command:
+      - --input
+      - /tacua-private-payload/input/input.json
+      - --model
+      - /tacua-private-payload/model/model
+    labels:
+      com.tacua.private-pilot-processor: "true"
+      com.tacua.runner-contract: "tacua.isolated-processing-command@1.0.0"
+      com.tacua.runner-role: "processor"
+      com.tacua.max-container-runtime-seconds: "150"
+      com.tacua.max-runner-seconds: "210"

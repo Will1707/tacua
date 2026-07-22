@@ -26,19 +26,34 @@ still require the model's deployment-specific overlays and live validation.
 | iOS capture | App-only ReplayKit capture, narration and app audio, bounded segmentation, issue marks and gaps, a 30-minute design limit, interruption recovery, and scoped local deletion. | The capture candidate passed its documented synthetic-data campaign on one physical iPhone. That campaign predates the complete SDK-to-backend path and is not a supported-device matrix. |
 | Mobile SDK lifecycle | A QA-build-only gate; sealed build, backend, consent, scope, and retention profile; consent-gated START and RESUME exchange; crash journals; native session discovery independent of prior JavaScript state; exact replay; stopped-capture admission; diagnostic projection; upload, completion, local retirement, server-anchored local expiry sweeping, and backend deletion. | Swift, TypeScript, config-plugin, and generated Expo/iOS build checks cover the implementation. The full lifecycle has not yet passed on a physical QA build. Upload uses an in-process foreground session: suspension or termination can stop progress, and the host must drain the durable queue again after relaunch. Expiry is checked when discovery or another lifecycle boundary runs. A reboot before the raw deadline blocks raw-data use until authenticated RESUME establishes a current-boot server-time anchor; this is deliberate fail-closed behavior, not continuous background enforcement. |
 | Self-hosted backend | A single-organization, single-process Python/SQLite service whose current pilot configuration pins exactly one project, application, tested build, reviewer identity, and administrator credential per deployment; exact SDK receipts; integrity-checked storage; retention and deletion; immutable job and candidate histories; atomic candidate publication and handoff export; sealed configuration; health, preflight, backup, restore, and smoke tooling; hardened Docker definitions. Backup manifest v2 binds and recomputes the earliest retained raw/derived session-evidence deadline and refuses verification plus dry-run or applied restore at expiry. This singular deployment scope is an implementation limit, not a narrowing of the product's future multi-project/member boundary. | Unit and contract suites plus the checked-in Docker CI job exercise these boundaries. Expiry refusal does not destroy off-host bytes, and this is not evidence that a real host, TLS proxy, firewall, storage device, backup destination, destruction lifecycle, or upgrade procedure has been operated successfully. |
-| Processing | Durable processing jobs and an opt-in, provider-neutral, shell-free local command adapter with bounded canonical input and output. Normal backend startup is inert and default-deny for egress. | No transcription model, LLM, repository connector, telemetry connector, API provider, or command is selected. The current local worker is an exclusive operator command that runs while the HTTP service is stopped; it is not an unattended production worker. |
-| Reviewer app | Secure self-hosted configuration; display of the single registered build projection and launch-code orchestration; recovery guidance; session, evidence, preview, and job views; candidate editing and clarification; exact-version approval; integrity-checked canonical Markdown/JSON sharing. | Deterministic tests include a rendered candidate-route regression for combined ticket, screenshot, SDK-timeline, and approval-lock states; TypeScript checks and iOS export cover their respective boundaries. A physical reviewer-to-QA-app-to-review run remains outstanding. Split and merge controls are intentionally absent pending the decision below. |
-| Handoff | Immutable candidate versions, evidence binding, exact approval, canonical Markdown/JSON export, and a separate execution-trust assertion contract. | Structural fixtures do not authorize an agent. [ADR-011](decisions/ADR-011-approved-handoff.md) remains proposed until a trusted real consumer trial and execution policy are accepted. |
+| Processing | Durable processing jobs; an opt-in, provider-neutral, shell-free command adapter; and the accepted [ADR-016](decisions/ADR-016-local-processor-isolation.md) host runner/Compose profile for an operator-selected private-pilot processor. Normal backend startup is inert and default-deny for egress. | No transcription model, LLM, repository connector, telemetry connector, API provider, image, model, or command is selected. The isolated profile is separately identified, offline, read-only and resource-bounded, but the exclusive worker still runs only while the HTTP service is stopped and is not an unattended production worker. |
+| Reviewer app | Secure self-hosted configuration; display of the single registered build projection and launch-code orchestration; recovery guidance; session, evidence, preview, and job views; candidate editing and clarification; atomic split/merge replacement; exact-version approval; integrity-checked canonical Markdown/JSON sharing. | [ADR-015](decisions/ADR-015-candidate-split-merge-semantics.md) is accepted and its backend/reviewer replacement controls are implemented with deterministic tests pending the complete repository verification run. A physical reviewer-to-QA-app-to-review run remains outstanding. |
+| Handoff | Immutable candidate versions, evidence binding, exact approval, canonical Markdown/JSON export, and the accepted local/private-pilot Codex execution policy in [ADR-017](decisions/ADR-017-codex-execution-trust.md). | Structural fixtures do not authorize an agent. The repository gate requires current registry trust plus a 15-minute, exact-scope, unrevoked `codex exec` assertion; all checked-in keys are synthetic. A trusted real consumer trial and any remotely distributed production key design remain external gates under [ADR-011](decisions/ADR-011-approved-handoff.md). |
 | SDK distribution | A pre-release `@tacua/mobile-sdk` tarball boundary, checksum validator, and tag-triggered GitHub prerelease workflow. Registry publication remains disabled; this does not make the Apache-2.0 source private. | No SDK release exists until the protected, signed release tag is pushed from a verification-green default-branch commit and the release workflow succeeds. See the [maintainer runbook](maintainers/MOBILE_SDK_RELEASE.md). |
+
+## Accepted V1 operational decisions
+
+- [ADR-015](decisions/ADR-015-candidate-split-merge-semantics.md) accepts atomic
+  replacement, exact source consumption, and lossless evidence-union semantics
+  for split and merge; backend/reviewer implementation is present pending the
+  complete repository verification run.
+- [ADR-016](decisions/ADR-016-local-processor-isolation.md) accepts the offline,
+  separate-UID/container, bounded private-pilot processor gate without choosing
+  or downloading a processor or model.
+- [ADR-017](decisions/ADR-017-codex-execution-trust.md) accepts OpenAI Codex as
+  the V1 execution consumer only through a current, exact-scope, short-lived,
+  unrevoked local assertion and the fixed non-interactive ephemeral
+  `workspace-write`, network-off, structured-output profile. Approval alone is
+  non-executable.
+- [ADR-018](decisions/ADR-018-v1-app-audio-acceptance.md) accepts a maximum 0.2%
+  app-audio append-drop rate only when every drop is recorded exactly once as a
+  gap. The decision is closed; new passing physical evidence is still required.
 
 ## Product-owner decisions still open
 
-These decisions cannot be inferred from the implementation:
+The remaining product input cannot be inferred from the implementation:
 
-1. **Candidate split and merge.** [ADR-015](decisions/ADR-015-candidate-split-merge-semantics.md) is only a proposal. Accept its recommended atomic replacement and exact evidence-union semantics, or specify a different source disposition and lossless evidence rule. Until then, split/merge endpoints and controls remain absent.
-2. **Real processing boundary.** Select a trusted local processor or an external provider, define the exact transcription/research behavior, and approve its evidence and network access. An external provider also needs a credential and egress design. An untrusted local processor needs a separate UID, container, or sandbox with read-only inputs, no network by default, and CPU, memory, time, and disk limits; the same-UID adapter is for trusted operator-selected code only.
-3. **Execution trust.** Choose how short-lived registry assertions are issued, signed, revoked, and scoped to repositories, builds, and evidence. Define which agent runtime is allowed to consume them. Approval alone must remain non-executable.
-4. **Measured capture acceptance.** Either eliminate the 121 app-audio boundary drops observed across 77,523 append attempts in the 30-minute device run (about 0.156%), or define and enforce an explicit acceptable threshold.
+1. **Real processor selection.** Choose the actual digest-pinned local processor image, executable and model that will run inside the accepted ADR-016 boundary, then define and approve its transcription/research behavior and evidence access. Choosing an external provider instead remains a new credential, destination, retention and egress design.
 
 ## Operator inputs and credentials still required
 
@@ -73,6 +88,15 @@ off-host backup transfer or destruction, provider authorization, or host monitor
   obtains truthful consent, capture records narration and issues, lifecycle
   interruptions are represented as gaps, relaunch discovers pending work, and
   foreground queue draining completes without losing exact evidence.
+- A new 30-minute physical run passes the ADR-018 machine gate: app-audio drops
+  are no more than 0.2% of all append attempts and every dropped attempt index
+  appears exactly once in an `app_audio_append_drop` gap. The artifact must be
+  labeled `physical_device`, validate against the exact digest- and
+  identity-bound schema-4 source manifest, contain no recovery reservation
+  ranges, stay within the 1,799,000–1,831,000 ms envelope, and respect the SDK's
+  10,000,000-attempt/2,048-drop caps. The label is operator evidence
+  classification, not hardware attestation. The historical
+  121/77,523 run does not satisfy this accounting requirement.
 - The selected real processor produces zero, one, and several grounded
   candidates from authorized test data. Screenshots, diagnostic context,
   clarification, edits, approval, canonical export, and rejection all work
@@ -88,9 +112,16 @@ off-host backup transfer or destruction, provider authorization, or host monitor
   raw/derived evidence deadline, then refuses verification and both restore
   modes at that boundary; the selected off-host system also proves that every
   bundle and replica is physically destroyed by that deadline.
-- A real coding agent consumes one approved handoff under a trusted,
-  least-privilege assertion and completes a scoped pilot task without treating
-  structural approval as authorization.
+- A real non-interactive `codex exec --ephemeral --sandbox workspace-write`
+  invocation, with network off and a required `--output-schema`, consumes one
+  approved handoff under the exact ADR-017 trust artifacts. Authentication is
+  scoped to only that invocation and is not exposed beside repository-controlled
+  code. Controlled Codex state/configuration disables web search and unapproved
+  MCP/apps/hooks, proves effective command networking is off, and exposes only
+  assertion-bound repository revisions. An authenticated current lookup or
+  trusted monotonic store rejects registry/revocation revision rollback. The
+  trial completes without treating the assertion as a sandbox, approval, merge,
+  or deploy bypass.
 
 Use synthetic or explicitly approved QA data for these gates. Do not publish
 recordings, credentials, private source, production telemetry, personal data,

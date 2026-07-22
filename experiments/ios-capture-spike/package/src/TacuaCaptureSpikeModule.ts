@@ -66,6 +66,17 @@ type CaptureStatus = {
   readonly microphoneSamplesObserved: number;
   readonly appAudioSamplesObserved: number;
   readonly appAudioAvailable: boolean;
+  /** Every AVAssetWriter app-audio append decision made by this logical run. */
+  readonly appAudioAppendAttemptsObserved: number;
+  readonly droppedAppAudioAppendAttempts: number;
+  /** False after interruption/recovery because an uncommitted writer tail cannot be inferred. */
+  readonly appAudioAppendAccountingComplete: boolean;
+  /** Legacy schema-3 recovery reports 0; fresh schema-4 capture reports 1. */
+  readonly appAudioAppendAccountingVersion: 0 | 1;
+  /** Inclusive high-watermark durably reserved before an app-audio index is issued. */
+  readonly appAudioAppendReservedThroughIndex: number;
+  /** Crash-reserved ranges skipped on recovery; their prior append outcomes are unknowable. */
+  readonly appAudioAppendUnknownRanges: readonly AppAudioAppendUnknownRange[];
   readonly diagnosticEventCount: number;
   readonly diagnosticContainsCollectionGap: boolean;
   readonly testFaultPlan?: string | null;
@@ -189,6 +200,29 @@ type CaptureSegmentEvent = {
   readonly byteLength: number;
   readonly durationSeconds: number;
   readonly heldVideoSamples?: number;
+  readonly appAudioAppendAttemptStartIndex: number | null;
+  readonly appAudioAppendAttempts: number | null;
+  readonly droppedAppAudioSamples: number;
+  readonly appAudioAppendDrops: readonly AppAudioAppendDrop[];
+};
+
+type AppAudioAppendDropCause =
+  | "sample_data_not_ready"
+  | "writer_finished"
+  | "writer_not_writing"
+  | "timestamp_invalid"
+  | "input_backpressure"
+  | "append_rejected";
+
+type AppAudioAppendDrop = {
+  readonly attemptIndex: number;
+  readonly cause: AppAudioAppendDropCause;
+};
+
+type AppAudioAppendUnknownRange = {
+  readonly startIndex: number;
+  readonly endIndex: number;
+  readonly reason: "process_recovery_reservation";
 };
 
 type CaptureGapEvent = {
@@ -771,6 +805,9 @@ export type {
   BackendStartRecoveryStatus,
   BackendStartSessionOptions,
   BackendTransportConfiguration,
+  AppAudioAppendDrop,
+  AppAudioAppendDropCause,
+  AppAudioAppendUnknownRange,
   CaptureCapabilities,
   CaptureErrorEvent,
   CaptureEventMap,

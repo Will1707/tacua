@@ -273,6 +273,9 @@ enum CaptureAdmissionTests {
     }
     let fixtures = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
     try admitsExactlyOnceAndSanitizes(fixtures)
+    try admitsCompleteSchema4AppAudioAccounting(fixtures)
+    try rejectsMalformedSchema4AppAudioAccounting(fixtures)
+    try incompleteSchema4AccountingAllowsOnlyExplicitMissingRanges(fixtures)
     try durableQueueAdmitsWithoutHostArtifacts(fixtures)
     try legacyQueueRequiresExplicitArtifacts(fixtures)
     try durableQueueRejectsHostArtifactSubstitution(fixtures)
@@ -300,6 +303,231 @@ enum CaptureAdmissionTests {
     try await uploadCancellationKeepsUnknownOutcomeAndLease(fixtures)
     try await fileBackedUploadRelaunchReplaysExactUnknownAndCompletes(fixtures)
     print("Capture admission tests passed")
+  }
+
+  private static func admitsCompleteSchema4AppAudioAccounting(_ fixtures: URL) throws {
+    let harness = try makeHarness(fixtures: fixtures, suffix: "schema4_audio_valid")
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    try rewriteCaptureAsSchema4(harness)
+    let result = try harness.coordinator.admit(harness.input)
+    try require(!result.alreadyAdmitted, "Valid schema-4 accounting was not freshly admitted")
+    try require(result.segmentCount == 1, "Valid schema-4 accounting lost its segment")
+    let admissionURL = harness.root
+      .appendingPathComponent(harness.localSessionID, isDirectory: true)
+      .appendingPathComponent(TacuaCaptureAdmissionCoordinator.admissionFileName)
+    let admission = try TacuaCanonicalJSON.parse(Data(contentsOf: admissionURL))
+    let accounting = try required(
+      admission.objectValue?["capture_manifest_seed"]?.objectValue?["app_audio_accounting"]?
+        .objectValue,
+      "Schema-4 accounting was not persisted in the runtime manifest seed"
+    )
+    try require(accounting["version"]?.integerValue == 1, "Wrong runtime accounting version")
+    try require(accounting["complete"]?.boolValue == true, "Complete accounting was downgraded")
+    try require(
+      accounting["append_attempts"]?.integerValue == 600
+        && accounting["reserved_through_index"]?.integerValue == 600,
+      "Runtime accounting totals drifted from the verified sidecar"
+    )
+    let segments = try required(accounting["segments"]?.arrayValue, "Accounting segments missing")
+    let projected = try segments[0].requiringObject(keys: [
+      "append_attempts", "appended_samples", "attempt_start_index", "drops", "segment_id",
+      "sequence",
+    ])
+    try require(
+      projected["segment_id"]?.stringValue == "segment_000000"
+        && projected["sequence"]?.integerValue == 0
+        && projected["attempt_start_index"]?.integerValue == 1,
+      "Runtime accounting did not bind the verified runtime segment"
+    )
+    let drop = try required(projected["drops"]?.arrayValue?.first?.objectValue, "Exact drop missing")
+    try require(
+      drop["attempt_index"]?.integerValue == 300
+        && drop["cause"]?.stringValue == "input_backpressure",
+      "Exact drop index or cause was not persisted downstream"
+    )
+    try require(
+      accounting["unknown_ranges"]?.arrayValue == [],
+      "Complete accounting fabricated an unknown range"
+    )
+  }
+
+  private static func rejectsMalformedSchema4AppAudioAccounting(_ fixtures: URL) throws {
+    try expectSchema4AccountingRejection(
+      fixtures,
+      suffix: "missing_fields",
+      segmentMutation: { segment in
+      segment.removeValue(forKey: "appAudioAppendDrops")
+      }
+    )
+    try expectSchema4AccountingRejection(
+      fixtures,
+      suffix: "noncontiguous",
+      segmentMutation: { segment in
+        segment["appAudioAppendAttemptStartIndex"] = 2
+      }
+    )
+    try expectSchema4AccountingRejection(
+      fixtures,
+      suffix: "duplicate",
+      segmentMutation: { segment in
+        segment["appAudioSamples"] = 598
+        segment["droppedAppAudioSamples"] = 2
+        segment["appAudioAppendDrops"] = [
+          ["attemptIndex": 300, "cause": "input_backpressure"],
+          ["attemptIndex": 300, "cause": "append_rejected"],
+        ]
+      },
+      manifestMutation: { manifest in
+        manifest["appAudioSamplesObserved"] = 598
+      }
+    )
+    try expectSchema4AccountingRejection(
+      fixtures,
+      suffix: "missing_drop",
+      segmentMutation: { segment in
+        segment["appAudioAppendDrops"] = []
+      }
+    )
+    try expectSchema4AccountingRejection(
+      fixtures,
+      suffix: "drop_count",
+      segmentMutation: { segment in
+        segment["droppedAppAudioSamples"] = 2
+        segment["appAudioSamples"] = 598
+      },
+      manifestMutation: { manifest in
+        manifest["appAudioSamplesObserved"] = 598
+      }
+    )
+    try expectSchema4AccountingRejection(
+      fixtures,
+      suffix: "invalid_cause",
+      segmentMutation: { segment in
+        segment["appAudioAppendDrops"] = [[
+          "attemptIndex": 300,
+          "cause": "private_writer_detail",
+        ]]
+      }
+    )
+    try expectSchema4AccountingRejection(
+      fixtures,
+      suffix: "manifest_attempt_total",
+      manifestMutation: { manifest in
+        manifest["appAudioAppendAttemptsObserved"] = 599
+      }
+    )
+    try expectSchema4AccountingRejection(
+      fixtures,
+      suffix: "manifest_appended_total",
+      manifestMutation: { manifest in
+        manifest["appAudioSamplesObserved"] = 598
+      }
+    )
+  }
+
+  private static func incompleteSchema4AccountingAllowsOnlyExplicitMissingRanges(
+    _ fixtures: URL
+  ) throws {
+    try expectSchema4AccountingRejection(
+      fixtures,
+      suffix: "completed_incomplete",
+      segmentMutation: { segment in
+        segment["appAudioAppendAttemptStartIndex"] = 2
+      },
+      manifestMutation: { manifest in
+        manifest["appAudioAppendAccountingComplete"] = false
+        manifest["appAudioAppendReservedThroughIndex"] = 601
+        manifest["appAudioAppendUnknownRanges"] = [[
+          "startIndex": 1,
+          "endIndex": 1,
+          "reason": "process_recovery_reservation",
+        ]]
+      }
+    )
+
+    let harness = try makeHarness(fixtures: fixtures, suffix: "schema4_audio_incomplete")
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    try rewriteCaptureAsSchema4(
+      harness,
+      segmentMutation: { segment in
+        segment["appAudioAppendAttemptStartIndex"] = 2
+      },
+      manifestMutation: { manifest in
+        manifest["state"] = "partial_ready_for_upload"
+        manifest["appAudioAppendAccountingComplete"] = false
+        manifest["appAudioAppendReservedThroughIndex"] = 601
+        manifest["appAudioAppendUnknownRanges"] = [[
+          "startIndex": 1,
+          "endIndex": 1,
+          "reason": "process_recovery_reservation",
+        ]]
+      }
+    )
+    let result = try harness.coordinator.admit(harness.input)
+    try require(
+      !result.alreadyAdmitted,
+      "Explicit incomplete accounting could not preserve uploadable debugging evidence"
+    )
+    let admissionURL = harness.root
+      .appendingPathComponent(harness.localSessionID, isDirectory: true)
+      .appendingPathComponent("backend-admission-v1.json")
+    let admission = try TacuaCanonicalJSON.parse(Data(contentsOf: admissionURL))
+    let admissionObject = try required(admission.objectValue, "Admission object missing")
+    let seed = try required(
+      admissionObject["capture_manifest_seed"]?.objectValue,
+      "Admission manifest seed missing"
+    )
+    let projectedGaps = seed["gaps"]?.arrayValue ?? []
+    try require(
+      projectedGaps.contains(where: {
+        $0.objectValue?["reason"]?.stringValue == "process_terminated"
+      }),
+      "Incomplete accounting had no backend-visible process-termination gap"
+    )
+    let accounting = try required(
+      seed["app_audio_accounting"]?.objectValue,
+      "Incomplete exact accounting was not persisted downstream"
+    )
+    try require(accounting["complete"]?.boolValue == false, "Incomplete history claimed complete")
+    try require(
+      accounting["append_attempts"]?.integerValue == 600
+        && accounting["reserved_through_index"]?.integerValue == 601,
+      "Incomplete accounting totals drifted"
+    )
+    let unknown = try required(
+      accounting["unknown_ranges"]?.arrayValue?.first?.objectValue,
+      "Explicit recovery range was lost"
+    )
+    try require(
+      unknown["start_index"]?.integerValue == 1
+        && unknown["end_index"]?.integerValue == 1
+        && unknown["reason"]?.stringValue == "process_recovery_reservation",
+      "Explicit recovery range changed during admission"
+    )
+
+    try expectSchema4AccountingRejection(
+      fixtures,
+      suffix: "incomplete_overlap",
+      segmentMutation: { segment in
+        segment["appAudioAppendAttemptStartIndex"] = 1
+      },
+      manifestMutation: { manifest in
+        manifest["state"] = "partial_ready_for_upload"
+        manifest["appAudioAppendAccountingComplete"] = false
+        manifest["appAudioAppendAttemptsObserved"] = 599
+        manifest["appAudioAppendReservedThroughIndex"] = 600
+        manifest["appAudioAppendUnknownRanges"] = []
+      }
+    )
+    try expectSchema4AccountingRejection(
+      fixtures,
+      suffix: "incomplete_without_unknown_range",
+      manifestMutation: { manifest in
+        manifest["state"] = "partial_ready_for_upload"
+        manifest["appAudioAppendAccountingComplete"] = false
+        manifest["appAudioAppendUnknownRanges"] = []
+      }
+    )
   }
 
   private static func sameBootResumeAnchorMapsHistoricalCapture(_ fixtures: URL) throws {
@@ -436,6 +664,32 @@ enum CaptureAdmissionTests {
     try require(!admissionText.contains("handoff_private"), "Admission leaked handoff identity")
     try require(admissionText.contains("session_received_at"), "Retention origin was not durable")
     try require(admissionText.contains("server_time_anchor"), "Server time anchor was not durable")
+    let admission = try TacuaCanonicalJSON.parse(admissionData)
+    let captureSeed = try required(
+      admission.objectValue?["capture_manifest_seed"]?.objectValue,
+      "Capture manifest seed missing"
+    )
+    let summary = try required(
+      admission.objectValue?["capture_summary"]?.objectValue,
+      "Capture summary missing"
+    )
+    try require(
+      summary["app_audio_accounting_complete"]?.boolValue == false,
+      "Schema-3 count-only audio was falsely labeled exact and complete"
+    )
+    try require(
+      captureSeed["app_audio_accounting"] == .null,
+      "Schema-3 count-only audio was falsely projected as exact accounting"
+    )
+    let captureGaps = captureSeed["gaps"]?.arrayValue ?? []
+    try require(
+      captureGaps.contains(where: {
+        $0.objectValue?["reason"]?.stringValue == "unknown"
+          && $0.objectValue?["affected_streams"]?.arrayValue?
+            .compactMap(\.stringValue) == ["app_audio"]
+      }),
+      "Schema-3 count-only accounting had no explicit backend-visible uncertainty gap"
+    )
 
     let second = try harness.coordinator.admit(harness.input)
     try require(second.alreadyAdmitted, "Exact retry was not idempotent")
@@ -1133,6 +1387,7 @@ enum CaptureAdmissionTests {
   ) async throws {
     let harness = try makeHarness(fixtures: fixtures, suffix: "upload_success")
     defer { try? FileManager.default.removeItem(at: harness.root) }
+    try rewriteCaptureAsSchema4(harness)
     _ = try harness.coordinator.admit(harness.input)
     let session = harness.root.appendingPathComponent(harness.localSessionID, isDirectory: true)
     let staging = session.appendingPathComponent(".tacua-upload-staging", isDirectory: true)
@@ -1165,6 +1420,26 @@ enum CaptureAdmissionTests {
     try require(result.diagnosticReceiptCount == 1, "Diagnostic receipt was not committed")
     try require(!result.alreadyCompleted, "First completed drive was reported as an old retry")
     try require(sender.observedCallCount() == 3, "Drive did not send segment, diagnostic, completion")
+    let completionRequest = try required(
+      sender.observedRequests().first(where: { $0.kind == .completion }),
+      "Drive did not retain its completion request"
+    )
+    let completion = try TacuaCanonicalJSON.parse(completionRequest.canonicalData)
+    let persistedAccounting = try required(
+      completion.objectValue?["capture_manifest"]?.objectValue?["app_audio_accounting"]?
+        .objectValue,
+      "Completion manifest lost exact schema-4 accounting"
+    )
+    let persistedDrop = try required(
+      persistedAccounting["segments"]?.arrayValue?.first?.objectValue?["drops"]?
+        .arrayValue?.first?.objectValue,
+      "Completion manifest lost the exact app-audio drop"
+    )
+    try require(
+      persistedDrop["attempt_index"]?.integerValue == 300
+        && persistedDrop["cause"]?.stringValue == "input_backpressure",
+      "Completion request changed exact app-audio accounting"
+    )
     let queue = try required(harness.queues.queue, "Upload drive lost its queue")
     try require(
       queue.completionCleanupAuthority?.completionID == "completion_capture_000001",
@@ -2016,6 +2291,81 @@ enum CaptureAdmissionTests {
     }
     mutation(&manifest)
     try JSONSerialization.data(withJSONObject: manifest, options: [.sortedKeys]).write(to: url)
+  }
+
+  private static func rewriteCaptureAsSchema4(
+    _ harness: AdmissionHarness,
+    segmentMutation: (inout [String: Any]) -> Void = { _ in },
+    manifestMutation: (inout [String: Any]) -> Void = { _ in }
+  ) throws {
+    let session = harness.root.appendingPathComponent(harness.localSessionID, isDirectory: true)
+    let sidecarURL = session.appendingPathComponent("segment-000000.segment.json")
+    let sidecarData = try Data(contentsOf: sidecarURL)
+    guard var segment = try JSONSerialization.jsonObject(with: sidecarData) as? [String: Any]
+    else {
+      throw CaptureAdmissionTestFailure.assertion("Test segment sidecar was not an object")
+    }
+    segment["appAudioSamples"] = 599
+    segment["droppedAppAudioSamples"] = 1
+    segment["appAudioAppendAttemptStartIndex"] = 1
+    segment["appAudioAppendAttempts"] = 600
+    segment["appAudioAppendDrops"] = [[
+      "attemptIndex": 300,
+      "cause": "input_backpressure",
+    ]]
+    segmentMutation(&segment)
+    try JSONSerialization.data(withJSONObject: segment, options: [.sortedKeys]).write(
+      to: sidecarURL
+    )
+
+    let manifestURL = session.appendingPathComponent("manifest.json")
+    let manifestData = try Data(contentsOf: manifestURL)
+    guard var manifest = try JSONSerialization.jsonObject(with: manifestData) as? [String: Any]
+    else {
+      throw CaptureAdmissionTestFailure.assertion("Test manifest was not an object")
+    }
+    manifest["schemaVersion"] = 4
+    manifest["appAudioAppendAccountingVersion"] = 1
+    manifest["appAudioAppendAccountingComplete"] = true
+    manifest["appAudioAppendAttemptsObserved"] = 600
+    manifest["appAudioAppendReservedThroughIndex"] = 600
+    manifest["appAudioAppendUnknownRanges"] = []
+    manifest["appAudioSamplesObserved"] = 599
+    manifest["segments"] = [segment]
+    manifestMutation(&manifest)
+    try JSONSerialization.data(withJSONObject: manifest, options: [.sortedKeys]).write(
+      to: manifestURL
+    )
+  }
+
+  private static func expectSchema4AccountingRejection(
+    _ fixtures: URL,
+    suffix: String,
+    segmentMutation: (inout [String: Any]) -> Void = { _ in },
+    manifestMutation: (inout [String: Any]) -> Void = { _ in }
+  ) throws {
+    let harness = try makeHarness(fixtures: fixtures, suffix: "schema4_audio_\(suffix)")
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    try rewriteCaptureAsSchema4(
+      harness,
+      segmentMutation: segmentMutation,
+      manifestMutation: manifestMutation
+    )
+    do {
+      _ = try harness.coordinator.admit(harness.input)
+      throw CaptureAdmissionTestFailure.assertion(
+        "Malformed schema-4 app-audio accounting \(suffix) was admitted"
+      )
+    } catch let error as TacuaCaptureAdmissionError {
+      try require(
+        error == .captureArtifactMismatch,
+        "Malformed schema-4 app-audio accounting \(suffix) surfaced \(error)"
+      )
+    }
+    try require(
+      harness.queues.compareAndSwapCount == 0,
+      "Rejected schema-4 app-audio accounting \(suffix) mutated the queue"
+    )
   }
 
   private static func required<T>(_ value: T?, _ message: String) throws -> T {

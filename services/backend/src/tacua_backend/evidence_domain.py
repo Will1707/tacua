@@ -1231,6 +1231,175 @@ class EvidenceStore:
         _, manifest = self._resolve(**binding)
         return copy.deepcopy(manifest)
 
+    def inherit_latest_previews(
+        self,
+        *,
+        source_bindings: list[Mapping[str, Any]],
+        target_binding: Mapping[str, Any],
+    ) -> int:
+        """Bind canonical source preview snapshots to a merged manifest.
+
+        Preview files are immutable session artifacts. A merged manifest can
+        therefore reference the exact verified source file rather than copying
+        bytes during the candidate transaction. Retirement remains fail closed:
+        the journal will not remove a path while another manifest's latest
+        revision still references it.
+        """
+
+        self._schema()
+        _require(
+            isinstance(source_bindings, list) and 2 <= len(source_bindings) <= 16,
+            "PREVIEW_INHERITANCE_INVALID",
+            "$.source_bindings",
+            "merge preview inheritance requires 2 through 16 sources",
+        )
+        _require(
+            isinstance(target_binding, Mapping),
+            "PREVIEW_INHERITANCE_INVALID",
+            "$.target_binding",
+            "target binding must be an object",
+        )
+        target_row_id, target_manifest = self._resolve(**dict(target_binding))
+        source_manifests = [
+            self._resolve(**dict(binding)) for binding in source_bindings
+        ]
+        inherited = 0
+        with _savepoint(self.connection):
+            for target_item in target_manifest["items"]:
+                if target_item["evidence_type"] != "media.keyframe":
+                    continue
+                target_item_row_id, _ = self._item(
+                    target_row_id, target_manifest, target_item["evidence_id"]
+                )
+                snapshots: list[tuple[Any, ...]] = []
+                for source_row_id, source_manifest in source_manifests:
+                    matches = [
+                        item
+                        for item in source_manifest["items"]
+                        if item["evidence_id"] == target_item["evidence_id"]
+                    ]
+                    if not matches:
+                        continue
+                    _require(
+                        len(matches) == 1
+                        and matches[0]["evidence_item_digest"]
+                        == target_item["evidence_item_digest"]
+                        and canonical_json(matches[0]) == canonical_json(target_item),
+                        "MERGE_EVIDENCE_ID_CONFLICT",
+                        "$.source_bindings",
+                        "merged keyframe identity differs across source manifests",
+                    )
+                    source_item_row_id, _ = self._item(
+                        source_row_id,
+                        source_manifest,
+                        target_item["evidence_id"],
+                    )
+                    latest = self.connection.execute(
+                        """SELECT preview_revision_id, availability, content_type,
+                                  size_bytes, content_digest, relative_path,
+                                  unavailable_reason, unavailable_detail
+                             FROM tacua_evidence_preview_revisions
+                            WHERE manifest_row_id = ? AND item_row_id = ?
+                            ORDER BY preview_row_id DESC LIMIT 1""",
+                        (source_row_id, source_item_row_id),
+                    ).fetchone()
+                    if latest is not None:
+                        snapshots.append(tuple(latest))
+                if not snapshots:
+                    continue
+                # Revision IDs identify append history, not preview content. Two
+                # source manifests may legitimately bind the same verified bytes
+                # under different revision IDs, while every content-bearing or
+                # availability field must still agree before inheritance.
+                canonical_snapshots = {
+                    (
+                        snapshot[1],
+                        snapshot[2],
+                        snapshot[3],
+                        snapshot[4],
+                        snapshot[6],
+                        snapshot[7],
+                    )
+                    for snapshot in snapshots
+                }
+                _require(
+                    len(canonical_snapshots) == 1,
+                    "MERGE_PREVIEW_CONFLICT",
+                    "$.source_bindings",
+                    "merged sources disagree on the latest keyframe preview",
+                )
+                chosen = min(
+                    snapshots,
+                    # Keep the target independent of caller/source ordering.
+                    key=lambda snapshot: (
+                        snapshot[0],
+                        "" if snapshot[5] is None else snapshot[5],
+                    ),
+                )
+                if chosen[1] == "available":
+                    self._require_bound_preview_reference(
+                        target_item,
+                        content_type=chosen[2],
+                        size_bytes=chosen[3],
+                        content_digest=chosen[4],
+                        stored=True,
+                    )
+                    self._read(chosen[5], chosen[2], chosen[3], chosen[4])
+                existing = self.connection.execute(
+                    """SELECT availability, content_type, size_bytes,
+                              content_digest, relative_path, unavailable_reason,
+                              unavailable_detail
+                         FROM tacua_evidence_preview_revisions
+                        WHERE manifest_row_id = ? AND item_row_id = ?
+                          AND preview_revision_id = ?""",
+                    (target_row_id, target_item_row_id, chosen[0]),
+                ).fetchone()
+                expected = tuple(chosen[1:8])
+                if existing is None:
+                    self.connection.execute(
+                        """INSERT INTO tacua_evidence_preview_revisions (
+                               manifest_row_id, item_row_id, preview_revision_id,
+                               availability, content_type, size_bytes,
+                               content_digest, relative_path, unavailable_reason,
+                               unavailable_detail, recorded_at
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            target_row_id,
+                            target_item_row_id,
+                            chosen[0],
+                            chosen[1],
+                            chosen[2],
+                            chosen[3],
+                            chosen[4],
+                            chosen[5],
+                            chosen[6],
+                            chosen[7],
+                            _now(),
+                        ),
+                    )
+                    self._audit(
+                        "preview_inherited",
+                        organization_id=target_binding["organization_id"],
+                        project_id=target_binding["project_id"],
+                        session_id=target_binding["session_id"],
+                        candidate_id=target_binding["candidate_id"],
+                        candidate_version=target_binding["candidate_version"],
+                        candidate_digest=target_binding["candidate_digest"],
+                        manifest_digest=target_binding["manifest_digest"],
+                        evidence_id=target_item["evidence_id"],
+                        item_digest=target_item["evidence_item_digest"],
+                        preview_digest=chosen[4],
+                    )
+                    inherited += 1
+                else:
+                    _require(
+                        tuple(existing) == expected,
+                        "PREVIEW_REVISION_COLLISION",
+                        "$.target_binding",
+                        "merged manifest already has different preview metadata",
+                    )
+        return inherited
+
     def _item(
         self, manifest_row_id: int, manifest: Mapping[str, Any], evidence_id: str
     ) -> tuple[int, dict[str, Any]]:

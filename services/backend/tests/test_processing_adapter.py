@@ -69,6 +69,17 @@ def forbidden(value):
             forbidden(child)
 
 forbidden(document)
+accounting = document["capture"]["manifest"]["app_audio_accounting"]
+assert accounting["version"] == 1
+assert accounting["complete"] is True
+assert accounting["unknown_ranges"] == []
+assert [
+    (item["segment_id"], item["sequence"])
+    for item in accounting["segments"]
+] == [
+    (item["segment_id"], item["sequence"])
+    for item in document["capture"]["segments"]
+]
 for item in document["capture"]["segments"] + document["capture"]["diagnostics"]:
     body = Path(item["read_only_path"]).read_bytes()
     assert len(body) == item["size_bytes"]

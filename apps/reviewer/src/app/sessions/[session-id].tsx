@@ -6,6 +6,7 @@ import { ActivityIndicator, Pressable, RefreshControl, ScrollView, Text, View } 
 
 import type { CaptureSession, TicketCandidateSummary } from "@/api/types";
 import { ActionButton } from "@/components/action-button";
+import { CandidateMergeCard } from "@/components/candidate-merge-card";
 import { MessageState } from "@/components/message-state";
 import { ResumeSessionCard } from "@/components/resume-session-card";
 import { SectionCard } from "@/components/section-card";
@@ -27,66 +28,75 @@ export default function SessionRoute() {
   const refreshGeneration = useRef(0);
   const pageRequestGeneration = useRef(0);
   const loadingMoreRef = useRef(false);
+  const currentContextRef = useRef({ client, sessionId });
+  currentContextRef.current = { client, sessionId };
 
   const refresh = useCallback(async () => {
     if (!client || !sessionId) return;
+    if (currentContextRef.current.client !== client || currentContextRef.current.sessionId !== sessionId) return;
+    const requestClient = client;
+    const requestSessionId = sessionId;
     const generation = ++refreshGeneration.current;
+    const isCurrent = () => generation === refreshGeneration.current
+      && currentContextRef.current.client === requestClient
+      && currentContextRef.current.sessionId === requestSessionId;
     ++pageRequestGeneration.current;
     loadingMoreRef.current = false;
     setLoading(true);
     setLoadingMoreCandidates(false);
     setError(null);
     try {
-      const loaded = await client.getSession(sessionId);
-      if (generation !== refreshGeneration.current) return;
+      const loaded = await requestClient.getSession(requestSessionId);
+      if (!isCurrent()) return;
       setSession(loaded);
       setCandidateError(null);
       try {
-        const page = await client.listCandidates(sessionId);
-        if (generation !== refreshGeneration.current) return;
+        const page = await requestClient.listCandidates(requestSessionId);
+        if (!isCurrent()) return;
         setCandidates(page.candidates);
         setNextCandidateCursor(page.next_cursor);
       } catch (caught) {
-        if (generation !== refreshGeneration.current) return;
+        if (!isCurrent()) return;
         setCandidates([]);
         setNextCandidateCursor(null);
         setCandidateError(caught instanceof Error ? caught.message : "Ticket candidates could not be loaded.");
       }
     } catch (caught) {
-      if (generation !== refreshGeneration.current) return;
+      if (!isCurrent()) return;
       setError(caught instanceof Error ? caught.message : "Tacua could not load this session.");
     } finally {
-      if (generation === refreshGeneration.current) setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
   }, [client, sessionId]);
 
   const loadMoreCandidates = useCallback(async () => {
     if (!client || !sessionId || !nextCandidateCursor || loading || loadingMoreRef.current) return;
+    if (currentContextRef.current.client !== client || currentContextRef.current.sessionId !== sessionId) return;
+    const requestClient = client;
+    const requestSessionId = sessionId;
     const refreshAtStart = refreshGeneration.current;
     const requestGeneration = ++pageRequestGeneration.current;
+    const isCurrent = () => refreshAtStart === refreshGeneration.current
+      && requestGeneration === pageRequestGeneration.current
+      && currentContextRef.current.client === requestClient
+      && currentContextRef.current.sessionId === requestSessionId;
     loadingMoreRef.current = true;
     setLoadingMoreCandidates(true);
     setCandidateError(null);
     try {
-      const page = await client.listCandidates(sessionId, nextCandidateCursor);
-      if (
-        refreshAtStart !== refreshGeneration.current
-        || requestGeneration !== pageRequestGeneration.current
-      ) return;
+      const page = await requestClient.listCandidates(requestSessionId, nextCandidateCursor);
+      if (!isCurrent()) return;
       setCandidates((current) => {
         const known = new Set(current.map((candidate) => candidate.candidate_id));
         return [...current, ...page.candidates.filter((candidate) => !known.has(candidate.candidate_id))];
       });
       setNextCandidateCursor(page.next_cursor);
     } catch (caught) {
-      if (
-        refreshAtStart === refreshGeneration.current
-        && requestGeneration === pageRequestGeneration.current
-      ) {
+      if (isCurrent()) {
         setCandidateError(caught instanceof Error ? caught.message : "More ticket candidates could not be loaded.");
       }
     } finally {
-      if (requestGeneration === pageRequestGeneration.current) {
+      if (isCurrent()) {
         loadingMoreRef.current = false;
         setLoadingMoreCandidates(false);
       }
@@ -166,6 +176,21 @@ export default function SessionRoute() {
         ))}
         {nextCandidateCursor ? <ActionButton label="Load 50 more candidates" onPress={() => void loadMoreCandidates()} loading={loadingMoreCandidates} disabled={loading || error !== null} /> : null}
       </SectionCard>
+
+      {client && config && !nextCandidateCursor ? (
+        <CandidateMergeCard
+          candidates={candidates}
+          client={client}
+          disabled={loading || error !== null || candidateError !== null}
+          reviewerId={config.reviewerId}
+          onCompleted={refresh}
+        />
+      ) : null}
+      {nextCandidateCursor ? (
+        <Text selectable style={{ color: colors.tertiaryLabel, fontSize: 13, lineHeight: 18 }}>
+          Load the complete active queue before choosing tickets to merge.
+        </Text>
+      ) : null}
     </ScrollView>
   );
 }

@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tacua.invalid/schemas/approved-handoff/1.0.0/execution-assertion.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "Tacua short-lived execution-agent assertion",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "media_type",
+    "assertion_id",
+    "issuer_id",
+    "consumer",
+    "organization_id",
+    "project_id",
+    "ticket_id",
+    "ticket_version",
+    "repositories",
+    "build_id",
+    "build_identity_digest",
+    "current_handoff_digest",
+    "evidence_manifest_digest",
+    "evidence_item_digests",
+    "allowed_actions",
+    "issued_at",
+    "expires_at",
+    "nonce",
+    "revocation_list_id",
+    "revocation_revision",
+    "signature"
+  ],
+  "properties": {
+    "contract_version": { "const": "tacua.execution-assertion@1.0.0" },
+    "media_type": { "const": "application/vnd.tacua.execution-assertion+json;version=1.0.0" },
+    "assertion_id": { "$ref": "#/$defs/id" },
+    "issuer_id": { "$ref": "#/$defs/id" },
+    "consumer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "agent", "instance_id", "runtime_profile"],
+      "properties": {
+        "kind": { "const": "execution_agent" },
+        "agent": { "const": "openai_codex" },
+        "instance_id": { "$ref": "#/$defs/id" },
+        "runtime_profile": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "command",
+            "non_interactive",
+            "ephemeral",
+            "sandbox",
+            "network_access",
+            "structured_output",
+            "authentication_scope"
+          ],
+          "properties": {
+            "command": { "const": "codex_exec" },
+            "non_interactive": { "const": true },
+            "ephemeral": { "const": true },
+            "sandbox": { "const": "workspace-write" },
+            "network_access": { "const": false },
+            "structured_output": { "const": true },
+            "authentication_scope": { "const": "single_invocation" }
+          }
+        }
+      }
+    },
+    "organization_id": { "$ref": "#/$defs/id" },
+    "project_id": { "$ref": "#/$defs/id" },
+    "ticket_id": { "$ref": "#/$defs/id" },
+    "ticket_version": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "repositories": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["repository_id", "revision"],
+        "properties": {
+          "repository_id": { "$ref": "#/$defs/id" },
+          "revision": { "$ref": "#/$defs/revision" }
+        }
+      }
+    },
+    "build_id": { "$ref": "#/$defs/id" },
+    "build_identity_digest": { "$ref": "#/$defs/digest" },
+    "current_handoff_digest": { "$ref": "#/$defs/digest" },
+    "evidence_manifest_digest": { "$ref": "#/$defs/digest" },
+    "evidence_item_digests": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["evidence_id", "evidence_item_digest"],
+        "properties": {
+          "evidence_id": { "$ref": "#/$defs/id" },
+          "evidence_item_digest": { "$ref": "#/$defs/digest" }
+        }
+      }
+    },
+    "allowed_actions": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": { "enum": ["modify_code", "read_authorized_evidence", "run_tests"] }
+    },
+    "issued_at": { "$ref": "#/$defs/timestamp" },
+    "expires_at": { "$ref": "#/$defs/timestamp" },
+    "nonce": { "type": "string", "pattern": "^[A-Za-z0-9_-]{22,128}$" },
+    "revocation_list_id": { "$ref": "#/$defs/id" },
+    "revocation_revision": { "$ref": "#/$defs/id" },
+    "signature": { "$ref": "#/$defs/signature" }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{2,63}$" },
+    "revision": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+    "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "key_id", "value"],
+      "properties": {
+        "algorithm": { "const": "hmac-sha256" },
+        "key_id": { "$ref": "#/$defs/id" },
+        "value": { "type": "string", "pattern": "^hmac-sha256:[a-f0-9]{64}$" }
+      }
+    }
+  }
+}

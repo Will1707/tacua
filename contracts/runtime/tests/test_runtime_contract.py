@@ -109,6 +109,9 @@ class RuntimeContractTests(unittest.TestCase):
     def test_fixture_exposes_truthful_gaps_unavailable_evidence_and_ticket_fields(self) -> None:
         capture, diagnostics, _, ticket = load_bundle()
         self.assertEqual("app_backgrounded", capture["gaps"][0]["reason"])
+        accounting = capture["app_audio_accounting"]
+        self.assertTrue(accounting["complete"])
+        self.assertEqual([3], [drop["attempt_index"] for drop in accounting["segments"][0]["drops"]])
         missing = next(item for item in diagnostics["evidence"] if item["availability"] == "unavailable")
         self.assertIsNone(missing["reference"])
         self.assertIsNotNone(missing["unavailable"])
@@ -120,6 +123,43 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertTrue(content["uncertainty"]["items"])
         self.assertGreaterEqual(len(content["clarifications"][0]["choices"]), 2)
         self.assertEqual("human", ticket["approval"]["actor_type"])
+
+    def test_app_audio_accounting_is_exactly_bound_and_legacy_null_or_absent_is_allowed(self) -> None:
+        for legacy in ("null", "absent"):
+            capture = load_bundle()[0]
+            if legacy == "null":
+                capture["app_audio_accounting"] = None
+            else:
+                capture.pop("app_audio_accounting")
+            validate(seal(capture))
+
+        incomplete = load_bundle()[0]
+        accounting = incomplete["app_audio_accounting"]
+        accounting["complete"] = False
+        accounting["segments"][0]["attempt_start_index"] = 2
+        accounting["reserved_through_index"] = 5
+        accounting["unknown_ranges"] = [{
+            "start_index": 1,
+            "end_index": 1,
+            "reason": "process_recovery_reservation",
+        }]
+        validate(seal(incomplete))
+
+        cases = []
+        mismatched_segment = load_bundle()[0]
+        mismatched_segment["app_audio_accounting"]["segments"][0]["segment_id"] = "segment_other"
+        cases.append((mismatched_segment, "APP_AUDIO_SEGMENT_BINDING_MISMATCH"))
+        missing_drop = load_bundle()[0]
+        missing_drop["app_audio_accounting"]["segments"][0]["drops"] = []
+        cases.append((missing_drop, "APP_AUDIO_APPEND_TOTAL_MISMATCH"))
+        false_complete = load_bundle()[0]
+        false_complete["app_audio_accounting"]["complete"] = False
+        cases.append((false_complete, "APP_AUDIO_COMPLETENESS_MISMATCH"))
+        for candidate, expected in cases:
+            with self.subTest(expected=expected):
+                with self.assertRaises(ContractError) as raised:
+                    validate(seal(candidate))
+                self.assertEqual(expected, raised.exception.code)
 
     def test_unknown_nested_properties_are_rejected(self) -> None:
         capture = load_bundle()[0]

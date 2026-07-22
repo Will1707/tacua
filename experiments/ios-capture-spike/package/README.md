@@ -45,6 +45,7 @@ this native module. Release maintainers must follow the repository's
 - Captures the host app's ReplayKit video, app-audio, and microphone sample buffers.
 - Requires microphone permission and at least one microphone sample. A video-only session cannot be classified as complete.
 - Writes independently finalized MOV segments. Continuous audio timestamps drive rotation even when ReplayKit suppresses unchanged video frames. Tacua retimes the last observed video frame only at a segment boundary or tail, and records `heldVideoSamples` so downstream consumers can distinguish those explicit static-frame holds from observed UI changes. Before each partial-to-final rename, it atomically writes a sidecar containing size, SHA-256, timing, and sample counts.
+- Gives every AVAssetWriter app-audio append decision a stable, one-based index across segment rotations. Schema-4 sidecars persist each known attempt range and every dropped index with a closed, privacy-safe cause. Before issuing an index, the SDK fsyncs a bounded 4,096-index reservation; process recovery reconstructs every leading, internal, and tail hole around surviving sidecars as an explicit `process_recovery_reservation` unknown range and resumes strictly after the reserved high-watermark, so an issued identity is never silently reused. Exactly 2,048 recorded drops remain valid; the next unrecordable drop fails the capture closed. Any recovered/unknown range permanently makes the run ineligible for physical acceptance.
 - Reconciles a finalized segment, or a sidecar-verified partial segment, after interruption. It never invents a segment from an unverified file.
 - Records host-clock/media-clock calibration, markers, dual-clock continuity gaps, stable public error codes, and truthful nullable status values. A long interval between ReplayKit video samples is not itself a gap when media time and host uptime advance together.
 - Keeps a first-party, append-only native diagnostic journal beside the capture. Route templates, semantic interaction targets, sanitized runtime failures, network completion metadata, lifecycle changes, digest-only custom state, issue marks, and capture gaps receive native monotonic time, dense sequence, deterministic identifiers, a SHA-256 hash chain, and an fsync before success. Tacua does not require OpenTelemetry for this V1 path.
@@ -416,14 +417,26 @@ and completion can restart without asking JavaScript to recreate authority.
 Admission performs one queue compare-and-swap and no network I/O. Exact retries,
 including retries after credential rotation, are idempotent; partial or different
 stable-ID occupancy is a conflict. Queues created before durable START retention
-authority fail closed. Admission also requires a schema-3 capture whose persisted
+authority fail closed. Admission also requires a schema-3 or schema-4 capture whose persisted
 boot identity matches both the queue time anchor and the current boot; legacy
 schema-2 captures have no provable host-uptime chronology and fail closed.
+Schema-3 remains uploadable for legacy debugging, but admission labels its
+count-only app-audio accounting incomplete and projects a full-run `unknown`
+app-audio gap. Schema-4 interrupted evidence is admitted only when its durable
+unknown index ranges are internally consistent; admission projects an explicit
+`process_terminated` app-audio gap rather than claiming complete accounting.
 
-Sidecars, including held/dropped sample counters, remain local until
-completion-authorized cleanup. The frozen wire protocol transmits only
-`sidecar_digest`, not the sidecar bytes, so the backend does not receive that
-richer sidecar evidence in V1.
+Sidecar bytes, including non-allowlisted metrics, remain local until
+completion-authorized cleanup; segment upload still transmits only their
+`sidecar_digest`. For schema 4, admission copies the verified, privacy-safe
+app-audio accounting subset into the sealed completion manifest as
+`app_audio_accounting`: ordered runtime-segment bindings, attempt ranges, exact
+drop indexes and closed causes, reservation high-watermark, and ordered unknown
+ranges. The backend persists that manifest and supplies it as
+`capture.manifest` to the asynchronous processor after local sidecar cleanup.
+Schema 3 projects `null`. The reviewer UI currently exposes only the processor's
+derived candidate, evidence, and SDK timeline; it does not render this raw
+accounting object directly.
 
 ## SDK-local raw-media retention
 
@@ -508,7 +521,7 @@ deleted.credentialRemoved;
 
 After interruption, the host UI can offer exactly three local actions:
 
-1. `resume(options)` reconciles verified segments, creates an explicit `process_resume` gap, and records into new segment indexes. Its remaining budget is 30 minutes minus the durations of already verified segments. Resume requires a schema-3 manifest from the current boot plus a fresh, unexpired handoff for the original stored identity and the currently installed app build. Legacy schema-2 and cross-boot sessions remain listable/finalizable/deletable but cannot restart ReplayKit.
+1. `resume(options)` reconciles verified segments, creates an explicit `process_resume` gap, and records into new segment indexes. Its remaining budget is 30 minutes minus the durations of already verified segments. Resume requires a schema-3 or schema-4 manifest from the current boot plus a fresh, unexpired handoff for the original stored identity and the currently installed app build. A resumed schema-4 capture first seals any unused durable reservation as an explicit unknown range, continues strictly after that range, and permanently sets `appAudioAppendAccountingComplete` to `false`; recovery never reuses or invents the prior writer tail. Legacy schema-2 and cross-boot sessions remain listable/finalizable/deletable but cannot restart ReplayKit.
 2. `markPartialReadyForUpload(options)` reconciles verified media and changes only the local manifest state to `partial_ready_for_upload`. It requires at least one verified segment and a fresh matching handoff. It does **not** upload, enqueue, transmit, or delete anything.
 3. `deleteSession(options)` removes the local session directory. Erasure remains available after handoff expiry, consent-contract changes, and app upgrades. It validates the safe session ID, stored organization/project/handoff identity, and current application identifier, but intentionally does not require the original build number to equal the currently installed build.
 
@@ -523,6 +536,42 @@ the user explicitly.
 Raw `partial` state is never backend-admissible. A person must first choose
 `markPartialReadyForUpload(options)`; only `completed` and the resulting explicit
 `partial_ready_for_upload` state cross the admission boundary.
+
+## App-audio acceptance artifact
+
+After a stopped, accounting-complete physical run, copy only its private
+`manifest.json` into an operator-controlled temporary directory. Generate the
+closed ADR-018 artifact offline; the command validates the derived object before
+publishing it atomically:
+
+```sh
+python3 ../scripts/generate_app_audio_acceptance.py \
+  /private/path/to/manifest.json \
+  --run-id physical-audio-001 \
+  --evidence-class physical_device \
+  --output /private/path/to/app-audio-acceptance.json
+
+python3 ../scripts/validate_app_audio_acceptance.py \
+  /private/path/to/app-audio-acceptance.json \
+  --source-manifest /private/path/to/manifest.json
+```
+
+The generator accepts only schema 4 with complete accounting, no process resume,
+the gap-free `completed` state, no stable errors, contiguous segment ranges,
+exact totals, and every dropped attempt recorded once. It refuses schema-3 history,
+`partial` or recovered runs, missing or
+duplicate indexes, and inconsistent sidecars instead of inferring data. The
+result is canonical compact JSON for
+`tacua.app-audio-acceptance@1.0.0` and binds the exact source-manifest bytes plus
+application, build, build-number, session, and schema identity. The
+validator requires those artifact bytes to be canonical UTF-8 JSON with one
+trailing newline; alternate encodings and merely equivalent pretty JSON fail.
+`physical_device` class is an explicit operator claim, not hardware attestation;
+the signed-device run record must independently support it. The physical
+validator requires the same source manifest and rejects byte or identity
+substitution.
+The manifest and artifact may expose capture measurements; keep them private
+until the aggregate evidence has been reviewed.
 
 ## Example
 
@@ -651,9 +700,11 @@ SDK. Promotion requires all remaining gates below to close:
   on a physical iPhone with synthetic QA data.
 - [x] Verify the byte length and SHA-256 of every media segment accepted as
   physical fault-campaign evidence.
-- [ ] Eliminate boundary-ordering app-audio drops or define and enforce a
-  measured threshold. The 30-minute candidate run dropped 121 of 77,523 app-audio
-  append attempts (about 0.156%).
+- [ ] Pass the accepted V1 app-audio gate: no more than 0.2% of append attempts
+  may drop, and every drop must appear exactly once in an explicit
+  `app_audio_append_drop` gap. The historical 30-minute run's 121/77,523 rate
+  (about 0.156%) is numerically below the ceiling, but it did not record those
+  drops as gaps and therefore fails the machine-checkable acceptance artifact.
 - [ ] Replace structural handoff fields with a cryptographically authenticated,
   backend-issued handoff scoped to the organization, project, build, and current
   consent contract.

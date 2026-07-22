@@ -1,4 +1,26 @@
 {
+  "app_audio_accounting": {
+    "append_attempts": 4,
+    "complete": true,
+    "reserved_through_index": 4,
+    "segments": [
+      {
+        "append_attempts": 4,
+        "appended_samples": 3,
+        "attempt_start_index": 1,
+        "drops": [
+          {
+            "attempt_index": 3,
+            "cause": "input_backpressure"
+          }
+        ],
+        "segment_id": "segment_synthetic",
+        "sequence": 0
+      }
+    ],
+    "unknown_ranges": [],
+    "version": 1
+  },
   "build_id": "build_synthetic",
   "build_identity_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
   "capture_scope": "app_only",
@@ -21,7 +43,7 @@
       }
     }
   ],
-  "manifest_digest": "sha256:ed29d84bd1ce896057b6b5bd8e5b7d0207ef65482ad9a2b00673a644020716bc",
+  "manifest_digest": "sha256:f8492d3b6e6a6ed169766992a0f74529b76de1c23fb046ac04d4109c3bf00181",
   "manifest_version": 2,
   "media_type": "application/vnd.tacua.capture-upload-manifest+json;version=1.0.0",
   "monotonic_duration_ms": 60000,

@@ -21,6 +21,10 @@ from ticket_candidate_contract import (  # noqa: E402
     validate,
     validate_chain,
 )
+from candidate_replacement_contract import (  # noqa: E402
+    validate_replacement_request,
+    validate_replacement_response,
+)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -30,6 +34,17 @@ def parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("candidate", type=Path)
     chain_parser = commands.add_parser("validate-chain", help="validate a complete ordered version chain")
     chain_parser.add_argument("candidates", nargs="+", type=Path)
+    replacement_request_parser = commands.add_parser(
+        "validate-replacement-request",
+        help="validate one atomic split/merge request body",
+    )
+    replacement_request_parser.add_argument("request", type=Path)
+    replacement_response_parser = commands.add_parser(
+        "validate-replacement-response",
+        help="validate one committed split/merge response",
+    )
+    replacement_response_parser.add_argument("response", type=Path)
+    replacement_response_parser.add_argument("--request", type=Path)
     seal_parser = commands.add_parser("seal", help="print canonical JSON with fixture/authoring digests recomputed")
     seal_parser.add_argument("candidate", type=Path)
     return result
@@ -46,6 +61,33 @@ def main() -> int:
             values = [load_json(path) for path in args.candidates]
             validate_chain(values)
             print(json.dumps({"versions": len(values), "result": "valid", "execution_authorized": False}, sort_keys=True))
+        elif args.command == "validate-replacement-request":
+            value = load_json(args.request)
+            validate_replacement_request(value)
+            print(
+                json.dumps(
+                    {
+                        "operation": value["operation"],
+                        "result": "valid",
+                        "execution_authorized": False,
+                    },
+                    sort_keys=True,
+                )
+            )
+        elif args.command == "validate-replacement-response":
+            value = load_json(args.response)
+            request = None if args.request is None else load_json(args.request)
+            validate_replacement_response(value, request=request)
+            print(
+                json.dumps(
+                    {
+                        "operation": value["operation"]["operation"],
+                        "result": "valid",
+                        "execution_authorized": False,
+                    },
+                    sort_keys=True,
+                )
+            )
         else:
             value = seal(load_json(args.candidate))
             sys.stdout.buffer.write(canonical_json_artifact(value))

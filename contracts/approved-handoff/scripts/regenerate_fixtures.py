@@ -17,6 +17,8 @@ from handoff_contract import (  # noqa: E402
     load_json,
     project_source_candidate_ticket,
     render_markdown,
+    seal_execution_assertion,
+    seal_execution_revocations,
     seal_handoff,
     seal_registry_assertion,
     seal_trial,
@@ -26,6 +28,7 @@ from handoff_contract import (  # noqa: E402
 
 POSITIVE = ROOT / "fixtures" / "positive"
 SYNTHETIC_KEY = bytes.fromhex("11" * 32)
+SYNTHETIC_EXECUTION_KEY = bytes.fromhex("22" * 32)
 SAMPLE_PROJECT_ID = "project-sample-mobile-app-synthetic"
 SAMPLE_MOBILE_REPOSITORY_ID = "repo-sample-mobile-app"
 SAMPLE_BACKEND_REPOSITORY_ID = "repo-sample-backend"
@@ -353,6 +356,13 @@ def main() -> None:
             ],
             key=lambda source: (source["component"], source["source_id"], source["snapshot_revision"]),
         ),
+        "execution_authority": {
+            "consumer": "openai_codex",
+            "issuer_id": "execution-issuer-synthetic",
+            "key_id": "execution-key-synthetic-001",
+            "revocation_list_id": "execution-revocations-synthetic",
+            "revocation_revision": "revocation-revision-synthetic-001",
+        },
         "issued_at": "2026-07-20T10:16:01Z",
         "expires_at": "2026-07-21T10:16:01Z",
         "signature": {
@@ -364,7 +374,99 @@ def main() -> None:
     assertion = seal_registry_assertion(assertion, SYNTHETIC_KEY)
     assertion_bytes = canonical_json_artifact(assertion)
 
+    execution_revocations = {
+        "contract_version": "tacua.execution-revocations@1.0.0",
+        "media_type": "application/vnd.tacua.execution-revocations+json;version=1.0.0",
+        "list_id": "execution-revocations-synthetic",
+        "issuer_id": "execution-issuer-synthetic",
+        "revision": "revocation-revision-synthetic-001",
+        "issued_at": "2026-07-20T10:58:00Z",
+        "expires_at": "2026-07-20T11:15:00Z",
+        "revoked_assertion_ids": [],
+        "revoked_nonces": [],
+        "revoked_key_ids": [],
+        "signature": {
+            "algorithm": "hmac-sha256",
+            "key_id": "execution-key-synthetic-001",
+            "value": "hmac-sha256:" + "0" * 64,
+        },
+    }
+    execution_revocations = seal_execution_revocations(
+        execution_revocations,
+        SYNTHETIC_EXECUTION_KEY,
+    )
+    execution_assertion = {
+        "contract_version": "tacua.execution-assertion@1.0.0",
+        "media_type": "application/vnd.tacua.execution-assertion+json;version=1.0.0",
+        "assertion_id": "execution-synthetic-001",
+        "issuer_id": "execution-issuer-synthetic",
+        "consumer": {
+            "kind": "execution_agent",
+            "agent": "openai_codex",
+            "instance_id": "codex-task-synthetic-001",
+            "runtime_profile": {
+                "command": "codex_exec",
+                "non_interactive": True,
+                "ephemeral": True,
+                "sandbox": "workspace-write",
+                "network_access": False,
+                "structured_output": True,
+                "authentication_scope": "single_invocation",
+            },
+        },
+        "organization_id": handoff["organization_id"],
+        "project_id": handoff["project_id"],
+        "ticket_id": ticket["ticket_id"],
+        "ticket_version": ticket["ticket_version"],
+        "repositories": sorted(
+            [
+                {
+                    "repository_id": handoff["build_identity"]["mobile"]["source"]["repository_id"],
+                    "revision": handoff["build_identity"]["mobile"]["source"]["revision"],
+                }
+            ]
+            + [
+                {
+                    "repository_id": source["repository_id"],
+                    "revision": source["revision"],
+                }
+                for source in handoff["build_identity"]["backend"]["sources"]
+            ],
+            key=lambda repository: (repository["repository_id"], repository["revision"]),
+        ),
+        "build_id": handoff["build_identity"]["build_id"],
+        "build_identity_digest": handoff["build_identity"]["build_identity_digest"],
+        "current_handoff_digest": handoff["handoff_digest"],
+        "evidence_manifest_digest": handoff["evidence_manifest"]["evidence_manifest_digest"],
+        "evidence_item_digests": sorted(
+            [
+                {
+                    "evidence_id": item["evidence_id"],
+                    "evidence_item_digest": item["evidence_item_digest"],
+                }
+                for item in handoff["evidence_manifest"]["items"]
+            ],
+            key=lambda item: item["evidence_id"],
+        ),
+        "allowed_actions": ["modify_code", "read_authorized_evidence", "run_tests"],
+        "issued_at": "2026-07-20T10:59:00Z",
+        "expires_at": "2026-07-20T11:14:00Z",
+        "nonce": "c3ludGhldGljLWV4ZWN1dGlvbi0wMDE",
+        "revocation_list_id": "execution-revocations-synthetic",
+        "revocation_revision": "revocation-revision-synthetic-001",
+        "signature": {
+            "algorithm": "hmac-sha256",
+            "key_id": "execution-key-synthetic-001",
+            "value": "hmac-sha256:" + "0" * 64,
+        },
+    }
+    execution_assertion = seal_execution_assertion(
+        execution_assertion,
+        SYNTHETIC_EXECUTION_KEY,
+    )
+
     trial = load_json(POSITIVE / "agent-trial.json")
+    trial["consumer"]["agent_name"] = "openai_codex"
     trial["project_id"] = SAMPLE_PROJECT_ID
     trial["ticket_id"] = ticket["ticket_id"]
     trial["ticket_version"] = ticket["ticket_version"]
@@ -376,6 +478,12 @@ def main() -> None:
     trial["json_artifact_digest"] = sha256_digest(handoff_bytes)
     trial["markdown_artifact_digest"] = sha256_digest(markdown.encode("utf-8"))
     trial["registry_assertion_digest"] = sha256_digest(assertion_bytes)
+    trial["execution_assertion_digest"] = sha256_digest(
+        canonical_json_artifact(execution_assertion)
+    )
+    trial["execution_revocations_digest"] = sha256_digest(
+        canonical_json_artifact(execution_revocations)
+    )
     trial["reporter_intervention"] = {
         "interaction_count": 0,
         "active_seconds": 0,
@@ -397,6 +505,8 @@ def main() -> None:
     (POSITIVE / "build-identity.json").write_bytes(canonical_json_artifact(handoff["build_identity"]))
     (POSITIVE / "evidence-manifest.json").write_bytes(canonical_json_artifact(handoff["evidence_manifest"]))
     (POSITIVE / "registry-assertion.json").write_bytes(assertion_bytes)
+    (POSITIVE / "execution-assertion.json").write_bytes(canonical_json_artifact(execution_assertion))
+    (POSITIVE / "execution-revocations.json").write_bytes(canonical_json_artifact(execution_revocations))
     (POSITIVE / "agent-trial.json").write_bytes(canonical_json_artifact(trial))
 
 

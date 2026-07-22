@@ -61,9 +61,15 @@ An approved or rejected snapshot is never edited. Reopening creates a later
 merge creation always records a human actor. Later versions name exactly one
 same-candidate predecessor and use `edited`,
 `clarification_answered`, `reviewed`, `approved`, `rejected` or `reopened`.
-Split and merge parents are represented now so those UI operations can be added
-without weakening provenance, but this package does not implement their
-backend behavior.
+Atomic split and merge requests use the closed
+`candidate-replacement-request.schema.json` boundary. A split binds one exact
+current source and two to sixteen distinct new result documents. A merge binds
+two to sixteen exact current sources and one new result. The committed response
+binds the immutable operation record to every exact source and result digest,
+the full first-version draft snapshots, their human actor and creation time.
+The portable validator proves request/response consistency; the backend remains
+responsible for current-head checks, evidence resolution, the canonical merge
+union, idempotency and one-transaction supersession.
 
 Approval is itself a new immutable version derived from the exact
 `ready_for_review` snapshot the human saw. It records both the reviewed parent
@@ -144,9 +150,9 @@ writes, merge, deployment or external model egress.
   revocation and compare-and-swap concurrency are backend responsibilities.
 - This package binds an evidence-manifest digest and inventory but does not
   validate or resolve evidence bytes.
-- It models human split/merge lineage but does not choose whether source heads
-  remain actionable or become superseded, how a merged evidence manifest is
-  formed, or the atomic backend/UI operation that creates the new candidates.
+- Replacement validation cannot prove a result differs from source content or
+  resolve evidence bytes from source manifest digests. The backend performs
+  those checks while holding the atomic storage transaction.
 - It does not render Markdown/JSON handoffs; that remains the separately
   versioned approved-handoff contract.
 - Runtime DLP must supplement the bundled obvious credential-pattern checks.

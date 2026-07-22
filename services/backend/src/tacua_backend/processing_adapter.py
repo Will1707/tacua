@@ -362,6 +362,7 @@ def _run_bounded_command(
                 "LANG": "C.UTF-8",
                 "LC_ALL": "C.UTF-8",
                 "PATH": "/usr/local/bin:/usr/bin:/bin",
+                "TACUA_ADAPTER_TIMEOUT_SECONDS": str(command.timeout_seconds),
             },
             close_fds=True,
             pass_fds=pass_fds,

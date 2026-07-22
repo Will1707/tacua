@@ -11,7 +11,7 @@
   "build_id": "build_synthetic",
   "build_identity_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
   "candidate_content_digest": "sha256:8ca65930a9bf5d1a044b74e12c2461a92ce74aa27cf65d6d271a44d302e7b1ab",
-  "candidate_digest": "sha256:6d69972a46b8ce0e31a8fc99b73ad85b6bb7d8afa725fa476bc1db5bead59bc4",
+  "candidate_digest": "sha256:6fbe8e696243a58b452ab22070e4436f7d0fc74b84b524f50e97f11ee76d132f",
   "candidate_id": "candidate_synthetic",
   "candidate_version": 2,
   "content": {
@@ -166,7 +166,7 @@
   "session_id": "session_synthetic",
   "source": {
     "evidence_manifest_digest": "sha256:08915b84578c23976d30bd5ac70429c570e28a43988161512949de07e78752c6",
-    "job_digest": "sha256:97f16381272e341b718210b3378bb8ee65bf8737e7e6817464ac59a786dc38bd",
+    "job_digest": "sha256:ca312fc8be2f10a9ebd0638d16607a02259fc395a09ce27ed9423ae733e8cfc8",
     "job_id": "job_synthetic"
   },
   "state": "approved",

@@ -25,6 +25,7 @@ function report(overrides = {}) {
 
 test("release paths are closed to an audited runtime file set", () => {
   for (const path of [
+    "ios/AppAudioAppendAccounting.swift",
     "ios/CaptureModels.swift",
     "ios/TacuaSDKLocalRetention.swift",
     "ios/TacuaCaptureSpike.podspec",

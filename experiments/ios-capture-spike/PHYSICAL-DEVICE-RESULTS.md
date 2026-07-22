@@ -2,7 +2,9 @@
 
 Status: physical candidate gates complete for foreground capture, interruption,
 verified-partial choice, resume, scoped deletion, the 30-minute foreground
-limit, lock recovery, and deterministic storage/writer/stop fault handling
+limit, lock recovery, and deterministic storage/writer/stop fault handling;
+V1 app-audio release acceptance remains open because the observed drops were
+not recorded as explicit gap entries
 
 Date: 2026-07-21
 
@@ -106,9 +108,47 @@ after the stop; the temporary override prevented auto-lock during capture.
 All 180 manifest SHA-256 values matched their media. Representative beginning,
 middle, and final MOV segments each contained full-duration video and both audio
 tracks. The 121 app-audio drops represent about 0.156% of 77,523 append attempts
-and occurred without microphone or video loss. This is acceptable for closing
-the experiment's foreground-duration gate, but production promotion must either
-eliminate boundary reordering drops or define and enforce a measured threshold.
+and occurred without microphone or video loss. This remains acceptable evidence
+for the experiment's foreground-duration gate. It does **not** pass the separate
+V1 app-audio acceptance gate in
+[ADR-018](../../docs/decisions/ADR-018-v1-app-audio-acceptance.md): the numeric
+rate is below the accepted 0.2% ceiling, but none of the 121 dropped append
+attempts was persisted as an explicit `app_audio_append_drop` gap.
+
+The machine-readable historical artifact is intentionally negative:
+
+```sh
+python3 scripts/validate_app_audio_acceptance.py \
+  fixtures/app-audio-acceptance/physical-2026-07-21-unaccounted.json
+# UNACCOUNTED_APP_AUDIO_DROPS
+```
+
+Repository tests also exercise a clearly labeled synthetic conformance fixture
+at exactly 0.2%. Synthetic conformance cannot close the physical gate. A new
+30-minute physical run must remain in the gap-free `completed` state, record
+every dropped append-attempt index exactly once in the acceptance artifact, and
+pass the validator without `--conformance`. Schema-4 captures
+now persist contiguous per-segment attempt ranges and each dropped index with a
+closed cause. After the new run stops with zero stable errors, derive and
+validate the canonical artifact directly from its private manifest:
+
+```sh
+python3 scripts/generate_app_audio_acceptance.py \
+  /private/path/to/manifest.json \
+  --run-id physical-audio-001 \
+  --evidence-class physical_device \
+  --output /private/path/to/app-audio-acceptance.json
+
+python3 scripts/validate_app_audio_acceptance.py \
+  /private/path/to/app-audio-acceptance.json \
+  --source-manifest /private/path/to/manifest.json
+```
+
+The artifact binds the exact manifest bytes and capture/build identity. Its
+mandatory `physical_device` label is the operator's evidence classification,
+not hardware attestation. The generator refuses schema-3, `partial`, gapped,
+interrupted/resumed, incomplete, errorful, or internally inconsistent runs. No new qualifying physical run has been executed
+yet, so ADR-018's physical gate remains open.
 
 ## Lock-screen lifecycle run
 

@@ -6,6 +6,11 @@ import type {
   AuditEventPage,
   CandidatePage,
   CandidateEvidenceView,
+  CandidateReplacementDraft,
+  CandidateReplacementOperation,
+  CandidateReplacementOperationProjection,
+  CandidateReplacementResponse,
+  CandidateSupersededDetails,
   CaptureSession,
   EvidencePreview,
   JobPage,
@@ -63,10 +68,20 @@ import {
   isAdminPageCursor,
 } from "@/api/admin-page-cursor";
 import { maximumSessionDetailResponseBytes } from "@/api/response-limits";
+import {
+  CandidateReplacementValidationError,
+  createCandidateReplacementRequest,
+  replacementRequestDigest,
+  serializedReplacementRequest,
+  validateCandidateReplacementResponse,
+  validateCandidateSupersededErrorEnvelope,
+  validateCandidateSupersessionResponse,
+} from "@/api/candidate-replacement";
 
 const maximumJsonResponseBytes = 2 * 1_024 * 1_024;
 const maximumCandidateBytes = 1_048_576;
 const maximumCandidateEvidenceViewBytes = 1_572_864;
+const maximumCandidateReplacementBytes = 16 * 1_024 * 1_024;
 const maximumEvidencePreviewBytes = 2 * 1_024 * 1_024;
 const evidencePreviewContentTypes = new Set(["image/png", "image/jpeg", "image/webp"] as const);
 
@@ -83,6 +98,16 @@ export class TacuaApiError extends Error {
   ) {
     super(message);
     this.name = "TacuaApiError";
+  }
+}
+
+export class CandidateSupersededApiError extends TacuaApiError {
+  readonly details: CandidateSupersededDetails;
+
+  constructor(status: number, message: string, details: CandidateSupersededDetails) {
+    super(status, "CANDIDATE_SUPERSEDED", message);
+    this.details = details;
+    this.name = "CandidateSupersededApiError";
   }
 }
 
@@ -305,10 +330,18 @@ export class TacuaApiClient {
       if (!response.ok) {
         try {
           const { document } = await readCanonicalJsonResponse(response, maximumGenericErrorBytes);
+          const errorCode = isRecord(document.error) ? document.error.code : null;
+          if (errorCode === "CANDIDATE_SUPERSEDED") {
+            const superseded = validateCandidateSupersededErrorEnvelope(document);
+            throw new CandidateSupersededApiError(response.status, superseded.message, superseded.details);
+          }
           const error = validateGenericErrorEnvelope(document);
           throw new TacuaApiError(response.status, error.code, error.message);
         } catch (error) {
           if (error instanceof TacuaApiError) throw error;
+          if (error instanceof CandidateReplacementValidationError) {
+            throw new TacuaApiError(502, error.code, "The Tacua backend returned an invalid supersession error envelope.");
+          }
           throw new TacuaApiError(502, "INVALID_ERROR_RESPONSE", "The Tacua backend returned an invalid error envelope.");
         }
       }
@@ -559,6 +592,27 @@ export class TacuaApiClient {
       if (error instanceof TacuaApiError) throw error;
       if (error instanceof ApprovedHandoffValidationError) {
         throw new TacuaApiError(502, error.code, `The candidate response failed validation (${error.path}).`);
+      }
+      throw error;
+    }
+  }
+
+  async getCandidateSupersession(
+    candidate: TicketCandidate,
+  ): Promise<CandidateReplacementOperationProjection | null> {
+    try {
+      const response = await this.request<unknown>(
+        `/v1/admin/candidates/${encodeURIComponent(candidate.candidate_id)}/supersession`,
+        undefined,
+        { expectedStatuses: [200], maximumBytes: maximumCandidateReplacementBytes },
+      );
+      return validateCandidateSupersessionResponse(response, candidate);
+    } catch (error) {
+      if (error instanceof TacuaApiError && error.status === 404 && error.code === "SUPERSESSION_NOT_FOUND") {
+        return null;
+      }
+      if (error instanceof CandidateReplacementValidationError) {
+        throw new TacuaApiError(502, error.code, "The supersession response was not bound to this exact ticket version.");
       }
       throw error;
     }
@@ -921,6 +975,46 @@ export class TacuaApiClient {
       if (error instanceof ApprovedHandoffValidationError || error instanceof AdminResponseValidationError) {
         const code = error.code;
         throw new TacuaApiError(502, code, "The transition response failed its candidate and predecessor binding checks.");
+      }
+      throw error;
+    }
+  }
+
+  async replaceCandidates(input: {
+    readonly operation: CandidateReplacementOperation;
+    readonly actorId: string;
+    readonly reason: string;
+    readonly sources: readonly TicketCandidate[];
+    readonly results: readonly CandidateReplacementDraft[];
+  }): Promise<CandidateReplacementResponse> {
+    let request;
+    try {
+      request = createCandidateReplacementRequest(input);
+    } catch (error) {
+      if (error instanceof CandidateReplacementValidationError) {
+        throw new TacuaApiError(0, error.code, "The candidate replacement request was invalid or not bound to one exact capture and build.");
+      }
+      throw error;
+    }
+    const requestDigest = await replacementRequestDigest(request, sha256Digest);
+    const result = await this.requestDocument<unknown>("/v1/admin/candidate-replacements", {
+      method: "POST",
+      headers: {
+        "Idempotency-Key": `replacement:${request.operation}:${requestDigest.slice("sha256:".length)}`,
+      },
+      body: serializedReplacementRequest(request),
+    }, { maximumBytes: maximumCandidateReplacementBytes, expectedStatuses: [201] });
+    try {
+      const response = await validateCandidateReplacementResponse(result.body, request, input.sources, sha256Digest);
+      const bodyDigest = await sha256Digest(result.bytes);
+      if (result.response.headers.get("Tacua-Body-Digest") !== bodyDigest) {
+        throw new TacuaApiError(502, "REPLACEMENT_RESPONSE_DIGEST_MISMATCH", "The replacement response bytes did not match their declared digest.");
+      }
+      return response;
+    } catch (error) {
+      if (error instanceof TacuaApiError) throw error;
+      if (error instanceof CandidateReplacementValidationError) {
+        throw new TacuaApiError(502, error.code, "The replacement response failed its exact source, result, lineage, or evidence binding checks.");
       }
       throw error;
     }

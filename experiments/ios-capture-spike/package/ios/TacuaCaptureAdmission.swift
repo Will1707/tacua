@@ -137,6 +137,20 @@ private struct TacuaAdmissionLocalSegment: Codable, Equatable {
   let droppedVideoSamples: Int
   let droppedAppAudioSamples: Int
   let droppedMicrophoneSamples: Int
+  let appAudioAppendAttemptStartIndex: Int?
+  let appAudioAppendAttempts: Int?
+  let appAudioAppendDrops: [TacuaAdmissionAppAudioAppendDrop]?
+}
+
+private struct TacuaAdmissionAppAudioAppendDrop: Codable, Equatable {
+  let attemptIndex: Int
+  let cause: String
+}
+
+private struct TacuaAdmissionAppAudioAppendUnknownRange: Codable, Equatable {
+  let startIndex: Int
+  let endIndex: Int
+  let reason: String
 }
 
 private struct TacuaAdmissionLocalGap: Decodable {
@@ -223,6 +237,11 @@ private struct TacuaAdmissionLocalManifest: Decodable {
   let errorCodes: [String]
   let microphoneSamplesObserved: Int?
   let appAudioSamplesObserved: Int?
+  let appAudioAppendAccountingVersion: Int?
+  let appAudioAppendAccountingComplete: Bool?
+  let appAudioAppendAttemptsObserved: Int?
+  let appAudioAppendReservedThroughIndex: Int?
+  let appAudioAppendUnknownRanges: [TacuaAdmissionAppAudioAppendUnknownRange]?
 }
 
 private struct TacuaAdmissionFileIdentity: Equatable {
@@ -688,7 +707,7 @@ final class TacuaCaptureAdmissionCoordinator {
       let startedHostUptime = manifest.startedHostUptimeSeconds,
       let stoppedHostUptime = manifest.stoppedHostUptimeSeconds
     else { throw TacuaCaptureAdmissionError.captureNotFinalized }
-    guard manifest.schemaVersion == 3,
+    guard (manifest.schemaVersion == 3 || manifest.schemaVersion == 4),
       manifest.bootSessionId == authority.timeAnchor.bootSessionID,
       manifest.bootSessionId == clock.bootSessionID
     else { throw TacuaCaptureAdmissionError.captureClockUnavailable }
@@ -757,6 +776,16 @@ final class TacuaCaptureAdmissionCoordinator {
     guard Set(sortedSegments.map(\.index)).count == sortedSegments.count,
       sortedSegments.allSatisfy({ $0.index >= 0 })
     else { throw TacuaCaptureAdmissionError.captureArtifactMismatch }
+    if manifest.schemaVersion == 4 {
+      guard validAppAudioAccounting(manifest: manifest, segments: sortedSegments) else {
+        throw TacuaCaptureAdmissionError.captureArtifactMismatch
+      }
+      if manifest.state == "completed" {
+        guard manifest.appAudioAppendAccountingComplete == true,
+          manifest.appAudioAppendUnknownRanges?.isEmpty == true
+        else { throw TacuaCaptureAdmissionError.captureArtifactMismatch }
+      }
+    }
     var tracked = [manifestFile.identity]
     var segmentPlans: [TacuaAdmissionSegmentPlan] = []
     var previousEnd: Int64 = 0
@@ -835,15 +864,108 @@ final class TacuaCaptureAdmissionCoordinator {
         "unavailable": .null,
       ])
     }
-    let runtimeGaps = try sanitizedGaps(
+    let runtimeAppAudioAccounting: TacuaJSONValue
+    if manifest.schemaVersion == 4 {
+      guard let complete = manifest.appAudioAppendAccountingComplete,
+        let appendAttempts = manifest.appAudioAppendAttemptsObserved,
+        let reservedThroughIndex = manifest.appAudioAppendReservedThroughIndex,
+        let unknownRanges = manifest.appAudioAppendUnknownRanges
+      else { throw TacuaCaptureAdmissionError.captureArtifactMismatch }
+      var projectedSegments: [TacuaJSONValue] = []
+      projectedSegments.reserveCapacity(sortedSegments.count)
+      for (offset, segment) in sortedSegments.enumerated() {
+        guard let attemptStartIndex = segment.appAudioAppendAttemptStartIndex,
+          let segmentAppendAttempts = segment.appAudioAppendAttempts,
+          let drops = segment.appAudioAppendDrops
+        else { throw TacuaCaptureAdmissionError.captureArtifactMismatch }
+        projectedSegments.append(.object([
+          "append_attempts": .integer(Int64(segmentAppendAttempts)),
+          "appended_samples": .integer(Int64(segment.appAudioSamples)),
+          "attempt_start_index": .integer(Int64(attemptStartIndex)),
+          "drops": .array(drops.map { drop in
+            .object([
+              "attempt_index": .integer(Int64(drop.attemptIndex)),
+              "cause": .string(drop.cause),
+            ])
+          }),
+          "segment_id": .string(segmentPlans[offset].segmentID),
+          "sequence": .integer(segmentPlans[offset].sequence),
+        ]))
+      }
+      let orderedUnknownRanges = unknownRanges.sorted { left, right in
+        if left.startIndex == right.startIndex { return left.endIndex < right.endIndex }
+        return left.startIndex < right.startIndex
+      }
+      runtimeAppAudioAccounting = .object([
+        "append_attempts": .integer(Int64(appendAttempts)),
+        "complete": .bool(complete),
+        "reserved_through_index": .integer(Int64(reservedThroughIndex)),
+        "segments": .array(projectedSegments),
+        "unknown_ranges": .array(orderedUnknownRanges.map { range in
+          .object([
+            "end_index": .integer(Int64(range.endIndex)),
+            "reason": .string(range.reason),
+            "start_index": .integer(Int64(range.startIndex)),
+          ])
+        }),
+        "version": .integer(1),
+      ])
+    } else {
+      // Schema 3 has counts but no exact drop indexes. Preserve that uncertainty explicitly.
+      runtimeAppAudioAccounting = .null
+    }
+    var runtimeGaps = try sanitizedGaps(
       manifest.gaps,
       startedHostUptimeSeconds: startedHostUptime,
       durationMilliseconds: timeline.durationMilliseconds
     )
+    if manifest.schemaVersion == 4,
+      manifest.appAudioAppendAccountingComplete == false
+    {
+      guard runtimeGaps.count < TacuaCapturePolicy.maximumManifestGaps else {
+        throw TacuaCaptureAdmissionError.captureArtifactMismatch
+      }
+      runtimeGaps.append(.object([
+        "affected_streams": .array([.string("app_audio")]),
+        "detail": .string(
+          "App-audio append accounting is incomplete after process recovery; "
+            + "crash-reserved indexes were skipped rather than reused."
+        ),
+        "gap_id": .string(String(format: "gap_%06d", runtimeGaps.count)),
+        "reason": .string("process_terminated"),
+        // The exact callback time is unknowable, so do not fabricate a narrower interval.
+        "time_range": timeRange(start: 0, end: timeline.durationMilliseconds),
+      ]))
+    } else if manifest.schemaVersion == 3 {
+      guard runtimeGaps.count < TacuaCapturePolicy.maximumManifestGaps else {
+        throw TacuaCaptureAdmissionError.captureArtifactMismatch
+      }
+      runtimeGaps.append(.object([
+        "affected_streams": .array([.string("app_audio")]),
+        "detail": .string(
+          "Legacy schema-3 app-audio counts have no exact append-attempt or drop indexes."
+        ),
+        "gap_id": .string(String(format: "gap_%06d", runtimeGaps.count)),
+        "reason": .string("unknown"),
+        "time_range": timeRange(start: 0, end: timeline.durationMilliseconds),
+      ]))
+    }
     let summary: TacuaJSONValue = .object([
+      "app_audio_accounting_complete": .bool(
+        manifest.schemaVersion == 4 && manifest.appAudioAppendAccountingComplete == true
+      ),
+      "app_audio_append_attempts": .integer(
+        Int64(manifest.appAudioAppendAttemptsObserved ?? 0)
+      ),
+      "app_audio_append_drops": .integer(Int64(
+        sortedSegments.reduce(0) { $0 + $1.droppedAppAudioSamples }
+      )),
+      "app_audio_unknown_range_count": .integer(Int64(
+        manifest.appAudioAppendUnknownRanges?.count ?? 0
+      )),
       "app_audio_available": .bool((manifest.appAudioSamplesObserved ?? 0) > 0),
       "error_count": .integer(Int64(manifest.errorCodes.count)),
-      "gap_count": .integer(Int64(manifest.gaps.count)),
+      "gap_count": .integer(Int64(runtimeGaps.count)),
       "marker_count": .integer(Int64(manifest.markers.count)),
       "microphone_available": .bool(true),
       "segment_count": .integer(Int64(segmentPlans.count)),
@@ -1002,6 +1124,7 @@ final class TacuaCaptureAdmissionCoordinator {
     }
 
     let manifestSeed: TacuaJSONValue = .object([
+      "app_audio_accounting": runtimeAppAudioAccounting,
       "build_id": scopeObject["build_id"]!,
       "build_identity_digest": scopeObject["build_identity_digest"]!,
       "capture_scope": .string("app_only"),
@@ -1185,7 +1308,7 @@ final class TacuaCaptureAdmissionCoordinator {
       throw TacuaCaptureAdmissionError.captureClockUnavailable
     }
     let duration = stoppedUptime - startedUptime
-    guard (0...1_800_000).contains(duration) else {
+    guard TacuaCapturePolicy.isAdmissionDurationValid(duration) else {
       throw TacuaCaptureAdmissionError.captureClockUnavailable
     }
     let (uptimeDelta, deltaOverflow) = startedUptime.subtractingReportingOverflow(
@@ -1784,6 +1907,108 @@ final class TacuaCaptureAdmissionCoordinator {
       && segment.firstHostUptimeSeconds <= segment.lastHostUptimeSeconds
       && segment.durationSeconds >= 0
       && counts.allSatisfy({ $0 >= 0 })
+  }
+
+  private func validAppAudioAccounting(
+    manifest: TacuaAdmissionLocalManifest,
+    segments: [TacuaAdmissionLocalSegment]
+  ) -> Bool {
+    guard manifest.appAudioAppendAccountingVersion == 1,
+      let complete = manifest.appAudioAppendAccountingComplete,
+      let observedAttempts = manifest.appAudioAppendAttemptsObserved,
+      let observedAppended = manifest.appAudioSamplesObserved,
+      let reservedThrough = manifest.appAudioAppendReservedThroughIndex,
+      let unknownRanges = manifest.appAudioAppendUnknownRanges,
+      observedAttempts >= 0,
+      observedAttempts <= 10_000_000,
+      observedAppended >= 0,
+      observedAppended <= observedAttempts,
+      reservedThrough >= 0,
+      reservedThrough <= 10_000_000,
+      unknownRanges.count <= 2_048
+    else { return false }
+    let allowedCauses: Set<String> = [
+      "sample_data_not_ready", "writer_finished", "writer_not_writing",
+      "timestamp_invalid", "input_backpressure", "append_rejected",
+    ]
+    let orderedUnknownRanges = unknownRanges.sorted { left, right in
+      if left.startIndex == right.startIndex { return left.endIndex < right.endIndex }
+      return left.startIndex < right.startIndex
+    }
+    var nextIndex = 1
+    var unknownOffset = 0
+    var totalAppended = 0
+    var totalAttempts = 0
+    var totalDrops = 0
+    var seenDropIndexes: Set<Int> = []
+
+    func consumeUnknownRanges(before segmentStart: Int) -> Bool {
+      while unknownOffset < orderedUnknownRanges.count {
+        let range = orderedUnknownRanges[unknownOffset]
+        if range.startIndex != nextIndex {
+          return range.startIndex > nextIndex
+        }
+        if range.endIndex >= segmentStart { return range.startIndex == segmentStart }
+        guard range.reason == "process_recovery_reservation",
+          range.endIndex >= range.startIndex,
+          range.endIndex <= 10_000_000
+        else { return false }
+        nextIndex = range.endIndex + 1
+        unknownOffset += 1
+      }
+      return true
+    }
+
+    for segment in segments {
+      guard let start = segment.appAudioAppendAttemptStartIndex,
+        let attempts = segment.appAudioAppendAttempts,
+        let drops = segment.appAudioAppendDrops,
+        start >= nextIndex,
+        consumeUnknownRanges(before: start),
+        start == nextIndex,
+        attempts >= 0,
+        segment.appAudioSamples >= 0,
+        segment.droppedAppAudioSamples >= 0,
+        segment.appAudioSamples <= 10_000_000 - segment.droppedAppAudioSamples,
+        segment.appAudioSamples + segment.droppedAppAudioSamples == attempts,
+        attempts <= 10_000_000 - (start - 1),
+        drops.count == segment.droppedAppAudioSamples,
+        totalDrops <= 2_048 - drops.count,
+        totalAppended <= 10_000_000 - segment.appAudioSamples
+      else { return false }
+      let endExclusive = start + attempts
+      var priorDropIndex = 0
+      for drop in drops {
+        guard allowedCauses.contains(drop.cause),
+          drop.attemptIndex >= start,
+          drop.attemptIndex < endExclusive,
+          drop.attemptIndex > priorDropIndex,
+          seenDropIndexes.insert(drop.attemptIndex).inserted
+        else { return false }
+        priorDropIndex = drop.attemptIndex
+      }
+      totalAppended += segment.appAudioSamples
+      totalDrops += drops.count
+      totalAttempts += attempts
+      nextIndex = endExclusive
+    }
+
+    while unknownOffset < orderedUnknownRanges.count {
+      let range = orderedUnknownRanges[unknownOffset]
+      guard range.startIndex == nextIndex,
+        range.reason == "process_recovery_reservation",
+        range.endIndex >= range.startIndex,
+        range.endIndex <= 10_000_000
+      else { return false }
+      nextIndex = range.endIndex + 1
+      unknownOffset += 1
+    }
+    guard reservedThrough == nextIndex - 1,
+      observedAttempts == totalAttempts,
+      observedAppended == totalAppended,
+      totalAttempts == totalAppended + totalDrops
+    else { return false }
+    return complete ? unknownRanges.isEmpty : !unknownRanges.isEmpty
   }
 
   private func operation(

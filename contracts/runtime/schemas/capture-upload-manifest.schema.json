@@ -41,6 +41,12 @@
     "monotonic_duration_ms": { "type": "integer", "minimum": 0, "maximum": 1800000 },
     "capture_scope": { "const": "app_only" },
     "streams": { "$ref": "#/$defs/streams" },
+    "app_audio_accounting": {
+      "oneOf": [
+        { "$ref": "#/$defs/appAudioAccounting" },
+        { "type": "null" }
+      ]
+    },
     "segments": {
       "type": "array",
       "maxItems": 2048,
@@ -66,6 +72,86 @@
     }
   ],
   "$defs": {
+    "appAudioAppendDrop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attempt_index", "cause"],
+      "properties": {
+        "attempt_index": { "type": "integer", "minimum": 1, "maximum": 10000000 },
+        "cause": {
+          "enum": [
+            "sample_data_not_ready",
+            "writer_finished",
+            "writer_not_writing",
+            "timestamp_invalid",
+            "input_backpressure",
+            "append_rejected"
+          ]
+        }
+      }
+    },
+    "appAudioSegmentAccounting": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "segment_id",
+        "sequence",
+        "attempt_start_index",
+        "append_attempts",
+        "appended_samples",
+        "drops"
+      ],
+      "properties": {
+        "segment_id": { "$ref": "common.schema.json#/$defs/id" },
+        "sequence": { "type": "integer", "minimum": 0, "maximum": 2047 },
+        "attempt_start_index": { "type": "integer", "minimum": 1, "maximum": 10000000 },
+        "append_attempts": { "type": "integer", "minimum": 0, "maximum": 10000000 },
+        "appended_samples": { "type": "integer", "minimum": 0, "maximum": 10000000 },
+        "drops": {
+          "type": "array",
+          "maxItems": 2048,
+          "items": { "$ref": "#/$defs/appAudioAppendDrop" }
+        }
+      }
+    },
+    "appAudioUnknownRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start_index", "end_index", "reason"],
+      "properties": {
+        "start_index": { "type": "integer", "minimum": 1, "maximum": 10000000 },
+        "end_index": { "type": "integer", "minimum": 1, "maximum": 10000000 },
+        "reason": { "const": "process_recovery_reservation" }
+      }
+    },
+    "appAudioAccounting": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "complete",
+        "append_attempts",
+        "reserved_through_index",
+        "segments",
+        "unknown_ranges"
+      ],
+      "properties": {
+        "version": { "const": 1 },
+        "complete": { "type": "boolean" },
+        "append_attempts": { "type": "integer", "minimum": 0, "maximum": 10000000 },
+        "reserved_through_index": { "type": "integer", "minimum": 0, "maximum": 10000000 },
+        "segments": {
+          "type": "array",
+          "maxItems": 2048,
+          "items": { "$ref": "#/$defs/appAudioSegmentAccounting" }
+        },
+        "unknown_ranges": {
+          "type": "array",
+          "maxItems": 2048,
+          "items": { "$ref": "#/$defs/appAudioUnknownRange" }
+        }
+      }
+    },
     "streams": {
       "type": "object",
       "additionalProperties": false,

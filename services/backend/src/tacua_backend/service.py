@@ -27,6 +27,7 @@ from typing import Any, BinaryIO, Callable, Protocol
 from . import PROCESSING_JOB_CONTRACT, __version__
 from .candidate_domain import ContractError as CandidateContractError, TICKET_CONTRACT
 from .candidate_store import (
+    CandidateReplacementResponse,
     CandidateStore,
     CandidateStoreError,
     CandidateTransitionResponse,
@@ -59,6 +60,7 @@ from .evidence_domain import (
     EvidenceDomainError,
     EvidenceStore,
     initialize_schema as initialize_evidence_schema,
+    seal_manifest as seal_evidence_manifest,
     sha256_digest as evidence_sha256_digest,
 )
 from .handoff_export import HandoffExportError, export_approved_candidate
@@ -171,6 +173,7 @@ class ApiError(Exception):
         message: str,
         *,
         sdk_reconciliation: SDKReconciliationBinding | None = None,
+        details: dict[str, Any] | None = None,
     ):
         if sdk_reconciliation is not None:
             expected_message = (
@@ -186,11 +189,14 @@ class ApiError(Exception):
                 raise ValueError(
                     "SDK reconciliation is only valid for historical operation denial"
                 )
+        if details is not None and code != "CANDIDATE_SUPERSEDED":
+            raise ValueError("structured API error details are not allowed for this code")
         super().__init__(message)
         self.status = status
         self.code = code
         self.message = message
         self.sdk_reconciliation = sdk_reconciliation
+        self.details = copy.deepcopy(details)
 
 
 @dataclass(frozen=True)
@@ -943,6 +949,8 @@ class PilotBackend:
             approval_guard=self._verify_candidate_approval_evidence,
             generated_insert_guard=self._verify_generated_candidate_publication,
             version_append_guard=self._append_candidate_evidence_version,
+            replacement_manifest_factory=self._replacement_manifest,
+            replacement_result_guard=self._bind_replacement_results,
         )
 
     def _evidence_store(self, connection: sqlite3.Connection) -> EvidenceStore:
@@ -1311,6 +1319,126 @@ class PilotBackend:
                 connection,
                 candidate=candidate,
                 evidence_manifest=approved_manifest,
+            )
+
+    def _replacement_manifest(
+        self,
+        connection: sqlite3.Connection,
+        operation: str,
+        sources: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Verify source evidence and construct the canonical merge union."""
+
+        if operation not in {"split", "merge"} or not sources:
+            raise CandidateStoreError(
+                500,
+                "CANDIDATE_REPLACEMENT_INVALID",
+                "candidate replacement evidence request is invalid",
+            )
+        evidence = self._evidence_store(connection)
+        manifests: list[dict[str, Any]] = []
+        for source in sources:
+            self._require_review_session(connection, source["session_id"])
+            manifest = evidence.get_manifest(**self._candidate_binding(source))
+            if (
+                manifest["manifest_id"]
+                != source["evidence_manifest"]["manifest_id"]
+                or manifest["manifest_digest"]
+                != source["evidence_manifest"]["manifest_digest"]
+                or {item["evidence_id"] for item in manifest["items"]}
+                != set(source["evidence_manifest"]["evidence_ids"])
+            ):
+                raise CandidateStoreError(
+                    500,
+                    "CANDIDATE_EVIDENCE_CORRUPT",
+                    "candidate replacement evidence binding changed",
+                )
+            manifests.append(manifest)
+        if operation == "split":
+            return copy.deepcopy(manifests[0])
+
+        items_by_id: dict[str, dict[str, Any]] = {}
+        for manifest in manifests:
+            for item in manifest["items"]:
+                existing = items_by_id.get(item["evidence_id"])
+                if existing is not None and canonical_json(existing) != canonical_json(item):
+                    raise CandidateStoreError(
+                        409,
+                        "MERGE_EVIDENCE_ID_CONFLICT",
+                        "merge sources contain conflicting immutable evidence identities",
+                    )
+                items_by_id[item["evidence_id"]] = copy.deepcopy(item)
+        if len(items_by_id) > 100:
+            raise CandidateStoreError(
+                409,
+                "MERGE_EVIDENCE_LIMIT_EXCEEDED",
+                "merged evidence union exceeds 100 items",
+            )
+        ordered_items = [items_by_id[key] for key in sorted(items_by_id)]
+        identity_digest = evidence_sha256_digest(
+            canonical_json(
+                {
+                    "operation": "merge",
+                    "organization_id": sources[0]["organization_id"],
+                    "project_id": sources[0]["project_id"],
+                    "session_id": sources[0]["session_id"],
+                    "items": [
+                        {
+                            "evidence_id": item["evidence_id"],
+                            "evidence_item_digest": item["evidence_item_digest"],
+                        }
+                        for item in ordered_items
+                    ],
+                }
+            )
+        )
+        return seal_evidence_manifest(
+            {
+                "contract_version": manifests[0]["contract_version"],
+                "media_type": manifests[0]["media_type"],
+                "organization_id": sources[0]["organization_id"],
+                "project_id": sources[0]["project_id"],
+                "session_id": sources[0]["session_id"],
+                "manifest_id": "manifest_merge_"
+                + identity_digest.removeprefix("sha256:")[:40],
+                "items": ordered_items,
+                "manifest_digest": "sha256:" + "0" * 64,
+            }
+        )
+
+    def _bind_replacement_results(
+        self,
+        connection: sqlite3.Connection,
+        operation: str,
+        sources: list[dict[str, Any]],
+        results: list[dict[str, Any]],
+        manifest: dict[str, Any],
+    ) -> None:
+        """Bind every result to evidence inside the replacement transaction."""
+
+        _ = (operation, sources)
+        evidence = self._evidence_store(connection)
+        for candidate in results:
+            binding = self._candidate_binding(candidate)
+            binding.pop("manifest_digest")
+            stored = evidence.put_manifest(manifest=manifest, **binding)
+            if (
+                stored["manifest_id"] != candidate["evidence_manifest"]["manifest_id"]
+                or stored["manifest_digest"]
+                != candidate["evidence_manifest"]["manifest_digest"]
+                or set(stored["evidence_ids"])
+                != set(candidate["evidence_manifest"]["evidence_ids"])
+                or stored["authorized_for_handoff"] is not False
+            ):
+                raise CandidateStoreError(
+                    500,
+                    "CANDIDATE_EVIDENCE_CORRUPT",
+                    "replacement result evidence binding changed",
+                )
+        if operation == "merge":
+            evidence.inherit_latest_previews(
+                source_bindings=[self._candidate_binding(source) for source in sources],
+                target_binding=self._candidate_binding(results[0]),
             )
 
     def _persist_approved_candidate_handoff(
@@ -3536,7 +3664,12 @@ class PilotBackend:
 
     @staticmethod
     def _raise_candidate_error(error: CandidateStoreError) -> None:
-        raise ApiError(error.status, error.code, error.message) from error
+        raise ApiError(
+            error.status,
+            error.code,
+            error.message,
+            details=error.details,
+        ) from error
 
     @staticmethod
     def _raise_evidence_error(error: EvidenceDomainError) -> None:
@@ -3984,6 +4117,10 @@ class PilotBackend:
                         WHERE heads.organization_id = ?
                           AND heads.project_id = ?
                           AND heads.session_id = ?
+                          AND NOT EXISTS (
+                              SELECT 1 FROM candidate_supersessions AS superseded
+                               WHERE superseded.source_candidate_id = heads.candidate_id
+                          )
                           AND (? IS NULL OR heads.candidate_id > ?)
                         ORDER BY heads.candidate_id ASC
                         LIMIT 51""",
@@ -4023,6 +4160,58 @@ class PilotBackend:
                 self._require_review_session(connection, candidate["session_id"])
                 return candidate
 
+    def get_candidate_supersession(self, candidate_id: str) -> dict[str, Any]:
+        _require_id(candidate_id, "candidate_id")
+        with self._lock:
+            self._sweep_before_review_access()
+            try:
+                supersession = self._candidate_store().get_supersession(candidate_id)
+            except CandidateStoreError as error:
+                self._raise_candidate_error(error)
+            source = next(
+                binding
+                for binding in supersession["operation"]["sources"]
+                if binding["candidate_id"] == candidate_id
+            )
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                candidate = self._candidate_from_connection(
+                    connection, candidate_id, source["candidate_version"]
+                )
+                self._require_review_session(connection, candidate["session_id"])
+                exact = {
+                    "candidate_id": candidate["candidate_id"],
+                    "candidate_version": candidate["candidate_version"],
+                    "candidate_digest": candidate["candidate_digest"],
+                    "candidate_content_digest": candidate["candidate_content_digest"],
+                    "evidence_manifest_digest": candidate["evidence_manifest"][
+                        "manifest_digest"
+                    ],
+                }
+                if exact != source:
+                    raise ApiError(
+                        500,
+                        "CANDIDATE_STORAGE_CORRUPT",
+                        "stored candidate supersession source changed",
+                    )
+            return supersession
+
+    def replace_candidates(
+        self,
+        *,
+        idempotency_key: str,
+        body: Any,
+    ) -> CandidateReplacementResponse:
+        with self._lock:
+            self._sweep_before_review_access()
+            try:
+                return self._candidate_store().replace(
+                    idempotency_key=idempotency_key,
+                    body=body,
+                )
+            except CandidateStoreError as error:
+                self._raise_candidate_error(error)
+
     def get_candidate_handoff(
         self,
         candidate_id: str,
@@ -4035,6 +4224,10 @@ class PilotBackend:
             raise ApiError(400, "INVALID_CANDIDATE_VERSION", "candidate version is invalid")
         with self._lock:
             self._sweep_before_review_access()
+            try:
+                self._candidate_store().require_not_superseded(candidate_id)
+            except CandidateStoreError as error:
+                self._raise_candidate_error(error)
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 try:

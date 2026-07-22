@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Verify rootless isolated processor
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rootless-isolated-processor:
+    # This is deliberately separate from ubuntu-latest: the acceptance gate
+    # requires a rootless daemon with cgroup v2/systemd delegation and builtin
+    # seccomp, which the ordinary rootful GitHub-hosted daemon does not prove.
+    runs-on: [self-hosted, linux, x64, tacua-rootless]
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Prove and run the rootless isolated-processor integration
+        run: python3 -B services/backend/scripts/run_synthetic_isolated_processor_integration.py

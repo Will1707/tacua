@@ -331,12 +331,28 @@ validated constants but are never used without the complete machine binding.
 | `GET` | `/v1/admin/sessions` | admin bearer | List one bounded page of session summaries |
 | `GET` | `/v1/admin/sessions/{session}` | admin bearer | Observe one session and its bounded receipt projection |
 | `GET` | `/v1/admin/sessions/{session}/candidates` | admin bearer | List one bounded page of current candidate summaries |
+| `GET` | `/v1/admin/candidates/{candidate}` | admin bearer | Read the current immutable candidate chain; response `ETag` is its exact head digest |
+| `GET` | `/v1/admin/candidates/{candidate}/versions/{version}/evidence` | admin bearer plus exact candidate and manifest digests | Read the exact version's bounded evidence projection |
+| `GET` | `/v1/admin/candidates/{candidate}/versions/{version}/evidence/{evidence}/preview` | admin bearer plus exact candidate and manifest digests | Read one integrity-bound preview for the exact version |
+| `POST` | `/v1/admin/candidates/{candidate}/transitions` | admin bearer, `If-Match`, idempotency key | Append one immutable transition from the exact current head |
+| `POST` | `/v1/admin/candidate-replacements` | admin bearer, idempotency key | Atomically split or merge exact current source heads and supersede them |
+| `GET` | `/v1/admin/candidates/{candidate}/supersession` | admin bearer | Read the immutable replacement operation for a superseded source |
 | `GET` | `/v1/admin/jobs` | admin bearer | List one bounded page of processing-job summaries |
 | `GET` | `/v1/admin/jobs/{job}` | admin bearer | Observe one full, digest-validated runtime job |
 | `GET` | `/v1/admin/candidates/{candidate}/handoff.{json,md}` | admin bearer | Download the current exact approved handoff |
 | `GET` | `/v1/admin/candidates/{candidate}/versions/{version}/handoff.{json,md}` | admin bearer | Download one immutable approved handoff version |
 | `GET` | `/v1/admin/audit-events` | admin bearer | List one bounded page of content-free audit events |
 | `DELETE` | `/v1/admin/sessions/{session}` | admin bearer | Operator-requested scoped erasure |
+
+Candidate evidence and preview reads require one quoted candidate digest in
+`If-Match` and the exact `Tacua-Evidence-Manifest-Digest`. Candidate transitions
+also require `If-Match`; transitions and replacements each require one
+`Idempotency-Key`. A replacement request carries every exact source binding, so
+it does not use a separate single-candidate `If-Match` header. Candidate lists
+exclude superseded sources, while their detail, evidence, previews, and
+supersession history remain readable. Attempts to transition, replace, approve,
+reject, or export a superseded source fail with the stable
+`409 CANDIDATE_SUPERSEDED` conflict and replacement references.
 
 The four admin list routes return exactly one of
 `{"sessions":[...],"next_cursor":...}`,

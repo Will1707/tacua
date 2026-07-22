@@ -23,8 +23,11 @@ MAX_JSON_BYTES = 1_048_576
 MAX_MARKDOWN_BYTES = 2_097_152
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 MAX_REGISTRY_ASSERTION_LIFETIME = timedelta(hours=24)
+MAX_EXECUTION_ASSERTION_LIFETIME = timedelta(minutes=15)
+MAX_EXECUTION_REVOCATIONS_LIFETIME = timedelta(hours=24)
 SYNTHETIC_FIXTURE_TIME = datetime(2026, 7, 20, 11, 0, 0, tzinfo=timezone.utc)
 SYNTHETIC_FIXTURE_KEY = bytes.fromhex("11" * 32)
+SYNTHETIC_EXECUTION_KEY = bytes.fromhex("22" * 32)
 DIGEST_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
 HMAC_RE = re.compile(r"^hmac-sha256:[a-f0-9]{64}$")
 FORBIDDEN_KEYS = {
@@ -86,9 +89,51 @@ class ContractError(ValueError):
         super().__init__(f"{code} at {path}: {detail}")
 
 
+def _validate_canonical_json_value(value: Any, path: str = "$", depth: int = 0) -> None:
+    """Reject values outside Tacua Canonical JSON v1 before serialization."""
+
+    if depth > 128:
+        raise ContractError("MAXIMUM_DEPTH", path, "JSON nesting exceeds the contract limit")
+    if value is None or isinstance(value, bool):
+        return
+    if isinstance(value, int):
+        if not -MAX_SAFE_INTEGER <= value <= MAX_SAFE_INTEGER:
+            raise ContractError(
+                "INTEGER_OUT_OF_RANGE",
+                path,
+                "integers must fit the interoperable JSON safe-integer range",
+            )
+        return
+    if isinstance(value, float):
+        raise ContractError("FLOAT_FORBIDDEN", path, "canonical contract permits integers, not floats")
+    if isinstance(value, str):
+        if unicodedata.normalize("NFC", value) != value:
+            raise ContractError("NON_CANONICAL_UNICODE", path, "strings must use Unicode NFC")
+        if "\x00" in value:
+            raise ContractError("CONTROL_CHARACTER", path, "NUL is forbidden")
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise ContractError("INVALID_UNICODE_SCALAR", path, "string is not valid UTF-8") from error
+        return
+    if isinstance(value, list):
+        for index, child in enumerate(value):
+            _validate_canonical_json_value(child, f"{path}[{index}]", depth + 1)
+        return
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if not isinstance(key, str):
+                raise ContractError("INVALID_JSON_KEY", path, "object keys must be strings")
+            _validate_canonical_json_value(key, f"{path}.{key}", depth)
+            _validate_canonical_json_value(child, f"{path}.{key}", depth + 1)
+        return
+    raise ContractError("INVALID_JSON_VALUE", path, "unsupported JSON value")
+
+
 def canonical_json(value: Any) -> str:
     """Return Tacua Canonical JSON v1 (integer-only JSON, sorted UTF-8 keys)."""
 
+    _validate_canonical_json_value(value)
     return json.dumps(
         value,
         ensure_ascii=False,
@@ -182,6 +227,40 @@ def seal_registry_assertion(assertion: dict[str, Any], key: bytes) -> dict[str, 
     payload = canonical_json(registry_assertion_subject(assertion)).encode("utf-8")
     assertion["signature"]["value"] = "hmac-sha256:" + hmac.new(key, payload, hashlib.sha256).hexdigest()
     return assertion
+
+
+def execution_assertion_subject(assertion: dict[str, Any]) -> dict[str, Any]:
+    subject = copy.deepcopy(assertion)
+    subject["signature"].pop("value", None)
+    return subject
+
+
+def seal_execution_assertion(assertion: dict[str, Any], key: bytes) -> dict[str, Any]:
+    """Sign a local assertion. The issuer still must be authorized by the current registry."""
+
+    if len(key) < 32:
+        raise ContractError("EXECUTION_KEY_TOO_SHORT", "$", "execution HMAC key must be at least 32 bytes")
+    assertion = copy.deepcopy(assertion)
+    payload = canonical_json(execution_assertion_subject(assertion)).encode("utf-8")
+    assertion["signature"]["value"] = "hmac-sha256:" + hmac.new(key, payload, hashlib.sha256).hexdigest()
+    return assertion
+
+
+def execution_revocations_subject(revocations: dict[str, Any]) -> dict[str, Any]:
+    subject = copy.deepcopy(revocations)
+    subject["signature"].pop("value", None)
+    return subject
+
+
+def seal_execution_revocations(revocations: dict[str, Any], key: bytes) -> dict[str, Any]:
+    """Sign a local execution revocation list with the execution issuer key."""
+
+    if len(key) < 32:
+        raise ContractError("EXECUTION_KEY_TOO_SHORT", "$", "execution HMAC key must be at least 32 bytes")
+    revocations = copy.deepcopy(revocations)
+    payload = canonical_json(execution_revocations_subject(revocations)).encode("utf-8")
+    revocations["signature"]["value"] = "hmac-sha256:" + hmac.new(key, payload, hashlib.sha256).hexdigest()
+    return revocations
 
 
 class SchemaValidator:
@@ -356,6 +435,19 @@ def _require(condition: bool, code: str, path: str, detail: str) -> None:
 def _unique(values: Iterable[str], path: str) -> None:
     materialized = list(values)
     _require(len(materialized) == len(set(materialized)), "DUPLICATE_ID", path, "IDs must be unique")
+
+
+def _validate_unique_repository_ids(
+    repositories: Iterable[dict[str, Any]],
+    path: str,
+) -> None:
+    repository_ids = [repository["repository_id"] for repository in repositories]
+    _require(
+        len(repository_ids) == len(set(repository_ids)),
+        "DUPLICATE_REPOSITORY_ID",
+        path,
+        "each repository ID must appear exactly once with one immutable revision",
+    )
 
 
 def _walk(value: Any, path: str = "$") -> Iterable[tuple[str, str | None, Any]]:
@@ -712,8 +804,11 @@ def _validate_digest(value: str, expected: str, path: str) -> None:
 def validate_build_identity(build: dict[str, Any]) -> None:
     SCHEMAS.validate(build, "build-identity.schema.json")
     _validate_text_and_secrets(build)
+    source_snapshots = [build["mobile"]["source"]]
     if build["backend"]["availability"] == "available":
+        source_snapshots.extend(build["backend"]["sources"])
         parse_timestamp(build["backend"]["deployed_at"], "$.backend.deployed_at")
+    _validate_unique_repository_ids(source_snapshots, "$.mobile.source/$.backend.sources")
     _validate_digest(
         build["build_identity_digest"],
         digest_without(build, "build_identity_digest"),
@@ -821,6 +916,28 @@ def validate_evidence_manifest(manifest: dict[str, Any]) -> None:
     )
 
 
+def _validate_execution_key_id_separation(assertion: dict[str, Any]) -> None:
+    _require(
+        assertion["signature"]["key_id"]
+        != assertion["execution_authority"]["key_id"],
+        "TRUST_KEY_ID_REUSE",
+        "$.execution_authority.key_id",
+        "registry-signature and execution-authority key IDs must be distinct",
+    )
+
+
+def _validate_trust_key_material_separation(
+    registry_key: bytes,
+    execution_key: bytes,
+) -> None:
+    _require(
+        not hmac.compare_digest(registry_key, execution_key),
+        "TRUST_KEY_MATERIAL_REUSE",
+        "$.execution_authority",
+        "registry-signature and execution-authority key material must be distinct",
+    )
+
+
 def validate_registry_assertion(
     assertion: dict[str, Any],
     key: bytes,
@@ -830,13 +947,23 @@ def validate_registry_assertion(
 ) -> None:
     """Verify an external registry assertion and bind it to this exact handoff.
 
-    The HMAC mechanism is a candidate trust adapter, not an accepted signature policy.
+    HMAC is accepted only for the single-host/local V1 trust path in ADR-017.
+    Remote or multi-host production distribution still needs an asymmetric policy.
     Callers must obtain the key through an authenticated channel outside the handoff.
     """
 
     _require(len(key) >= 32, "REGISTRY_KEY_TOO_SHORT", "$", "registry HMAC key must be at least 32 bytes")
+    validate_handoff(handoff, executable=False)
     SCHEMAS.validate(assertion, "registry-assertion.schema.json")
     _validate_text_and_secrets(assertion)
+    _validate_execution_key_id_separation(assertion)
+    _require(
+        handoff["supersession"]["status"] == "current"
+        and handoff["supersession"]["superseded_by_handoff_digest"] is None,
+        "STALE_HANDOFF",
+        "$.supersession",
+        "the registry cannot authorize a handoff already marked superseded",
+    )
     issued_at = parse_timestamp(assertion["issued_at"], "$.issued_at")
     expires_at = parse_timestamp(assertion["expires_at"], "$.expires_at")
     _require(issued_at < expires_at, "INVALID_ASSERTION_WINDOW", "$.expires_at", "expiry must follow issue time")
@@ -858,7 +985,7 @@ def validate_registry_assertion(
     if now.tzinfo is None:
         raise ContractError("INVALID_TRUST_TIME", "$", "trust evaluation time must be timezone-aware")
     now = now.astimezone(timezone.utc)
-    _require(issued_at <= now <= expires_at, "REGISTRY_ASSERTION_EXPIRED", "$", "assertion is not current")
+    _require(issued_at <= now < expires_at, "REGISTRY_ASSERTION_EXPIRED", "$", "assertion is not current")
 
     supplied = assertion["signature"]["value"]
     _require(bool(HMAC_RE.fullmatch(supplied)), "INVALID_REGISTRY_SIGNATURE", "$.signature.value", "invalid HMAC")
@@ -895,11 +1022,320 @@ def validate_registry_assertion(
         (item["source"]["component"], item["source"]["source_id"], item["source"]["snapshot_revision"])
         for item in handoff["evidence_manifest"]["items"]
     }
+    missing_sources = manifest_sources - trusted_sources
+    extra_sources = trusted_sources - manifest_sources
     _require(
-        manifest_sources <= trusted_sources,
+        not missing_sources and not extra_sources,
         "UNTRUSTED_EVIDENCE_SOURCE",
         "$.authorized_sources",
-        f"registry does not bind sources {sorted(manifest_sources - trusted_sources)!r}",
+        (
+            "registry evidence-source scope must exactly match the handoff manifest; "
+            f"missing {sorted(missing_sources)!r}, extra {sorted(extra_sources)!r}"
+        ),
+    )
+
+
+def _execution_source_repositories(handoff: dict[str, Any]) -> list[dict[str, str]]:
+    build = handoff["build_identity"]
+    snapshots = [build["mobile"]["source"]]
+    if build["backend"]["availability"] == "available":
+        snapshots.extend(build["backend"]["sources"])
+    repositories = sorted(
+        (
+            {
+                "repository_id": snapshot["repository_id"],
+                "revision": snapshot["revision"],
+            }
+            for snapshot in snapshots
+        ),
+        key=lambda item: (item["repository_id"], item["revision"]),
+    )
+    _validate_unique_repository_ids(repositories, "$.build_identity")
+    _require(
+        {item["repository_id"] for item in repositories}
+        == set(handoff["authority"]["allowed_repositories"]),
+        "EXECUTION_REPOSITORY_REVISION_REQUIRED",
+        "$.authority.allowed_repositories",
+        "every allowed repository must have an immutable revision in the approved build identity",
+    )
+    return repositories
+
+
+def issue_execution_assertion(
+    handoff: dict[str, Any],
+    registry_assertion: dict[str, Any],
+    registry_key: bytes,
+    execution_key: bytes,
+    *,
+    assertion_id: str,
+    instance_id: str,
+    nonce: str,
+    issued_at: datetime,
+    lifetime_seconds: int,
+) -> dict[str, Any]:
+    """Authenticate current registry trust, then sign one exact Codex assertion."""
+
+    validate_handoff(handoff, executable=False)
+    _validate_trust_key_material_separation(registry_key, execution_key)
+    if issued_at.tzinfo is None:
+        raise ContractError("INVALID_TRUST_TIME", "$.issued_at", "issue time must be timezone-aware")
+    issued_at = issued_at.astimezone(timezone.utc).replace(microsecond=0)
+    validate_registry_assertion(
+        registry_assertion,
+        registry_key,
+        handoff,
+        at_time=issued_at,
+    )
+    _require(
+        isinstance(lifetime_seconds, int)
+        and not isinstance(lifetime_seconds, bool)
+        and 1 <= lifetime_seconds <= int(MAX_EXECUTION_ASSERTION_LIFETIME.total_seconds()),
+        "INVALID_EXECUTION_LIFETIME",
+        "$.lifetime_seconds",
+        "local execution lifetime must be 1 through 900 seconds",
+    )
+    expires_at = issued_at + timedelta(seconds=lifetime_seconds)
+    registry_expires_at = parse_timestamp(registry_assertion["expires_at"], "$.registry_assertion.expires_at")
+    _require(
+        expires_at <= registry_expires_at,
+        "EXECUTION_OUTSIDE_REGISTRY_WINDOW",
+        "$.expires_at",
+        "requested execution lifetime extends beyond the current registry assertion",
+    )
+    authority = registry_assertion["execution_authority"]
+    ticket = handoff["ticket"]
+    build = handoff["build_identity"]
+    manifest = handoff["evidence_manifest"]
+    assertion = {
+        "contract_version": "tacua.execution-assertion@1.0.0",
+        "media_type": "application/vnd.tacua.execution-assertion+json;version=1.0.0",
+        "assertion_id": assertion_id,
+        "issuer_id": authority["issuer_id"],
+        "consumer": {
+            "kind": "execution_agent",
+            "agent": "openai_codex",
+            "instance_id": instance_id,
+            "runtime_profile": {
+                "command": "codex_exec",
+                "non_interactive": True,
+                "ephemeral": True,
+                "sandbox": "workspace-write",
+                "network_access": False,
+                "structured_output": True,
+                "authentication_scope": "single_invocation",
+            },
+        },
+        "organization_id": handoff["organization_id"],
+        "project_id": handoff["project_id"],
+        "ticket_id": ticket["ticket_id"],
+        "ticket_version": ticket["ticket_version"],
+        "repositories": _execution_source_repositories(handoff),
+        "build_id": build["build_id"],
+        "build_identity_digest": build["build_identity_digest"],
+        "current_handoff_digest": handoff["handoff_digest"],
+        "evidence_manifest_digest": manifest["evidence_manifest_digest"],
+        "evidence_item_digests": sorted(
+            [
+                {
+                    "evidence_id": item["evidence_id"],
+                    "evidence_item_digest": item["evidence_item_digest"],
+                }
+                for item in manifest["items"]
+            ],
+            key=lambda item: item["evidence_id"],
+        ),
+        "allowed_actions": ["modify_code", "read_authorized_evidence", "run_tests"],
+        "issued_at": issued_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "expires_at": expires_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "nonce": nonce,
+        "revocation_list_id": authority["revocation_list_id"],
+        "revocation_revision": authority["revocation_revision"],
+        "signature": {
+            "algorithm": "hmac-sha256",
+            "key_id": authority["key_id"],
+            "value": "hmac-sha256:" + "0" * 64,
+        },
+    }
+    assertion = seal_execution_assertion(assertion, execution_key)
+    SCHEMAS.validate(assertion, "execution-assertion.schema.json")
+    _validate_text_and_secrets(assertion)
+    return assertion
+
+
+def validate_execution_authorization(
+    assertion: dict[str, Any],
+    revocations: dict[str, Any],
+    key: bytes,
+    registry_assertion: dict[str, Any],
+    handoff: dict[str, Any],
+    *,
+    registry_key: bytes,
+    at_time: datetime | None = None,
+) -> None:
+    """Authorize one OpenAI Codex execution against an exact approved handoff.
+
+    The assertion is deliberately separate from structural approval and the registry's
+    current-version assertion. It is short-lived, nonce-bearing, digest complete and
+    checked against authenticated registry trust plus the current signed revocation list.
+    """
+
+    _require(len(key) >= 32, "EXECUTION_KEY_TOO_SHORT", "$", "execution HMAC key must be at least 32 bytes")
+    _validate_trust_key_material_separation(registry_key, key)
+    SCHEMAS.validate(assertion, "execution-assertion.schema.json")
+    SCHEMAS.validate(revocations, "execution-revocations.schema.json")
+    _validate_text_and_secrets(assertion)
+    _validate_text_and_secrets(revocations)
+    _validate_unique_repository_ids(assertion["repositories"], "$.repositories")
+
+    now = at_time or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        raise ContractError("INVALID_TRUST_TIME", "$", "trust evaluation time must be timezone-aware")
+    now = now.astimezone(timezone.utc)
+    validate_registry_assertion(
+        registry_assertion,
+        registry_key,
+        handoff,
+        at_time=now,
+    )
+    issued_at = parse_timestamp(assertion["issued_at"], "$.issued_at")
+    expires_at = parse_timestamp(assertion["expires_at"], "$.expires_at")
+    _require(issued_at < expires_at, "INVALID_EXECUTION_WINDOW", "$.expires_at", "expiry must follow issue time")
+    _require(
+        expires_at - issued_at <= MAX_EXECUTION_ASSERTION_LIFETIME,
+        "EXECUTION_WINDOW_TOO_LONG",
+        "$.expires_at",
+        "execution assertions may be valid for at most 15 minutes",
+    )
+    _require(issued_at <= now < expires_at, "EXECUTION_ASSERTION_EXPIRED", "$", "execution assertion is not current")
+
+    registry_issued_at = parse_timestamp(registry_assertion["issued_at"], "$.registry_assertion.issued_at")
+    registry_expires_at = parse_timestamp(registry_assertion["expires_at"], "$.registry_assertion.expires_at")
+    _require(
+        registry_issued_at <= issued_at and expires_at <= registry_expires_at,
+        "EXECUTION_OUTSIDE_REGISTRY_WINDOW",
+        "$.expires_at",
+        "execution assertion must be wholly contained in the current registry assertion window",
+    )
+
+    authority = registry_assertion["execution_authority"]
+    for supplied, expected, path in (
+        (assertion["issuer_id"], authority["issuer_id"], "$.issuer_id"),
+        (assertion["signature"]["key_id"], authority["key_id"], "$.signature.key_id"),
+        (assertion["revocation_list_id"], authority["revocation_list_id"], "$.revocation_list_id"),
+        (assertion["revocation_revision"], authority["revocation_revision"], "$.revocation_revision"),
+        (revocations["issuer_id"], authority["issuer_id"], "$.revocations.issuer_id"),
+        (revocations["signature"]["key_id"], authority["key_id"], "$.revocations.signature.key_id"),
+        (revocations["list_id"], authority["revocation_list_id"], "$.revocations.list_id"),
+        (revocations["revision"], authority["revocation_revision"], "$.revocations.revision"),
+    ):
+        _require(
+            supplied == expected,
+            "EXECUTION_AUTHORITY_MISMATCH",
+            path,
+            f"expected registry-authorized value {expected!r}",
+        )
+
+    supplied_signature = assertion["signature"]["value"]
+    expected_signature = "hmac-sha256:" + hmac.new(
+        key,
+        canonical_json(execution_assertion_subject(assertion)).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    _require(
+        hmac.compare_digest(supplied_signature, expected_signature),
+        "EXECUTION_SIGNATURE_MISMATCH",
+        "$.signature.value",
+        "assertion was not authenticated by the registry-authorized local execution key",
+    )
+
+    revocations_issued_at = parse_timestamp(revocations["issued_at"], "$.revocations.issued_at")
+    revocations_expires_at = parse_timestamp(revocations["expires_at"], "$.revocations.expires_at")
+    _require(
+        revocations_issued_at < revocations_expires_at,
+        "INVALID_REVOCATION_WINDOW",
+        "$.revocations.expires_at",
+        "expiry must follow issue time",
+    )
+    _require(
+        revocations_expires_at - revocations_issued_at <= MAX_EXECUTION_REVOCATIONS_LIFETIME,
+        "REVOCATION_WINDOW_TOO_LONG",
+        "$.revocations.expires_at",
+        "execution revocation lists may be valid for at most 24 hours",
+    )
+    _require(
+        revocations_issued_at <= now < revocations_expires_at,
+        "REVOCATION_LIST_EXPIRED",
+        "$.revocations",
+        "the registry-current revocation list is not current",
+    )
+    supplied_revocation_signature = revocations["signature"]["value"]
+    expected_revocation_signature = "hmac-sha256:" + hmac.new(
+        key,
+        canonical_json(execution_revocations_subject(revocations)).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    _require(
+        hmac.compare_digest(supplied_revocation_signature, expected_revocation_signature),
+        "REVOCATION_SIGNATURE_MISMATCH",
+        "$.revocations.signature.value",
+        "revocation list was not authenticated by the registry-authorized local execution key",
+    )
+    _require(
+        assertion["assertion_id"] not in revocations["revoked_assertion_ids"]
+        and assertion["nonce"] not in revocations["revoked_nonces"]
+        and assertion["signature"]["key_id"] not in revocations["revoked_key_ids"],
+        "EXECUTION_ASSERTION_REVOKED",
+        "$.revocations",
+        "the assertion, nonce, or signing key is revoked",
+    )
+
+    ticket = handoff["ticket"]
+    build = handoff["build_identity"]
+    manifest = handoff["evidence_manifest"]
+    for field, expected in (
+        ("organization_id", handoff["organization_id"]),
+        ("project_id", handoff["project_id"]),
+        ("ticket_id", ticket["ticket_id"]),
+        ("ticket_version", ticket["ticket_version"]),
+        ("build_id", build["build_id"]),
+        ("build_identity_digest", build["build_identity_digest"]),
+        ("current_handoff_digest", handoff["handoff_digest"]),
+        ("evidence_manifest_digest", manifest["evidence_manifest_digest"]),
+    ):
+        _require(
+            assertion[field] == expected,
+            "EXECUTION_SCOPE_MISMATCH",
+            f"$.{field}",
+            f"expected {expected!r}",
+        )
+    _require(
+        assertion["repositories"] == _execution_source_repositories(handoff),
+        "EXECUTION_SCOPE_MISMATCH",
+        "$.repositories",
+        "repository IDs and immutable revisions must exactly equal the approved build and authority",
+    )
+    expected_evidence = sorted(
+        (
+            {
+                "evidence_id": item["evidence_id"],
+                "evidence_item_digest": item["evidence_item_digest"],
+            }
+            for item in manifest["items"]
+        ),
+        key=lambda item: item["evidence_id"],
+    )
+    _require(
+        assertion["evidence_item_digests"] == expected_evidence,
+        "EXECUTION_SCOPE_MISMATCH",
+        "$.evidence_item_digests",
+        "evidence IDs and digests must exactly equal the approved evidence manifest",
+    )
+    _require(
+        assertion["allowed_actions"]
+        == ["modify_code", "read_authorized_evidence", "run_tests"],
+        "EXECUTION_SCOPE_MISMATCH",
+        "$.allowed_actions",
+        "V1 Codex assertions grant only the three approved local implementation actions",
     )
 
 
@@ -909,6 +1345,9 @@ def _validate_handoff_at_time(
     executable: bool = False,
     registry_assertion: dict[str, Any] | None = None,
     registry_key: bytes | None = None,
+    execution_assertion: dict[str, Any] | None = None,
+    execution_revocations: dict[str, Any] | None = None,
+    execution_key: bytes | None = None,
     at_time: datetime | None = None,
 ) -> None:
     encoded_size = len(canonical_json_artifact(handoff))
@@ -1150,10 +1589,14 @@ def _validate_handoff_at_time(
     _validate_digest(handoff["handoff_digest"], digest_without(handoff, "handoff_digest"), "$.handoff_digest")
     if executable:
         _require(
-            registry_assertion is not None and registry_key is not None,
+            registry_assertion is not None
+            and registry_key is not None
+            and execution_assertion is not None
+            and execution_revocations is not None
+            and execution_key is not None,
             "TRUST_INPUT_REQUIRED",
             "$",
-            "executable validation requires an authenticated registry assertion and external key",
+            "executable validation requires registry trust plus a current, unrevoked, short-lived execution assertion",
         )
         _require(
             supersession["status"] == "current" and supersession["superseded_by_handoff_digest"] is None,
@@ -1161,10 +1604,14 @@ def _validate_handoff_at_time(
             "$.supersession",
             "only the current approved version is executable",
         )
-        validate_registry_assertion(
+        _validate_trust_key_material_separation(registry_key, execution_key)
+        validate_execution_authorization(
+            execution_assertion,
+            execution_revocations,
+            execution_key,
             registry_assertion,
-            registry_key,
             handoff,
+            registry_key=registry_key,
             at_time=at_time,
         )
 
@@ -1175,6 +1622,9 @@ def validate_handoff(
     executable: bool = False,
     registry_assertion: dict[str, Any] | None = None,
     registry_key: bytes | None = None,
+    execution_assertion: dict[str, Any] | None = None,
+    execution_revocations: dict[str, Any] | None = None,
+    execution_key: bytes | None = None,
 ) -> None:
     """Validate structurally or, in executable mode, against the real current UTC clock."""
 
@@ -1183,6 +1633,9 @@ def validate_handoff(
         executable=executable,
         registry_assertion=registry_assertion,
         registry_key=registry_key,
+        execution_assertion=execution_assertion,
+        execution_revocations=execution_revocations,
+        execution_key=execution_key,
         at_time=datetime.now(timezone.utc) if executable else None,
     )
 
@@ -1192,11 +1645,19 @@ def validate_synthetic_fixture_handoff(
     registry_assertion: dict[str, Any],
     registry_key: bytes,
     registry_key_path: Path,
+    execution_assertion: dict[str, Any],
+    execution_revocations: dict[str, Any],
+    execution_key: bytes,
+    execution_key_path: Path,
 ) -> None:
     """Validate only the checked-in synthetic fixture at its immutable fixture clock."""
 
+    _validate_trust_key_material_separation(registry_key, execution_key)
     expected_key_path = (
         CONTRACT_ROOT / "fixtures" / "positive" / "registry-key.synthetic.hex"
+    ).resolve()
+    expected_execution_key_path = (
+        CONTRACT_ROOT / "fixtures" / "positive" / "execution-key.synthetic.hex"
     ).resolve()
     build = handoff.get("build_identity", {})
     mobile = build.get("mobile", {})
@@ -1204,6 +1665,8 @@ def validate_synthetic_fixture_handoff(
     checks = (
         (registry_key_path.resolve() == expected_key_path, "synthetic key path"),
         (registry_key == SYNTHETIC_FIXTURE_KEY, "synthetic key bytes"),
+        (execution_key_path.resolve() == expected_execution_key_path, "synthetic execution key path"),
+        (execution_key == SYNTHETIC_EXECUTION_KEY, "synthetic execution key bytes"),
         (handoff.get("organization_id") == "org-synthetic", "synthetic organization"),
         (handoff.get("project_id") == "project-sample-mobile-app-synthetic", "synthetic project"),
         (handoff.get("ticket", {}).get("ticket_id") == "ticket-synthetic-001", "synthetic ticket"),
@@ -1215,6 +1678,10 @@ def validate_synthetic_fixture_handoff(
         (registry_assertion.get("assertion_id") == "assertion-synthetic-001", "synthetic assertion ID"),
         (registry_assertion.get("issuer_id") == "registry-synthetic-001", "synthetic issuer ID"),
         (registry_assertion.get("signature", {}).get("key_id") == "registry-key-synthetic-001", "synthetic key ID"),
+        (execution_assertion.get("assertion_id") == "execution-synthetic-001", "synthetic execution assertion ID"),
+        (execution_assertion.get("consumer", {}).get("agent") == "openai_codex", "synthetic Codex consumer"),
+        (execution_assertion.get("signature", {}).get("key_id") == "execution-key-synthetic-001", "synthetic execution key ID"),
+        (execution_revocations.get("list_id") == "execution-revocations-synthetic", "synthetic revocation list ID"),
     )
     for condition, label in checks:
         _require(
@@ -1228,6 +1695,9 @@ def validate_synthetic_fixture_handoff(
         executable=True,
         registry_assertion=registry_assertion,
         registry_key=registry_key,
+        execution_assertion=execution_assertion,
+        execution_revocations=execution_revocations,
+        execution_key=execution_key,
         at_time=SYNTHETIC_FIXTURE_TIME,
     )
 
@@ -1414,7 +1884,7 @@ def render_markdown(handoff: dict[str, Any]) -> str:
         [
             "## Structural scope — not execution authority",
             "",
-            "- This file is not execution authorization. Before acting, obtain and verify a current trusted registry assertion for this exact handoff digest.",
+            "- This file is not execution authorization. Before acting, verify the current trusted registry assertion and its authorized, short-lived, unrevoked OpenAI Codex execution assertion for this exact handoff.",
             "- Only after that independent authorization, the requested scope permits reading the authorized evidence references, modifying code in the listed repositories, and running tests.",
             "- This structural scope never permits external writes, merge, or deploy.",
             "- Repositories: " + ", ".join(f"`{repo}`" for repo in handoff["authority"]["allowed_repositories"]),
@@ -1454,10 +1924,19 @@ def validate_trial(
     *,
     registry_assertion: dict[str, Any],
     registry_key: bytes,
+    execution_assertion: dict[str, Any],
+    execution_revocations: dict[str, Any],
+    execution_key: bytes,
     json_artifact_bytes: bytes,
 ) -> None:
     SCHEMAS.validate(trial, "agent-trial.schema.json")
     _validate_text_and_secrets(trial)
+    _require(
+        trial["consumer"]["agent_name"] == execution_assertion["consumer"]["agent"],
+        "TRIAL_EXECUTION_CONSUMER_MISMATCH",
+        "$.consumer.agent_name",
+        "trial consumer must be the OpenAI Codex consumer authorized by the execution assertion",
+    )
     started_at = parse_timestamp(trial["started_at"], "$.started_at")
     completed_at = parse_timestamp(trial["completed_at"], "$.completed_at")
     _require(started_at <= completed_at, "TRIAL_TIME_REVERSED", "$.completed_at", "completion precedes start")
@@ -1466,6 +1945,9 @@ def validate_trial(
         executable=True,
         registry_assertion=registry_assertion,
         registry_key=registry_key,
+        execution_assertion=execution_assertion,
+        execution_revocations=execution_revocations,
+        execution_key=execution_key,
         at_time=started_at,
     )
     validate_markdown(handoff, markdown)
@@ -1501,6 +1983,16 @@ def validate_trial(
         sha256_digest(canonical_json_artifact(registry_assertion)),
         "$.registry_assertion_digest",
     )
+    _validate_digest(
+        trial["execution_assertion_digest"],
+        sha256_digest(canonical_json_artifact(execution_assertion)),
+        "$.execution_assertion_digest",
+    )
+    _validate_digest(
+        trial["execution_revocations_digest"],
+        sha256_digest(canonical_json_artifact(execution_revocations)),
+        "$.execution_revocations_digest",
+    )
     evidence_ids = {item["evidence_id"] for item in handoff["evidence_manifest"]["items"]}
     _require(
         set(trial["evidence_used"]) <= evidence_ids,
@@ -1518,14 +2010,16 @@ def validate_trial(
     approved_at = parse_timestamp(handoff["approval"]["approved_at"], "$.approval.approved_at")
     assertion_issued_at = parse_timestamp(registry_assertion["issued_at"], "$.registry_assertion.issued_at")
     assertion_expires_at = parse_timestamp(registry_assertion["expires_at"], "$.registry_assertion.expires_at")
+    execution_issued_at = parse_timestamp(execution_assertion["issued_at"], "$.execution_assertion.issued_at")
+    execution_expires_at = parse_timestamp(execution_assertion["expires_at"], "$.execution_assertion.expires_at")
     _require(
-        approved_at <= assertion_issued_at <= started_at,
+        approved_at <= assertion_issued_at <= execution_issued_at <= started_at,
         "TRIAL_PRECEDES_EXECUTION_AUTHORIZATION",
         "$.started_at",
         "trial must start after approval and trusted execution authorization",
     )
     _require(
-        completed_at <= assertion_expires_at,
+        completed_at < execution_expires_at <= assertion_expires_at,
         "TRIAL_OUTLIVES_EXECUTION_AUTHORIZATION",
         "$.completed_at",
         "trial must complete before execution authorization expires",
@@ -1615,11 +2109,30 @@ def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _reject_json_float(_: str) -> Any:
+    raise ContractError(
+        "FLOAT_FORBIDDEN",
+        "$",
+        "Tacua Canonical JSON permits integers, not floats",
+    )
+
+
 def load_json(path: Path, *, require_canonical: bool = False) -> dict[str, Any]:
     try:
         raw = path.read_bytes()
         text = raw.decode("utf-8")
-        value = json.loads(text, object_pairs_hook=_reject_duplicate_pairs)
+        value = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_float=_reject_json_float,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ContractError(
+                    "NON_FINITE_JSON_NUMBER",
+                    "$",
+                    f"{value} is not permitted by the JSON contract",
+                )
+            ),
+        )
     except ContractError:
         raise
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
@@ -1642,4 +2155,14 @@ def load_registry_key(path: Path) -> bytes:
     except (OSError, UnicodeError, ValueError) as error:
         raise ContractError("INVALID_REGISTRY_KEY", str(path), "expected an external hex-encoded key") from error
     _require(len(key) >= 32, "REGISTRY_KEY_TOO_SHORT", str(path), "registry HMAC key must be at least 32 bytes")
+    return key
+
+
+def load_execution_key(path: Path) -> bytes:
+    try:
+        encoded = path.read_text(encoding="ascii").strip()
+        key = bytes.fromhex(encoded)
+    except (OSError, UnicodeError, ValueError) as error:
+        raise ContractError("INVALID_EXECUTION_KEY", str(path), "expected an external hex-encoded key") from error
+    _require(len(key) >= 32, "EXECUTION_KEY_TOO_SHORT", str(path), "execution HMAC key must be at least 32 bytes")
     return key

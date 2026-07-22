@@ -8,6 +8,11 @@ This is a deterministic, zero-runtime-dependency harness for the synthetic, pre-
 - Unknown field, destination, operation and data-class failures with stable reason codes.
 - Synthetic secret/PII/raw-payload canary denial or irreversible transformation before simulated sinks.
 - Immutable provenance and project/reviewer approval requirements.
+- Structural approval remains non-executable; synthetic-key cases exercise the
+  strict trust-artifact shapes, exact evidence-source/repository/build scope,
+  exclusive expiry windows, current revocation revision, and Codex-only runtime
+  profile, rejecting `danger-full-access`, network-enabled, stale, malformed,
+  source-incomplete and missing-assertion cases.
 - One-organization, project/member, object-key, job, evidence-reference, ticket-version, connector-query and export authorization.
 - Read-only/revocable/bounded connector behavior under malicious content.
 - Deterministic Markdown/JSON output from one approved ticket version, including hostile text and stale/cross-project rejection.
@@ -15,7 +20,11 @@ This is a deterministic, zero-runtime-dependency harness for the synthetic, pre-
 - The fixed 30-day raw-media default, permitted shortening and rejected silent lengthening.
 - Content-free audit records and scans of every generated result artifact.
 
-The corpus represents pixels/OCR, speech/audio, transcripts, keyframes, logs, network records, app/provider state, source, connector output, prompts, model output, tickets, Markdown, JSON, filenames, audit, caches and deletion indexes as typed synthetic envelopes. Actual binary OCR/audio/media redaction is intentionally unverified until those runtime boundaries exist.
+The corpus represents pixels/OCR, speech/audio, transcripts, keyframes, logs, network records, app/provider state, source, connector output, prompts, model output, tickets, Markdown, JSON, filenames, audit, caches and deletion indexes as typed synthetic envelopes. Execution cases consume only the checked-in synthetic approved-handoff keys and artifacts; they never authenticate a real invocation. Actual binary OCR/audio/media redaction and a real nonce-consuming launcher with controlled effective Codex configuration and single-invocation credential isolation remain unverified until exercised in the selected runtime.
+
+The harness checks the supplied signed revocation revision; it has no online
+registry or monotonic revision store and cannot prove that a newer revision does
+not exist. That freshness and rollback check belongs to the real launcher.
 
 ## Run exactly
 

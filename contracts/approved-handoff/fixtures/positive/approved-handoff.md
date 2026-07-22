@@ -198,7 +198,7 @@ Verification:
 
 ## Structural scope — not execution authority
 
-- This file is not execution authorization. Before acting, obtain and verify a current trusted registry assertion for this exact handoff digest.
+- This file is not execution authorization. Before acting, verify the current trusted registry assertion and its authorized, short-lived, unrevoked OpenAI Codex execution assertion for this exact handoff.
 - Only after that independent authorization, the requested scope permits reading the authorized evidence references, modifying code in the listed repositories, and running tests.
 - This structural scope never permits external writes, merge, or deploy.
 - Repositories: `repo-sample-mobile-app`, `repo-sample-backend`

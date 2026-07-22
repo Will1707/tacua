@@ -56,7 +56,7 @@ and single-process.
 | Embedded mobile SDK | Trusted only when linked into the sealed, authorized QA build. It owns the local capture namespace and SDK credential. Host JavaScript, launch URLs, server bodies, local files, and clocks are validated rather than assumed authoritative. |
 | Self-hosted backend | The main V1 trusted computing base for authorization and durable state. It trusts its exact config, mounted administrator secret, system clock, Python/SQLite runtime, kernel, filesystem semantics, and exclusive state-volume lock. |
 | Deployment operator | Has effective control of image, host, config, administrator secret, state, backups, processing command, network, and upgrades. A malicious or compromised root/operator is outside the in-process protection boundary. |
-| Local processor | Trusted operator-selected code only. The adapter narrows inherited data and validates output, but its child runs as the backend UID and is not a hostile-code sandbox. |
+| Local processor | Trusted adapter glue may run as the backend UID. An operator-selected model/plugin must use the accepted [ADR-016](decisions/ADR-016-local-processor-isolation.md) host gate: dedicated UID/container, network none, read-only exact inputs/model, incrementally capped canonical attached-stdout output, rootless cgroup-v2/systemd plus builtin-seccomp preflight, and closed resource limits. |
 | External provider, connector, or coding agent | Untrusted and unauthorized by default. None is installed or granted network/credential authority by this repository. Structural handoff approval is not agent execution authority. |
 | Adversary and untrusted content | Includes network attackers, stolen bearer holders, malicious deep links, malformed/oversized requests, tampered local or stored files, hostile model/connector/ticket text, and denial-of-service attempts. A host-root or same-UID compromise can exceed repository controls. |
 
@@ -79,8 +79,8 @@ deployment; it is not a hostile multi-tenant boundary.
 | 3. Reviewer launches the tested app | Backend to reviewer app to a custom URL scheme in the QA app. Only an opaque, short-lived, one-use launch code crosses the deep-link boundary. | The code carries no evidence or reusable upload credential. The SDK rejects alternate authorities, paths, fields, and backend overrides; consent must produce a one-shot native handle before exchange ([launch parser](../experiments/ios-capture-spike/package/ios/TacuaLaunchLink.swift), [start lifecycle](../experiments/ios-capture-spike/package/ios/TacuaSDKStartLifecycle.swift)). |
 | 4. SDK captures and persists locally | ReplayKit and host app into the tested app's sandbox, protected capture directory, crash journals, upload queue, and Keychain. | The SDK is app-only, uses protected files excluded from device backup, stores the bearer secret in this-device-only Keychain, seals media/sidecars and append-only diagnostics, snapshots uploads with no-follow descriptors, and records outcome-unknown before network I/O. A server/monotonic time anchor guards the immutable raw-media deadline; lifecycle and relaunch checks retire the scoped local footprint crash-safely at expiry and block use when a pre-deadline reboot needs authenticated RESUME reconciliation ([SDK README](../experiments/ios-capture-spike/package/README.md)). |
 | 5. SDK uploads to backend | QA app through TLS to its build-pinned origin, then backend authentication, SQLite, and object storage. | HTTPS is required outside debug loopback; redirects are rejected. Scope, current capability, canonical request digest, body size, object size/digest, exact replay, credential history, and commit-time session/build state are checked under the frozen [protocol](../contracts/sdk-backend-protocol/README.md) and backend [service](../services/backend/src/tacua_backend/service.py). |
-| 6. Backend persists and processes | SQLite metadata plus filesystem objects; optional offline child receives a canonical descriptor and inherited read-only evidence descriptors. | One state lock excludes HTTP, operator, and worker processes. Evidence publication is journaled and candidate visibility is atomic under [ADR-014](decisions/ADR-014-atomic-processing-result-publication.md). Normal startup has no processor or egress; the opt-in [adapter](../services/backend/PROCESSING_ADAPTER.md) is bounded and shell-free but trusts the same-UID child. |
-| 7. Reviewer approves and exports | Backend evidence/candidate routes to reviewer, then native share sheet to a receiving app or agent. | Preview bytes and exact candidate/evidence versions are verified before approval; exports are bounded canonical JSON and deterministic Markdown. The [handoff contract](../contracts/approved-handoff/README.md) omits evidence payloads and secrets and explicitly requires separate, current execution trust. The share receiver is outside Tacua's trust boundary. |
+| 6. Backend persists and processes | SQLite metadata plus filesystem objects; trusted adapter receives canonical input and inherited read-only evidence descriptors, then may translate them into the isolated processor bundle. | One state lock excludes HTTP, operator, and worker processes. Evidence publication is journaled and candidate visibility is atomic under [ADR-014](decisions/ADR-014-atomic-processing-result-publication.md). Normal startup has no processor or egress. [ADR-016](decisions/ADR-016-local-processor-isolation.md) puts an operator-selected model behind a network-none, separate-UID container with read-only inputs and CPU/memory/PID/time/disk ceilings. |
+| 7. Reviewer approves and exports | Backend evidence/candidate routes to reviewer, then native share sheet to a receiving app or agent. | Preview bytes and exact candidate/evidence versions are verified before approval; exports are bounded canonical JSON and deterministic Markdown. The [handoff contract](../contracts/approved-handoff/README.md) omits payloads/secrets and keeps approval non-executable. [ADR-017](decisions/ADR-017-codex-execution-trust.md) separately requires a current, unrevoked, exact-scope Codex assertion. The share receiver is outside Tacua's trust boundary. |
 | 8. Operator backs up or restores | Stopped state volume to a private offline bundle, then optional encrypted off-host storage or a new restore root. | The [operator tool](../services/backend/src/tacua_backend/operator_tool.py) checks ownership/modes, SQLite and deployment pins, exact files/digests, recomputes the sealed earliest raw/derived evidence deadline from the copied database, and refuses verification or either restore mode at expiry. Applied restore re-verifies staging before atomic publication and the published destination afterward. The [runbook](../services/backend/OPERATIONS.md) assigns encryption, transfer, replica destruction, and recovery access control to the operator. |
 
 ## Abuse-case review
@@ -95,7 +95,7 @@ The control identifiers refer to the evidence table in the next section.
 | Repudiation | A participant disputes consent, upload, deletion, edit, approval, or export. | Server acceptance times, exact durable receipts, immutable candidate versions, transition actors, deletion tombstones, and bounded audit metadata provide operational traceability (C2, C5, C6, C8). V1 does not provide cryptographic human signatures or legal non-repudiation. |
 | Information disclosure | Credentials or private evidence leak through redirects, diagnostics, errors, logs, processor environment, tickets, signed URLs, share cache, or cross-project reads. | C1–C8 reject redirects and cross-scope bindings, omit secrets from public artifacts/journals, bound diagnostic and error schemas, inherit minimal processor state, verify evidence references, scan obvious export secrets, and age the reviewer share cache. Pattern-based secret scanning is defense in depth, infrastructure logs are operator-controlled, and a selected processor/connector may add new disclosure paths. |
 | Denial of service | Oversized bodies/files/JSON, request floods, SQLite contention, decompression/media work, processor hangs/output floods, disk exhaustion, or deletion backlog exhaust a single node. | C3, C5, C7, and C9 bound protocol bodies, collections, pagination, processor files/pipes/time/process groups, container PIDs, and health/retention signals. No repository-owned WAF, global rate limiter, resource quota, high-availability replica, or automatic capacity system exists. |
-| Elevation of privilege | A launch code becomes an upload bearer; a completed credential uploads new evidence; approval becomes repository execution; a processor gains provider or repository credentials. | C1, C2, C7, and C8 keep grant, receiving, completion/delete, human approval, and execution capabilities distinct. Provider/connector credentials are not inherited or bundled. A same-UID processor or compromised administrator/operator can exceed these logical controls. |
+| Elevation of privilege | A launch code becomes an upload bearer; a completed credential uploads new evidence; approval becomes repository execution; a processor gains provider or repository credentials. | C1, C2, C7, and C8 keep grant, receiving, completion/delete, human approval, and execution capabilities distinct. Provider/connector credentials are not inherited or bundled. Selected local model code is isolated under ADR-016; same-UID execution is limited to trusted Tacua glue. A compromised host runtime, administrator, or operator can still exceed these controls. |
 | Scope confusion | Valid data from another organization, project, session, application, build, credential history, evidence manifest, or repository is substituted. | C1, C2, C5, and C8 cross-bind every implemented scope and fail closed. The current single-scope deployment reduces but does not replace these checks; it does not establish cross-customer isolation. |
 | Malicious processing or connector content | Hostile transcript, source text, model output, preview, or prompt attempts path traversal, schema escape, secret exfiltration, false grounding, or instruction injection. | C7 and C8 constrain adapter argv, descriptors, paths, output shape/files, authoritative validators, evidence grounding, and human approval. No model or connector is trusted by default. Semantic truth, prompt-injection resistance, and an untrusted-code sandbox require the selected overlays. |
 | Destructive or retention-evading action | A caller deletes the wrong session, races evidence reads, restores expired evidence, silently extends retention, or leaves undeleted replicas. | C2 and C4–C6 scope deletion, exclude concurrent reads/publication, use recoverable deletion state, enforce local and backend expiry, and refuse expired recovery bundles. They cannot destroy an operator/provider copy they cannot reach or prove physical erasure on selected storage. |
@@ -111,8 +111,8 @@ The control identifiers refer to the evidence table in the next section.
 | C4 | Crash-safe mobile evidence, diagnostics, queue replay, deadline enforcement, and receipt-authorized retirement | [Capture session](../experiments/ios-capture-spike/package/ios/TacuaCaptureSession.swift), [admission/snapshot boundary](../experiments/ios-capture-spike/package/ios/TacuaCaptureAdmission.swift), [diagnostic journal](../experiments/ios-capture-spike/package/ios/TacuaDiagnosticJournal.swift), [queue file store](../experiments/ios-capture-spike/package/ios/TacuaTransportQueueFileStore.swift), [local retention coordinator](../experiments/ios-capture-spike/package/ios/TacuaSDKLocalRetention.swift), and [deletion coordinator](../experiments/ios-capture-spike/package/ios/TacuaCaptureDeletionCoordinator.swift). | The package [core test runner](../experiments/ios-capture-spike/package/tests/run-core-tests.sh), dedicated [local retention tests](../experiments/ios-capture-spike/package/tests/LocalRetentionTests.swift), [fault campaign](../experiments/ios-capture-spike/FAULT-INJECTION-RUNBOOK.md), and bounded [physical-device results](../experiments/ios-capture-spike/PHYSICAL-DEVICE-RESULTS.md). |
 | C5 | Single-writer, integrity-checked backend persistence and atomic review visibility | [Instance lock](../services/backend/src/tacua_backend/instance_lock.py), [evidence store](../services/backend/src/tacua_backend/evidence_domain.py), [job store](../services/backend/src/tacua_backend/processing_jobs.py), [candidate store](../services/backend/src/tacua_backend/candidate_store.py), and [handoff store](../services/backend/src/tacua_backend/handoff_store.py). | Backend tests for [release regressions](../services/backend/tests/test_backend_release_regressions.py), [evidence](../services/backend/tests/test_evidence_domain.py), [processing publication](../services/backend/tests/test_processing_publication.py), [candidates](../services/backend/tests/test_candidate_store.py), and [handoffs](../services/backend/tests/test_handoff_store.py). |
 | C6 | Backend retention, scoped deletion, recovery, and backup deadline binding | Backend [service](../services/backend/src/tacua_backend/service.py), [evidence deletion](../services/backend/src/tacua_backend/evidence_domain.py), and [operator backup/restore tool](../services/backend/src/tacua_backend/operator_tool.py), with the operational boundary stated in the [runbook](../services/backend/OPERATIONS.md). | Backend [lifecycle/regression tests](../services/backend/tests/test_backend_release_regressions.py), [evidence deletion tests](../services/backend/tests/test_evidence_domain.py), and [operator tests](../services/backend/tests/test_operator_tool.py). Device-side status and remaining physical proof are kept current in [release readiness](RELEASE-READINESS.md). |
-| C7 | Default-deny, opt-in processing with bounded data inheritance and output | Checked-in [internal Compose network](../services/backend/compose.yaml), [processing adapter](../services/backend/src/tacua_backend/processing_adapter.py), [worker](../services/backend/src/tacua_backend/processing_worker.py), and [adapter runbook](../services/backend/PROCESSING_ADAPTER.md). No command, model, connector, provider key, or automatic runner is configured. | [Adapter tests](../services/backend/tests/test_processing_adapter.py), [job tests](../services/backend/tests/test_processing_jobs.py), and [publication tests](../services/backend/tests/test_processing_publication.py). |
-| C8 | Exact candidate/evidence approval and non-executable structural export | Authoritative [candidate contract](../contracts/ticket-candidate/README.md), backend [handoff export](../services/backend/src/tacua_backend/handoff_export.py), reviewer [candidate route](../apps/reviewer/src/app/candidates/[candidate-id].tsx), [preview verifier](../apps/reviewer/src/api/evidence-preview-integrity.ts), and [handoff contract](../contracts/approved-handoff/README.md). | Candidate [contract tests](../contracts/ticket-candidate/tests/test_ticket_candidate_contract.py), approved-handoff [tests](../contracts/approved-handoff/tests/test_contract.py), reviewer [preview tests](../apps/reviewer/src/api/evidence-preview-integrity.test.mjs), rendered [candidate-route regression](../apps/reviewer/src/components/candidate-route.render.test.cjs), and backend [handoff tests](../services/backend/tests/test_handoff_store.py). |
+| C7 | Default-deny, opt-in processing with bounded data inheritance and isolated selected-model execution | Checked-in [internal Compose network](../services/backend/compose.yaml), [processing adapter](../services/backend/src/tacua_backend/processing_adapter.py), [worker](../services/backend/src/tacua_backend/processing_worker.py), [ADR-016 isolated profile](decisions/ADR-016-local-processor-isolation.md), [Compose profile](../services/backend/compose.processor.yaml), [host runner](../services/backend/scripts/run_isolated_processor.py), and [adapter runbook](../services/backend/PROCESSING_ADAPTER.md). No command, model, connector, provider key, or automatic runner is configured. | [Adapter tests](../services/backend/tests/test_processing_adapter.py), isolated profile/runner [tests](../services/backend/tests/test_isolated_processor.py), [job tests](../services/backend/tests/test_processing_jobs.py), and [publication tests](../services/backend/tests/test_processing_publication.py). |
+| C8 | Exact candidate/evidence approval, atomic replacement, non-executable structural export, and separately authenticated execution | Authoritative [candidate contract](../contracts/ticket-candidate/README.md), accepted [split/merge replacement semantics](decisions/ADR-015-candidate-split-merge-semantics.md), backend [handoff export](../services/backend/src/tacua_backend/handoff_export.py), reviewer [candidate route](../apps/reviewer/src/app/candidates/[candidate-id].tsx), [preview verifier](../apps/reviewer/src/api/evidence-preview-integrity.ts), [handoff contract](../contracts/approved-handoff/README.md), and accepted [Codex execution trust](decisions/ADR-017-codex-execution-trust.md). | Candidate [contract tests](../contracts/ticket-candidate/tests/test_ticket_candidate_contract.py), approved-handoff execution/revocation [tests](../contracts/approved-handoff/tests/test_contract.py), synthetic security-harness [Codex cases](../experiments/security-harness/test/harness.test.mjs), reviewer [preview tests](../apps/reviewer/src/api/evidence-preview-integrity.test.mjs), rendered [candidate-route regression](../apps/reviewer/src/components/candidate-route.render.test.cjs), and backend candidate/handoff tests. |
 | C9 | Hardened single-node packaging and fail-closed operator preflight | Non-root digest-pinned [Dockerfile](../services/backend/Dockerfile), read-only/capability-dropped/default-deny [Compose model](../services/backend/compose.yaml), immutable-image [production override](../services/backend/compose.production.yaml), and [operator preflight](../services/backend/src/tacua_backend/operator_tool.py). | [Operator tests](../services/backend/tests/test_operator_tool.py), backend-image input [validator](../.github/scripts/validate-backend-image-inputs.mjs) and [adversarial tests](../.github/scripts/validate-backend-image-inputs.test.mjs), plus the repository [verification workflow](../.github/workflows/verify.yml). |
 | C10 | Security-policy and contract regression evidence, kept distinct from runtime proof | The synthetic [security harness](../experiments/security-harness/README.md), canonical contracts, ADRs, and this model make default-deny and non-claim boundaries explicit. | The harness [tests](../experiments/security-harness/test/harness.test.mjs) exercise policy/authorization/deletion shapes only; the harness explicitly does not verify runtime security. Repository-local links are checked by the [Markdown checker](../.github/scripts/check-markdown-links.mjs). |
 
@@ -135,16 +135,19 @@ The control identifiers refer to the evidence table in the next section.
   host root/operator or code running with the service UID can read evidence and
   can potentially rewrite state coherently; internal SHA-256 bindings are not a
   substitute for a trusted host or authenticated external ledger.
-- The local processor boundary is for trusted code. Same-UID execution is not
-  isolation from malicious native code, filesystem discovery, disk exhaustion,
-  or kernel/runtime compromise.
+- The direct local adapter child remains trusted same-UID code. ADR-016 provides
+  the accepted private-pilot model/plugin container boundary, but does not
+  protect against a compromised host kernel/container runtime or malicious
+  operator and has not yet run a selected real model workload.
 - Pattern-based secret rejection and bounded diagnostic schemas are not a
   complete DLP system. Ticket, model, connector, and source text can contain
   sensitive or adversarial semantics even when structurally valid, and Tacua
   does not redact sensitive pixels or speech from an authorized raw capture.
-- [ADR-011](decisions/ADR-011-approved-handoff.md) remains proposed. No accepted
-  production assertion key lifecycle or real least-privilege agent consumer is
-  present.
+- [ADR-017](decisions/ADR-017-codex-execution-trust.md) accepts the single-host
+  V1 assertion/revocation and exact Codex runtime profile. [ADR-011](decisions/ADR-011-approved-handoff.md)
+  remains proposed for the broader handoff/remote-production trust decision;
+  no real least-privilege consumer trial or remotely distributed asymmetric
+  key lifecycle is present.
 - A real transcription/research processor, provider, repository connector, and
   observability connector are absent. Their privacy, credential, egress,
   injection, vendor-retention, and erasure risks are therefore unmitigated
@@ -175,14 +178,18 @@ not a deployment toggle.
 
 ### Processor overlay
 
-Choose whether the processor is trusted same-UID code or untrusted code needing
-a separate UID/container/sandbox. Inventory every raw and derived input, output,
-temporary copy, log, and retention deadline. Set CPU/memory/disk/time/file
-limits; mount only read-only scoped evidence; default network to none; isolate
-provider credentials from Tacua credentials; allow-list any destinations; treat
-media/decoder input and model output as hostile; preserve authoritative output
-validation; and prove cleanup, provider-copy deletion, monitoring, and failure
-recovery.
+Trusted Tacua adapter glue may remain same-UID; an operator-selected local
+model/plugin must use ADR-016's separate UID/container, read-only input/model,
+network-none posture, exact carrier-RW/final-RO Docker-volume transaction, no
+host binds, a canonical attached-stdout envelope whose preview bodies exactly
+match result references, rootless cgroup-v2/systemd and builtin-seccomp proof,
+and CPU/memory/PID/time/stream/file limits.
+For the selected image/model, inventory every raw and derived input, output,
+temporary copy, log, and retention deadline; verify provenance; treat media,
+decoder input and model output as hostile; preserve authoritative output
+validation; and prove cleanup, monitoring, storage pressure and failure
+recovery. Any provider credential or network destination remains a separate
+allow-listed overlay and is not granted by ADR-016.
 
 ### Connector overlay
 
@@ -197,14 +204,25 @@ agent-write credentials.
 
 ### Coding-agent overlay
 
-Resolve [ADR-011](decisions/ADR-011-approved-handoff.md) with a production
-issuer/key distribution and revocation design. Require a current assertion for
-the exact handoff, repositories, build, evidence, and expiry; isolate the agent
-runtime; give it only task-scoped repository authority; retain branch
-protection and human merge/deploy gates; treat ticket and evidence text as
-untrusted instructions; prevent credential and unrelated-file reads; and audit
-tool use, changes, review, rollback, and acceptance. Human candidate approval
-alone must never enable execution.
+Use ADR-017's current registry assertion, 15-minute local Codex assertion and
+registry-current signed revocation list for the exact handoff, repository
+revisions, build and evidence digests. The invocation must be non-interactive
+`codex exec --ephemeral --sandbox workspace-write`, with effective command and
+tool network access off and structured `--output-schema`; reject any profile
+difference and never use
+`danger-full-access`. Evaluate effective configuration rather than flags alone:
+use controlled Codex state/configuration, disable web search and all unapproved
+MCP/apps/hooks, and expose only checkouts at the assertion-bound repository
+revisions. Obtain registry/revocation state through an authenticated current
+lookup or trusted monotonic revision store and reject rollback; signed cached
+files alone cannot prove that no newer revocation exists. Scope authentication
+to the single invocation without placing it beside repository-controlled code.
+The assertion is a precondition,
+not a sandbox or approval bypass. Retain branch protection and human merge/
+deploy gates, treat ticket/evidence text as untrusted instructions, prevent
+unrelated-file reads, and audit tool use, changes, review, rollback and
+acceptance. A remotely distributed production issuer still needs ADR-011's
+asymmetric key-distribution decision.
 
 ### Deployment overlay
 
