@@ -10,6 +10,20 @@ evaluation corpus format and not execution authority.
 Contract version:
 `tacua.ticket-candidate@1.0.0` / `application/vnd.tacua.ticket-candidate+json;version=1.0.0`.
 
+## Exact identity owner
+
+This package is the sole schema and validator owner for that exact contract
+version and media type. Consumers must dispatch on both exact values and must
+not choose a schema by inspecting payload fields.
+
+The incompatible prototype formerly found in `contracts/runtime` now uses the
+distinct `tacua.runtime-ticket-candidate@1.0.0` /
+`application/vnd.tacua.runtime-ticket-candidate+json;version=1.0.0` identity.
+It exists only as a recovery boundary for the original runtime bundle and is
+not accepted here. The runtime package provides an explicit, shape-validating
+migration for old prototype artifacts that carried this package's identity;
+normal validation never treats the two contracts as aliases.
+
 ## Boundary
 
 Each artifact is one immutable candidate-version snapshot. It binds:

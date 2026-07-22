@@ -165,11 +165,15 @@ class SchemaValidator:
 
 
 SCHEMAS = SchemaValidator()
+AUTHORITATIVE_TICKET_VERSION = "tacua.ticket-candidate@1.0.0"
+AUTHORITATIVE_TICKET_MEDIA_TYPE = "application/vnd.tacua.ticket-candidate+json;version=1.0.0"
+RUNTIME_TICKET_VERSION = "tacua.runtime-ticket-candidate@1.0.0"
+RUNTIME_TICKET_MEDIA_TYPE = "application/vnd.tacua.runtime-ticket-candidate+json;version=1.0.0"
 SCHEMA_BY_VERSION = {
     "tacua.capture-upload-manifest@1.0.0": "capture-upload-manifest.schema.json",
     "tacua.diagnostic-envelope@1.0.0": "diagnostic-envelope.schema.json",
     "tacua.processing-job@1.0.0": "processing-job.schema.json",
-    "tacua.ticket-candidate@1.0.0": "ticket-candidate.schema.json",
+    RUNTIME_TICKET_VERSION: "ticket-candidate.schema.json",
 }
 
 
@@ -225,19 +229,52 @@ def seal(value: dict[str, Any]) -> dict[str, Any]:
         result["envelope_digest"] = digest_without(result, "envelope_digest")
     elif version == "tacua.processing-job@1.0.0":
         result["job_digest"] = digest_without(result, "job_digest")
-    elif version == "tacua.ticket-candidate@1.0.0":
+    elif version == RUNTIME_TICKET_VERSION:
         result["candidate_content_digest"] = digest(result["content"])
         if result.get("approval") is not None:
             result["approval"]["candidate_content_digest"] = result["candidate_content_digest"]
         result["candidate_digest"] = digest_without(result, "candidate_digest")
+    elif version == AUTHORITATIVE_TICKET_VERSION:
+        raise ContractError(
+            "CONTRACT_OWNERSHIP_MISMATCH",
+            "$.contract_version",
+            "this identity is owned by contracts/ticket-candidate; the retired runtime shape must be explicitly migrated",
+        )
     else:
         raise ContractError("UNSUPPORTED_VERSION", "$.contract_version", str(version))
     return result
 
 
+def migrate_retired_runtime_ticket(value: dict[str, Any]) -> dict[str, Any]:
+    """Migrate only the retired runtime-shaped artifact away from the ambiguous identity."""
+
+    require(
+        value.get("contract_version") == AUTHORITATIVE_TICKET_VERSION
+        and value.get("media_type") == AUTHORITATIVE_TICKET_MEDIA_TYPE,
+        "MIGRATION_SOURCE_MISMATCH",
+        "$",
+        "expected the retired runtime artifact's former identity pair",
+    )
+    validate_basics(value)
+    migrated = copy.deepcopy(value)
+    migrated["contract_version"] = RUNTIME_TICKET_VERSION
+    migrated["media_type"] = RUNTIME_TICKET_MEDIA_TYPE
+    SCHEMAS.validate(migrated, SCHEMA_BY_VERSION[RUNTIME_TICKET_VERSION])
+    validate_ticket(value)
+    migrated = seal(migrated)
+    validate(migrated)
+    return migrated
+
+
 def validate(value: dict[str, Any]) -> None:
     validate_basics(value)
     version = value.get("contract_version")
+    if version == AUTHORITATIVE_TICKET_VERSION:
+        raise ContractError(
+            "CONTRACT_OWNERSHIP_MISMATCH",
+            "$.contract_version",
+            "validate this identity with contracts/ticket-candidate; it is not the runtime prototype",
+        )
     require(version in SCHEMA_BY_VERSION, "UNSUPPORTED_VERSION", "$.contract_version", str(version))
     SCHEMAS.validate(value, SCHEMA_BY_VERSION[version])
     if version == "tacua.capture-upload-manifest@1.0.0":

@@ -38,6 +38,38 @@ def chain() -> list[dict]:
 
 
 class TicketCandidateContractTests(unittest.TestCase):
+    def test_contract_identity_has_one_schema_owner(self) -> None:
+        authoritative = json.loads(
+            (ROOT / "schemas" / "ticket-candidate.schema.json").read_text(encoding="utf-8")
+        )
+        runtime_prototype = json.loads(
+            (ROOT.parent / "runtime" / "schemas" / "ticket-candidate.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            "tacua.ticket-candidate@1.0.0",
+            authoritative["properties"]["contract_version"]["const"],
+        )
+        self.assertEqual(
+            "application/vnd.tacua.ticket-candidate+json;version=1.0.0",
+            authoritative["properties"]["media_type"]["const"],
+        )
+        self.assertNotEqual(
+            authoritative["properties"]["contract_version"]["const"],
+            runtime_prototype["properties"]["contract_version"]["const"],
+        )
+        self.assertNotEqual(
+            authoritative["properties"]["media_type"]["const"],
+            runtime_prototype["properties"]["media_type"]["const"],
+        )
+        runtime_fixture = load_json(
+            ROOT.parent / "runtime" / "fixtures" / "positive" / "ticket.json"
+        )
+        with self.assertRaises(ContractError) as raised:
+            validate(runtime_fixture)
+        self.assertEqual("UNSUPPORTED_VERSION", raised.exception.code)
+
     def test_all_typed_schema_objects_are_closed(self) -> None:
         for path in sorted((ROOT / "schemas").glob("*.schema.json")):
             schema = json.loads(path.read_text(encoding="utf-8"))

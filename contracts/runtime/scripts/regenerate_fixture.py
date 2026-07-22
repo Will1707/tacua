@@ -88,7 +88,7 @@ def main() -> None:
     })
 
     ticket = seal({
-        "contract_version": "tacua.ticket-candidate@1.0.0", "media_type": "application/vnd.tacua.ticket-candidate+json;version=1.0.0",
+        "contract_version": "tacua.runtime-ticket-candidate@1.0.0", "media_type": "application/vnd.tacua.runtime-ticket-candidate+json;version=1.0.0",
         "organization_id": "org_synthetic", "project_id": "project_synthetic", "build_id": "build_synthetic", "build_identity_digest": BUILD, "session_id": "session_synthetic",
         "candidate_id": "candidate_synthetic", "candidate_version": 2, "previous_candidate_digest": "sha256:" + "8" * 64, "state": "approved",
         "created_at": "2026-07-21T10:04:00Z", "updated_at": "2026-07-21T10:06:00Z",

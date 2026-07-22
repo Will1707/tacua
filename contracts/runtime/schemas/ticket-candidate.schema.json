@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://tacua.invalid/schemas/runtime/1.0.0/ticket-candidate.schema.json",
+  "$id": "https://tacua.invalid/schemas/runtime-ticket-candidate/1.0.0/ticket-candidate.schema.json",
   "$comment": "SPDX-License-Identifier: Apache-2.0",
-  "title": "Tacua editable ticket candidate lifecycle snapshot",
+  "title": "Tacua retired runtime ticket candidate lifecycle snapshot",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -29,8 +29,8 @@
     "candidate_digest"
   ],
   "properties": {
-    "contract_version": { "const": "tacua.ticket-candidate@1.0.0" },
-    "media_type": { "const": "application/vnd.tacua.ticket-candidate+json;version=1.0.0" },
+    "contract_version": { "const": "tacua.runtime-ticket-candidate@1.0.0" },
+    "media_type": { "const": "application/vnd.tacua.runtime-ticket-candidate+json;version=1.0.0" },
     "organization_id": { "$ref": "common.schema.json#/$defs/id" },
     "project_id": { "$ref": "common.schema.json#/$defs/id" },
     "build_id": { "$ref": "common.schema.json#/$defs/id" },

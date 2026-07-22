@@ -11,7 +11,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from runtime_contract import ContractError, load_json, seal, validate, validate_bundle  # noqa: E402
+from runtime_contract import (  # noqa: E402
+    AUTHORITATIVE_TICKET_MEDIA_TYPE,
+    AUTHORITATIVE_TICKET_VERSION,
+    RUNTIME_TICKET_MEDIA_TYPE,
+    RUNTIME_TICKET_VERSION,
+    ContractError,
+    digest_without,
+    load_json,
+    migrate_retired_runtime_ticket,
+    seal,
+    validate,
+    validate_bundle,
+)
 
 
 POSITIVE = ROOT / "fixtures" / "positive"
@@ -23,6 +35,54 @@ def load_bundle() -> list[dict]:
 
 
 class RuntimeContractTests(unittest.TestCase):
+    def test_runtime_ticket_identity_is_distinct_and_retired_identity_is_migratable(self) -> None:
+        runtime_schema = json.loads(
+            (ROOT / "schemas" / "ticket-candidate.schema.json").read_text(encoding="utf-8")
+        )
+        authoritative_schema = json.loads(
+            (ROOT.parent / "ticket-candidate" / "schemas" / "ticket-candidate.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(RUNTIME_TICKET_VERSION, runtime_schema["properties"]["contract_version"]["const"])
+        self.assertEqual(RUNTIME_TICKET_MEDIA_TYPE, runtime_schema["properties"]["media_type"]["const"])
+        self.assertEqual(
+            AUTHORITATIVE_TICKET_VERSION,
+            authoritative_schema["properties"]["contract_version"]["const"],
+        )
+        self.assertEqual(
+            AUTHORITATIVE_TICKET_MEDIA_TYPE,
+            authoritative_schema["properties"]["media_type"]["const"],
+        )
+        self.assertNotEqual(RUNTIME_TICKET_VERSION, AUTHORITATIVE_TICKET_VERSION)
+        self.assertNotEqual(RUNTIME_TICKET_MEDIA_TYPE, AUTHORITATIVE_TICKET_MEDIA_TYPE)
+
+        retired = copy.deepcopy(load_bundle()[3])
+        retired["contract_version"] = AUTHORITATIVE_TICKET_VERSION
+        retired["media_type"] = AUTHORITATIVE_TICKET_MEDIA_TYPE
+        retired["candidate_digest"] = digest_without(retired, "candidate_digest")
+        with self.assertRaises(ContractError) as raised:
+            validate(retired)
+        self.assertEqual("CONTRACT_OWNERSHIP_MISMATCH", raised.exception.code)
+
+        migrated = migrate_retired_runtime_ticket(retired)
+        validate(migrated)
+        self.assertEqual(RUNTIME_TICKET_VERSION, migrated["contract_version"])
+        self.assertEqual(RUNTIME_TICKET_MEDIA_TYPE, migrated["media_type"])
+        self.assertEqual(retired["content"], migrated["content"])
+
+        tampered = copy.deepcopy(retired)
+        tampered["content"]["title"] = "Tampered before migration"
+        with self.assertRaises(ContractError) as raised:
+            migrate_retired_runtime_ticket(tampered)
+        self.assertEqual("DIGEST_MISMATCH", raised.exception.code)
+
+        authoritative_fixture = load_json(
+            ROOT.parent / "ticket-candidate" / "fixtures" / "positive" / "version-1-draft.json"
+        )
+        with self.assertRaises(ContractError):
+            migrate_retired_runtime_ticket(authoritative_fixture)
+
     def test_all_schemas_are_valid_json_and_all_typed_objects_are_closed(self) -> None:
         for path in sorted((ROOT / "schemas").glob("*.schema.json")):
             schema = json.loads(path.read_text(encoding="utf-8"))

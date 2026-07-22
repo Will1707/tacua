@@ -11,7 +11,7 @@
   "build_id": "build_synthetic",
   "build_identity_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
   "candidate_content_digest": "sha256:8ca65930a9bf5d1a044b74e12c2461a92ce74aa27cf65d6d271a44d302e7b1ab",
-  "candidate_digest": "sha256:bf480f8fb7f9a367c30c8528edec41762d4c1ef9eec4cbefa9699feaeaf3ace0",
+  "candidate_digest": "sha256:6d69972a46b8ce0e31a8fc99b73ad85b6bb7d8afa725fa476bc1db5bead59bc4",
   "candidate_id": "candidate_synthetic",
   "candidate_version": 2,
   "content": {
@@ -147,9 +147,9 @@
       "overall_confidence": "high"
     }
   },
-  "contract_version": "tacua.ticket-candidate@1.0.0",
+  "contract_version": "tacua.runtime-ticket-candidate@1.0.0",
   "created_at": "2026-07-21T10:04:00Z",
-  "media_type": "application/vnd.tacua.ticket-candidate+json;version=1.0.0",
+  "media_type": "application/vnd.tacua.runtime-ticket-candidate+json;version=1.0.0",
   "organization_id": "org_synthetic",
   "previous_candidate_digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
   "project_id": "project_synthetic",
