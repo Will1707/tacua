@@ -21,6 +21,7 @@ private func expectFailure(_ operation: () throws -> Void) throws {
 @main
 enum SessionRetirementTests {
   static func main() throws {
+    try anchorsTraversalAtCanonicalHomeWithoutPrefixConfusion()
     try retiresWholeTreeWithoutFollowingLinks()
     try rejectsRedirectedOrAmbiguousSessionNames()
     try renameFsyncAmbiguityRecovers()
@@ -34,6 +35,55 @@ enum SessionRetirementTests {
       .resolvingSymlinksInPath()
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     return root
+  }
+
+  private static func anchorsTraversalAtCanonicalHomeWithoutPrefixConfusion() throws {
+    let root = try makeRoot("home-anchor")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let canonicalHome = root.appendingPathComponent("sandbox-home", isDirectory: true)
+    let nested = canonicalHome.appendingPathComponent(
+      "Library/Caches/TacuaCapture",
+      isDirectory: true
+    )
+    let sibling = root.appendingPathComponent("sandbox-home-other", isDirectory: true)
+    try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: sibling, withIntermediateDirectories: false)
+    let homeAlias = root.appendingPathComponent("sandbox-home-alias", isDirectory: true)
+    try FileManager.default.createSymbolicLink(at: homeAlias, withDestinationURL: canonicalHome)
+    let resolvedHome = try canonicalExistingDirectory(canonicalHome)
+    let resolvedNested = try canonicalExistingDirectory(nested)
+    let resolvedSibling = try canonicalExistingDirectory(sibling)
+
+    let nestedPlan = try TacuaScopedSessionRetirer.directoryTraversalPlan(
+      for: resolvedNested,
+      homeDirectory: homeAlias
+    )
+    try require(nestedPlan.anchorPath == resolvedHome.path, "Did not use canonical home anchor")
+    try require(
+      nestedPlan.relativeComponents == ["Library", "Caches", "TacuaCapture"],
+      "Home-relative traversal components were incorrect"
+    )
+
+    let exactHomePlan = try TacuaScopedSessionRetirer.directoryTraversalPlan(
+      for: resolvedHome,
+      homeDirectory: homeAlias
+    )
+    try require(exactHomePlan.anchorPath == resolvedHome.path, "Exact home was not anchored")
+    try require(exactHomePlan.relativeComponents.isEmpty, "Exact home traversed extra components")
+
+    let siblingPlan = try TacuaScopedSessionRetirer.directoryTraversalPlan(
+      for: resolvedSibling,
+      homeDirectory: resolvedHome
+    )
+    try require(siblingPlan.anchorPath == "/", "Path-prefix sibling escaped the root fallback")
+  }
+
+  private static func canonicalExistingDirectory(_ directory: URL) throws -> URL {
+    var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+    guard directory.path.withCString({ realpath($0, &buffer) }) != nil else {
+      throw SessionRetirementTestFailure.assertion("Could not canonicalize test directory")
+    }
+    return URL(fileURLWithPath: String(cString: buffer), isDirectory: true)
   }
 
   private static func retiresWholeTreeWithoutFollowingLinks() throws {

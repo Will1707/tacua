@@ -73,3 +73,10 @@ The repository's Capture Lab uses the same plugin in its
 [Expo configuration](https://github.com/Will1707/tacua/blob/main/experiments/ios-capture-spike/harness/app.json), and the core suite exercises its
 strict option parser. A native prebuild test verifies the generated plist in the
 development harness.
+
+The plugin intentionally does not expose or write
+`TacuaLocalHarnessRetentionBypassEnabled`. That separate repository-harness key
+is declared directly by Capture Lab and is accepted natively only in a Debug
+build with the exact `com.tacua.capturelab.acceptance` bundle identifier and the
+existing local-development QA gates. It cannot enable a release or another host
+bundle.

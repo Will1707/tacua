@@ -365,6 +365,27 @@ swiftc \
 
 "$TEST_TMP_DIR/tacua-capture-fault-injection-tests"
 
+swiftc \
+  -D DEBUG \
+  -warnings-as-errors \
+  -module-cache-path "$TEST_TMP_DIR/module-cache" \
+  ios/CapturePolicy.swift \
+  ios/TacuaLocalHarnessPolicy.swift \
+  tests/LocalHarnessPolicyTests.swift \
+  -o "$TEST_TMP_DIR/tacua-local-harness-policy-debug-tests"
+
+"$TEST_TMP_DIR/tacua-local-harness-policy-debug-tests"
+
+swiftc \
+  -warnings-as-errors \
+  -module-cache-path "$TEST_TMP_DIR/module-cache" \
+  ios/CapturePolicy.swift \
+  ios/TacuaLocalHarnessPolicy.swift \
+  tests/LocalHarnessPolicyTests.swift \
+  -o "$TEST_TMP_DIR/tacua-local-harness-policy-release-tests"
+
+"$TEST_TMP_DIR/tacua-local-harness-policy-release-tests"
+
 node --check app.plugin.js
 for plugin_file in plugin/*.js; do
   node --check "$plugin_file"
@@ -384,5 +405,19 @@ if strings "$TEST_TMP_DIR/libTacuaCaptureFaultRelease.dylib" \
   | grep -Eq 'low_storage_start|writer_finish_timeout_1|stop_timeout_twice|TACUA_CAPTURE_TEST_FAULT'
 then
   echo "QA fault-plan strings leaked into a non-fault build" >&2
+  exit 1
+fi
+
+swiftc \
+  -module-cache-path "$TEST_TMP_DIR/module-cache" \
+  -emit-library \
+  ios/CapturePolicy.swift \
+  ios/TacuaLocalHarnessPolicy.swift \
+  -o "$TEST_TMP_DIR/libTacuaLocalHarnessRelease.dylib"
+
+if strings "$TEST_TMP_DIR/libTacuaLocalHarnessRelease.dylib" \
+  | grep -Eq 'TacuaLocalHarnessRetentionBypassEnabled|com\.tacua\.capturelab\.acceptance'
+then
+  echo "Local harness retention-bypass strings leaked into a release build" >&2
   exit 1
 fi

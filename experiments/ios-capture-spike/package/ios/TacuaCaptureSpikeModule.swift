@@ -31,11 +31,14 @@ public final class TacuaCaptureSpikeModule: Module {
     Function("getCapabilities") { () -> [String: Any] in
       let recorder = RPScreenRecorder.shared()
       let buildGate = Self.captureBuildGate()
+      let localHarnessRetentionBypassEnabled = Self.localHarnessRetentionDecision()
+        .bypassesBackendRetention
       var result: [String: Any] = [
         "platform": "ios",
         "api": "ReplayKit.startCapture",
         "available": recorder.isAvailable && buildGate.configuration != nil,
         "qaBuildEnabled": buildGate.configuration != nil,
+        "localHarnessRetentionBypassEnabled": localHarnessRetentionBypassEnabled,
         "buildVariant": buildGate.configuration?.buildVariant ?? NSNull(),
         "distribution": buildGate.configuration?.distribution ?? NSNull(),
         "unavailableReason": !recorder.isAvailable
@@ -641,7 +644,9 @@ public final class TacuaCaptureSpikeModule: Module {
         return
       }
       do {
-        _ = try self.backendLifecycleCoordinators().retention.sweep()
+        if !Self.localHarnessRetentionDecision().bypassesBackendRetention {
+          _ = try self.backendLifecycleCoordinators().retention.sweep()
+        }
         promise.resolve(
           try TacuaCaptureSession.withExclusiveRecoveryAccess {
             try TacuaCaptureSession.listRecoverableSessions()
@@ -663,9 +668,11 @@ public final class TacuaCaptureSpikeModule: Module {
         return
       }
       do {
-        try self.backendLifecycleCoordinators().retention.requireActive(
-          localSessionID: options.sessionId
-        )
+        if !Self.localHarnessRetentionDecision().bypassesBackendRetention {
+          try self.backendLifecycleCoordinators().retention.requireActive(
+            localSessionID: options.sessionId
+          )
+        }
         promise.resolve(
           try TacuaCaptureSession.withExclusiveRecoveryAccess {
             try TacuaCaptureSession.markPartialReadyForUpload(options: options)
@@ -688,11 +695,13 @@ public final class TacuaCaptureSpikeModule: Module {
         return
       }
       do {
-        if try self.backendLifecycleCoordinators().retention.enforce(
-          localSessionID: options.sessionId
-        ) == .retired {
-          promise.resolve()
-          return
+        if !Self.localHarnessRetentionDecision().bypassesBackendRetention {
+          if try self.backendLifecycleCoordinators().retention.enforce(
+            localSessionID: options.sessionId
+          ) == .retired {
+            promise.resolve()
+            return
+          }
         }
         try TacuaCaptureSession.withExclusiveRecoveryAccess {
           try TacuaCaptureSession.deleteSession(options: options)
@@ -743,16 +752,24 @@ public final class TacuaCaptureSpikeModule: Module {
     }
 
     do {
-      let retention = try backendLifecycleCoordinators().retention.enforce(
-        localSessionID: options.sessionId
-      )
-      guard case .active(let rawMediaExpiresAt, let stopUptimeMilliseconds) = retention,
-        rawMediaExpiresAt == options.rawMediaExpiresAt
-      else { throw TacuaSDKLocalRetentionError.expired }
+      let retentionDecision = Self.localHarnessRetentionDecision()
+      let rawMediaStopHostUptimeSeconds: Double
+      switch retentionDecision {
+      case .backendEnforced:
+        let retention = try backendLifecycleCoordinators().retention.enforce(
+          localSessionID: options.sessionId
+        )
+        guard case .active(let rawMediaExpiresAt, let stopUptimeMilliseconds) = retention,
+          rawMediaExpiresAt == options.rawMediaExpiresAt
+        else { throw TacuaSDKLocalRetentionError.expired }
+        rawMediaStopHostUptimeSeconds = Double(stopUptimeMilliseconds) / 1_000
+      case .localHarness(let stopUptimeSeconds):
+        rawMediaStopHostUptimeSeconds = stopUptimeSeconds
+      }
       let session = try TacuaCaptureSession(
         options: options,
         resuming: resuming,
-        rawMediaStopHostUptimeSeconds: Double(stopUptimeMilliseconds) / 1_000,
+        rawMediaStopHostUptimeSeconds: rawMediaStopHostUptimeSeconds,
         eventSink: { [weak self] name, payload in
           DispatchQueue.main.async {
             self?.sendEvent(name, payload)
@@ -761,7 +778,7 @@ public final class TacuaCaptureSpikeModule: Module {
         terminalSink: { [weak self] completedSession, snapshot in
           self?.rememberTerminalStatus(snapshot)
           self?.clearSession(ifMatching: completedSession)
-          guard let self else { return }
+          guard let self, !retentionDecision.bypassesBackendRetention else { return }
           DispatchQueue.global(qos: .utility).async {
             _ = try? self.backendLifecycleCoordinators().retention.enforce(
               localSessionID: completedSession.sessionId
@@ -892,6 +909,16 @@ public final class TacuaCaptureSpikeModule: Module {
     } catch {
       return (nil, "launch_scheme_invalid")
     }
+  }
+
+  private static func localHarnessRetentionDecision() -> TacuaLocalHarnessRetentionDecision {
+    let decision = TacuaLocalHarnessPolicy.retentionDecision()
+    guard decision.bypassesBackendRetention,
+      let configuration = captureBuildGate().configuration,
+      configuration.buildVariant == "development",
+      configuration.distribution == "local"
+    else { return .backendEnforced }
+    return decision
   }
 
   private func startLifecycleCoordinator() throws -> TacuaSDKStartLifecycleCoordinator {

@@ -137,15 +137,17 @@ enum CaptureFaultInjectionTests {
   }
 
   private static func runtimeGatesAndOneClaim() throws {
-    let wrongBundle = TacuaCaptureFaultLeaseSource()
-    try expect(
-      wrongBundle.claim(
-        bundleIdentifier: "com.example.capturelab",
-        faultInjectionEnabled: true,
-        environmentValue: TacuaCaptureFaultPlan.lowStorageStart.rawValue
-      ) == nil,
-      "A non-harness bundle must not receive a lease"
-    )
+    for bundleIdentifier in ["com.tacua.capturelab", "com.example.capturelab"] {
+      let wrongBundle = TacuaCaptureFaultLeaseSource()
+      try expect(
+        wrongBundle.claim(
+          bundleIdentifier: bundleIdentifier,
+          faultInjectionEnabled: true,
+          environmentValue: TacuaCaptureFaultPlan.lowStorageStart.rawValue
+        ) == nil,
+        "A non-acceptance bundle must not receive a lease"
+      )
+    }
 
     let disabled = TacuaCaptureFaultLeaseSource()
     try expect(

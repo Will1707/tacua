@@ -9,6 +9,8 @@ type CaptureCapabilities = {
   readonly available: boolean;
   /** True only when the native binary carries the complete fail-closed QA build profile. */
   readonly qaBuildEnabled: boolean;
+  /** True only for the exact DEBUG-only repository acceptance harness. */
+  readonly localHarnessRetentionBypassEnabled: boolean;
   readonly buildVariant: "development" | "preview" | null;
   readonly distribution: "local" | "internal" | "testflight" | null;
   readonly unavailableReason:
@@ -106,6 +108,8 @@ type CaptureRecoveryOptions = Omit<
 type RecoverableSession = {
   readonly sessionId: string;
   readonly state: string;
+  /** Immutable stored deadline required to resume the same local capture. */
+  readonly rawMediaExpiresAt?: string | null;
   readonly segmentCount: number;
   readonly gapCount?: number;
   readonly partialFileCount: number;
