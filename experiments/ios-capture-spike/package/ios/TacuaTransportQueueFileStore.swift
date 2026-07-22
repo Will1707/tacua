@@ -1133,12 +1133,12 @@ final class TacuaScopedSessionRetirer: TacuaLocalSessionRetiring {
   }
 
   private static func openAbsoluteDirectoryNoFollow(_ directory: URL) throws -> Int32 {
-    guard directory.isFileURL, directory.path.hasPrefix("/") else {
-      throw TacuaTransportQueueFileStoreError.unsafePayloadPath
+    let plan = try directoryTraversalPlan(for: directory)
+    var descriptor = plan.anchorPath.withCString {
+      open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
     }
-    var descriptor = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
     guard descriptor >= 0 else { throw TacuaTransportQueueFileStoreError.unsafePayloadPath }
-    for component in directory.path.split(separator: "/").map(String.init) {
+    for component in plan.relativeComponents {
       let child = component.withCString {
         openat(descriptor, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
       }
@@ -1150,6 +1150,37 @@ final class TacuaScopedSessionRetirer: TacuaLocalSessionRetiring {
       descriptor = child
     }
     return descriptor
+  }
+
+  static func directoryTraversalPlan(
+    for directory: URL,
+    homeDirectory: URL = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+  ) throws -> (anchorPath: String, relativeComponents: [String]) {
+    guard directory.isFileURL, directory.path.hasPrefix("/") else {
+      throw TacuaTransportQueueFileStoreError.unsafePayloadPath
+    }
+    let directoryComponents = directory.path.split(separator: "/").map(String.init)
+    guard directoryComponents.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+      throw TacuaTransportQueueFileStoreError.unsafePayloadPath
+    }
+
+    if let canonicalHome = try? canonicalExistingDirectory(homeDirectory.standardizedFileURL) {
+      let homeComponents = canonicalHome.path.split(separator: "/").map(String.init)
+      if directoryComponents.starts(with: homeComponents) {
+        let relativeComponents = Array(directoryComponents.dropFirst(homeComponents.count))
+        guard relativeComponents.allSatisfy({
+          !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("/")
+        }) else {
+          throw TacuaTransportQueueFileStoreError.unsafePayloadPath
+        }
+        // iOS may deny opening global `/`, while permitting direct access to the app container.
+        // Platform-owned ancestors are trusted here; every mutable descendant is still reopened
+        // component-by-component with O_NOFOLLOW.
+        return (canonicalHome.path, relativeComponents)
+      }
+    }
+
+    return ("/", directoryComponents)
   }
 
   private static func canonicalExistingDirectory(_ directory: URL) throws -> URL {
