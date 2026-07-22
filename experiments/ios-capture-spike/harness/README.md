@@ -38,10 +38,57 @@ previous generated `com.tacua.capturelab` target with new JavaScript. The UI
 also refuses to scan recovery data unless native code reports that every exact
 acceptance-harness gate is active.
 
+### Narrow physical UI driver
+
+The generated iOS project may install the tracked
+`TacuaCaptureLabAutomation` UI-test scheme after `pod install`:
+
+```sh
+./scripts/add_physical_ui_test_target.sh
+```
+
+The driver only targets `com.tacua.capturelab.acceptance`. Its system-prompt
+allowlist contains exact English and Spanish microphone-preserving choices; it
+never selects a screen-only or denial choice and fails closed in an unsupported
+locale. Run the permission bootstrap first if an earlier attempt left a system
+sheet pending. Then use the split Start and Stop tests rather than keeping
+XCTest active for a long recording:
+
+```sh
+xcodebuild test \
+  -workspace ios/TacuaCaptureLab.xcworkspace \
+  -scheme TacuaCaptureLabAutomation \
+  -configuration Debug \
+  -destination "platform=iOS,id=${TACUA_TEST_DEVICE_ID}" \
+  -only-testing:TacuaCaptureLabUITests/TacuaCaptureLabUITests/testGrantPendingPermissions \
+  -parallel-testing-enabled NO \
+  -collect-test-diagnostics never \
+  -allowProvisioningUpdates
+
+xcodebuild test \
+  -workspace ios/TacuaCaptureLab.xcworkspace \
+  -scheme TacuaCaptureLabAutomation \
+  -configuration Debug \
+  -destination "platform=iOS,id=${TACUA_TEST_DEVICE_ID}" \
+  -only-testing:TacuaCaptureLabUITests/TacuaCaptureLabUITests/testStartRecordingAndExit \
+  -parallel-testing-enabled NO \
+  -collect-test-diagnostics never \
+  -allowProvisioningUpdates
+```
+
+`testStartRecordingAndExit` starts capture, waits for ReplayKit, adds one issue
+marker, and exits while the app remains in the foreground. For a short smoke
+run, invoke `testStopActiveRecording` separately. For the 30-minute gate, leave
+the app untouched and let the SDK's native monotonic limit stop it. Narration
+played by automation must be labeled synthetic; it does not substitute for a
+human manual-QA result.
+
 Start with a short recording. Confirm microphone narration and at least one
 verified segment before running interruption, recovery, or 30-minute tests.
-The test operator must handle iOS consent prompts and physical lock/background
-actions. Delete local sessions after evidence has been minimized and recorded.
+The driver handles only its exact allowlisted iOS prompts; an unexpected prompt
+or locale remains an operator decision. Physical lock/background actions also
+remain manual. Delete local sessions after evidence has been minimized and
+recorded.
 
 Sanitized experiment observations live in
 [`../PHYSICAL-DEVICE-RESULTS.md`](../PHYSICAL-DEVICE-RESULTS.md). Raw media and

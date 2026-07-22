@@ -48,15 +48,34 @@ historical 2026-07-21 artifact is checked in as an intentional negative: its
 0.156% rate satisfies the numeric ceiling, but its 121 drops have no gap
 records, so validation returns `UNACCOUNTED_APP_AUDIO_DROPS`.
 
+## Accepted physical evidence
+
+On 2026-07-23, an isolated acceptance build completed a 1,800,310 ms physical
+run with 180 contiguous segments, zero resumes, zero continuity gaps, zero
+stable errors, complete app-audio reservation accounting, and no unknown
+ranges. It appended 77,500 of 77,521 app-audio attempts and recorded all 21
+dropped attempt indexes in the derived artifact, a drop rate of about 0.027%.
+
+The checked-in
+[`physical-2026-07-23-passing.json`](../../experiments/ios-capture-spike/fixtures/app-audio-acceptance/physical-2026-07-23-passing.json)
+is the canonical privacy-safe artifact. It was generated from and validated
+against the exact source-manifest bytes; that manifest is retained privately
+because it is operational evidence, not a public fixture. One checksum-matched
+representative segment was inspected as H.264 video, stereo AAC app audio, and
+non-silent mono AAC microphone audio, then its temporary host copy was removed.
+The narration was a clearly labeled synthetic sentence, so this closes the
+app-audio accounting gate only. It is not evidence of human manual QA, the full
+capture-to-ticket path, or a supported-device matrix.
+
 ## Consequences
 
 - A small, bounded drop rate is accepted only when downstream processing can
   identify exactly where capture evidence is discontinuous; reviewer-facing
   candidates may surface the resulting derived evidence.
 - Zero-gap claims are impossible when any app-audio append was dropped.
-- The numeric decision is closed, but physical release evidence remains open
-  until a new 30-minute run records the accepted gap artifact and passes it
-  without the synthetic-conformance option.
+- The numeric decision and its narrow physical app-audio accounting gate are
+  closed by the 2026-07-23 artifact. Human narrated capture-to-ticket evidence
+  and supported-device coverage remain separate release gates.
 - Schema 4 carries exact append ranges, drop indexes, and closed causes in local
   segment sidecars, then admission persists their verified allowlisted
   projection in the sealed runtime completion manifest. That manifest remains

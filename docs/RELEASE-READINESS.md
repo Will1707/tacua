@@ -23,7 +23,7 @@ still require the model's deployment-specific overlays and live validation.
 
 | Area | Implemented foundation | Proof boundary |
 | --- | --- | --- |
-| iOS capture | App-only ReplayKit capture, narration and app audio, bounded segmentation, issue marks and gaps, a 30-minute design limit, interruption recovery, and scoped local deletion. | The capture candidate passed its documented synthetic-data campaign on one physical iPhone. That campaign predates the complete SDK-to-backend path and is not a supported-device matrix. |
+| iOS capture | App-only ReplayKit capture, narration and app audio, bounded segmentation, issue marks and gaps, a 30-minute design limit, interruption recovery, and scoped local deletion. | The capture candidate passed its documented synthetic-data campaign on one physical iPhone. A later 30-minute schema-4 run with clearly labeled synthetic narration passed the narrow ADR-018 app-audio machine gate and exact private-manifest validation. Neither run exercises the complete SDK-to-backend-to-ticket path, human manual QA, or a supported-device matrix. |
 | Mobile SDK lifecycle | A QA-build-only gate; sealed build, backend, consent, scope, and retention profile; consent-gated START and RESUME exchange; crash journals; native session discovery independent of prior JavaScript state; exact replay; stopped-capture admission; diagnostic projection; upload, completion, local retirement, server-anchored local expiry sweeping, and backend deletion. | Swift, TypeScript, config-plugin, and generated Expo/iOS build checks cover the implementation. The full lifecycle has not yet passed on a physical QA build. Upload uses an in-process foreground session: suspension or termination can stop progress, and the host must drain the durable queue again after relaunch. Expiry is checked when discovery or another lifecycle boundary runs. A reboot before the raw deadline blocks raw-data use until authenticated RESUME establishes a current-boot server-time anchor; this is deliberate fail-closed behavior, not continuous background enforcement. |
 | Self-hosted backend | A single-organization, single-process Python/SQLite service whose current pilot configuration pins exactly one project, application, tested build, reviewer identity, and administrator credential per deployment; exact SDK receipts; integrity-checked storage; retention and deletion; immutable job and candidate histories; atomic candidate publication and handoff export; sealed configuration; health, preflight, backup, restore, and smoke tooling; hardened Docker definitions. Backup manifest v2 binds and recomputes the earliest retained raw/derived session-evidence deadline and refuses verification plus dry-run or applied restore at expiry. This singular deployment scope is an implementation limit, not a narrowing of the product's future multi-project/member boundary. | Unit and contract suites plus the checked-in Docker CI job exercise these boundaries. Expiry refusal does not destroy off-host bytes, and this is not evidence that a real host, TLS proxy, firewall, storage device, backup destination, destruction lifecycle, or upgrade procedure has been operated successfully. |
 | Processing | Durable processing jobs; an opt-in, provider-neutral, shell-free command adapter; and the accepted [ADR-016](decisions/ADR-016-local-processor-isolation.md) host runner/Compose profile for an operator-selected private-pilot processor. Normal backend startup is inert and default-deny for egress. | No transcription model, LLM, repository connector, telemetry connector, API provider, image, model, or command is selected. The isolated profile is separately identified, offline, read-only and resource-bounded, but the exclusive worker still runs only while the HTTP service is stopped and is not an unattended production worker. |
@@ -47,7 +47,9 @@ still require the model's deployment-specific overlays and live validation.
   non-executable.
 - [ADR-018](decisions/ADR-018-v1-app-audio-acceptance.md) accepts a maximum 0.2%
   app-audio append-drop rate only when every drop is recorded exactly once as a
-  gap. The decision is closed; new passing physical evidence is still required.
+  gap. The checked-in 2026-07-23 physical artifact records 21/77,521 drops
+  (about 0.027%) and passed against its privately retained exact schema-4
+  source manifest, closing this narrow machine gate.
 
 ## Product-owner decisions still open
 
@@ -88,15 +90,13 @@ off-host backup transfer or destruction, provider authorization, or host monitor
   obtains truthful consent, capture records narration and issues, lifecycle
   interruptions are represented as gaps, relaunch discovers pending work, and
   foreground queue draining completes without losing exact evidence.
-- A new 30-minute physical run passes the ADR-018 machine gate: app-audio drops
-  are no more than 0.2% of all append attempts and every dropped attempt index
-  appears exactly once in an `app_audio_append_drop` gap. The artifact must be
-  labeled `physical_device`, validate against the exact digest- and
-  identity-bound schema-4 source manifest, contain no recovery reservation
-  ranges, stay within the 1,799,000–1,831,000 ms envelope, and respect the SDK's
-  10,000,000-attempt/2,048-drop caps. The label is operator evidence
-  classification, not hardware attestation. The historical
-  121/77,523 run does not satisfy this accounting requirement.
+- Repeat the 30-minute capture in the complete signed pilot workflow with human
+  narration and across the selected supported-device matrix. The separate
+  ADR-018 machine gate is already closed by the 2026-07-23 `physical_device`
+  artifact: it stayed within the duration and accounting bounds, contained no
+  recovery reservation ranges, and validated against the exact digest- and
+  identity-bound private source manifest. The evidence label is an operator
+  classification, not hardware attestation.
 - The selected real processor produces zero, one, and several grounded
   candidates from authorized test data. Screenshots, diagnostic context,
   clarification, edits, approval, canonical export, and rejection all work

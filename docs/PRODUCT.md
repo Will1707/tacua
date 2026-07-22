@@ -148,9 +148,12 @@ and separate short-lived Codex execution assertions. The SDK and backend pieces
 are now connected in code and simulator builds, but not yet in a physical
 capture-to-reviewed-ticket run. They do not authorize external model egress,
 and structural approval alone does not authorize agent execution. The accepted
-app-audio ceiling is 0.2% only when every drop is an explicit gap. The 30-minute
-run's 121/77,523 rate (about 0.156%) is below that ceiling, but its drops were
-not gap-accounted, so the physical release gate remains open. The SDK implements
+app-audio ceiling is 0.2% only when every drop is an explicit gap. A later
+schema-4 physical run with clearly labeled synthetic narration recorded and
+accounted for all 21 drops across 77,521 attempts (about 0.027%) and passed
+against its private exact manifest. That closes the narrow ADR-018 machine
+gate, not human manual QA or the complete physical capture-to-ticket release
+gate. The SDK implements
 authenticated, manifest-independent deletion, but the tested QA app still needs
 to expose that reset as an explicit destructive action. Protected-file behavior
 and that host UI both require production-integration verification.

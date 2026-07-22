@@ -3,10 +3,10 @@
 Status: physical candidate gates complete for foreground capture, interruption,
 verified-partial choice, resume, scoped deletion, the 30-minute foreground
 limit, lock recovery, and deterministic storage/writer/stop fault handling;
-V1 app-audio release acceptance remains open because the observed drops were
-not recorded as explicit gap entries
+the narrow V1 app-audio machine gate is also closed by a later schema-4
+physical run with exact drop accounting
 
-Date: 2026-07-21
+Dates: original campaign 2026-07-21; qualifying app-audio rerun 2026-07-23
 
 Scope: local-only synthetic capture; no upload or external model egress
 
@@ -147,8 +147,46 @@ python3 scripts/validate_app_audio_acceptance.py \
 The artifact binds the exact manifest bytes and capture/build identity. Its
 mandatory `physical_device` label is the operator's evidence classification,
 not hardware attestation. The generator refuses schema-3, `partial`, gapped,
-interrupted/resumed, incomplete, errorful, or internally inconsistent runs. No new qualifying physical run has been executed
-yet, so ADR-018's physical gate remains open.
+interrupted/resumed, incomplete, errorful, or internally inconsistent runs.
+
+### 2026-07-23 schema-4 acceptance rerun
+
+An isolated acceptance build completed a second unattended physical run using
+one clearly labeled synthetic narration sentence and one issue marker. The SDK
+stopped itself at its persisted monotonic deadline; no UI automation process
+remained attached for the duration.
+
+| Measurement | Observed |
+| --- | ---: |
+| Stop reason | `maximum_duration` |
+| Terminal state | `completed` |
+| Finalized segments | 180 |
+| Start-to-terminal elapsed time | 1,800.310 seconds |
+| Microphone samples | 78,250 |
+| App-audio append attempts | 77,521 |
+| App-audio samples appended | 77,500 |
+| Dropped app-audio samples | 21 |
+| App-audio drop rate | about 0.027% |
+| Resume count | 0 |
+| Continuity gaps | 0 |
+| Stable errors | 0 |
+| Unknown app-audio reservation ranges | 0 |
+
+Segment indexes were contiguous from 0 through 179, every segment recorded a
+digest, and the schema-4 manifest reported complete append accounting. Every
+dropped attempt index was preserved in the canonical derived artifact as one
+explicit `app_audio_append_drop` gap. A representative first segment matched
+its manifest SHA-256 and contained H.264 video, stereo AAC app audio, and a
+non-silent mono AAC microphone track; its temporary host media copy was then
+removed.
+
+The privacy-safe machine artifact is checked in as
+[`physical-2026-07-23-passing.json`](fixtures/app-audio-acceptance/physical-2026-07-23-passing.json).
+It passed the validator with the exact source manifest, whose bytes are retained
+privately rather than committed. This closes ADR-018's app-audio accounting
+gate. Because narration was synthetic and the isolated harness did not upload,
+process evidence, create a ticket, or exercise the reviewer, it does not close
+the human manual-QA, capture-to-ticket, or supported-device release gates.
 
 ## Lock-screen lifecycle run
 
