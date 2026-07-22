@@ -3,53 +3,53 @@
 import { useEffect, useMemo, useState } from "react";
 import { ActivityIndicator, Image, Text, View } from "react-native";
 
-import type { TacuaApiClient } from "@/api/client";
 import type {
   CandidateDiagnosticEvent,
   CandidateEvidenceItem,
   CandidateEvidenceView,
-  EvidencePreview,
-  TicketCandidate,
 } from "@/api/types";
+import {
+  keyframeCarouselPositionLabel,
+  type KeyframePreviewState,
+} from "@/candidates/keyframe-gallery-state";
+import { ActionButton } from "@/components/action-button";
 import { SectionCard } from "@/components/section-card";
 import { colors } from "@/theme/colors";
 import { formatBytes } from "@/utils/format";
 
 type Props = {
-  readonly candidate: TicketCandidate;
-  readonly client: TacuaApiClient;
   readonly evidence: CandidateEvidenceView | null;
+  readonly activeKeyframeIndex: number;
+  readonly activePreviewState: KeyframePreviewState | undefined;
+  readonly inspectedKeyframeCount: number;
+  readonly keyframes: readonly CandidateEvidenceItem[];
   readonly loading: boolean;
   readonly error: string | null;
-  readonly onInspectionStateChange?: (ready: boolean) => void;
+  readonly retryDisabled: boolean;
+  readonly onRetry: () => void;
+  readonly onRetryActivePreview: () => void;
+  readonly onShowNextKeyframe: () => void;
+  readonly onShowPreviousKeyframe: () => void;
+  readonly onKeyframeDecodeStateChange: (evidenceId: string, decoded: boolean) => void;
 };
 
 const maximumVisibleEvents = 40;
 
 export function CandidateEvidencePanel({
-  candidate,
-  client,
   evidence,
+  activeKeyframeIndex,
+  activePreviewState,
+  inspectedKeyframeCount,
+  keyframes,
   loading,
   error,
-  onInspectionStateChange,
+  retryDisabled,
+  onRetry,
+  onRetryActivePreview,
+  onShowNextKeyframe,
+  onShowPreviousKeyframe,
+  onKeyframeDecodeStateChange,
 }: Props) {
-  const referencedEvidence = useMemo(() => Array.from(new Set([
-    ...candidate.content.actual_behavior.evidence_refs,
-    ...candidate.content.summary.evidence_refs,
-    ...candidate.content.claims.flatMap((claim) => claim.evidence_refs),
-  ])), [
-    candidate.content.actual_behavior.evidence_refs,
-    candidate.content.claims,
-    candidate.content.summary.evidence_refs,
-  ]);
-  const keyframe = referencedEvidence
-    .map((evidenceId) => evidence?.items.find((item) => item.evidence_id === evidenceId))
-    .find((item) => (
-      item?.evidence_type === "media.keyframe"
-      && item.availability === "available"
-      && item.preview.status === "available"
-    ));
   const events = useMemo(
     () => [...(evidence?.diagnostic_events ?? [])].sort((left, right) => left.elapsed_ms - right.elapsed_ms).slice(0, maximumVisibleEvents),
     [evidence?.diagnostic_events],
@@ -61,22 +61,27 @@ export function CandidateEvidencePanel({
       trailing={evidence ? <Text style={{ color: colors.tertiaryLabel }}>{evidence.items.length} items</Text> : undefined}
     >
       {loading ? (
-        <View accessibilityLabel="Loading ticket evidence" style={{ minHeight: 96, alignItems: "center", justifyContent: "center" }}>
+        <View accessible accessibilityLabel="Loading ticket evidence" accessibilityRole="progressbar" style={{ minHeight: 96, alignItems: "center", justifyContent: "center" }}>
           <ActivityIndicator color={colors.primary} />
         </View>
       ) : error ? (
         <View style={{ gap: 4 }}>
-          <Text selectable style={{ color: colors.orange, fontWeight: "700" }}>Evidence is temporarily unavailable</Text>
+          <Text selectable accessibilityRole="alert" style={{ color: colors.orange, fontWeight: "700" }}>Evidence is temporarily unavailable</Text>
           <Text selectable style={{ color: colors.secondaryLabel }}>{error}</Text>
           <Text selectable style={{ color: colors.tertiaryLabel, fontSize: 12 }}>The ticket remains visible, but do not approve it until its bound evidence can be inspected.</Text>
+          <ActionButton disabled={retryDisabled} label="Retry evidence check" onPress={onRetry} />
         </View>
       ) : evidence ? (
         <View style={{ gap: 16 }}>
-          <KeyframePreview
-            candidate={candidate}
-            client={client}
-            item={keyframe}
-            onInspectionStateChange={onInspectionStateChange}
+          <KeyframeGallery
+            activeIndex={activeKeyframeIndex}
+            items={keyframes}
+            inspectedCount={inspectedKeyframeCount}
+            previewState={activePreviewState}
+            onKeyframeDecodeStateChange={onKeyframeDecodeStateChange}
+            onNext={onShowNextKeyframe}
+            onPrevious={onShowPreviousKeyframe}
+            onRetry={onRetryActivePreview}
           />
 
           <View style={{ gap: 8 }}>
@@ -103,83 +108,139 @@ export function CandidateEvidencePanel({
   );
 }
 
-function KeyframePreview({
-  candidate,
-  client,
-  item,
-  onInspectionStateChange,
+function KeyframeGallery({
+  activeIndex,
+  items,
+  inspectedCount,
+  previewState,
+  onKeyframeDecodeStateChange,
+  onNext,
+  onPrevious,
+  onRetry,
 }: {
-  readonly candidate: TicketCandidate;
-  readonly client: TacuaApiClient;
-  readonly item: CandidateEvidenceItem | undefined;
-  readonly onInspectionStateChange?: (ready: boolean) => void;
+  readonly activeIndex: number;
+  readonly items: readonly CandidateEvidenceItem[];
+  readonly inspectedCount: number;
+  readonly previewState: KeyframePreviewState | undefined;
+  readonly onKeyframeDecodeStateChange: (evidenceId: string, decoded: boolean) => void;
+  readonly onNext: () => void;
+  readonly onPrevious: () => void;
+  readonly onRetry: () => void;
 }) {
-  const [preview, setPreview] = useState<EvidencePreview | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const expectedDigest = item?.preview.content_digest;
-
-  useEffect(() => {
-    let active = true;
-    setPreview(null);
-    setError(null);
-    onInspectionStateChange?.(false);
-    if (!item || !expectedDigest) return () => { active = false; };
-    void client.getEvidencePreview(candidate, item.evidence_id, expectedDigest)
-      .then((loaded) => {
-        if (active) {
-          setPreview(loaded);
-        }
-      })
-      .catch((caught) => {
-        if (active) {
-          setError(caught instanceof Error ? caught.message : "The screenshot could not be loaded.");
-          onInspectionStateChange?.(false);
-        }
-      });
-    return () => { active = false; };
-  }, [candidate, client, expectedDigest, item, onInspectionStateChange]);
-
-  if (!item) {
+  if (!items.length) {
     return (
       <View style={{ minHeight: 112, borderRadius: 14, borderCurve: "continuous", backgroundColor: colors.groupedBackground, alignItems: "center", justifyContent: "center", padding: 16 }}>
-        <Text selectable style={{ color: colors.secondaryLabel, textAlign: "center" }}>No available screenshot was referenced by this ticket. Approval remains locked.</Text>
+        <Text selectable style={{ color: colors.secondaryLabel, textAlign: "center" }}>No available screenshot was referenced anywhere in this ticket. Approval remains locked.</Text>
       </View>
     );
   }
-  if (error) {
-    return (
-      <View style={{ minHeight: 112, borderRadius: 14, borderCurve: "continuous", backgroundColor: colors.groupedBackground, alignItems: "center", justifyContent: "center", padding: 16, gap: 4 }}>
-        <Text selectable style={{ color: colors.orange, fontWeight: "700" }}>Screenshot unavailable</Text>
-        <Text selectable style={{ color: colors.secondaryLabel, textAlign: "center" }}>{error}</Text>
+
+  const item = items[activeIndex] ?? items[0];
+  if (!item) return null;
+  const positionLabel = keyframeCarouselPositionLabel(activeIndex, items.length);
+
+  return (
+    <View style={{ gap: 12 }}>
+      <View style={{ flexDirection: "row", flexWrap: "wrap", justifyContent: "space-between", alignItems: "baseline", gap: 8 }}>
+        <Text selectable style={{ color: colors.label, fontWeight: "800", fontSize: 15, flexShrink: 1 }}>Referenced screenshot gallery</Text>
+        <Text selectable style={{ color: colors.tertiaryLabel, fontSize: 12, fontVariant: ["tabular-nums"] }}>
+          {Math.min(inspectedCount, items.length)} of {items.length} inspected
+        </Text>
       </View>
-    );
-  }
-  if (!preview) {
-    return (
-      <View accessibilityLabel="Loading bound screenshot" style={{ minHeight: 240, borderRadius: 14, borderCurve: "continuous", backgroundColor: colors.groupedBackground, alignItems: "center", justifyContent: "center" }}>
-        <ActivityIndicator color={colors.primary} />
+      <Text
+        accessibilityLiveRegion="polite"
+        selectable
+        style={{ color: colors.tertiaryLabel, fontSize: 12, fontWeight: "700", textTransform: "uppercase", fontVariant: ["tabular-nums"] }}
+      >
+        {positionLabel}
+      </Text>
+      <KeyframePreview
+        item={item}
+        key={`${item.evidence_id}:${item.preview.content_digest ?? "missing-preview"}`}
+        position={activeIndex + 1}
+        previewState={previewState}
+        total={items.length}
+        onDecodeStateChange={onKeyframeDecodeStateChange}
+        onRetry={onRetry}
+      />
+      <View style={{ flexDirection: "row", gap: 10 }}>
+        <View style={{ flex: 1 }}>
+          <ActionButton disabled={activeIndex <= 0} label="Previous screenshot" onPress={onPrevious} />
+        </View>
+        <View style={{ flex: 1 }}>
+          <ActionButton disabled={activeIndex >= items.length - 1} label="Next screenshot" onPress={onNext} />
+        </View>
       </View>
-    );
-  }
+    </View>
+  );
+}
+
+function KeyframePreview({
+  item,
+  position,
+  previewState,
+  total,
+  onDecodeStateChange,
+  onRetry,
+}: {
+  readonly item: CandidateEvidenceItem;
+  readonly position: number;
+  readonly previewState: KeyframePreviewState | undefined;
+  readonly total: number;
+  readonly onDecodeStateChange: (evidenceId: string, decoded: boolean) => void;
+  readonly onRetry: () => void;
+}) {
+  const [decodeError, setDecodeError] = useState<string | null>(null);
+  useEffect(() => {
+    // A newly fetched, re-bound preview deserves a fresh native decode attempt.
+    // Do not let a prior transient Image failure permanently poison this row.
+    setDecodeError(null);
+  }, [item.evidence_id, item.preview.content_digest, previewState]);
+
   return (
     <View style={{ gap: 8 }}>
-      <View style={{ overflow: "hidden", borderRadius: 14, borderCurve: "continuous", borderColor: colors.separator, borderWidth: 1, backgroundColor: colors.groupedBackground }}>
-        <Image
-          accessible
-          accessibilityLabel={item.description}
-          onError={() => {
-            setError("The screenshot bytes passed transport checks but could not be decoded.");
-            onInspectionStateChange?.(false);
-          }}
-          onLoad={() => onInspectionStateChange?.(true)}
-          resizeMode="contain"
-          source={{ uri: preview.uri }}
-          style={{ width: "100%", aspectRatio: 9 / 16, maxHeight: 560 }}
-        />
-      </View>
+      {decodeError || previewState?.status === "error" ? (
+        <View style={{ minHeight: 112, borderRadius: 14, borderCurve: "continuous", backgroundColor: colors.groupedBackground, alignItems: "center", justifyContent: "center", padding: 16, gap: 4 }}>
+          <Text selectable accessibilityRole="alert" style={{ color: colors.orange, fontWeight: "700" }}>Screenshot unavailable</Text>
+          <Text selectable style={{ color: colors.secondaryLabel, textAlign: "center" }}>
+            {decodeError ?? (previewState?.status === "error" ? previewState.message : "The screenshot could not be loaded.")}
+          </Text>
+          <ActionButton
+            label={`Retry screenshot ${position}`}
+            onPress={() => {
+              setDecodeError(null);
+              onRetry();
+            }}
+          />
+        </View>
+      ) : previewState?.status !== "ready" ? (
+        <View accessible accessibilityLabel={`Loading bound screenshot ${position} of ${total}`} accessibilityRole="progressbar" style={{ minHeight: 240, borderRadius: 14, borderCurve: "continuous", backgroundColor: colors.groupedBackground, alignItems: "center", justifyContent: "center" }}>
+          <ActivityIndicator color={colors.primary} />
+        </View>
+      ) : (
+        <View style={{ overflow: "hidden", borderRadius: 14, borderCurve: "continuous", borderColor: colors.separator, borderWidth: 1, backgroundColor: colors.groupedBackground }}>
+          <Image
+            accessible
+            accessibilityLabel={`${item.description}. Screenshot ${position} of ${total}.`}
+            onError={() => {
+              setDecodeError("The screenshot bytes passed integrity checks but could not be decoded.");
+              onDecodeStateChange(item.evidence_id, false);
+            }}
+            onLoad={() => onDecodeStateChange(item.evidence_id, true)}
+            resizeMode="contain"
+            source={{ uri: previewState.preview.uri }}
+            style={{ width: "100%", aspectRatio: 9 / 16, maxHeight: 560 }}
+          />
+        </View>
+      )}
       <Text selectable style={{ color: colors.label, lineHeight: 20 }}>{item.description}</Text>
       <Text selectable style={{ color: colors.tertiaryLabel, fontSize: 12 }}>
-        {formatElapsed(item.time_range?.start_ms)} · {formatBytes(preview.sizeBytes)} · integrity bound to this candidate
+        {formatElapsed(item.time_range?.start_ms)}
+        {previewState?.status === "ready"
+          ? ` · ${formatBytes(previewState.preview.sizeBytes)} · digest verified`
+          : previewState?.status === "error"
+            ? " · verification failed"
+            : " · verification pending"}
       </Text>
     </View>
   );

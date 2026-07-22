@@ -317,6 +317,8 @@ private final class TestJournalStore: TacuaSDKStartJournalPersisting {
       expected.credentialID == replacement.credentialID,
       expected.credentialOwnershipDigest == replacement.credentialOwnershipDigest,
       expected.transportConfigurationDigest == replacement.transportConfigurationDigest,
+      expected.buildIdentityJSON == replacement.buildIdentityJSON,
+      expected.captureScopeJSON == replacement.captureScopeJSON,
       journals[expected.localSessionID] == expected
     else { throw TacuaSDKStartJournalError.stateConflict }
     try record(replacement)
@@ -467,7 +469,7 @@ enum SDKStartLifecycleTests {
     try await recoveryStatusReflectsReceiptRecoverability(fixtureRoot)
     try await committedQueueStatusReflectsUsableAuthority(fixtureRoot)
     try coexistingQueueAndJournalMustMatch(fixtureRoot)
-    try journalFileStoreEnforcesExclusiveOwnershipAndCAS()
+    try journalFileStoreEnforcesExclusiveOwnershipAndCAS(fixtureRoot)
     print("Tacua SDK START lifecycle tests passed")
   }
 
@@ -483,7 +485,7 @@ enum SDKStartLifecycleTests {
     try require(started.remoteSessionID == "session_remote_001", "Remote session was not bound")
     try require(started.credentialCapability == .active, "START credential must be active")
     try require(started.credentialAvailability == .available, "START credential is unavailable")
-    try require(started.queueSchemaVersion == 3, "START did not expose queue schema v3")
+    try require(started.queueSchemaVersion == 4, "START did not expose queue schema v4")
     try require(!started.resumeRequired, "Fresh START unexpectedly requires resume")
     let queue = try requireValue(
       harness.queues.queues["local_success_001"], "Committed queue is missing"
@@ -492,6 +494,32 @@ enum SDKStartLifecycleTests {
     try require(
       queue.transportConfigurationDigest == harness.configuration.configurationDigest,
       "START queue was not bound to the current transport configuration"
+    )
+    try require(
+      queue.sessionRetentionAuthority == TacuaSessionRetentionAuthority(
+        sessionReceivedAt: "2026-07-21T09:57:01Z",
+        rawMediaExpiresAt: "2026-08-20T09:57:01Z",
+        derivedDataExpiresAt: "2026-08-20T09:57:01Z"
+      ),
+      "START did not retain the backend's exact immutable session deadlines"
+    )
+    let durableArtifacts = try requireValue(
+      queue.durableSessionArtifacts(),
+      "START queue did not retain canonical build/scope artifacts"
+    )
+    let expectedBuildArtifact = try TacuaCanonicalJSON.data(
+      TacuaCanonicalJSON.parse(harness.build)
+    )
+    let expectedScopeArtifact = try TacuaCanonicalJSON.data(
+      TacuaCanonicalJSON.parse(harness.scope)
+    )
+    try require(
+      durableArtifacts.buildIdentityJSON == expectedBuildArtifact,
+      "START queue changed the canonical build identity"
+    )
+    try require(
+      durableArtifacts.scopeJSON == expectedScopeArtifact,
+      "START queue changed the canonical capture scope"
     )
     try require(harness.journals.journals.isEmpty, "Committed journal was not removed")
     try require(
@@ -503,6 +531,13 @@ enum SDKStartLifecycleTests {
     let queueText = String(decoding: try queue.encoded(), as: UTF8.self).lowercased()
     try require(!queueText.contains("launch_code"), "Queue persisted a launch-code key")
     try require(!queueText.contains("secret"), "Queue persisted secret material")
+    let journalText = harness.journals.persistedBytes
+      .map { String(decoding: $0, as: UTF8.self) }.joined()
+    try require(
+      journalText.contains("\"build_identity_json\"")
+        && journalText.contains("\"capture_scope_json\""),
+      "START journal did not make public artifacts crash-recoverable"
+    )
     try require(harness.exchanger.requests.count == 1, "START must exchange exactly once")
     do {
       _ = try harness.gate.withApprovedLaunchCode(approvedLaunchID: approved) { $0 }
@@ -1019,6 +1054,10 @@ enum SDKStartLifecycleTests {
       harness.journals.journals["local_recover_001"], "Receipt journal missing"
     )
     try require(
+      pending.buildIdentityJSON != nil && pending.captureScopeJSON != nil,
+      "Receipt journal cannot reconstruct session artifacts after relaunch"
+    )
+    try require(
       pending.validatedReceipt?.timeAnchor.uptimeMillisecondsAtIssue == 100_000,
       "Receipt journal did not retain the observation-time anchor"
     )
@@ -1027,6 +1066,10 @@ enum SDKStartLifecycleTests {
     try require(recovered.remoteSessionID == "session_remote_001", "Recovery changed session")
     let queue = try requireValue(
       harness.queues.queues["local_recover_001"], "Recovered queue missing"
+    )
+    try require(
+      queue.hasDurableSessionArtifacts,
+      "Headless START recovery dropped its canonical session artifacts"
     )
     let delayedTimestamp = try queue.timestampForNewOperation(clock: harness.clock)
     try require(
@@ -1168,7 +1211,7 @@ enum SDKStartLifecycleTests {
     let recovered = try harness.coordinator.recover(
       localSessionID: "local_install_throw_001"
     )
-    try require(recovered.queueSchemaVersion == 3, "Recovered queue did not expose schema v3")
+    try require(recovered.queueSchemaVersion == 4, "Recovered queue did not expose schema v4")
     try require(
       harness.queues.persistAttempts == attemptsBeforeRecovery + 1,
       "Recovery trusted an ambiguously installed queue without re-persisting it"
@@ -1423,20 +1466,71 @@ enum SDKStartLifecycleTests {
       "Temporary device-lock Keychain unavailability requested a destructive re-launch"
     )
 
+    let pendingCompletionData = try TacuaCanonicalJSON.data(
+      TacuaCanonicalJSON.parse(
+        Data(contentsOf: root.appendingPathComponent("completion-request.json"))
+      )
+    )
+    let pendingCompletionKind = try TacuaSDKBackendProtocol.validateRequest(
+      pendingCompletionData
+    )
+    try require(
+      pendingCompletionKind == .completion,
+      "Completion-restricted status fixture is not a valid frozen completion request"
+    )
+    let pendingCompletion = try TacuaCanonicalJSON.parse(pendingCompletionData)
+    let pendingCompletionRoot = try requireValue(
+      pendingCompletion.objectValue,
+      "Completion-restricted status fixture is not an object"
+    )
+    let pendingSessionID = try requireValue(
+      pendingCompletionRoot["session_id"]?.stringValue,
+      "Completion-restricted status fixture has no session ID"
+    )
+    let pendingScopeDigest = try requireValue(
+      pendingCompletionRoot["scope_digest"]?.stringValue,
+      "Completion-restricted status fixture has no scope digest"
+    )
+    let pendingCredentialID = try requireValue(
+      pendingCompletionRoot["credential_id"]?.stringValue,
+      "Completion-restricted status fixture has no credential ID"
+    )
+    let pendingCompletionID = try requireValue(
+      pendingCompletionRoot["completion_id"]?.stringValue,
+      "Completion-restricted status fixture has no completion ID"
+    )
+    let pendingDigest = try requireValue(
+      pendingCompletionRoot["request_digest"]?.stringValue,
+      "Completion-restricted status fixture has no request digest"
+    )
     var terminal = try TacuaTransportQueueV3(localSessionID: "local_status_terminal_001")
     try terminal.applyExchange(
-      remoteSessionID: "session_status_terminal_001",
-      scopeDigest: "sha256:" + String(repeating: "a", count: 64),
-      credentialID: "credential_status_terminal_001",
+      remoteSessionID: pendingSessionID,
+      scopeDigest: pendingScopeDigest,
+      credentialID: pendingCredentialID,
       transportConfigurationDigest: harness.configuration.configurationDigest,
       expiresAt: "2026-08-20T10:00:00Z",
       capability: .active,
       issuedAt: "2026-07-21T09:57:01Z",
       clock: harness.clock
     )
+    try terminal.enqueueNewOperation(
+      kind: .completion,
+      operationID: pendingCompletionID,
+      requestCredentialID: pendingCredentialID,
+      request: pendingCompletion,
+      requestDigest: pendingDigest,
+      clock: harness.clock
+    )
+    _ = try terminal.beginAttempt(
+      operationID: pendingCompletionID,
+      expectedTransportConfigurationDigest: harness.configuration.configurationDigest,
+      clock: harness.clock
+    )
+    terminal.pendingCompletionReplayID = pendingCompletionID
     terminal.credentialCapability = .completionReplayOrDeleteOnly
     try terminal.validate()
-    harness.credentials.values["credential_status_terminal_001"] = Data(repeating: 3, count: 32)
+    harness.credentials.values[pendingCredentialID] = Data(repeating: 3, count: 32)
     harness.queues.queues[terminal.localSessionID] = terminal
     let terminalStatus = try harness.coordinator.recoveryStatus(
       localSessionID: terminal.localSessionID
@@ -1529,7 +1623,7 @@ enum SDKStartLifecycleTests {
     }
   }
 
-  private static func journalFileStoreEnforcesExclusiveOwnershipAndCAS() throws {
+  private static func journalFileStoreEnforcesExclusiveOwnershipAndCAS(_ fixtureRoot: URL) throws {
     let root = FileManager.default.temporaryDirectory
       .appendingPathComponent("tacua-start-journal-\(UUID().uuidString)", isDirectory: true)
     defer { try? FileManager.default.removeItem(at: root) }
@@ -1580,6 +1674,37 @@ enum SDKStartLifecycleTests {
       state: .credentialPrepared
     )
     try store.createWhileQueueAbsent(journal) {}
+    let external = root.appendingPathComponent("outside-target")
+    try Data("not-a-journal".utf8).write(to: external)
+    let symlink = root.appendingPathComponent("local_symlink_001.start-v1.json")
+    try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: external)
+    do {
+      _ = try store.listLocalSessionIDs()
+      throw LifecycleTestFailure.assertion("START discovery hid a matching symlink")
+    } catch let error as LifecycleTestFailure { throw error }
+    catch {}
+    try FileManager.default.removeItem(at: symlink)
+    let directory = root.appendingPathComponent("local_directory_001.start-v1.json")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+    do {
+      _ = try store.listLocalSessionIDs()
+      throw LifecycleTestFailure.assertion("START discovery hid a matching directory")
+    } catch let error as LifecycleTestFailure { throw error }
+    catch {}
+    try FileManager.default.removeItem(at: directory)
+    let hardlink = root.appendingPathComponent("local_hardlink_001.start-v1.json")
+    try FileManager.default.linkItem(at: external, to: hardlink)
+    do {
+      _ = try store.listLocalSessionIDs()
+      throw LifecycleTestFailure.assertion("START discovery hid a matching hard link")
+    } catch let error as LifecycleTestFailure { throw error }
+    catch {}
+    try FileManager.default.removeItem(at: hardlink)
+    let discoveredIDs = try store.listLocalSessionIDs()
+    try require(
+      discoveredIDs == [journal.localSessionID],
+      "START discovery did not recover after unsafe paths were removed"
+    )
     let journalAttributes = try FileManager.default.attributesOfItem(
       atPath: store.journalURL(localSessionID: journal.localSessionID).path
     )
@@ -1617,6 +1742,66 @@ enum SDKStartLifecycleTests {
     let text = String(decoding: bytes, as: UTF8.self).lowercased()
     try require(!text.contains("launch_code"), "Journal file contains launch-code key")
     try require(!text.contains("secret"), "Journal file contains secret key")
+
+    // Schema-1 journals remain recoverable as legacy nil-artifact authority. Current journals are
+    // closed and reject a half-present or non-protocol artifact instead of trusting host strings.
+    guard case .object(var legacyRoot) = try TacuaCanonicalJSON.parse(try journal.encoded()) else {
+      throw LifecycleTestFailure.assertion("Journal fixture was not an object")
+    }
+    legacyRoot["schema_version"] = .integer(1)
+    legacyRoot.removeValue(forKey: "build_identity_json")
+    legacyRoot.removeValue(forKey: "capture_scope_json")
+    let legacyDecoded = try TacuaSDKStartJournal.decode(
+      TacuaCanonicalJSON.data(.object(legacyRoot))
+    )
+    let legacyArtifacts = try legacyDecoded.durableSessionArtifacts()
+    try require(
+      legacyArtifacts == nil,
+      "Schema-1 journal migration invented session artifacts"
+    )
+
+    let canonicalBuild = try TacuaCanonicalJSON.data(
+      TacuaCanonicalJSON.parse(
+        Data(contentsOf: fixtureRoot.appendingPathComponent("build-identity.json"))
+      )
+    )
+    let canonicalScope = try TacuaCanonicalJSON.data(
+      TacuaCanonicalJSON.parse(
+        Data(contentsOf: fixtureRoot.appendingPathComponent("capture-scope.json"))
+      )
+    )
+    let artifacts = try TacuaDurableSessionArtifacts.canonicalizing(
+      buildIdentityJSON: canonicalBuild,
+      scopeJSON: canonicalScope
+    )
+    let artifactJournal = try TacuaSDKStartJournal(
+      localSessionID: "local_file_artifact_001",
+      exchangeID: "exchange_file_artifact_001",
+      credentialID: "credential_file_artifact_001",
+      credentialOwnershipDigest: "sha256:" + String(repeating: "a", count: 64),
+      transportConfigurationDigest: artifacts.transportConfigurationDigest,
+      buildIdentityJSON: String(decoding: canonicalBuild, as: UTF8.self),
+      captureScopeJSON: String(decoding: canonicalScope, as: UTF8.self),
+      createdAt: "2026-07-21T09:57:00Z",
+      state: .credentialPrepared
+    )
+    guard case .object(var tamperedRoot) = try TacuaCanonicalJSON.parse(
+      try artifactJournal.encoded()
+    ) else { throw LifecycleTestFailure.assertion("Artifact journal was not an object") }
+    tamperedRoot["capture_scope_json"] = .string("{}")
+    do {
+      _ = try TacuaSDKStartJournal.decode(TacuaCanonicalJSON.data(.object(tamperedRoot)))
+      throw LifecycleTestFailure.assertion("Journal accepted a substituted capture scope")
+    } catch let error as LifecycleTestFailure {
+      throw error
+    } catch {}
+    let artifactBytes = try artifactJournal.encoded()
+    do {
+      _ = try TacuaSDKStartJournal.decode(Data(artifactBytes.dropLast()))
+      throw LifecycleTestFailure.assertion("Journal accepted a torn artifact append")
+    } catch let error as LifecycleTestFailure {
+      throw error
+    } catch {}
     try store.remove(expected: resetPending)
     let removed = try store.load(localSessionID: journal.localSessionID)
     try require(

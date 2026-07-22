@@ -1,20 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { useLocalSearchParams } from "expo-router";
+import * as Crypto from "expo-crypto";
 import type { File } from "expo-file-system";
 import * as Sharing from "expo-sharing";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ActivityIndicator, Alert, Pressable, ScrollView, Text, TextInput, View } from "react-native";
+import { ActivityIndicator, Alert, Pressable, RefreshControl, ScrollView, Text, TextInput, View } from "react-native";
 
 import { TacuaApiError } from "@/api/client";
-import type { CandidateEvidenceView, TicketCandidate } from "@/api/types";
+import type { CandidateEvidenceView, Clarification, ClarificationChoice, TicketCandidate } from "@/api/types";
 import { cleanupApprovedHandoffShareCache, createApprovedHandoffShareFile } from "@/approved-handoff/share-cache";
+import type { KeyframePreviewState, KeyframePreviewStates } from "@/candidates/keyframe-gallery-state";
 import { ActionButton } from "@/components/action-button";
 import { CandidateEvidencePanel } from "@/components/candidate-evidence-panel";
+import { CandidateEditCard } from "@/components/candidate-edit-card";
 import { MessageState } from "@/components/message-state";
 import { SectionCard } from "@/components/section-card";
 import { StatusPill } from "@/components/status-pill";
 import { useBackend } from "@/hooks/use-backend";
+import { useCandidateKeyframePreviews } from "@/hooks/use-candidate-keyframe-previews";
 import { colors } from "@/theme/colors";
 
 const handoffShareTypes = {
@@ -37,8 +41,8 @@ export default function CandidateRoute() {
   const [evidence, setEvidence] = useState<CandidateEvidenceView | null>(null);
   const [evidenceLoading, setEvidenceLoading] = useState(false);
   const [evidenceError, setEvidenceError] = useState<string | null>(null);
-  const [evidenceInspectionReady, setEvidenceInspectionReady] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [candidateStale, setCandidateStale] = useState(true);
   const [action, setAction] = useState<string | null>(null);
   const [handoffAction, setHandoffAction] = useState<"json" | "markdown" | null>(null);
   const [handoffVerification, setHandoffVerification] = useState<{
@@ -54,6 +58,9 @@ export default function CandidateRoute() {
     readonly note: string;
   } | null>(null);
   const mountedRef = useRef(false);
+  const loadingRef = useRef(true);
+  const actionRef = useRef<string | null>(null);
+  const loadRequestSequence = useRef(0);
   const handoffRequestSequence = useRef(0);
   const handoffRequestRef = useRef<{
     readonly requestId: number;
@@ -63,17 +70,79 @@ export default function CandidateRoute() {
   const candidateBinding = candidate
     ? `${candidateId ?? "missing-route"}:${candidate.candidate_id}:${candidate.candidate_version}:${candidate.candidate_digest}`
     : null;
+  const currentContextRef = useRef({ candidate, candidateId, candidateStale, client });
+  currentContextRef.current = { candidate, candidateId, candidateStale, client };
+  const {
+    activeIndex: activeKeyframeIndex,
+    activePreviewState,
+    inspectionReady: evidenceInspectionReady,
+    inspectedCount: inspectedKeyframeCount,
+    keyframes,
+    moveNext: showNextKeyframe,
+    movePrevious: showPreviousKeyframe,
+    previewStates,
+    retryActivePreview,
+    setKeyframeDecoded,
+  } = useCandidateKeyframePreviews({ candidate, client, evidence });
 
-  const load = useCallback(async () => {
-    if (!client || !candidateId) return;
+  function isCurrentDisplayedCandidate(
+    requestClient: typeof client,
+    snapshot: TicketCandidate,
+    routeId: typeof candidateId,
+  ): boolean {
+    const current = currentContextRef.current;
+    return mountedRef.current
+      && !current.candidateStale
+      && current.client === requestClient
+      && current.candidateId === routeId
+      && current.candidate?.candidate_id === snapshot.candidate_id
+      && current.candidate.candidate_version === snapshot.candidate_version
+      && current.candidate.candidate_digest === snapshot.candidate_digest;
+  }
+
+  const load = useCallback(async (): Promise<{ readonly ok: true } | { readonly ok: false; readonly message: string }> => {
+    const requestId = loadRequestSequence.current + 1;
+    loadRequestSequence.current = requestId;
+    if (!client || !candidateId) {
+      const message = "A backend connection and candidate identifier are required.";
+      loadingRef.current = false;
+      setLoading(false);
+      setCandidateStale(true);
+      setError(message);
+      return { ok: false, message };
+    }
+    loadingRef.current = true;
     setLoading(true);
+    setCandidateStale(true);
     setError(null);
-    try { setCandidate(await client.getCandidate(candidateId)); }
-    catch (caught) { setError(caught instanceof Error ? caught.message : "Tacua could not load this candidate."); }
-    finally { setLoading(false); }
+    try {
+      const loaded = await client.getCandidate(candidateId);
+      if (loadRequestSequence.current !== requestId) {
+        return { ok: false, message: "A newer ticket refresh replaced this request." };
+      }
+      setCandidate(loaded);
+      setCandidateStale(false);
+      setError(null);
+      return { ok: true };
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : "Tacua could not load this candidate.";
+      if (loadRequestSequence.current === requestId) {
+        setCandidateStale(true);
+        setError(message);
+      }
+      return { ok: false, message };
+    } finally {
+      if (loadRequestSequence.current === requestId) {
+        loadingRef.current = false;
+        setLoading(false);
+      }
+    }
   }, [candidateId, client]);
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    void load();
+    return () => { loadRequestSequence.current += 1; };
+  }, [load]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -84,6 +153,7 @@ export default function CandidateRoute() {
     }
     return () => {
       mountedRef.current = false;
+      loadRequestSequence.current += 1;
       handoffRequestRef.current?.controller.abort();
       handoffRequestRef.current = null;
     };
@@ -98,17 +168,23 @@ export default function CandidateRoute() {
   }, [candidateBinding, client]);
 
   useEffect(() => {
+    // In-flight transitions belong to the client and route that created them.
+    // Releasing the local lock makes the new binding usable while stale
+    // completions are ignored by the per-operation checks below.
+    actionRef.current = null;
+    setAction(null);
+  }, [candidateId, client]);
+
+  useEffect(() => {
     let active = true;
     if (!client || !candidate) {
       setEvidence(null);
       setEvidenceLoading(false);
-      setEvidenceInspectionReady(false);
       return () => { active = false; };
     }
     setEvidence(null);
     setEvidenceError(null);
     setEvidenceLoading(true);
-    setEvidenceInspectionReady(false);
     void client.getCandidateEvidence(candidate)
       .then((loaded) => { if (active) setEvidence(loaded); })
       .catch((caught) => {
@@ -118,62 +194,236 @@ export default function CandidateRoute() {
     return () => { active = false; };
   }, [candidate, client]);
 
-  async function handleTransitionError(title: string, caught: unknown) {
+  async function handleTransitionError(title: string, caught: unknown, shouldReport: () => boolean) {
     if (caught instanceof TacuaApiError && (caught.status === 409 || caught.status === 412)) {
-      await load();
-      Alert.alert("Ticket refreshed", "This ticket changed while you were reviewing it. Tacua loaded the current version; please check it before trying again.");
+      const refresh = await load();
+      if (!shouldReport()) return;
+      if (refresh.ok) {
+        Alert.alert("Ticket refreshed", "This ticket changed while you were reviewing it. Tacua loaded the current version; please check it before trying again.");
+      } else {
+        Alert.alert("Refresh failed", `${refresh.message}\n\nActions remain locked until Tacua successfully refreshes this ticket.`);
+      }
       return;
     }
-    Alert.alert(title, caught instanceof Error ? caught.message : "The backend rejected the transition.");
+    if (!shouldReport()) return;
+    const message = caught instanceof Error ? caught.message : "The backend rejected the transition.";
+    setCandidateStale(true);
+    setError("Tacua could not confirm the current ticket version. Refresh it before taking another action.");
+    Alert.alert(title, `${message}\n\nActions are locked until this ticket is refreshed.`);
   }
 
   async function transition(nextAction: "mark_ready" | "approve" | "reject", reason: string) {
-    if (!client || !config || !candidate) return;
+    if (
+      !client
+      || !config
+      || !candidate
+      || candidateStale
+      || loadingRef.current
+      || actionRef.current !== null
+      || !isCurrentDisplayedCandidate(client, candidate, candidateId)
+    ) return;
+    const parent = candidate;
+    const requestClient = client;
+    const requestRouteId = candidateId;
+    actionRef.current = nextAction;
     setAction(nextAction);
+    const isCurrentContext = () => {
+      const current = currentContextRef.current;
+      return mountedRef.current
+        && actionRef.current === nextAction
+        && current.client === requestClient
+        && current.candidateId === requestRouteId;
+    };
+    const isCurrentOperation = () => {
+      const current = currentContextRef.current;
+      return isCurrentContext()
+        && current.candidate?.candidate_id === parent.candidate_id
+        && current.candidate.candidate_version === parent.candidate_version
+        && current.candidate.candidate_digest === parent.candidate_digest;
+    };
     try {
-      setCandidate(await client.transitionCandidate(candidate.candidate_id, {
-        expected_candidate_digest: candidate.candidate_digest,
-        candidate_version: candidate.candidate_version,
-        candidate_content_digest: candidate.candidate_content_digest,
-        evidence_manifest_digest: candidate.evidence_manifest.manifest_digest,
-        action: nextAction,
+      const binding = {
+        expected_candidate_id: parent.candidate_id,
+        expected_candidate_version: parent.candidate_version,
+        expected_candidate_digest: parent.candidate_digest,
+        expected_candidate_content_digest: parent.candidate_content_digest,
+        expected_evidence_manifest_digest: parent.evidence_manifest.manifest_digest,
         actor_id: config.reviewerId,
         reason,
-      }));
+      };
+      const request = nextAction === "approve"
+        ? {
+          ...binding,
+          action: "approve" as const,
+          approval_id: `approval_${Crypto.randomUUID().replaceAll("-", "")}`,
+        }
+        : nextAction === "mark_ready"
+          ? { ...binding, action: "mark_ready" as const }
+          : { ...binding, action: "reject" as const };
+      const transitioned = await requestClient.transitionCandidate(parent, request);
+      if (!isCurrentOperation()) return;
+      setCandidate(transitioned);
+      setCandidateStale(false);
+      setError(null);
     } catch (caught) {
-      await handleTransitionError("Candidate was not changed", caught);
-    } finally { setAction(null); }
+      if (!isCurrentOperation()) return;
+      await handleTransitionError("Candidate was not changed", caught, isCurrentContext);
+    } finally {
+      if (actionRef.current === nextAction) {
+        actionRef.current = null;
+        setAction(null);
+      }
+    }
+  }
+
+  async function editContent(content: TicketCandidate["content"]): Promise<boolean> {
+    const operation = "edit_content";
+    if (
+      !client
+      || !config
+      || !candidate
+      || candidateStale
+      || loadingRef.current
+      || actionRef.current !== null
+      || !isCurrentDisplayedCandidate(client, candidate, candidateId)
+    ) return false;
+    const parent = candidate;
+    const requestClient = client;
+    const requestRouteId = candidateId;
+    actionRef.current = operation;
+    setAction(operation);
+    const isCurrentContext = () => {
+      const current = currentContextRef.current;
+      return mountedRef.current
+        && actionRef.current === operation
+        && current.client === requestClient
+        && current.candidateId === requestRouteId;
+    };
+    const isCurrentOperation = () => {
+      const current = currentContextRef.current;
+      return isCurrentContext()
+        && current.candidate?.candidate_id === parent.candidate_id
+        && current.candidate.candidate_version === parent.candidate_version
+        && current.candidate.candidate_digest === parent.candidate_digest;
+    };
+    try {
+      const transitioned = await requestClient.transitionCandidate(parent, {
+        expected_candidate_id: parent.candidate_id,
+        expected_candidate_version: parent.candidate_version,
+        expected_candidate_digest: parent.candidate_digest,
+        expected_candidate_content_digest: parent.candidate_content_digest,
+        expected_evidence_manifest_digest: parent.evidence_manifest.manifest_digest,
+        action: "edit_content",
+        actor_id: config.reviewerId,
+        reason: "Reviewer corrected the candidate content.",
+        content,
+      });
+      if (!isCurrentOperation()) return false;
+      setCandidate(transitioned);
+      setCandidateStale(false);
+      setError(null);
+      return true;
+    } catch (caught) {
+      if (!isCurrentOperation()) return false;
+      await handleTransitionError("Candidate edits were not saved", caught, isCurrentContext);
+      return false;
+    } finally {
+      if (actionRef.current === operation) {
+        actionRef.current = null;
+        setAction(null);
+      }
+    }
   }
 
   async function resolveClarification(clarificationId: string, choiceId: string, resolutionNote?: string) {
-    if (!client || !config || !candidate) return;
-    setAction(`clarification:${clarificationId}`);
+    const operation = `clarification:${clarificationId}`;
+    if (
+      !client
+      || !config
+      || !candidate
+      || candidateStale
+      || loadingRef.current
+      || actionRef.current !== null
+      || !isCurrentDisplayedCandidate(client, candidate, candidateId)
+    ) return;
+    const parent = candidate;
+    const requestClient = client;
+    const requestRouteId = candidateId;
+    actionRef.current = operation;
+    setAction(operation);
+    const isCurrentContext = () => {
+      const current = currentContextRef.current;
+      return mountedRef.current
+        && actionRef.current === operation
+        && current.client === requestClient
+        && current.candidateId === requestRouteId;
+    };
+    const isCurrentOperation = () => {
+      const current = currentContextRef.current;
+      return isCurrentContext()
+        && current.candidate?.candidate_id === parent.candidate_id
+        && current.candidate.candidate_version === parent.candidate_version
+        && current.candidate.candidate_digest === parent.candidate_digest;
+    };
     try {
-      setCandidate(await client.transitionCandidate(candidate.candidate_id, {
-        expected_candidate_digest: candidate.candidate_digest,
-        candidate_version: candidate.candidate_version,
-        candidate_content_digest: candidate.candidate_content_digest,
-        evidence_manifest_digest: candidate.evidence_manifest.manifest_digest,
+      const transitioned = await requestClient.transitionCandidate(parent, {
+        expected_candidate_id: parent.candidate_id,
+        expected_candidate_version: parent.candidate_version,
+        expected_candidate_digest: parent.candidate_digest,
+        expected_candidate_content_digest: parent.candidate_content_digest,
+        expected_evidence_manifest_digest: parent.evidence_manifest.manifest_digest,
         action: "resolve_clarification",
         actor_id: config.reviewerId,
         reason: "Reviewer selected one bounded clarification choice.",
         clarification_id: clarificationId,
-        selected_choice_id: choiceId,
-        ...(resolutionNote ? { resolution_note: resolutionNote } : {}),
-      }));
+        choice_id: choiceId,
+        resolution_note: resolutionNote ?? null,
+      });
+      if (!isCurrentOperation()) return;
+      setCandidate(transitioned);
+      setCandidateStale(false);
+      setError(null);
       setClarificationDraft(null);
     } catch (caught) {
-      await handleTransitionError("Clarification was not saved", caught);
-    } finally { setAction(null); }
+      if (!isCurrentOperation()) return;
+      await handleTransitionError("Clarification was not saved", caught, isCurrentContext);
+    } finally {
+      if (actionRef.current === operation) {
+        actionRef.current = null;
+        setAction(null);
+      }
+    }
+  }
+
+  function confirmImmediateChoice(clarification: Clarification, choice: ClarificationChoice) {
+    Alert.alert(
+      `Choose “${choice.label}”?`,
+      `${choice.description}\n\nConsequence: ${choice.consequence}`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Choose",
+          onPress: () => void resolveClarification(clarification.clarification_id, choice.choice_id),
+        },
+      ],
+    );
   }
 
   async function shareHandoff(format: "json" | "markdown") {
-    if (!client || !candidate || candidate.state !== "approved" || candidate.candidate_id !== candidateId) return;
+    if (
+      !client
+      || !candidate
+      || candidateStale
+      || loadingRef.current
+      || handoffRequestRef.current !== null
+      || candidate.state !== "approved"
+      || candidate.candidate_id !== candidateId
+      || !isCurrentDisplayedCandidate(client, candidate, candidateId)
+    ) return;
     const candidateSnapshot = candidate;
     const requestBinding = `${candidateId}:${candidate.candidate_id}:${candidate.candidate_version}:${candidate.candidate_digest}`;
     const requestId = handoffRequestSequence.current + 1;
     handoffRequestSequence.current = requestId;
-    handoffRequestRef.current?.controller.abort();
     const controller = new AbortController();
     handoffRequestRef.current = { requestId, candidateBinding: requestBinding, controller };
     const isCurrentRequest = () => (
@@ -181,6 +431,9 @@ export default function CandidateRoute() {
       && !controller.signal.aborted
       && handoffRequestRef.current?.requestId === requestId
       && handoffRequestRef.current.candidateBinding === requestBinding
+      && currentContextRef.current.client === client
+      && currentContextRef.current.candidateId === candidateId
+      && currentContextRef.current.candidate?.candidate_digest === candidateSnapshot.candidate_digest
     );
     setHandoffAction(format);
     setHandoffError(null);
@@ -221,12 +474,23 @@ export default function CandidateRoute() {
     }
   }
 
-  if (loading && !candidate) return <View style={{ flex: 1, justifyContent: "center" }}><ActivityIndicator /></View>;
-  if (!candidate || !client) return <ScrollView contentInsetAdjustmentBehavior="automatic"><MessageState title="Candidate unavailable" detail={error ?? "The candidate was not found."} /></ScrollView>;
+  if (loading && !candidate) return <View accessible accessibilityLabel="Loading ticket candidate" accessibilityRole="progressbar" style={{ flex: 1, justifyContent: "center" }}><ActivityIndicator /></View>;
+  if (!candidate || !client) return (
+    <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 16, gap: 12 }}>
+      <MessageState title="Candidate unavailable" detail={error ?? "The candidate was not found."} />
+      {client && candidateId ? <ActionButton label="Retry candidate" loading={loading} onPress={() => void load()} /> : null}
+    </ScrollView>
+  );
   const unresolved = candidate.content.clarifications.filter((item) => item.status === "unresolved");
+  const resolved = candidate.content.clarifications.filter((item) => item.status === "resolved");
+  const actionsDisabled = candidateStale || loading || action !== null;
 
   return (
-    <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 16, gap: 14 }}>
+    <ScrollView
+      contentInsetAdjustmentBehavior="automatic"
+      refreshControl={<RefreshControl refreshing={loading} onRefresh={() => { if (actionRef.current === null) void load(); }} />}
+      contentContainerStyle={{ padding: 16, gap: 14 }}
+    >
       <View style={{ gap: 8 }}>
         <View style={{ flexDirection: "row", justifyContent: "space-between", gap: 12, alignItems: "flex-start" }}>
           <Text selectable style={{ color: colors.label, fontSize: 24, lineHeight: 29, fontWeight: "800", flex: 1 }}>{candidate.content.title}</Text>
@@ -236,13 +500,44 @@ export default function CandidateRoute() {
         <Text selectable style={{ color: colors.tertiaryLabel }}>Version {candidate.candidate_version} · {candidate.content.priority} · confidence {candidate.content.uncertainty.overall_confidence}</Text>
       </View>
 
-      <CandidateEvidencePanel
+      {candidateStale || error ? (
+        <SectionCard title={loading ? "Checking current version" : "Current version not verified"}>
+          <Text selectable style={{ color: colors.orange, fontWeight: "700", lineHeight: 20 }}>
+            {loading
+              ? "Review actions are temporarily locked while Tacua refreshes this ticket."
+              : "Review actions are locked because Tacua could not verify that this is the current ticket version."}
+          </Text>
+          {error ? <Text selectable style={{ color: colors.secondaryLabel, lineHeight: 20 }}>{error}</Text> : null}
+          <ActionButton
+            label="Refresh ticket"
+            disabled={loading || action !== null}
+            loading={loading}
+            onPress={() => { void load(); }}
+          />
+        </SectionCard>
+      ) : null}
+
+      <CandidateEditCard
         candidate={candidate}
-        client={client}
+        disabled={actionsDisabled}
+        saving={action === "edit_content"}
+        onSave={editContent}
+      />
+
+      <CandidateEvidencePanel
+        activeKeyframeIndex={activeKeyframeIndex}
+        activePreviewState={activePreviewState}
         evidence={evidence}
         error={evidenceError}
-        loading={evidenceLoading}
-        onInspectionStateChange={setEvidenceInspectionReady}
+        inspectedKeyframeCount={inspectedKeyframeCount}
+        keyframes={keyframes}
+        loading={evidenceLoading || loading}
+        retryDisabled={actionsDisabled}
+        onRetry={() => { if (actionRef.current === null) void load(); }}
+        onRetryActivePreview={retryActivePreview}
+        onShowNextKeyframe={showNextKeyframe}
+        onShowPreviousKeyframe={showPreviousKeyframe}
+        onKeyframeDecodeStateChange={setKeyframeDecoded}
       />
 
       <SectionCard title="Observed">
@@ -309,44 +604,48 @@ export default function CandidateRoute() {
         return (
           <SectionCard key={clarification.clarification_id} title={clarification.impact === "blocking" ? "Decision required" : "Clarification"}>
             <Text selectable style={{ color: colors.label, fontSize: 16 }}>{clarification.question}</Text>
-            {clarification.choices.map((choice) => (
-              <Pressable
-                key={choice.choice_id}
-                accessibilityRole="radio"
-                accessibilityHint={choice.requires_note ? "Requires a short explanation before saving." : undefined}
-                accessibilityState={{ checked: draft?.choiceId === choice.choice_id, busy: action === `clarification:${clarification.clarification_id}` }}
-                disabled={action !== null}
-                onPress={() => {
-                  if (choice.requires_note) {
-                    setClarificationDraft({ clarificationId: clarification.clarification_id, choiceId: choice.choice_id, note: "" });
-                  } else {
-                    setClarificationDraft(null);
-                    void resolveClarification(clarification.clarification_id, choice.choice_id);
-                  }
-                }}
-                style={({ pressed }) => ({
-                  borderColor: draft?.choiceId === choice.choice_id ? colors.primary : colors.separator,
-                  borderWidth: draft?.choiceId === choice.choice_id ? 2 : 1,
-                  borderRadius: 12,
-                  borderCurve: "continuous",
-                  padding: 12,
-                  gap: 4,
-                  opacity: action !== null ? 0.5 : pressed ? 0.65 : 1,
-                })}
-              >
-                <ChoicePreview choice={choice} />
-                <Text selectable style={{ color: colors.label, fontWeight: "700" }}>{choice.label}</Text>
-                <Text selectable style={{ color: colors.secondaryLabel }}>{choice.description}</Text>
-                <Text selectable style={{ color: colors.secondaryLabel }}>{choice.consequence}</Text>
-                {choice.requires_note ? <Text selectable style={{ color: colors.orange, fontSize: 13, fontWeight: "700" }}>Explanation required</Text> : null}
-              </Pressable>
-            ))}
+            <View accessibilityRole="radiogroup" style={{ gap: 12 }}>
+              {clarification.choices.map((choice) => (
+                <Pressable
+                  key={choice.choice_id}
+                  accessibilityLabel={clarificationChoiceAccessibilityLabel(choice)}
+                  accessibilityRole="radio"
+                  accessibilityHint={choice.requires_note ? "Requires a short explanation before saving." : undefined}
+                  accessibilityState={{ checked: draft?.choiceId === choice.choice_id, busy: action === `clarification:${clarification.clarification_id}`, disabled: actionsDisabled }}
+                  disabled={actionsDisabled}
+                  onPress={() => {
+                    if (choice.requires_note) {
+                      setClarificationDraft({ clarificationId: clarification.clarification_id, choiceId: choice.choice_id, note: "" });
+                    } else {
+                      setClarificationDraft(null);
+                      confirmImmediateChoice(clarification, choice);
+                    }
+                  }}
+                  style={({ pressed }) => ({
+                    borderColor: draft?.choiceId === choice.choice_id ? colors.primary : colors.separator,
+                    borderWidth: draft?.choiceId === choice.choice_id ? 2 : 1,
+                    borderRadius: 12,
+                    borderCurve: "continuous",
+                    padding: 12,
+                    gap: 4,
+                    opacity: actionsDisabled ? 0.5 : pressed ? 0.65 : 1,
+                  })}
+                >
+                  <ChoicePreview choice={choice} previewStates={previewStates} />
+                  <Text selectable style={{ color: colors.label, fontWeight: "700" }}>{choice.label}</Text>
+                  <Text selectable style={{ color: colors.secondaryLabel }}>{choice.description}</Text>
+                  <Text selectable style={{ color: colors.secondaryLabel }}>{choice.consequence}</Text>
+                  {choice.requires_note ? <Text selectable style={{ color: colors.orange, fontSize: 13, fontWeight: "700" }}>Explanation required</Text> : null}
+                </Pressable>
+              ))}
+            </View>
             {draft && selectedChoice?.requires_note ? (
               <View style={{ gap: 8 }}>
                 <Text nativeID={`clarification-note-${clarification.clarification_id}`} style={{ color: colors.label, fontWeight: "700" }}>
                   Why choose “{selectedChoice.label}”?
                 </Text>
                 <TextInput
+                  accessibilityLabel={`Why choose ${selectedChoice.label}?`}
                   accessibilityLabelledBy={`clarification-note-${clarification.clarification_id}`}
                   multiline
                   maxLength={2048}
@@ -370,7 +669,7 @@ export default function CandidateRoute() {
                 />
                 <ActionButton
                   label="Save choice and explanation"
-                  disabled={!draft.note.trim()}
+                  disabled={!draft.note.trim() || actionsDisabled}
                   loading={action === `clarification:${clarification.clarification_id}`}
                   onPress={() => void resolveClarification(clarification.clarification_id, draft.choiceId, draft.note.trim())}
                 />
@@ -380,6 +679,33 @@ export default function CandidateRoute() {
         );
       })}
 
+      {resolved.length ? (
+        <SectionCard title="Decisions made">
+          {resolved.map((clarification) => {
+            const selectedChoice = clarification.choices.find(
+              (choice) => choice.choice_id === clarification.selected_choice_id,
+            );
+            return (
+              <View key={clarification.clarification_id} style={{ borderTopColor: colors.separator, borderTopWidth: 1, paddingTop: 10, gap: 7 }}>
+                <Text selectable style={{ color: colors.label, fontSize: 16, lineHeight: 22 }}>{clarification.question}</Text>
+                {selectedChoice ? (
+                  <>
+                    <ChoicePreview choice={selectedChoice} previewStates={previewStates} />
+                    <Text selectable style={{ color: colors.primary, fontWeight: "800" }}>{selectedChoice.label}</Text>
+                    <Text selectable style={{ color: colors.secondaryLabel, lineHeight: 20 }}>{selectedChoice.consequence}</Text>
+                  </>
+                ) : (
+                  <Text selectable style={{ color: colors.orange }}>The selected choice is unavailable in this ticket version.</Text>
+                )}
+                {clarification.resolution_note ? (
+                  <Text selectable style={{ color: colors.secondaryLabel, lineHeight: 20 }}>Reviewer note: {clarification.resolution_note}</Text>
+                ) : null}
+              </View>
+            );
+          })}
+        </SectionCard>
+      ) : null}
+
       {candidate.state === "ready_for_review" ? (
         <SectionCard title="Exact version to approve">
           <Text selectable style={{ color: colors.label, fontVariant: ["tabular-nums"] }}>Candidate version {candidate.candidate_version}</Text>
@@ -388,7 +714,7 @@ export default function CandidateRoute() {
           <Text selectable style={{ color: colors.tertiaryLabel, fontSize: 12 }}>{candidate.evidence_manifest.evidence_ids.length} evidence items are bound to this version.</Text>
           {!evidenceInspectionReady ? (
             <Text selectable style={{ color: colors.orange, fontSize: 13, fontWeight: "700" }}>
-              Approval unlocks after the bound screenshot has loaded and passed its integrity checks.
+              Approval unlocks after every content-referenced available screenshot passes its digest check and decodes in the gallery ({keyframes.length} found).
             </Text>
           ) : null}
         </SectionCard>
@@ -414,36 +740,53 @@ export default function CandidateRoute() {
           <ActionButton
             label="Share Markdown handoff"
             loading={handoffAction === "markdown"}
-            disabled={handoffAction !== null}
+            disabled={handoffAction !== null || candidateStale || loading}
             onPress={() => void shareHandoff("markdown")}
           />
           <ActionButton
             label="Share JSON handoff"
             loading={handoffAction === "json"}
-            disabled={handoffAction !== null}
+            disabled={handoffAction !== null || candidateStale || loading}
             onPress={() => void shareHandoff("json")}
           />
         </SectionCard>
       ) : null}
 
       <View style={{ gap: 10, paddingTop: 4 }}>
-        {candidate.state === "draft" || candidate.state === "needs_clarification" ? <ActionButton label="Mark ready for review" disabled={unresolved.some((item) => item.impact === "blocking")} loading={action === "mark_ready"} onPress={() => void transition("mark_ready", "Reviewer completed candidate preparation.")} /> : null}
-        {candidate.state === "ready_for_review" ? <ActionButton label="Approve exact version" disabled={!evidenceInspectionReady || evidenceLoading || evidenceError !== null} loading={action === "approve"} onPress={() => Alert.alert("Approve this ticket?", "Approval binds this exact candidate and evidence and atomically creates its immutable handoff. The handoff is not authenticated execution trust by itself.", [{ text: "Cancel", style: "cancel" }, { text: "Approve", onPress: () => void transition("approve", "Reviewer approved the exact candidate version.") }])} /> : null}
-        {candidate.state === "needs_clarification" || candidate.state === "ready_for_review" ? <ActionButton destructive label="Reject candidate" loading={action === "reject"} onPress={() => Alert.alert("Reject this candidate?", undefined, [{ text: "Cancel", style: "cancel" }, { text: "Reject", style: "destructive", onPress: () => void transition("reject", "Reviewer rejected the candidate.") }])} /> : null}
+        {candidate.state === "draft" || candidate.state === "needs_clarification" ? <ActionButton label="Mark ready for review" disabled={actionsDisabled || unresolved.some((item) => item.impact === "blocking")} loading={action === "mark_ready"} onPress={() => void transition("mark_ready", "Reviewer completed candidate preparation.")} /> : null}
+        {candidate.state === "ready_for_review" ? <ActionButton label="Approve exact version" disabled={actionsDisabled || !evidenceInspectionReady || evidenceLoading || evidenceError !== null} loading={action === "approve"} onPress={() => Alert.alert("Approve this ticket?", "Approval binds this exact candidate and evidence and atomically creates its immutable handoff. The handoff is not authenticated execution trust by itself.", [{ text: "Cancel", style: "cancel" }, { text: "Approve", onPress: () => void transition("approve", "Reviewer approved the exact candidate version.") }])} /> : null}
+        {candidate.state === "needs_clarification" || candidate.state === "ready_for_review" ? <ActionButton destructive label="Reject candidate" disabled={actionsDisabled} loading={action === "reject"} onPress={() => Alert.alert("Reject this candidate?", undefined, [{ text: "Cancel", style: "cancel" }, { text: "Reject", style: "destructive", onPress: () => void transition("reject", "Reviewer rejected the candidate.") }])} /> : null}
       </View>
     </ScrollView>
   );
 }
 
-function ChoicePreview({ choice }: { readonly choice: TicketCandidate["content"]["clarifications"][number]["choices"][number] }) {
+function ChoicePreview({
+  choice,
+  previewStates,
+}: {
+  readonly choice: ClarificationChoice;
+  readonly previewStates: KeyframePreviewStates;
+}) {
   const presentation = choice.presentation;
   if (presentation.kind === "color_swatch" && presentation.value) {
-    return <View accessibilityLabel={`Colour ${presentation.value}`} style={{ width: 42, height: 42, borderRadius: 10, borderCurve: "continuous", borderColor: colors.separator, borderWidth: 1, backgroundColor: presentation.value }} />;
+    return <View accessibilityElementsHidden importantForAccessibility="no" style={{ width: 42, height: 42, borderRadius: 10, borderCurve: "continuous", borderColor: colors.separator, borderWidth: 1, backgroundColor: presentation.value }} />;
   }
   if (presentation.kind === "evidence_thumbnail" && presentation.evidence_ref) {
+    const previewState: KeyframePreviewState | undefined = previewStates[presentation.evidence_ref];
+    const status = previewState?.status === "ready"
+      ? "This digest-verified screenshot is open in the evidence gallery"
+      : previewState?.status === "loading"
+        ? "Loading this screenshot in the evidence gallery"
+        : previewState?.status === "error"
+          ? "Evidence screenshot unavailable"
+          : "View this screenshot in the evidence gallery";
     return (
       <View style={{ minHeight: 58, borderRadius: 10, borderCurve: "continuous", borderColor: colors.separator, borderWidth: 1, backgroundColor: colors.groupedBackground, padding: 10, justifyContent: "center" }}>
-        <Text selectable style={{ color: colors.primary, fontWeight: "700" }}>Evidence preview</Text>
+        <Text selectable style={{ color: previewState?.status === "error" ? colors.orange : colors.primary, fontWeight: "700" }}>
+          {status}
+        </Text>
+        {previewState?.status === "error" ? <Text selectable style={{ color: colors.secondaryLabel, fontSize: 12 }}>{previewState.message}</Text> : null}
         <Text selectable style={{ color: colors.tertiaryLabel, fontSize: 12 }}>{presentation.evidence_ref}</Text>
       </View>
     );
@@ -452,4 +795,16 @@ function ChoicePreview({ choice }: { readonly choice: TicketCandidate["content"]
     return <Text selectable style={{ color: colors.primary, fontSize: presentation.kind === "text" ? 20 : 16, fontWeight: "800" }}>{presentation.value}</Text>;
   }
   return null;
+}
+
+function clarificationChoiceAccessibilityLabel(choice: ClarificationChoice): string {
+  const presentation = choice.presentation;
+  const presentationDetail = presentation.value
+    ? presentation.kind === "color_swatch"
+      ? ` Colour ${presentation.value}.`
+      : ` Preview value ${presentation.value}.`
+    : presentation.evidence_ref
+      ? ` Evidence ${presentation.evidence_ref}.`
+      : "";
+  return `${choice.label}. ${choice.description}. Consequence: ${choice.consequence}.${presentationDetail}`;
 }

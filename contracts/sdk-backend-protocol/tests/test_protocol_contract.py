@@ -263,6 +263,17 @@ class ProtocolContractTests(unittest.TestCase):
             )
         self.assertEqual(caught.exception.code, "DUPLICATE_CREDENTIAL_ID")
 
+    def test_launch_chain_enforces_credential_history_bound(self) -> None:
+        pair = (load("launch-exchange-request.json"), load("launch-exchange-receipt.json"))
+        with self.assertRaises(protocol.ContractError) as caught:
+            protocol.validate_launch_chain(
+                load("build-identity.json"),
+                load("capture-scope.json"),
+                [pair] * (protocol.MAX_SESSION_CREDENTIALS + 1),
+            )
+        self.assertEqual(protocol.MAX_SESSION_CREDENTIALS, 64)
+        self.assertEqual(caught.exception.code, "CREDENTIAL_ROTATION_LIMIT_REACHED")
+
     def test_launch_chain_rejects_completed_to_receiving_regression(self) -> None:
         completed_request = load("completed-resume-request.json")
         completed_receipt = load("completed-resume-receipt.json")

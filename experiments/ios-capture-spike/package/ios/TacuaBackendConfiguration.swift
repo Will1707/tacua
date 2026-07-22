@@ -2,12 +2,91 @@
 
 import Foundation
 
+enum TacuaQABuildConfigurationError: Error, Equatable {
+  case captureNotEnabled
+  case invalidCaptureFlag
+  case invalidBuildVariant
+  case invalidDistribution
+  case unsupportedBuildPair
+  case developmentBuildRequiresDebug
+}
+
+struct TacuaQABuildConfiguration: Equatable {
+  static let enabledInfoPlistKey = "TacuaCaptureEnabled"
+  static let buildVariantInfoPlistKey = "TacuaCaptureBuildVariant"
+  static let distributionInfoPlistKey = "TacuaCaptureDistribution"
+
+  let buildVariant: String
+  let distribution: String
+
+  init(
+    captureEnabled: Bool,
+    buildVariant: String,
+    distribution: String,
+    debugBuild: Bool
+  ) throws {
+    guard captureEnabled else {
+      throw TacuaQABuildConfigurationError.captureNotEnabled
+    }
+    guard buildVariant == "development" || buildVariant == "preview" else {
+      throw TacuaQABuildConfigurationError.invalidBuildVariant
+    }
+    guard ["local", "internal", "testflight"].contains(distribution) else {
+      throw TacuaQABuildConfigurationError.invalidDistribution
+    }
+    guard !(
+      (buildVariant == "development" && distribution == "testflight")
+        || (buildVariant == "preview" && distribution == "local")
+    ) else {
+      throw TacuaQABuildConfigurationError.unsupportedBuildPair
+    }
+    if buildVariant == "development" && !debugBuild {
+      throw TacuaQABuildConfigurationError.developmentBuildRequiresDebug
+    }
+    self.buildVariant = buildVariant
+    self.distribution = distribution
+  }
+
+  static func fromBuildConfiguration(
+    bundle: Bundle = .main,
+    debugBuild: Bool = _isDebugAssertConfiguration()
+  ) throws -> TacuaQABuildConfiguration {
+    let rawEnabled = bundle.object(forInfoDictionaryKey: enabledInfoPlistKey)
+    guard rawEnabled != nil else {
+      throw TacuaQABuildConfigurationError.captureNotEnabled
+    }
+    guard let captureEnabled = rawEnabled as? Bool else {
+      throw TacuaQABuildConfigurationError.invalidCaptureFlag
+    }
+    guard captureEnabled else {
+      throw TacuaQABuildConfigurationError.captureNotEnabled
+    }
+    guard let buildVariant = bundle.object(
+      forInfoDictionaryKey: buildVariantInfoPlistKey
+    ) as? String else {
+      throw TacuaQABuildConfigurationError.invalidBuildVariant
+    }
+    guard let distribution = bundle.object(
+      forInfoDictionaryKey: distributionInfoPlistKey
+    ) as? String else {
+      throw TacuaQABuildConfigurationError.invalidDistribution
+    }
+    return try TacuaQABuildConfiguration(
+      captureEnabled: captureEnabled,
+      buildVariant: buildVariant,
+      distribution: distribution,
+      debugBuild: debugBuild
+    )
+  }
+}
+
 enum TacuaBackendConfigurationError: Error, Equatable {
   case missingBuildConfiguration
   case invalidOrigin
   case insecureOrigin
   case loopbackDevelopmentOnly
   case invalidPathSegment
+  case buildIdentityMismatch
 }
 
 struct TacuaBackendConfiguration: Equatable {
@@ -18,11 +97,15 @@ struct TacuaBackendConfiguration: Equatable {
   let origin: URL
   let normalizedOrigin: String
   let configurationDigest: String
+  /// Present for the real app-bundle configuration path. Direct construction is retained for
+  /// isolated protocol tests and non-bundle tooling, which do not have an Info.plist authority.
+  let qaBuildConfiguration: TacuaQABuildConfiguration?
 
   init(
     buildConfiguredOrigin: String,
     allowInsecureLoopback: Bool,
-    debugBuild: Bool
+    debugBuild: Bool,
+    qaBuildConfiguration: TacuaQABuildConfiguration? = nil
   ) throws {
     guard var components = URLComponents(string: buildConfiguredOrigin),
       let rawScheme = components.scheme,
@@ -71,6 +154,7 @@ struct TacuaBackendConfiguration: Equatable {
     }
     origin = normalizedURL
     normalizedOrigin = normalized
+    self.qaBuildConfiguration = qaBuildConfiguration
     configurationDigest = try TacuaCanonicalJSON.digest(
       .object([
         "backend_origin": .string(normalized),
@@ -83,6 +167,10 @@ struct TacuaBackendConfiguration: Equatable {
     bundle: Bundle = .main,
     debugBuild: Bool = _isDebugAssertConfiguration()
   ) throws -> TacuaBackendConfiguration {
+    let qaBuildConfiguration = try TacuaQABuildConfiguration.fromBuildConfiguration(
+      bundle: bundle,
+      debugBuild: debugBuild
+    )
     guard let origin = bundle.object(forInfoDictionaryKey: originInfoPlistKey) as? String,
       !origin.isEmpty
     else {
@@ -93,8 +181,23 @@ struct TacuaBackendConfiguration: Equatable {
     return try TacuaBackendConfiguration(
       buildConfiguredOrigin: origin,
       allowInsecureLoopback: allowInsecureLoopback,
-      debugBuild: debugBuild
+      debugBuild: debugBuild,
+      qaBuildConfiguration: qaBuildConfiguration
     )
+  }
+
+  /// Prevents caller-supplied JSON from claiming a different build channel than the native
+  /// Info.plist compiled into the QA build. This check is deliberately independent of the
+  /// protocol schema validation: the schema proves that values are allowed, while this proves
+  /// that they describe this binary.
+  func validateBuildIdentityBinding(_ buildIdentity: TacuaJSONValue) throws {
+    guard let qaBuildConfiguration else { return }
+    guard let object = buildIdentity.objectValue,
+      object["build_variant"]?.stringValue == qaBuildConfiguration.buildVariant,
+      object["distribution"]?.stringValue == qaBuildConfiguration.distribution
+    else {
+      throw TacuaBackendConfigurationError.buildIdentityMismatch
+    }
   }
 
   func endpoint(pathSegments: [String]) throws -> URL {

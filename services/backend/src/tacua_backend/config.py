@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Mounted-file configuration for the self-hosted Tacua backend."""
 
 from __future__ import annotations
@@ -22,6 +24,10 @@ BUNDLE_ID_PATTERN = re.compile(
 )
 DIGEST_PATTERN = re.compile(r"^sha256:[a-f0-9]{64}$")
 TRANSPORT_POLICY_VERSION = "tacua.sdk-transport@1.0.0"
+MAX_CONFIG_BYTES = 2_097_152
+MAX_CONFIG_JSON_NESTING_DEPTH = 64
+MAX_ADMIN_SECRET_FILE_BYTES = 4_098
+MAX_SAFE_INTEGER = 9_007_199_254_740_991
 APPROVED_HANDOFF_KEYS = frozenset(
     {"build_identity", "authority", "registry_revision"}
 )
@@ -195,6 +201,75 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _reject_json_float(_value: str) -> None:
+    raise ConfigError("config file contains a floating-point number")
+
+
+def _parse_json_integer(value: str) -> int:
+    digits = value[1:] if value.startswith("-") else value
+    if len(digits) > 16:
+        raise ConfigError("config file contains an unsafe integer")
+    result = int(value)
+    if abs(result) > MAX_SAFE_INTEGER:
+        raise ConfigError("config file contains an unsafe integer")
+    return result
+
+
+def _contains_unicode_surrogate(value: str) -> bool:
+    return any(0xD800 <= ord(character) <= 0xDFFF for character in value)
+
+
+def _validate_json_strings(value: Any) -> None:
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    while stack:
+        child, depth = stack.pop()
+        if depth > MAX_CONFIG_JSON_NESTING_DEPTH:
+            raise ConfigError("config file exceeds the safe JSON nesting depth")
+        if isinstance(child, str):
+            if _contains_unicode_surrogate(child):
+                raise ConfigError("config file contains an invalid Unicode surrogate")
+            if unicodedata.normalize("NFC", child) != child:
+                raise ConfigError("config file contains non-NFC text")
+        elif isinstance(child, list):
+            stack.extend((item, depth + 1) for item in child)
+        elif isinstance(child, dict):
+            for key, item in child.items():
+                if _contains_unicode_surrogate(key):
+                    raise ConfigError(
+                        "config file contains an invalid Unicode surrogate in an object key"
+                    )
+                if unicodedata.normalize("NFC", key) != key:
+                    raise ConfigError("config file contains a non-NFC object key")
+                stack.append((item, depth + 1))
+
+
+def _parse_config_json(serialized: str) -> dict[str, Any]:
+    if serialized.startswith("\ufeff"):
+        raise ConfigError("config file must not contain a UTF-8 BOM")
+    if _contains_unicode_surrogate(serialized):
+        raise ConfigError("config file contains an invalid Unicode surrogate")
+    if len(serialized.encode("utf-8")) > MAX_CONFIG_BYTES:
+        raise ConfigError("config file exceeds the 2 MiB limit")
+    try:
+        raw = json.loads(
+            serialized,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                ConfigError("non-finite numbers are forbidden")
+            ),
+            parse_float=_reject_json_float,
+            parse_int=_parse_json_integer,
+        )
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"config file is not valid JSON: {exc.msg}") from exc
+    except RecursionError as exc:
+        raise ConfigError("config file exceeds the safe JSON nesting depth") from exc
+    if not isinstance(raw, dict):
+        raise ConfigError("config file root must be an object")
+    _validate_json_strings(raw)
+    return raw
+
+
 def validate_approved_handoff_config(config: PilotConfig) -> None:
     approved_handoff = config.approved_handoff
     if not isinstance(approved_handoff, dict):
@@ -265,19 +340,9 @@ def validate_approved_handoff_config(config: PilotConfig) -> None:
         )
 
 
-def load_config(config_file: Path, admin_secret_file: Path) -> tuple[PilotConfig, bytes]:
-    """Load public configuration and the administrator/verifier root secret."""
+def _config_from_document(raw: dict[str, Any]) -> PilotConfig:
+    """Validate one already strict-decoded public configuration document."""
 
-    try:
-        raw = json.loads(
-            config_file.read_text(encoding="utf-8"),
-            object_pairs_hook=_reject_duplicate_keys,
-            parse_constant=lambda _value: (_ for _ in ()).throw(ConfigError("non-finite numbers are forbidden")),
-        )
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ConfigError(f"cannot load config file: {exc}") from exc
-    if not isinstance(raw, dict):
-        raise ConfigError("config file root must be an object")
     allowed_keys = {
         "organization_id",
         "project_id",
@@ -329,6 +394,10 @@ def load_config(config_file: Path, admin_secret_file: Path) -> tuple[PilotConfig
 
     raw_days = _bounded_int(raw, "raw_retention_days", 30, 1, 30)
     derived_days = _bounded_int(raw, "derived_retention_days", 30, 1, 30)
+    if raw_days != derived_days:
+        raise ConfigError(
+            "V1 raw and derived retention periods must use one session boundary"
+        )
     config = PilotConfig(
         **ids,
         reviewer_id=reviewer_id,
@@ -337,7 +406,11 @@ def load_config(config_file: Path, admin_secret_file: Path) -> tuple[PilotConfig
         consent_contract=_required_text(raw, "consent_contract", 128),
         backend_origin=normalize_backend_origin(_required_text(raw, "backend_origin", 2048)),
         state_directory=state_directory,
-        listen_host=str(raw.get("listen_host", "127.0.0.1")),
+        listen_host=_required_text(
+            {"listen_host": raw.get("listen_host", "127.0.0.1")},
+            "listen_host",
+            255,
+        ),
         listen_port=_bounded_int(raw, "listen_port", 8080, 1, 65535),
         launch_code_ttl_seconds=_bounded_int(raw, "launch_code_ttl_seconds", 300, 30, 3600),
         credential_ttl_seconds=_bounded_int(raw, "credential_ttl_seconds", 2_592_000, 300, 2_592_000),
@@ -351,17 +424,67 @@ def load_config(config_file: Path, admin_secret_file: Path) -> tuple[PilotConfig
         transport_policy_version=policy,
     )
     validate_approved_handoff_config(config)
+    return config
+
+
+def parse_config_text(serialized: str) -> PilotConfig:
+    """Parse public config with the exact validation used by backend startup."""
+
+    if not isinstance(serialized, str):
+        raise ConfigError("config file must be UTF-8 text")
+    return _config_from_document(_parse_config_json(serialized))
+
+
+def load_public_config(config_file: Path) -> PilotConfig:
+    """Load only public configuration; this never reads secrets or opens state."""
 
     try:
-        secret = admin_secret_file.read_bytes().rstrip(b"\r\n")
+        with config_file.open("rb") as stream:
+            payload = stream.read(MAX_CONFIG_BYTES + 1)
     except OSError as exc:
-        raise ConfigError(f"cannot load admin secret file: {exc}") from exc
+        raise ConfigError(f"cannot load config file: {exc}") from exc
+    if len(payload) > MAX_CONFIG_BYTES:
+        raise ConfigError("config file exceeds the 2 MiB limit")
+    try:
+        serialized = payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ConfigError("config file must be strict UTF-8") from exc
+    return parse_config_text(serialized)
+
+
+def parse_admin_secret(payload: bytes) -> bytes:
+    """Validate one bounded mounted administrator secret payload."""
+
+    if not isinstance(payload, bytes) or len(payload) > MAX_ADMIN_SECRET_FILE_BYTES:
+        raise ConfigError("admin secret file exceeds the 4098-byte limit")
+    secret = payload.rstrip(b"\r\n")
     if not 32 <= len(secret) <= 4096:
         raise ConfigError("admin secret must contain from 32 through 4096 bytes")
     try:
-        secret_text = secret.decode("utf-8")
+        secret_text = secret.decode("ascii")
     except UnicodeDecodeError as exc:
-        raise ConfigError("admin secret must be a UTF-8 bearer token") from exc
-    if any(character.isspace() for character in secret_text):
-        raise ConfigError("admin secret must not contain whitespace")
-    return config, secret
+        raise ConfigError("admin secret must be an ASCII RFC 7235 token68 value") from exc
+    if re.fullmatch(r"[A-Za-z0-9._~+/-]+={0,2}", secret_text) is None:
+        raise ConfigError(
+            "admin secret must be an ASCII RFC 7235 token68 value with padding only at the end"
+        )
+    return secret
+
+
+def load_admin_secret(admin_secret_file: Path) -> bytes:
+    """Read the mounted administrator secret without an unbounded allocation."""
+
+    try:
+        with admin_secret_file.open("rb") as stream:
+            payload = stream.read(MAX_ADMIN_SECRET_FILE_BYTES + 1)
+    except OSError as exc:
+        raise ConfigError(f"cannot load admin secret file: {exc}") from exc
+    return parse_admin_secret(payload)
+
+
+def load_config(config_file: Path, admin_secret_file: Path) -> tuple[PilotConfig, bytes]:
+    """Load public configuration and the administrator/verifier root secret."""
+
+    config = load_public_config(config_file)
+
+    return config, load_admin_secret(admin_secret_file)

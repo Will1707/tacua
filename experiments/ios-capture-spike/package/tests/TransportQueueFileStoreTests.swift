@@ -50,11 +50,43 @@ enum TransportQueueFileStoreTests {
     defer { try? FileManager.default.removeItem(at: temporary) }
     let store = try TacuaTransportQueueFileStore(rootDirectory: temporary)
     try atomicallyPersistsAndLoads(store, root: temporary)
+    try discoveryListsOnlySafeQueuePaths(store, root: temporary)
     try compareAndSwapRejectsStaleSnapshots(store)
     try rewritesLegacyQueueAfterMigration(store)
     try startupRecoveryDrainsRevokedCredentialJournal(store)
     try payloadRemovalIsStrictlySessionScoped(temporary)
     print("Tacua transport queue file-store tests passed")
+  }
+
+  private static func discoveryListsOnlySafeQueuePaths(
+    _ store: TacuaTransportQueueFileStore,
+    root: URL
+  ) throws {
+    let external = root.appendingPathComponent("outside-target")
+    try Data("not-a-queue".utf8).write(to: external)
+    try Data("noise".utf8).write(to: root.appendingPathComponent("unrelated.json"))
+    let initialIDs = try store.listLocalSessionIDs()
+    try require(
+      initialIDs == ["session_store_001"],
+      "Queue discovery admitted an unrelated path"
+    )
+    let symlink = root.appendingPathComponent("local_symlink_001.queue-v2.json")
+    try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: external)
+    try expectFailure { _ = try store.listLocalSessionIDs() }
+    try FileManager.default.removeItem(at: symlink)
+    let directory = root.appendingPathComponent("local_directory_001.queue-v2.json")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+    try expectFailure { _ = try store.listLocalSessionIDs() }
+    try FileManager.default.removeItem(at: directory)
+    let hardlink = root.appendingPathComponent("local_hardlink_001.queue-v2.json")
+    try FileManager.default.linkItem(at: external, to: hardlink)
+    try expectFailure { _ = try store.listLocalSessionIDs() }
+    try FileManager.default.removeItem(at: hardlink)
+    let recoveredIDs = try store.listLocalSessionIDs()
+    try require(
+      recoveredIDs == ["session_store_001"],
+      "Queue discovery did not recover after unsafe paths were removed"
+    )
   }
 
   private static func atomicallyPersistsAndLoads(
@@ -164,11 +196,11 @@ enum TransportQueueFileStoreTests {
     let url = try store.queueURL(localSessionID: "session_legacy_001")
     try legacy.write(to: url, options: .atomic)
     let migrated = try store.load(localSessionID: "session_legacy_001")
-    try require(migrated?.schemaVersion == 3, "Store load must migrate queue v1 to v3")
+    try require(migrated?.schemaVersion == 4, "Store load must migrate queue v1 to v4")
     try require(migrated?.credentialCapability == .requiresExchange, "Migration must discard legacy authority")
     let rewritten = try Data(contentsOf: url)
     let object = try JSONSerialization.jsonObject(with: rewritten) as? [String: Any]
-    try require(object?["schemaVersion"] as? Int == 3, "Migration must be persisted atomically")
+    try require(object?["schemaVersion"] as? Int == 4, "Migration must be persisted atomically")
   }
 
   private static func payloadRemovalIsStrictlySessionScoped(_ root: URL) throws {
@@ -217,6 +249,31 @@ enum TransportQueueFileStoreTests {
       FileManager.default.fileExists(atPath: wrongDigestFile.path),
       "A digest mismatch must preserve the file"
     )
+
+    let syncFailureFile = session.appendingPathComponent("sync-failure.mov")
+    try payloadData.write(to: syncFailureFile)
+    let syncFailureRemover = try TacuaScopedPayloadRemover(
+      sessionDirectory: session,
+      directorySynchronizer: { _ in false }
+    )
+    try expectFailure {
+      try syncFailureRemover.removePayload(TacuaLocalPayloadBinding(
+        role: .segmentMedia,
+        relativePath: "sync-failure.mov",
+        contentDigest: binding.contentDigest
+      ))
+    }
+    try require(
+      !FileManager.default.fileExists(atPath: syncFailureFile.path),
+      "Directory-sync fault injection did not occur after unlink"
+    )
+    try expectFailure {
+      try syncFailureRemover.removePayload(TacuaLocalPayloadBinding(
+        role: .segmentMedia,
+        relativePath: "already-absent.mov",
+        contentDigest: binding.contentDigest
+      ))
+    }
 
     let symlink = session.appendingPathComponent("alias.mov")
     try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: wrongDigestFile)

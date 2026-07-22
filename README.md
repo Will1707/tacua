@@ -14,19 +14,32 @@ Tacua is currently in evidence-driven product and technical de-risking. It is no
 
 See [the V1 product boundary](docs/PRODUCT.md) for the sanitized workflow,
 privacy boundary, approval model, and explicit non-goals.
+See [release readiness](docs/RELEASE-READINESS.md) for the exact distinction
+between implemented foundations, verified evidence, owner decisions, and the
+remaining device, integration, and production gates.
+See [V1 requirements traceability](docs/V1-TRACEABILITY.md) for a direct map
+from each fixed product requirement to code, tests, proof limits, and external
+gates.
+See the [V1 security model](docs/SECURITY-MODEL.md) for the completed
+repository-owned source/design threat review, implemented controls and residual
+risks, and the deployment-specific review that remains required.
 
-The repository now contains a non-production backend pilot and reviewer-app
-scaffold. Neither is a released V1 or safe for Internet-facing production use.
+The repository now contains a non-production vertical foundation spanning the
+mobile SDK, backend, and reviewer app. It is not a released V1 or safe for
+Internet-facing production use.
 
-Names under the local `@tacua` package scope are unpublished experiment identifiers, not a claim that any public package-registry scope is owned or available. Schema identifiers use the reserved `.invalid` top-level domain for the same reason.
+`@tacua/mobile-sdk` is intended for source and GitHub Release tarball
+distribution; npm registry publication remains disabled and the name is not a
+claim that any public package-registry scope is owned or available. Schema
+identifiers use the reserved `.invalid` top-level domain for the same reason.
 
 ## V1 boundary
 
-The first pilot targets an authorized private Expo/React Native iOS app. The V1 design limits capture to the tested app, requires explicit consent, and permits the SDK only in QA/development builds. The planned raw-media retention default is 30 days. Android, whole-device capture, Linear synchronization, and autonomous ticket execution are deferred.
+The first pilot targets an authorized private Expo/React Native iOS app. The V1 design limits capture to the tested app, requires explicit consent, and permits the SDK only in QA/development builds. The raw-media retention default is 30 days. Android, whole-device capture, Linear synchronization, and autonomous ticket execution are deferred.
 
 ## What is here today
 
-- [`experiments/ios-capture-spike`](experiments/ios-capture-spike/package/README.md): a removable, first-party Expo/ReplayKit package candidate with segmented local recovery, plus a local-only [physical-iPhone development harness](experiments/ios-capture-spike/harness/README.md). `EXP-001` completed its physical candidate gates on one iPhone using synthetic QA data, including foreground narration, static-screen segmentation, interruption and recovery choices, scoped deletion, the 30-minute limit, lock recovery, and the deterministic [fault-injection campaign](experiments/ios-capture-spike/FAULT-INJECTION-RUNBOOK.md). The package now also contains a build-pinned, redirect-rejecting SDK/backend client, Keychain credential boundary, crash-safe replay queue, and crash-safe START/RESUME credential lifecycle coordinators. The stopped-capture-to-protocol adapter and upload/completion/deletion orchestration remain unimplemented, so stopping a capture does not yet upload it.
+- [`experiments/ios-capture-spike`](experiments/ios-capture-spike/package/README.md): a removable, first-party Expo/ReplayKit SDK candidate with segmented local recovery, plus a local-only [physical-iPhone development harness](experiments/ios-capture-spike/harness/README.md). `EXP-001` completed its physical candidate gates on one iPhone using synthetic QA data, including foreground narration, static-screen segmentation, interruption and recovery choices, scoped deletion, the 30-minute limit, lock recovery, and the deterministic [fault-injection campaign](experiments/ios-capture-spike/FAULT-INJECTION-RUNBOOK.md). A sealed QA-build profile now drives native START/RESUME plans; explicit stopped-capture admission verifies media and diagnostics before a crash-safe queue uploads them, completes the backend session, and retires local payloads only after a validated receipt. The SDK also enforces the immutable server raw-media deadline across its recoverable capture, journals, credentials, and queue, with crash-safe sweeping when relaunch discovery or another lifecycle boundary runs. A reboot before that deadline blocks raw-data use until authenticated RESUME refreshes the server-time anchor; at or after the deadline, a valid system wall-time observation is deletion authority. Authenticated backend deletion is also implemented. Upload remains a foreground, process-bound operation with exact replay after relaunch; `stop()` itself never transmits evidence.
 - [`experiments/eval-harness`](experiments/eval-harness/README.md): a synthetic multi-issue corpus, scorer and reporter-time protocol. Its fixtures are not product-quality evidence.
 - [`experiments/security-harness`](experiments/security-harness/README.md): deterministic, synthetic default-deny, authorization, retention and deletion contract checks. Runtime security remains unverified.
 - [`experiments/docker-topology-probe`](experiments/docker-topology-probe/README.md): a non-production container lifecycle probe. It does not select or implement the backend topology.
@@ -35,7 +48,7 @@ The first pilot targets an authorized private Expo/React Native iOS app. The V1 
 - [`contracts/ticket-candidate`](contracts/ticket-candidate/README.md): the standalone production draft/review contract for immutable candidate versions, evidence-manifest binding, visual clarification choices, and exact human approval before approved-handoff export.
 - [`contracts/sdk-backend-protocol`](contracts/sdk-backend-protocol/README.md): the exact retry-safe SDK wire contract for scoped Keychain credentials, media and diagnostic receipts, idempotent completion, local cleanup authority, and deletion.
 - [`apps/reviewer`](apps/reviewer/README.md): an iOS-first Expo reviewer app with secure self-hosted configuration, QA-build launch orchestration, session/evidence/job views, clarification choices, exact-version human approval, and verified Markdown/JSON file sharing.
-- [`services/backend`](services/backend/README.md): a dependency-free, Docker-packaged upload boundary with fixed deployment scope, integrity-checked segment and diagnostic persistence, contract-valid processing jobs, immutable evidence-linked candidate review, atomic approved-handoff persistence, and durable deletion. Its documented production blockers remain release work.
+- [`services/backend`](services/backend/README.md): a dependency-free, Docker-packaged upload boundary with fixed deployment scope, integrity-checked segment and diagnostic persistence, contract-valid processing jobs, immutable evidence-linked candidate review, atomic approved-handoff persistence, durable deletion, operator backup/restore tooling, and an opt-in provider-neutral local processing command adapter. The checked-in deployment keeps external egress disabled; selecting and authorizing a real transcription/research implementation remains operator work.
 - [`docs/design/visual-direction.md`](docs/design/visual-direction.md): the adaptive, cicada-derived light and dark colour system used by the reviewer app.
 
 ## Local verification
@@ -53,10 +66,19 @@ python3 -B -m unittest discover -s experiments/eval-harness/tests -v
 node --test experiments/security-harness/test/harness.test.mjs
 sh experiments/ios-capture-spike/package/tests/run-core-tests.sh
 npm --prefix apps/reviewer ci --ignore-scripts --no-audit --no-fund
+npm --prefix apps/reviewer test
 npm --prefix apps/reviewer run typecheck
+npm --prefix apps/reviewer run export:ios
+node --test .github/scripts/check-markdown-links.test.mjs
+node .github/scripts/check-markdown-links.mjs
 ```
 
-The security harness requires Node 22 or newer. The Docker probe additionally requires a local Docker engine and creates only labelled experiment resources; read its runbook before execution.
+The security harness and repository checks require Node 22 or newer. On an
+isolated Docker host, `bash .github/scripts/verify-backend-container.sh` runs the
+same hardened image, single-writer, smoke, backup, restore, and restored-start
+gate as CI. It refuses to replace colliding Docker resources and removes only
+the uniquely named resources it creates. The older Docker topology probe is a
+separate experiment; read its runbook before running it.
 
 ## Safety boundary
 

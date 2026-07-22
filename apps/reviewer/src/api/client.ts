@@ -3,30 +3,77 @@
 import type { BackendConfig } from "@/config/backend-config";
 import type {
   ApprovedHandoffArtifact,
+  AuditEventPage,
   CandidatePage,
   CandidateEvidenceView,
   CaptureSession,
   EvidencePreview,
-  LaunchGrant,
+  JobPage,
   ProcessingJob,
   RegisteredBuild,
+  ResumeLaunchGrant,
   SessionPage,
+  StartLaunchGrant,
   TicketCandidate,
 } from "@/api/types";
 import * as Crypto from "expo-crypto";
 import { fetch, type FetchRequestInit } from "expo/fetch";
 
 import {
+  AdminResponseValidationError,
+  type CandidateTransitionBody,
+  validateAuditEventPage,
+  validateProcessingJobDetail,
+  validateProcessingJobPage,
+  validateSessionDetail,
+  validateTransitionBinding,
+  validateTransitionRequestBinding,
+} from "@/api/admin-response-validators";
+import {
+  CanonicalJsonResponseError,
+  assertExpectedSuccessStatus,
+  maximumGenericErrorBytes,
+  readCanonicalJsonResponse,
+  validateGenericErrorEnvelope,
+} from "@/api/canonical-json-response";
+import {
   ApprovedHandoffValidationError,
   approvedHandoffMediaType,
   maximumJsonHandoffBytes,
   maximumMarkdownHandoffBytes,
   validateApprovedHandoffArtifact,
+  validateTicketCandidateSnapshot,
 } from "@/approved-handoff/contract";
+import {
+  EvidencePreviewIntegrityError,
+  verifyEvidencePreviewBytes,
+} from "@/api/evidence-preview-integrity";
+import {
+  CandidateEvidenceViewValidationError,
+  validateCandidateEvidenceView,
+} from "@/api/candidate-evidence-view";
+import {
+  LaunchGrantValidationError,
+  validateResumeLaunchGrant,
+  validateStartLaunchGrant,
+} from "@/api/launch-grant-validation";
+import {
+  AdminPageCursorError,
+  adminPageHeaders,
+  isAdminPageCursor,
+} from "@/api/admin-page-cursor";
+import { maximumSessionDetailResponseBytes } from "@/api/response-limits";
 
-const maximumResponseCharacters = 2_000_000;
+const maximumJsonResponseBytes = 2 * 1_024 * 1_024;
+const maximumCandidateBytes = 1_048_576;
+const maximumCandidateEvidenceViewBytes = 1_572_864;
 const maximumEvidencePreviewBytes = 2 * 1_024 * 1_024;
 const evidencePreviewContentTypes = new Set(["image/png", "image/jpeg", "image/webp"] as const);
+
+type ExpectedJsonResponse = {
+  readonly expectedStatuses: readonly number[];
+  readonly maximumBytes?: number;
+};
 
 export class TacuaApiError extends Error {
   constructor(
@@ -38,8 +85,6 @@ export class TacuaApiError extends Error {
     this.name = "TacuaApiError";
   }
 }
-
-type ErrorResponse = { readonly error?: { readonly code?: unknown; readonly message?: unknown } };
 
 // This fingerprint only keeps distinct human edits from accidentally reusing
 // an idempotency key. The backend's canonical request digest remains the trust
@@ -91,22 +136,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function validatePageCursor(value: unknown): value is string | null {
-  return value === null || (
-    typeof value === "string"
-    && value.length >= 1
-    && value.length <= 512
-    && value.length % 4 !== 1
-    && /^[A-Za-z0-9_-]+$/.test(value)
-  );
-}
-
 function pageHeaders(cursor?: string): HeadersInit | undefined {
-  if (cursor === undefined) return undefined;
-  if (!validatePageCursor(cursor) || cursor === null) {
+  try {
+    return adminPageHeaders(cursor);
+  } catch (error) {
+    if (!(error instanceof AdminPageCursorError)) throw error;
     throw new TacuaApiError(0, "INVALID_PAGE_CURSOR", "The Tacua page cursor is invalid.");
   }
-  return { "Tacua-Page-Cursor": cursor };
 }
 
 function isSessionSummary(value: unknown): value is CaptureSession {
@@ -142,7 +178,7 @@ function isSessionSummary(value: unknown): value is CaptureSession {
   const createdAt = Date.parse(value.created_at as string);
   const rawExpiresAt = Date.parse(value.retention.raw_media_expires_at as string);
   const derivedExpiresAt = Date.parse(value.retention.derived_data_expires_at as string);
-  const retentionIsOrdered = createdAt <= rawExpiresAt && rawExpiresAt <= derivedExpiresAt;
+  const retentionIsOrdered = createdAt < rawExpiresAt && rawExpiresAt <= derivedExpiresAt;
   return retentionIsOrdered && ((value.state === "receiving" && completionIsAbsent)
     || (
       value.state === "completed"
@@ -152,28 +188,6 @@ function isSessionSummary(value: unknown): value is CaptureSession {
     ));
 }
 
-function bytesToBase64(bytes: Uint8Array): string {
-  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  const chunks: string[] = [];
-  let chunk = "";
-  for (let index = 0; index < bytes.length; index += 3) {
-    const first = bytes[index] ?? 0;
-    const second = bytes[index + 1] ?? 0;
-    const third = bytes[index + 2] ?? 0;
-    const packed = (first << 16) | (second << 8) | third;
-    chunk += alphabet[(packed >>> 18) & 63];
-    chunk += alphabet[(packed >>> 12) & 63];
-    chunk += index + 1 < bytes.length ? alphabet[(packed >>> 6) & 63] : "=";
-    chunk += index + 2 < bytes.length ? alphabet[packed & 63] : "=";
-    if (chunk.length >= 16_384) {
-      chunks.push(chunk);
-      chunk = "";
-    }
-  }
-  if (chunk) chunks.push(chunk);
-  return chunks.join("");
-}
-
 async function sha256Digest(bytes: Uint8Array): Promise<string> {
   const digestInput = new Uint8Array(new ArrayBuffer(bytes.byteLength));
   digestInput.set(bytes);
@@ -181,7 +195,11 @@ async function sha256Digest(bytes: Uint8Array): Promise<string> {
   return `sha256:${Array.from(digest, (value) => value.toString(16).padStart(2, "0")).join("")}`;
 }
 
-async function readBoundedBytes(response: Response, maximum: number): Promise<Uint8Array> {
+async function readBoundedBytes(
+  response: Response,
+  maximum: number,
+  cancelSibling?: () => Promise<unknown>,
+): Promise<Uint8Array> {
   if (!response.body) {
     throw new TacuaApiError(502, "RESPONSE_STREAM_REQUIRED", "The backend response could not be read within the reviewer limit.");
   }
@@ -195,7 +213,10 @@ async function readBoundedBytes(response: Response, maximum: number): Promise<Ui
       if (result.done) break;
       length += result.value.byteLength;
       if (length > maximum) {
-        await reader.cancel();
+        await Promise.allSettled([
+          reader.cancel(),
+          ...(cancelSibling ? [cancelSibling()] : []),
+        ]);
         throw new TacuaApiError(502, "RESPONSE_TOO_LARGE", "The backend response exceeded the reviewer limit.");
       }
       chunks.push(result.value);
@@ -213,10 +234,42 @@ async function readBoundedBytes(response: Response, maximum: number): Promise<Ui
   return bytes;
 }
 
+type CloseableBlob = Blob & { readonly close?: () => void };
+
+function createEvidencePreviewObject(blob: Blob): Pick<EvidencePreview, "uri" | "release"> {
+  let uri: string;
+  try {
+    uri = URL.createObjectURL(blob);
+  } catch (error) {
+    (blob as CloseableBlob).close?.();
+    throw error;
+  }
+  let released = false;
+  return {
+    uri,
+    release: () => {
+      if (released) return;
+      released = true;
+      try {
+        URL.revokeObjectURL(uri);
+      } finally {
+        (blob as CloseableBlob).close?.();
+      }
+    },
+  };
+}
+
 export class TacuaApiClient {
   constructor(private readonly config: BackendConfig) {}
 
-  private async request<T>(path: string, init?: FetchRequestInit): Promise<T> {
+  private async requestDocument<T>(
+    path: string,
+    init?: FetchRequestInit,
+    options?: ExpectedJsonResponse,
+  ): Promise<{ readonly body: T; readonly bytes: Uint8Array; readonly response: Response }> {
+    if (!options) {
+      throw new TacuaApiError(0, "EXPECTED_STATUS_REQUIRED", "The Tacua API call did not pin its success status.");
+    }
     if (!path.startsWith("/") || path.startsWith("//")) {
       throw new TacuaApiError(0, "INVALID_REQUEST_PATH", "The Tacua request path is invalid.");
     }
@@ -226,7 +279,11 @@ export class TacuaApiClient {
     }
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15_000);
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, 15_000);
     const headers = new Headers(init?.headers);
     headers.set("Accept", "application/json");
     headers.set("Authorization", `Bearer ${this.config.adminToken}`);
@@ -245,40 +302,25 @@ export class TacuaApiClient {
         throw new TacuaApiError(502, "UNEXPECTED_RESPONSE_ORIGIN", "The backend response came from another origin.");
       }
 
-      const declaredLength = response.headers.get("Content-Length");
-      if (declaredLength !== null && (!/^\d+$/.test(declaredLength) || Number(declaredLength) > maximumResponseCharacters * 4)) {
-        throw new TacuaApiError(502, "RESPONSE_TOO_LARGE", "The Tacua backend response exceeded the reviewer limit.");
-      }
-      const contentType = response.headers.get("Content-Type")?.split(";", 1)[0]?.trim().toLowerCase();
-      const rawBody = await response.text();
-      if (rawBody.length > maximumResponseCharacters) {
-        throw new TacuaApiError(502, "RESPONSE_TOO_LARGE", "The Tacua backend response exceeded the reviewer limit.");
-      }
-      let body: T | ErrorResponse | null = null;
-      if (contentType === "application/json") {
+      if (!response.ok) {
         try {
-          body = JSON.parse(rawBody) as T | ErrorResponse;
-        } catch {
-          body = null;
+          const { document } = await readCanonicalJsonResponse(response, maximumGenericErrorBytes);
+          const error = validateGenericErrorEnvelope(document);
+          throw new TacuaApiError(response.status, error.code, error.message);
+        } catch (error) {
+          if (error instanceof TacuaApiError) throw error;
+          throw new TacuaApiError(502, "INVALID_ERROR_RESPONSE", "The Tacua backend returned an invalid error envelope.");
         }
       }
-      if (!response.ok) {
-        const error = body && typeof body === "object" && "error" in body
-          ? (body as ErrorResponse).error
-          : undefined;
-        throw new TacuaApiError(
-          response.status,
-          typeof error?.code === "string" ? error.code : "HTTP_ERROR",
-          typeof error?.message === "string" ? error.message : "The Tacua backend request failed.",
-        );
-      }
-      if (body === null) {
-        throw new TacuaApiError(502, "INVALID_RESPONSE", "The Tacua backend returned invalid JSON.");
-      }
-      return body as T;
+      assertExpectedSuccessStatus(response.status, options.expectedStatuses);
+      const parsed = await readCanonicalJsonResponse(response, options.maximumBytes ?? maximumJsonResponseBytes);
+      return { body: parsed.document as T, bytes: parsed.bytes, response };
     } catch (error) {
       if (error instanceof TacuaApiError) throw error;
-      if (error instanceof Error && error.name === "AbortError") {
+      if (error instanceof CanonicalJsonResponseError) {
+        throw new TacuaApiError(502, error.code, "The Tacua backend response was not valid bounded canonical JSON.");
+      }
+      if (controller.signal.aborted && timedOut) {
         throw new TacuaApiError(408, "REQUEST_TIMEOUT", "The Tacua backend did not respond in time.");
       }
       throw new TacuaApiError(0, "NETWORK_ERROR", "Tacua could not reach the configured backend.");
@@ -287,8 +329,16 @@ export class TacuaApiClient {
     }
   }
 
+  private async request<T>(
+    path: string,
+    init?: FetchRequestInit,
+    options?: ExpectedJsonResponse,
+  ): Promise<T> {
+    return (await this.requestDocument<T>(path, init, options)).body;
+  }
+
   async listSessions(cursor?: string): Promise<SessionPage> {
-    const response = await this.request<SessionPage>("/v1/admin/sessions", { headers: pageHeaders(cursor) });
+    const response = await this.request<SessionPage>("/v1/admin/sessions", { headers: pageHeaders(cursor) }, { expectedStatuses: [200] });
     if (
       !isRecord(response)
       || !hasExactKeys(response, ["sessions", "next_cursor"])
@@ -297,7 +347,7 @@ export class TacuaApiClient {
       || response.sessions.some((session) => !isSessionSummary(session))
       || new Set(response.sessions.map((session) => session.session_id)).size !== response.sessions.length
       || (response.next_cursor !== null && response.sessions.length !== 50)
-      || !validatePageCursor(response.next_cursor)
+      || !isAdminPageCursor(response.next_cursor)
     ) {
       throw new TacuaApiError(502, "INVALID_SESSION_PAGE", "The backend returned an invalid session page.");
     }
@@ -305,7 +355,7 @@ export class TacuaApiClient {
   }
 
   async listBuilds(): Promise<readonly RegisteredBuild[]> {
-    const response = await this.request<{ readonly builds: readonly RegisteredBuild[] }>("/v1/admin/builds");
+    const response = await this.request<{ readonly builds: readonly RegisteredBuild[] }>("/v1/admin/builds", undefined, { expectedStatuses: [200] });
     if (
       !response
       || typeof response !== "object"
@@ -332,60 +382,123 @@ export class TacuaApiClient {
         || !/^[A-Za-z0-9][A-Za-z0-9-]*(?:\.[A-Za-z0-9][A-Za-z0-9-]*)+$/.test(build.bundle_identifier)
         || typeof build.native_version !== "string"
         || build.native_version.length < 1
-        || build.native_version.length > 64
+        || build.native_version.length > 128
+        || !/^[A-Za-z0-9._+/-]+$/.test(build.native_version)
         || typeof build.native_build !== "string"
         || build.native_build.length < 1
-        || build.native_build.length > 64
+        || build.native_build.length > 128
+        || !/^[A-Za-z0-9._+/-]+$/.test(build.native_build)
         || !["local", "internal", "testflight"].includes(build.distribution)
         || !isDigest(build.build_identity_digest)
       ))
+      || new Set(response.builds.map((build) => build.build_id)).size !== response.builds.length
+      || new Set(response.builds.map((build) => build.build_identity_digest)).size !== response.builds.length
     ) {
       throw new TacuaApiError(502, "INVALID_BUILD_REGISTRY", "The backend returned an invalid build registry.");
     }
     return response.builds;
   }
 
-  async createLaunchGrant(buildId: string): Promise<LaunchGrant> {
+  async createLaunchGrant(buildId: string): Promise<StartLaunchGrant> {
     if (!isIdentifier(buildId)) {
       throw new TacuaApiError(0, "INVALID_BUILD_ID", "The selected build identifier is invalid.");
     }
-    const grant = await this.request<LaunchGrant>("/v1/admin/launch-codes", {
+    const grant = await this.request<unknown>("/v1/admin/launch-codes", {
       method: "POST",
       body: JSON.stringify({ exchange_kind: "start_session", build_id: buildId }),
-    });
-    if (
-      !grant
-      || typeof grant !== "object"
-      || !hasExactKeys(grant, [
-        "launch_id",
-        "launch_code",
-        "exchange_kind",
-        "session_id",
-        "build_identity_digest",
-        "scope_policy_digest",
-        "expires_at",
-      ])
-      || !isIdentifier(grant.launch_id)
-      || typeof grant.launch_code !== "string"
-      || !/^[A-Za-z0-9_-]{32,512}$/.test(grant.launch_code)
-      || grant.exchange_kind !== "start_session"
-      || grant.session_id !== null
-      || !isDigest(grant.build_identity_digest)
-      || !isDigest(grant.scope_policy_digest)
-      || !isTimestamp(grant.expires_at)
-    ) {
+    }, { expectedStatuses: [201] });
+    try {
+      return validateStartLaunchGrant(grant);
+    } catch (error) {
+      if (!(error instanceof LaunchGrantValidationError)) throw error;
       throw new TacuaApiError(502, "INVALID_LAUNCH_GRANT", "The backend returned an invalid launch grant.");
     }
-    return grant;
   }
 
-  getSession(sessionId: string): Promise<CaptureSession> {
-    return this.request(`/v1/admin/sessions/${encodeURIComponent(sessionId)}`);
+  async createResumeGrant(sessionId: string): Promise<ResumeLaunchGrant> {
+    if (!isIdentifier(sessionId)) {
+      throw new TacuaApiError(0, "INVALID_SESSION_ID", "The session identifier is invalid.");
+    }
+    const grant = await this.request<unknown>("/v1/admin/launch-codes", {
+      method: "POST",
+      body: JSON.stringify({ exchange_kind: "resume_session", session_id: sessionId }),
+    }, { expectedStatuses: [201] });
+    try {
+      return validateResumeLaunchGrant(grant, sessionId);
+    } catch (error) {
+      if (!(error instanceof LaunchGrantValidationError)) throw error;
+      throw new TacuaApiError(
+        502,
+        error.code,
+        "The backend returned a recovery grant that was not bound to this session.",
+      );
+    }
   }
 
-  async listJobs(): Promise<readonly ProcessingJob[]> {
-    const response = await this.request<{ readonly jobs: readonly ProcessingJob[] }>("/v1/admin/jobs");
-    return response.jobs;
+  async getSession(sessionId: string): Promise<CaptureSession> {
+    if (!isIdentifier(sessionId)) throw new TacuaApiError(0, "INVALID_SESSION_ID", "The session identifier is invalid.");
+    const response = await this.request<unknown>(
+      `/v1/admin/sessions/${encodeURIComponent(sessionId)}`,
+      undefined,
+      { expectedStatuses: [200], maximumBytes: maximumSessionDetailResponseBytes },
+    );
+    try {
+      return await validateSessionDetail(response, sessionId, sha256Digest);
+    } catch (error) {
+      if (error instanceof AdminResponseValidationError) {
+        throw new TacuaApiError(502, error.code, "The backend returned an invalid session detail response.");
+      }
+      throw error;
+    }
+  }
+
+  async listJobs(cursor?: string): Promise<JobPage> {
+    const response = await this.request<unknown>(
+      "/v1/admin/jobs",
+      { headers: pageHeaders(cursor) },
+      { expectedStatuses: [200] },
+    );
+    try {
+      return validateProcessingJobPage(response);
+    } catch (error) {
+      if (error instanceof AdminResponseValidationError) {
+        throw new TacuaApiError(502, error.code, "The backend returned an invalid processing-job page.");
+      }
+      throw error;
+    }
+  }
+
+  async getJob(jobId: string): Promise<ProcessingJob> {
+    if (!isIdentifier(jobId)) throw new TacuaApiError(0, "INVALID_JOB_ID", "The processing-job identifier is invalid.");
+    const response = await this.request<unknown>(
+      `/v1/admin/jobs/${encodeURIComponent(jobId)}`,
+      undefined,
+      { expectedStatuses: [200] },
+    );
+    try {
+      return await validateProcessingJobDetail(response, jobId, sha256Digest);
+    } catch (error) {
+      if (error instanceof AdminResponseValidationError) {
+        throw new TacuaApiError(502, error.code, "The backend returned an invalid processing-job detail.");
+      }
+      throw error;
+    }
+  }
+
+  async listAuditEvents(cursor?: string): Promise<AuditEventPage> {
+    const response = await this.request<unknown>(
+      "/v1/admin/audit-events",
+      { headers: pageHeaders(cursor) },
+      { expectedStatuses: [200] },
+    );
+    try {
+      return validateAuditEventPage(response);
+    } catch (error) {
+      if (error instanceof AdminResponseValidationError) {
+        throw new TacuaApiError(502, error.code, "The backend returned an invalid audit-event page.");
+      }
+      throw error;
+    }
   }
 
   async listCandidates(sessionId: string, cursor?: string): Promise<CandidatePage> {
@@ -393,13 +506,14 @@ export class TacuaApiClient {
     const response = await this.request<CandidatePage>(
       `/v1/admin/sessions/${encodeURIComponent(sessionId)}/candidates`,
       { headers: pageHeaders(cursor) },
+      { expectedStatuses: [200] },
     );
     if (
       !isRecord(response)
       || !hasExactKeys(response, ["candidates", "next_cursor"])
       || !Array.isArray(response.candidates)
       || response.candidates.length > 50
-      || !validatePageCursor(response.next_cursor)
+      || !isAdminPageCursor(response.next_cursor)
       || (response.next_cursor !== null && response.candidates.length !== 50)
       || response.candidates.some((candidate) => (
         !isRecord(candidate)
@@ -425,12 +539,33 @@ export class TacuaApiClient {
     return response;
   }
 
-  getCandidate(candidateId: string): Promise<TicketCandidate> {
-    return this.request(`/v1/admin/candidates/${encodeURIComponent(candidateId)}`);
+  async getCandidate(candidateId: string): Promise<TicketCandidate> {
+    if (!isIdentifier(candidateId)) throw new TacuaApiError(0, "INVALID_CANDIDATE_ID", "The candidate identifier is invalid.");
+    const result = await this.requestDocument<unknown>(
+      `/v1/admin/candidates/${encodeURIComponent(candidateId)}`,
+      undefined,
+      { maximumBytes: maximumCandidateBytes, expectedStatuses: [200] },
+    );
+    try {
+      const candidate = await validateTicketCandidateSnapshot(result.body, sha256Digest) as TicketCandidate;
+      if (
+        candidate.candidate_id !== candidateId
+        || result.response.headers.get("ETag") !== quotedEntityTag(candidate.candidate_digest)
+      ) {
+        throw new TacuaApiError(502, "CANDIDATE_BINDING_MISMATCH", "The candidate response was not bound to the requested ticket.");
+      }
+      return candidate;
+    } catch (error) {
+      if (error instanceof TacuaApiError) throw error;
+      if (error instanceof ApprovedHandoffValidationError) {
+        throw new TacuaApiError(502, error.code, `The candidate response failed validation (${error.path}).`);
+      }
+      throw error;
+    }
   }
 
   async getCandidateEvidence(candidate: TicketCandidate): Promise<CandidateEvidenceView> {
-    const view = await this.request<CandidateEvidenceView>(
+    const result = await this.requestDocument<unknown>(
       `/v1/admin/candidates/${encodeURIComponent(candidate.candidate_id)}/versions/${candidate.candidate_version}/evidence`,
       {
         headers: {
@@ -438,58 +573,39 @@ export class TacuaApiClient {
           "Tacua-Evidence-Manifest-Digest": candidate.evidence_manifest.manifest_digest,
         },
       },
+      { expectedStatuses: [200], maximumBytes: maximumCandidateEvidenceViewBytes },
     );
-    if (
-      !view
-      || typeof view !== "object"
-      || view.contract_version !== "tacua.candidate-evidence-view@1.0.0"
-      || view.candidate_id !== candidate.candidate_id
-      || view.candidate_version !== candidate.candidate_version
-      || view.candidate_digest !== candidate.candidate_digest
-      || view.evidence_manifest_digest !== candidate.evidence_manifest.manifest_digest
-      || !Array.isArray(view.items)
-      || !Array.isArray(view.diagnostic_events)
-      || view.items.length > 100
-      || view.diagnostic_events.length > 512
-    ) {
-      throw new TacuaApiError(502, "EVIDENCE_BINDING_MISMATCH", "The evidence response was not bound to this ticket version.");
+    try {
+      if (
+        result.response.headers.get("ETag") !== quotedEntityTag(candidate.candidate_digest)
+        || result.response.headers.get("Tacua-Evidence-Manifest-Digest") !== candidate.evidence_manifest.manifest_digest
+      ) {
+        throw new TacuaApiError(502, "EVIDENCE_BINDING_MISMATCH", "The evidence response was not bound to this ticket version.");
+      }
+      return validateCandidateEvidenceView(result.body, {
+        candidateId: candidate.candidate_id,
+        candidateVersion: candidate.candidate_version,
+        candidateDigest: candidate.candidate_digest,
+        evidenceManifestDigest: candidate.evidence_manifest.manifest_digest,
+        evidenceIds: candidate.evidence_manifest.evidence_ids,
+      });
+    } catch (error) {
+      if (error instanceof TacuaApiError) throw error;
+      if (error instanceof CandidateEvidenceViewValidationError) {
+        const message = error.code === "EVIDENCE_BINDING_MISMATCH"
+          ? "The evidence response was not bound to this ticket version."
+          : "The backend returned an invalid ticket evidence view.";
+        throw new TacuaApiError(502, error.code, message);
+      }
+      throw error;
     }
-    const expectedIds = [...candidate.evidence_manifest.evidence_ids].sort();
-    const returnedIds = view.items.map((item) => item.evidence_id).sort();
-    if (
-      returnedIds.length !== expectedIds.length
-      || new Set(returnedIds).size !== returnedIds.length
-      || returnedIds.some((evidenceId, index) => evidenceId !== expectedIds[index])
-      || view.diagnostic_events.some((event) => (
-        !Array.isArray(event.evidence_refs)
-        || event.evidence_refs.some((evidenceId: unknown) => (
-          typeof evidenceId !== "string" || !expectedIds.includes(evidenceId)
-        ))
-      ))
-      || view.items.some((item) => {
-        const preview = item.preview;
-        if (!preview || preview.status !== "available") return false;
-        return item.evidence_type !== "media.keyframe"
-          || item.availability !== "available"
-          || preview.content_type === null
-          || !evidencePreviewContentTypes.has(preview.content_type)
-          || preview.size_bytes === null
-          || !Number.isSafeInteger(preview.size_bytes)
-          || preview.size_bytes < 1
-          || preview.size_bytes > maximumEvidencePreviewBytes
-          || preview.content_digest === null
-          || !/^sha256:[a-f0-9]{64}$/.test(preview.content_digest);
-      })
-    ) {
-      throw new TacuaApiError(502, "INVALID_EVIDENCE_VIEW", "The backend returned an invalid ticket evidence view.");
-    }
-    return view;
   }
 
   async getEvidencePreview(
     candidate: TicketCandidate,
     evidenceId: string,
     expectedContentDigest: string,
+    externalSignal?: AbortSignal,
   ): Promise<EvidencePreview> {
     const path = `/v1/admin/candidates/${encodeURIComponent(candidate.candidate_id)}/versions/${candidate.candidate_version}/evidence/${encodeURIComponent(evidenceId)}/preview`;
     if (!path.startsWith("/") || path.startsWith("//")) {
@@ -501,7 +617,15 @@ export class TacuaApiClient {
     }
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15_000);
+    let previewResponse: Response | null = null;
+    let timedOut = false;
+    const abortFromCaller = () => controller.abort();
+    if (externalSignal?.aborted) abortFromCaller();
+    else externalSignal?.addEventListener("abort", abortFromCaller, { once: true });
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, 15_000);
     try {
       const response = await fetch(endpoint, {
         method: "GET",
@@ -521,6 +645,9 @@ export class TacuaApiClient {
       }
       if (!response.ok) {
         throw new TacuaApiError(response.status, "EVIDENCE_PREVIEW_FAILED", "The evidence preview could not be loaded.");
+      }
+      if (response.status !== 200) {
+        throw new TacuaApiError(502, "UNEXPECTED_RESPONSE_STATUS", "The evidence preview returned an unexpected success status.");
       }
 
       const contentType = response.headers.get("Content-Type")?.split(";", 1)[0]?.trim().toLowerCase();
@@ -542,24 +669,67 @@ export class TacuaApiClient {
         throw new TacuaApiError(502, "EVIDENCE_BINDING_MISMATCH", "The preview was not bound to this ticket evidence.");
       }
 
-      const bytes = await readBoundedBytes(response, maximumEvidencePreviewBytes);
-      if (bytes.byteLength !== Number(declaredLength)) {
-        throw new TacuaApiError(502, "PREVIEW_LENGTH_MISMATCH", "The evidence preview length did not match its declaration.");
+      // Tee only this one active preview. The sibling is canceled together
+      // with the integrity stream if the hard byte cap is crossed.
+      previewResponse = response.clone();
+      const bytes = await readBoundedBytes(
+        response,
+        maximumEvidencePreviewBytes,
+        () => previewResponse?.body?.cancel() ?? Promise.resolve(),
+      );
+      try {
+        await verifyEvidencePreviewBytes({
+          bytes,
+          declaredLength: Number(declaredLength),
+          expectedDigest: contentDigest,
+          digest: sha256Digest,
+        });
+      } catch (error) {
+        if (error instanceof EvidencePreviewIntegrityError) {
+          const message = error.code === "PREVIEW_DIGEST_MISMATCH"
+            ? "The evidence preview bytes did not match their bound digest."
+            : "The evidence preview length or digest declaration was invalid.";
+          throw new TacuaApiError(502, error.code, message);
+        }
+        throw error;
+      }
+      const typedContentType = contentType as EvidencePreview["contentType"];
+      let objectPreview: Pick<EvidencePreview, "uri" | "release">;
+      try {
+        const blob = await previewResponse.blob();
+        previewResponse = null;
+        if (
+          blob.size !== bytes.byteLength
+          || blob.type.split(";", 1)[0]?.trim().toLowerCase() !== typedContentType
+        ) {
+          (blob as CloseableBlob).close?.();
+          throw new Error("The native preview object differed from the verified response.");
+        }
+        objectPreview = createEvidencePreviewObject(blob);
+      } catch {
+        throw new TacuaApiError(502, "PREVIEW_URI_FAILED", "The verified evidence preview could not be prepared for display.");
       }
       return {
-        uri: `data:${contentType};base64,${bytesToBase64(bytes)}`,
-        contentType: contentType as EvidencePreview["contentType"],
+        ...objectPreview,
+        contentType: typedContentType,
         sizeBytes: bytes.byteLength,
         contentDigest,
       };
     } catch (error) {
       if (error instanceof TacuaApiError) throw error;
-      if (error instanceof Error && error.name === "AbortError") {
+      if (controller.signal.aborted && timedOut) {
         throw new TacuaApiError(408, "REQUEST_TIMEOUT", "The evidence preview did not respond in time.");
+      }
+      if (controller.signal.aborted) {
+        throw new TacuaApiError(499, "REQUEST_CANCELLED", "The evidence preview request was cancelled.");
       }
       throw new TacuaApiError(0, "NETWORK_ERROR", "Tacua could not load the evidence preview.");
     } finally {
       clearTimeout(timeout);
+      externalSignal?.removeEventListener("abort", abortFromCaller);
+      if (previewResponse && !previewResponse.bodyUsed) {
+        void previewResponse.body?.cancel().catch(() => undefined);
+      }
     }
   }
 
@@ -638,6 +808,9 @@ export class TacuaApiClient {
       if (!response.ok) {
         throw new TacuaApiError(response.status, "HANDOFF_DOWNLOAD_FAILED", "The approved handoff could not be downloaded.");
       }
+      if (response.status !== 200) {
+        throw new TacuaApiError(502, "UNEXPECTED_RESPONSE_STATUS", "The approved handoff returned an unexpected success status.");
+      }
       if (response.headers.get("Content-Type")?.toLowerCase() !== expectedContentType) {
         throw new TacuaApiError(502, "INVALID_HANDOFF_TYPE", "The backend returned an unexpected handoff representation.");
       }
@@ -709,29 +882,47 @@ export class TacuaApiClient {
     }
   }
 
-  transitionCandidate(
-    candidateId: string,
-    body: {
-      readonly expected_candidate_digest: string;
-      readonly candidate_version: number;
-      readonly candidate_content_digest: string;
-      readonly evidence_manifest_digest: string;
-      readonly action: "mark_ready" | "approve" | "reject" | "resolve_clarification";
-      readonly actor_id: string;
-      readonly reason: string;
-      readonly clarification_id?: string;
-      readonly selected_choice_id?: string;
-      readonly resolution_note?: string;
-    },
+  async transitionCandidate(
+    parent: TicketCandidate,
+    body: CandidateTransitionBody,
   ): Promise<TicketCandidate> {
-    const idempotencyKey = `candidate:${candidateId}:${body.candidate_version}:${body.action}:${operationFingerprint(JSON.stringify(body))}`;
-    return this.request(`/v1/admin/candidates/${encodeURIComponent(candidateId)}/transitions`, {
+    const candidateId = parent.candidate_id;
+    if (!isIdentifier(candidateId)) throw new TacuaApiError(0, "INVALID_CANDIDATE_ID", "The candidate identifier is invalid.");
+    try {
+      validateTransitionRequestBinding(parent, body);
+    } catch (error) {
+      if (error instanceof AdminResponseValidationError) {
+        throw new TacuaApiError(0, error.code, "The transition request was not bound to the displayed candidate.");
+      }
+      throw error;
+    }
+    const idempotencyKey = `candidate:${candidateId}:${body.expected_candidate_version}:${body.action}:${operationFingerprint(JSON.stringify(body))}`;
+    const result = await this.requestDocument<unknown>(`/v1/admin/candidates/${encodeURIComponent(candidateId)}/transitions`, {
       method: "POST",
       headers: {
         "If-Match": quotedEntityTag(body.expected_candidate_digest),
         "Idempotency-Key": idempotencyKey,
       },
       body: JSON.stringify(body),
-    });
+    }, { maximumBytes: maximumCandidateBytes, expectedStatuses: [200, 201] });
+    try {
+      const candidate = await validateTicketCandidateSnapshot(result.body, sha256Digest) as TicketCandidate;
+      validateTransitionBinding(parent, body, candidate);
+      const bodyDigest = await sha256Digest(result.bytes);
+      if (
+        result.response.headers.get("ETag") !== quotedEntityTag(candidate.candidate_digest)
+        || result.response.headers.get("Tacua-Body-Digest") !== bodyDigest
+      ) {
+        throw new TacuaApiError(502, "TRANSITION_RESPONSE_BINDING_MISMATCH", "The transition response headers did not bind its candidate bytes.");
+      }
+      return candidate;
+    } catch (error) {
+      if (error instanceof TacuaApiError) throw error;
+      if (error instanceof ApprovedHandoffValidationError || error instanceof AdminResponseValidationError) {
+        const code = error.code;
+        throw new TacuaApiError(502, code, "The transition response failed its candidate and predecessor binding checks.");
+      }
+      throw error;
+    }
   }
 }

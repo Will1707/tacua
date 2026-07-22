@@ -31,6 +31,7 @@ from tacua_backend.config import (  # noqa: E402
     PilotConfig,
     load_config,
     normalize_backend_origin,
+    parse_admin_secret,
 )
 from tacua_backend.candidate_domain import TICKET_CONTRACT  # noqa: E402
 from tacua_backend.contracts import (  # noqa: E402
@@ -60,9 +61,19 @@ from tacua_backend.evidence_domain import (  # noqa: E402
 )
 from tacua_backend.service import (  # noqa: E402
     ApiError,
+    COMPLETION_NOT_AUTHORIZED_MESSAGE,
+    CREDENTIAL_ORDINAL_CHECK_SQL,
+    CREDENTIAL_ROTATION_LIMIT_MESSAGE,
+    HISTORICAL_OPERATION_NOT_FOUND,
     InvalidJSONValue,
     MAX_CANDIDATE_EVIDENCE_VIEW_BYTES,
+    MAX_JSON_NESTING_DEPTH,
+    MAX_SESSION_CREDENTIALS,
+    OPERATION_NOT_AUTHORIZED_MESSAGE,
     PilotBackend,
+    SDK_BACKEND_ERROR_CONTRACT,
+    SDK_BACKEND_ERROR_MEDIA_TYPE,
+    SDKReconciliationBinding,
     strict_json_loads,
 )
 
@@ -192,6 +203,31 @@ class BackendHarness(unittest.TestCase):
         self.assertEqual(status, captured.exception.status)
         self.assertEqual(code, captured.exception.code)
         return captured.exception
+
+    def persist_candidate_fixture(
+        self,
+        *,
+        candidate: dict,
+        evidence_manifest: dict,
+        previews: list[dict],
+        backend: PilotBackend | None = None,
+    ) -> dict:
+        """Install a generated candidate solely as legacy reviewer test state.
+
+        Production callers must use ``publish_processing_result``. A handful
+        of reviewer-focused tests need already-published state without walking
+        the processing pipeline, so the harness deliberately takes the private
+        persistence path while holding the backend process lock.
+        """
+
+        target = backend or self.backend
+        with target._lock:
+            return target._persist_candidate_bundle_locked(
+                candidate=candidate,
+                evidence_manifest=evidence_manifest,
+                previews=previews,
+                publish_candidate=True,
+            )
 
     def start_session(
         self,
@@ -753,7 +789,7 @@ class BackendProtocolTests(BackendHarness):
         def publish() -> None:
             try:
                 publication_results.append(
-                    self.backend.persist_candidate_bundle(
+                    self.persist_candidate_fixture(
                         candidate=candidate,
                         evidence_manifest=manifest,
                         previews=previews,
@@ -823,7 +859,7 @@ class BackendProtocolTests(BackendHarness):
             "_verified_candidate_publication_manifest",
             side_effect=observed_guard,
         ):
-            inserted = self.backend.persist_candidate_bundle(
+            inserted = self.persist_candidate_fixture(
                 candidate=candidate,
                 evidence_manifest=manifest,
                 previews=previews,
@@ -842,7 +878,7 @@ class BackendProtocolTests(BackendHarness):
         candidate = TICKET_CONTRACT.seal(candidate)
         TICKET_CONTRACT.validate_chain([candidate])
 
-        inserted = self.backend.persist_candidate_bundle(
+        inserted = self.persist_candidate_fixture(
             candidate=candidate,
             evidence_manifest=manifest,
             previews=previews,
@@ -874,7 +910,7 @@ class BackendProtocolTests(BackendHarness):
             self.assert_api_error(
                 410,
                 "SESSION_DELETED",
-                lambda: self.backend.persist_candidate_bundle(
+                lambda: self.persist_candidate_fixture(
                     candidate=candidate,
                     evidence_manifest=manifest,
                     previews=previews,
@@ -916,7 +952,7 @@ class BackendProtocolTests(BackendHarness):
             self.assert_api_error(
                 410,
                 "SESSION_DELETED",
-                lambda: self.backend.persist_candidate_bundle(
+                lambda: self.persist_candidate_fixture(
                     candidate=candidate,
                     evidence_manifest=manifest,
                     previews=previews,
@@ -958,7 +994,7 @@ class BackendProtocolTests(BackendHarness):
             self.assert_api_error(
                 500,
                 "CANDIDATE_SESSION_BINDING_CORRUPT",
-                lambda: self.backend.persist_candidate_bundle(
+                lambda: self.persist_candidate_fixture(
                     candidate=candidate,
                     evidence_manifest=manifest,
                     previews=previews,
@@ -977,7 +1013,7 @@ class BackendProtocolTests(BackendHarness):
         lifecycle = self.full_completed_session()
         session_id = lifecycle["launch_receipt"]["session_id"]
         candidate, manifest, previews = self.candidate_bundle(session_id)
-        self.backend.persist_candidate_bundle(
+        self.persist_candidate_fixture(
             candidate=candidate, evidence_manifest=manifest, previews=previews
         )
         entered = threading.Event()
@@ -1012,7 +1048,7 @@ class BackendProtocolTests(BackendHarness):
         lifecycle = self.full_completed_session()
         session_id = lifecycle["launch_receipt"]["session_id"]
         candidate, manifest, previews = self.candidate_bundle(session_id)
-        self.backend.persist_candidate_bundle(
+        self.persist_candidate_fixture(
             candidate=candidate, evidence_manifest=manifest, previews=previews
         )
         entered = threading.Event()
@@ -1048,7 +1084,7 @@ class BackendProtocolTests(BackendHarness):
         lifecycle = self.full_completed_session()
         session_id = lifecycle["launch_receipt"]["session_id"]
         candidate, manifest, previews = self.candidate_bundle(session_id)
-        self.backend.persist_candidate_bundle(
+        self.persist_candidate_fixture(
             candidate=candidate, evidence_manifest=manifest, previews=previews
         )
         entered = threading.Event()
@@ -1081,7 +1117,7 @@ class BackendProtocolTests(BackendHarness):
         lifecycle = self.full_completed_session()
         session_id = lifecycle["launch_receipt"]["session_id"]
         candidate, manifest, previews = self.candidate_bundle(session_id)
-        self.backend.persist_candidate_bundle(
+        self.persist_candidate_fixture(
             candidate=candidate, evidence_manifest=manifest, previews=previews
         )
         events = [
@@ -1138,7 +1174,7 @@ class BackendProtocolTests(BackendHarness):
         lifecycle = self.full_completed_session()
         session_id = lifecycle["launch_receipt"]["session_id"]
         candidate, manifest, previews = self.candidate_bundle(session_id)
-        self.backend.persist_candidate_bundle(
+        self.persist_candidate_fixture(
             candidate=candidate, evidence_manifest=manifest, previews=previews
         )
         with self.backend._connect() as connection:
@@ -1182,7 +1218,7 @@ class BackendProtocolTests(BackendHarness):
         lifecycle = self.full_completed_session()
         session_id = lifecycle["launch_receipt"]["session_id"]
         candidate, manifest, previews = self.candidate_bundle(session_id)
-        self.backend.persist_candidate_bundle(
+        self.persist_candidate_fixture(
             candidate=candidate, evidence_manifest=manifest, previews=previews
         )
         request = copy.deepcopy(lifecycle["diagnostic_request"])
@@ -1235,7 +1271,7 @@ class BackendProtocolTests(BackendHarness):
         lifecycle = self.full_completed_session()
         session_id = lifecycle["launch_receipt"]["session_id"]
         candidate, manifest, previews = self.candidate_bundle(session_id)
-        self.backend.persist_candidate_bundle(
+        self.persist_candidate_fixture(
             candidate=candidate, evidence_manifest=manifest, previews=previews
         )
         with self.backend._connect() as connection:
@@ -1260,7 +1296,7 @@ class BackendProtocolTests(BackendHarness):
         lifecycle = self.full_completed_session()
         session_id = lifecycle["launch_receipt"]["session_id"]
         candidate, manifest, previews = self.candidate_bundle(session_id)
-        self.backend.persist_candidate_bundle(
+        self.persist_candidate_fixture(
             candidate=candidate, evidence_manifest=manifest, previews=previews
         )
         with self.backend._connect() as connection:
@@ -1315,7 +1351,7 @@ class BackendProtocolTests(BackendHarness):
         lifecycle = self.full_completed_session()
         session_id = lifecycle["launch_receipt"]["session_id"]
         candidate, manifest, previews = self.candidate_bundle(session_id)
-        self.backend.persist_candidate_bundle(
+        self.persist_candidate_fixture(
             candidate=candidate,
             evidence_manifest=manifest,
             previews=previews,
@@ -1408,7 +1444,7 @@ class BackendProtocolTests(BackendHarness):
         lifecycle = self.full_completed_session()
         session_id = lifecycle["launch_receipt"]["session_id"]
         candidate, manifest, previews = self.candidate_bundle(session_id)
-        self.backend.persist_candidate_bundle(
+        self.persist_candidate_fixture(
             candidate=candidate,
             evidence_manifest=manifest,
             previews=previews,
@@ -1491,7 +1527,7 @@ class BackendProtocolTests(BackendHarness):
         lifecycle = self.full_completed_session()
         session_id = lifecycle["launch_receipt"]["session_id"]
         candidate, manifest, previews = self.candidate_bundle(session_id)
-        inserted = self.backend.persist_candidate_bundle(
+        inserted = self.persist_candidate_fixture(
             candidate=candidate,
             evidence_manifest=manifest,
             previews=previews,
@@ -1613,7 +1649,7 @@ class BackendProtocolTests(BackendHarness):
             "evidence_id": unrelated["evidence_id"],
             "preview_revision_id": "preview_unrelated",
         }
-        self.backend.persist_candidate_bundle(
+        self.persist_candidate_fixture(
             candidate=candidate,
             evidence_manifest=manifest,
             previews=[*previews, unrelated_preview],
@@ -1688,7 +1724,7 @@ class BackendProtocolTests(BackendHarness):
             "evidence_id": unrelated["evidence_id"],
             "preview_revision_id": "preview_unrelated_only",
         }
-        self.backend.persist_candidate_bundle(
+        self.persist_candidate_fixture(
             candidate=candidate,
             evidence_manifest=manifest,
             previews=[unrelated_preview],
@@ -1722,7 +1758,7 @@ class BackendProtocolTests(BackendHarness):
         lifecycle = self.full_completed_session()
         session_id = lifecycle["launch_receipt"]["session_id"]
         candidate, manifest, previews = self.candidate_bundle(session_id)
-        self.backend.persist_candidate_bundle(
+        self.persist_candidate_fixture(
             candidate=candidate,
             evidence_manifest=manifest,
             previews=previews,
@@ -1986,13 +2022,103 @@ class BackendProtocolTests(BackendHarness):
         missing["segment_id"] = "segment_missing_after_rotation"
         missing["sequence"] = 1
         missing = seal(missing)
-        self.assert_api_error(
+        missing_error = self.assert_api_error(
             403,
             "OPERATION_NOT_AUTHORIZED",
             lambda: self.backend.upload_segment(
                 session_id, 1, missing["segment_id"], "U" * 43, missing, io.BytesIO(b"x")
             ),
         )
+        self.assertEqual(
+            SDKReconciliationBinding(
+                session_id=session_id,
+                operation_kind="segment",
+                operation_id=missing["upload_id"],
+                request_digest=missing["intent_digest"],
+                request_credential_id="credential_synthetic",
+                authenticated_credential_id="credential_receiving_resume",
+            ),
+            missing_error.sdk_reconciliation,
+        )
+
+    def test_receiving_rotation_proves_missing_completion_before_rebuild(self) -> None:
+        launch_request, launch_receipt, _, _ = self.start_session()
+        session_id = launch_receipt["session_id"]
+        _, segment_receipt, _ = self.store_segment(
+            session_id,
+            "credential_synthetic",
+            launch_request["credential"]["secret"],
+        )
+        _, diagnostic_receipt, _ = self.store_diagnostic(
+            session_id,
+            "credential_synthetic",
+            launch_request["credential"]["secret"],
+        )
+        historical = self.completion_request(
+            session_id,
+            "credential_synthetic",
+            [segment_receipt],
+            [diagnostic_receipt],
+        )
+        self.resume_session(
+            session_id,
+            "credential_synthetic",
+            state="receiving",
+            completion_id=None,
+            credential_id="credential_receiving_resume",
+            secret="U" * 43,
+            exchange_id="exchange_receiving_resume",
+            requested_at="2026-07-21T10:02:06Z",
+            accepted_at="2026-07-21T10:02:07Z",
+        )
+        self.clock.set("2026-07-21T10:02:08Z")
+        missing_error = self.assert_api_error(
+            403,
+            "OPERATION_NOT_AUTHORIZED",
+            lambda: self.backend.complete_session(
+                session_id,
+                historical["completion_id"],
+                "U" * 43,
+                historical,
+            ),
+        )
+        self.assertEqual(COMPLETION_NOT_AUTHORIZED_MESSAGE, missing_error.message)
+        self.assertEqual(
+            SDKReconciliationBinding(
+                session_id=session_id,
+                operation_kind="completion",
+                operation_id=historical["completion_id"],
+                request_digest=historical["request_digest"],
+                request_credential_id="credential_synthetic",
+                authenticated_credential_id="credential_receiving_resume",
+            ),
+            missing_error.sdk_reconciliation,
+        )
+        self.assertEqual(
+            {"jobs": [], "next_cursor": None},
+            self.backend.list_jobs(),
+        )
+
+        rebuilt = self.completion_request(
+            session_id,
+            "credential_receiving_resume",
+            [segment_receipt],
+            [diagnostic_receipt],
+        )
+        # Reconciliation changes only transport authority and time. The durable client keeps the
+        # same stable operation ID so a retry can never fork one logical completion into two.
+        rebuilt["completion_id"] = historical["completion_id"]
+        rebuilt["requested_at"] = "2026-07-21T10:02:08Z"
+        rebuilt = seal(rebuilt)
+        self.clock.set("2026-07-21T10:02:09Z")
+        response = self.backend.complete_session(
+            session_id,
+            rebuilt["completion_id"],
+            "U" * 43,
+            rebuilt,
+        )
+        self.assertEqual(201, response.status)
+        validate_operation_pair(rebuilt, response.json())
 
     def test_segment_integrity_conflicts_and_sidecar_is_digest_only(self) -> None:
         launch_request, launch_receipt, _, _ = self.start_session()
@@ -2038,7 +2164,27 @@ class BackendProtocolTests(BackendHarness):
         lifecycle = self.full_completed_session()
         completion = lifecycle["completion_receipt"]
         self.assertEqual("queued", completion["processing_job"]["status"])
-        self.assertEqual([completion["processing_job"]], self.backend.list_jobs())
+        job_page = self.backend.list_jobs()
+        self.assertIsNone(job_page["next_cursor"])
+        self.assertEqual(
+            [completion["processing_job"]["job_id"]],
+            [job["job_id"] for job in job_page["jobs"]],
+        )
+        self.assertTrue(
+            all(
+                set(job)
+                == {
+                    "job_id",
+                    "job_type",
+                    "status",
+                    "requested_at",
+                    "started_at",
+                    "completed_at",
+                    "failure_code",
+                }
+                for job in job_page["jobs"]
+            )
+        )
         replay = self.backend.complete_session(
             lifecycle["launch_receipt"]["session_id"],
             lifecycle["completion_request"]["completion_id"],
@@ -2093,6 +2239,181 @@ class BackendProtocolTests(BackendHarness):
                 lifecycle["diagnostic_request"],
             ),
         )
+
+    def test_credential_history_stops_at_the_closed_v1_limit(self) -> None:
+        _launch_request, launch_receipt, _, _grant = self.start_session()
+        session_id = launch_receipt["session_id"]
+        current_id = launch_receipt["credential"]["credential_id"]
+        base = instant("2026-07-21T09:57:01Z")
+
+        def at(offset_seconds: int) -> str:
+            return (base + timedelta(seconds=offset_seconds)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+
+        # Leave one slot so two grants can race for the final rotation.
+        for ordinal in range(1, MAX_SESSION_CREDENTIALS - 1):
+            credential_id = f"credential_rotation_{ordinal:03d}"
+            _request, receipt, _body = self.resume_session(
+                session_id,
+                current_id,
+                state="receiving",
+                completion_id=None,
+                credential_id=credential_id,
+                secret="T" * 43,
+                exchange_id=f"exchange_rotation_{ordinal:03d}",
+                requested_at=at(ordinal * 2),
+                accepted_at=at(ordinal * 2 + 1),
+            )
+            self.assertEqual(ordinal, self.backend.get_session(session_id)["credentials"][-1]["ordinal"])
+            current_id = receipt["credential"]["credential_id"]
+
+        preissued = self.backend.create_launch_code(
+            {"exchange_kind": "resume_session", "session_id": session_id}
+        )
+        final_ordinal = MAX_SESSION_CREDENTIALS - 1
+        _request, final_receipt, _body = self.resume_session(
+            session_id,
+            current_id,
+            state="receiving",
+            completion_id=None,
+            credential_id=f"credential_rotation_{final_ordinal:03d}",
+            secret="U" * 43,
+            exchange_id=f"exchange_rotation_{final_ordinal:03d}",
+            requested_at=at(final_ordinal * 2),
+            accepted_at=at(final_ordinal * 2 + 1),
+        )
+        current_id = final_receipt["credential"]["credential_id"]
+
+        detail = self.backend.get_session(session_id)
+        self.assertEqual(MAX_SESSION_CREDENTIALS, len(detail["credentials"]))
+        self.assertEqual(
+            list(range(MAX_SESSION_CREDENTIALS)),
+            [item["ordinal"] for item in detail["credentials"]],
+        )
+        self.assertEqual(current_id, detail["credentials"][-1]["credential_id"])
+
+        preflight = self.assert_api_error(
+            409,
+            "CREDENTIAL_ROTATION_LIMIT_REACHED",
+            lambda: self.backend.create_launch_code(
+                {"exchange_kind": "resume_session", "session_id": session_id}
+            ),
+        )
+        self.assertEqual(CREDENTIAL_ROTATION_LIMIT_MESSAGE, preflight.message)
+
+        raced_request = fixture("receiving-resume-request")
+        raced_request.update(
+            {
+                "exchange_id": "exchange_rotation_overflow",
+                "launch_code": preissued["launch_code"],
+                "expected_session_id": session_id,
+                "expected_session_state": "receiving",
+                "expected_completion_id": None,
+                "previous_credential_id": f"credential_rotation_{MAX_SESSION_CREDENTIALS - 2:03d}",
+                "build_identity": copy.deepcopy(self.build),
+                "scope": copy.deepcopy(self.scope),
+                "requested_at": at(MAX_SESSION_CREDENTIALS * 2),
+                "credential": {
+                    "credential_id": "credential_rotation_overflow",
+                    "secret": "V" * 43,
+                    "authentication_scheme": "Bearer",
+                    "local_storage": "ios_keychain_when_unlocked_this_device_only",
+                },
+            }
+        )
+        raced_request = seal(raced_request)
+        self.clock.set(at(MAX_SESSION_CREDENTIALS * 2 + 1))
+        raced = self.assert_api_error(
+            409,
+            "CREDENTIAL_ROTATION_LIMIT_REACHED",
+            lambda: self.backend.exchange_launch_code(raced_request),
+        )
+        self.assertEqual(CREDENTIAL_ROTATION_LIMIT_MESSAGE, raced.message)
+        self.assertEqual(
+            MAX_SESSION_CREDENTIALS,
+            len(self.backend.get_session(session_id)["credentials"]),
+        )
+
+    def test_startup_rejects_schema_two_without_credential_ordinal_check(self) -> None:
+        self.start_session()
+        columns = (
+            "credential_id,session_id,ordinal,verifier,issued_at,expires_at,revoked_at,"
+            "issued_session_state,issued_state,current_state,replay_completion_id"
+        )
+        with closing(sqlite3.connect(self.backend.db_path)) as conn:
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'credentials'"
+            ).fetchone()
+            self.assertIsNotNone(row)
+            current_ddl = row[0]
+            self.assertIn(CREDENTIAL_ORDINAL_CHECK_SQL, current_ddl)
+            legacy_ddl = current_ddl.replace(
+                f" CHECK (ordinal BETWEEN 0 AND {MAX_SESSION_CREDENTIALS - 1})",
+                "",
+            )
+            self.assertNotEqual(current_ddl, legacy_ddl)
+            conn.execute("PRAGMA foreign_keys = OFF")
+            conn.execute("DROP INDEX one_current_credential")
+            conn.execute("ALTER TABLE credentials RENAME TO credentials_with_check")
+            conn.execute(legacy_ddl)
+            conn.execute(
+                f"INSERT INTO credentials ({columns}) SELECT {columns} FROM credentials_with_check"
+            )
+            conn.execute("DROP TABLE credentials_with_check")
+            conn.execute(
+                """CREATE UNIQUE INDEX one_current_credential
+                   ON credentials(session_id) WHERE revoked_at IS NULL"""
+            )
+            conn.commit()
+            self.assertEqual(2, conn.execute("PRAGMA user_version").fetchone()[0])
+
+        with self.assertRaisesRegex(ValueError, "back up and start with an empty state directory"):
+            PilotBackend(self.config, self.admin_secret, clock=self.clock)
+
+    def test_startup_rejects_noncontiguous_credential_history(self) -> None:
+        _request, receipt, _body, _grant = self.start_session()
+        with closing(sqlite3.connect(self.backend.db_path)) as conn:
+            conn.execute(
+                "UPDATE credentials SET ordinal = 1 WHERE session_id = ?",
+                (receipt["session_id"],),
+            )
+            conn.commit()
+
+        with self.assertRaisesRegex(ValueError, "credential history failed safe"):
+            PilotBackend(self.config, self.admin_secret, clock=self.clock)
+
+    def test_startup_rejects_current_credential_below_maximum_ordinal(self) -> None:
+        _request, receipt, _body, _grant = self.start_session()
+        with closing(sqlite3.connect(self.backend.db_path)) as conn:
+            conn.execute(
+                """INSERT INTO credentials
+                   (credential_id,session_id,ordinal,verifier,issued_at,expires_at,revoked_at,
+                    issued_session_state,issued_state,current_state,replay_completion_id)
+                   SELECT 'credential_tampered',session_id,1,verifier,issued_at,expires_at,issued_at,
+                          issued_session_state,issued_state,'revoked',replay_completion_id
+                     FROM credentials WHERE session_id = ? AND ordinal = 0""",
+                (receipt["session_id"],),
+            )
+            conn.commit()
+
+        with self.assertRaisesRegex(ValueError, "credential history failed safe"):
+            PilotBackend(self.config, self.admin_secret, clock=self.clock)
+
+    def test_startup_rejects_credential_state_and_replay_mismatch(self) -> None:
+        _request, receipt, _body, _grant = self.start_session()
+        with closing(sqlite3.connect(self.backend.db_path)) as conn:
+            conn.execute(
+                """UPDATE credentials
+                      SET current_state = 'completion_replay_or_delete_only',
+                          replay_completion_id = 'completion_tampered'
+                    WHERE session_id = ?""",
+                (receipt["session_id"],),
+            )
+            conn.commit()
+
+        with self.assertRaisesRegex(ValueError, "credential history failed safe"):
+            PilotBackend(self.config, self.admin_secret, clock=self.clock)
 
     def test_completion_rejects_omitted_durable_receipt_and_sidecar_mismatch(self) -> None:
         launch_request, launch_receipt, _, _ = self.start_session()
@@ -2276,7 +2597,9 @@ class BackendProtocolTests(BackendHarness):
         self.assertNotIn("verifier", encoded)
         self.assertNotIn(lifecycle["secret"], encoded)
         self.assertEqual(1, len(session["jobs"]))
-        self.assertTrue(self.backend.list_audit_events())
+        audit_page = self.backend.list_audit_events()
+        self.assertTrue(audit_page["events"])
+        self.assertIsNone(audit_page["next_cursor"])
 
 
 class StrictJSONAndConfigTests(unittest.TestCase):
@@ -2303,6 +2626,40 @@ class StrictJSONAndConfigTests(unittest.TestCase):
         ):
             with self.subTest(value=value), self.assertRaises(ConfigError):
                 normalize_backend_origin(value)
+
+    def test_admin_secret_is_bounded_ascii_token68(self) -> None:
+        for value in (
+            b"a" * 32,
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef+/0123456789._~-",
+            b"a" * 32 + b"=",
+            b"a" * 32 + b"==\r\n",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(value.rstrip(b"\r\n"), parse_admin_secret(value))
+
+        for value in (
+            ("é" * 32).encode("utf-8"),
+            b"a" * 31 + b"\x00",
+            b"a" * 31 + b" ",
+            b"a" * 32 + b"=a",
+            b"a" * 32 + b"===",
+        ):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ConfigError,
+                "ASCII RFC 7235 token68",
+            ):
+                parse_admin_secret(value)
+
+    def test_strict_json_rejects_excessive_nesting_and_surrogates(self) -> None:
+        accepted = "[" * MAX_JSON_NESTING_DEPTH + "0" + "]" * MAX_JSON_NESTING_DEPTH
+        self.assertIsNotNone(strict_json_loads(accepted))
+        excessive = "[" + accepted + "]"
+        with self.assertRaisesRegex(InvalidJSONValue, "safe depth"):
+            strict_json_loads(excessive)
+        with self.assertRaisesRegex(InvalidJSONValue, "invalid Unicode"):
+            strict_json_loads(r'"\ud800"')
+        with self.assertRaisesRegex(InvalidJSONValue, "interoperable range"):
+            strict_json_loads("9" * 5_000)
 
     def test_mounted_config_is_closed_and_secret_is_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2494,6 +2851,107 @@ class HTTPAdapterTests(BackendHarness):
             handler.headers["Content-Length"] = str(len(body))
         return handler
 
+    def test_expect_100_is_rejected_with_the_bounded_json_error_path(self) -> None:
+        handler = self.handler("/v1/sdk/launch-exchanges", method="POST")
+        sent: list[tuple[int, dict]] = []
+        handler._send_json = lambda status, body: sent.append((status, body))
+
+        self.assertFalse(handler.handle_expect_100())
+        self.assertTrue(handler.close_connection)
+        self.assertEqual(
+            [
+                (
+                    417,
+                    {
+                        "error": {
+                            "code": "EXPECTATION_NOT_SUPPORTED",
+                            "message": "100-continue is not supported",
+                        }
+                    },
+                )
+            ],
+            sent,
+        )
+
+    def test_sdk_reconciliation_error_is_exact_bounded_vendor_json(self) -> None:
+        binding = SDKReconciliationBinding(
+            session_id="session_synthetic",
+            operation_kind="diagnostic",
+            operation_id="upload_diagnostic_synthetic",
+            request_digest="sha256:" + "8" * 64,
+            request_credential_id="credential_synthetic",
+            authenticated_credential_id="credential_receiving_resume",
+        )
+        error = ApiError(
+            403,
+            "OPERATION_NOT_AUTHORIZED",
+            OPERATION_NOT_AUTHORIZED_MESSAGE,
+            sdk_reconciliation=binding,
+        )
+        handler = self.handler("/unused")
+        sent: list[tuple[int, bytes, str]] = []
+        handler._send_bytes = lambda status, payload, content_type="application/json", headers=None: sent.append(
+            (status, payload, content_type)
+        )
+        handler._send_api_error(error)
+        expected = {
+            "contract_version": SDK_BACKEND_ERROR_CONTRACT,
+            "media_type": SDK_BACKEND_ERROR_MEDIA_TYPE,
+            "protocol_version": PROTOCOL_VERSION,
+            "error": {
+                "code": "OPERATION_NOT_AUTHORIZED",
+                "message": OPERATION_NOT_AUTHORIZED_MESSAGE,
+                "reconciliation": {
+                    "outcome": HISTORICAL_OPERATION_NOT_FOUND,
+                    "session_id": binding.session_id,
+                    "operation_kind": binding.operation_kind,
+                    "operation_id": binding.operation_id,
+                    "request_digest": binding.request_digest,
+                    "request_credential_id": binding.request_credential_id,
+                    "authenticated_credential_id": binding.authenticated_credential_id,
+                },
+            },
+        }
+        self.assertEqual(
+            (403, canonical_json(expected).encode("utf-8"), SDK_BACKEND_ERROR_MEDIA_TYPE),
+            sent[0],
+        )
+        self.assertEqual(expected, strict_json_loads(sent[0][1]))
+
+        generic: list[tuple[int, dict]] = []
+        handler._send_json = lambda status, body: generic.append((status, body))
+        handler._send_api_error(
+            ApiError(403, "OPERATION_NOT_AUTHORIZED", OPERATION_NOT_AUTHORIZED_MESSAGE)
+        )
+        self.assertEqual(
+            (
+                403,
+                {
+                    "error": {
+                        "code": "OPERATION_NOT_AUTHORIZED",
+                        "message": OPERATION_NOT_AUTHORIZED_MESSAGE,
+                    }
+                },
+            ),
+            generic[0],
+        )
+        with self.assertRaisesRegex(ValueError, "invalid SDK reconciliation binding"):
+            SDKReconciliationBinding(
+                session_id=binding.session_id,
+                operation_kind=binding.operation_kind,
+                operation_id=binding.operation_id,
+                request_digest=binding.request_digest,
+                request_credential_id=binding.request_credential_id,
+                authenticated_credential_id=binding.request_credential_id,
+            )
+        with self.assertRaisesRegex(ValueError, "only valid"):
+            ApiError(
+                409,
+                "IDEMPOTENCY_CONFLICT",
+                "operation conflicted",
+                sdk_reconciliation=binding,
+            )
+
     def test_build_bootstrap_requires_admin_and_rejects_a_body(self) -> None:
         unauthenticated = self.handler("/v1/admin/builds")
         with self.assertRaises(ApiError) as captured:
@@ -2538,7 +2996,7 @@ class HTTPAdapterTests(BackendHarness):
         lifecycle = self.full_completed_session()
         session_id = lifecycle["launch_receipt"]["session_id"]
         candidate, manifest, previews = self.candidate_bundle(session_id)
-        self.backend.persist_candidate_bundle(
+        self.persist_candidate_fixture(
             candidate=candidate,
             evidence_manifest=manifest,
             previews=previews,
@@ -2635,7 +3093,7 @@ class HTTPAdapterTests(BackendHarness):
         lifecycle = self.full_completed_session()
         session_id = lifecycle["launch_receipt"]["session_id"]
         candidate, manifest, previews = self.candidate_bundle(session_id)
-        self.backend.persist_candidate_bundle(
+        self.persist_candidate_fixture(
             candidate=candidate,
             evidence_manifest=manifest,
             previews=previews,
@@ -2798,6 +3256,37 @@ class HTTPAdapterTests(BackendHarness):
         with self.assertRaises(ApiError) as captured:
             handler._read_json(100)
         self.assertEqual(415, captured.exception.status)
+
+    def test_huge_content_length_and_sequence_are_bounded_before_integer_parsing(self) -> None:
+        handler = self.handler("/unused", method="POST")
+        handler.headers["Content-Length"] = "9" * 5_000
+        with self.assertRaises(ApiError) as captured:
+            handler._content_length(1_073_741_824)
+        self.assertEqual(411, captured.exception.status)
+        self.assertEqual("CONTENT_LENGTH_REQUIRED", captured.exception.code)
+
+        route = self.handler(
+            "/v1/sdk/sessions/session_synthetic/segments/"
+            + "9" * 5_000
+            + "/segment_synthetic",
+            method="PUT",
+        )
+        with self.assertRaises(ApiError) as captured:
+            route._dispatch()
+        self.assertEqual(404, captured.exception.status)
+        self.assertEqual("NOT_FOUND", captured.exception.code)
+
+        excessive = (
+            "[" * (MAX_JSON_NESTING_DEPTH + 1)
+            + "0"
+            + "]" * (MAX_JSON_NESTING_DEPTH + 1)
+        ).encode("ascii")
+        nested = self.handler("/unused", method="POST", body=excessive)
+        nested.headers["Content-Type"] = "application/json"
+        with self.assertRaises(ApiError) as captured:
+            nested._read_json(len(excessive))
+        self.assertEqual(400, captured.exception.status)
+        self.assertEqual("INVALID_JSON", captured.exception.code)
 
 
 if __name__ == "__main__":

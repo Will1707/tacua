@@ -95,6 +95,7 @@ struct TacuaSDKStartedSession: Equatable {
   let scopeDigest: String
   let credentialID: String
   let credentialExpiresAt: String
+  let rawMediaExpiresAt: String
   let credentialCapability: TacuaTransportCredentialCapability
   let credentialAvailability: TacuaCredentialAvailability
   let queueSchemaVersion: Int
@@ -177,7 +178,8 @@ struct TacuaSDKResumeRequirement: Equatable {
     func resumable(_ reason: TacuaSDKResumeRequirementReason)
       -> TacuaSDKResumeRequirement
     {
-      let completionID = queue.completionCleanupAuthority?.completionID
+      let completionID = queue.authorizedCompletionReplayID
+        ?? queue.outcomeUnknownCompletionReplayCandidateID
       return TacuaSDKResumeRequirement(
         kind: .resumeSession,
         reason: reason,
@@ -205,7 +207,7 @@ struct TacuaSDKResumeRequirement: Equatable {
       }
       return resumable(.transportBindingMissing)
     case .completionReplayOrDeleteOnly:
-      guard queue.completionCleanupAuthority?.completionID.isEmpty == false else {
+      guard queue.authorizedCompletionReplayID?.isEmpty == false else {
         return terminal(.blocked, .invalidCompletionBinding)
       }
     case .active:
@@ -235,6 +237,7 @@ struct TacuaSDKBackendQueueStatus: Equatable {
   let localSessionID: String
   let remoteSessionID: String?
   let scopeDigest: String?
+  let sessionArtifactsAvailable: Bool
   let currentCredentialID: String?
   let currentCredentialExpiresAt: String?
   let credentialCapability: TacuaTransportCredentialCapability
@@ -274,10 +277,6 @@ protocol TacuaSDKStartQueueStoring: TacuaTransportQueuePersisting {
 
 extension TacuaTransportQueueFileStore: TacuaSDKStartQueueStoring {}
 
-protocol TacuaSDKResumeRecoveryInspecting {
-  func hasRecovery(localSessionID: String) throws -> Bool
-}
-
 final class TacuaSDKStartLifecycleCoordinator {
   private let configuration: TacuaBackendConfiguration
   private let consentGate: TacuaLaunchConsentGate
@@ -286,6 +285,7 @@ final class TacuaSDKStartLifecycleCoordinator {
   private let queueStore: TacuaSDKStartQueueStoring
   private let journalStore: TacuaSDKStartJournalPersisting
   private let resumeRecoveryInspector: TacuaSDKResumeRecoveryInspecting?
+  private let retentionChecker: TacuaSDKLocalRetentionChecking?
   private let clock: TacuaMonotonicClock
   private let operationLock = NSLock()
   private var activeLocalSessionIDs = Set<String>()
@@ -298,6 +298,7 @@ final class TacuaSDKStartLifecycleCoordinator {
     queueStore: TacuaSDKStartQueueStoring,
     journalStore: TacuaSDKStartJournalPersisting,
     resumeRecoveryInspector: TacuaSDKResumeRecoveryInspecting? = nil,
+    retentionChecker: TacuaSDKLocalRetentionChecking? = nil,
     clock: TacuaMonotonicClock = TacuaSystemMonotonicClock()
   ) {
     self.configuration = configuration
@@ -307,6 +308,7 @@ final class TacuaSDKStartLifecycleCoordinator {
     self.queueStore = queueStore
     self.journalStore = journalStore
     self.resumeRecoveryInspector = resumeRecoveryInspector
+    self.retentionChecker = retentionChecker
     self.clock = clock
   }
 
@@ -317,6 +319,9 @@ final class TacuaSDKStartLifecycleCoordinator {
     let artifacts = try validateInput(input)
     let lifecycleLease = try acquireLifecycleLease(localSessionID: input.localSessionID)
     defer { lifecycleLease.release() }
+    try retentionChecker?.requireActiveHoldingLifecycleLease(
+      localSessionID: input.localSessionID
+    )
     do {
       try requireNoResumeRecovery(localSessionID: input.localSessionID)
       if try queueStore.load(localSessionID: input.localSessionID) != nil {
@@ -342,6 +347,8 @@ final class TacuaSDKStartLifecycleCoordinator {
           credentialID: credentialID,
           credentialOwnershipDigest: credentialOwnershipDigest,
           transportConfigurationDigest: self.configuration.configurationDigest,
+          buildIdentityJSON: String(decoding: artifacts.buildIdentityJSON, as: UTF8.self),
+          captureScopeJSON: String(decoding: artifacts.scopeJSON, as: UTF8.self),
           createdAt: input.requestedAt,
           state: .credentialPrepared
         )
@@ -481,6 +488,10 @@ final class TacuaSDKStartLifecycleCoordinator {
         timeAnchor: try TacuaServerTimeAnchor.establish(
           issuedAt: receipt.authoritativeTimestamp,
           clock: clock
+        ),
+        sessionRetentionAuthority: try sessionRetentionAuthority(
+          receivedAt: receipt.receivedTimestamp,
+          scope: artifacts.scope
         )
       )
     } catch {
@@ -515,6 +526,9 @@ final class TacuaSDKStartLifecycleCoordinator {
     } catch {
       throw TacuaSDKStartLifecycleError.journalCleanupRequired
     }
+    try retentionChecker?.requireActiveHoldingLifecycleLease(
+      localSessionID: input.localSessionID
+    )
     return try startedSession(from: queue)
   }
 
@@ -524,6 +538,7 @@ final class TacuaSDKStartLifecycleCoordinator {
     defer { release(localSessionID) }
     let lifecycleLease = try acquireLifecycleLease(localSessionID: localSessionID)
     defer { lifecycleLease.release() }
+    try retentionChecker?.requireActiveHoldingLifecycleLease(localSessionID: localSessionID)
     do {
       try requireNoResumeRecovery(localSessionID: localSessionID)
       // Read the journal first: queue publication is durable before that journal can disappear.
@@ -617,6 +632,7 @@ final class TacuaSDKStartLifecycleCoordinator {
         localSessionID: queue.localSessionID,
         remoteSessionID: queue.remoteSessionID,
         scopeDigest: queue.scopeDigest,
+        sessionArtifactsAvailable: queue.hasDurableSessionArtifacts,
         currentCredentialID: queue.currentCredentialID,
         currentCredentialExpiresAt: queue.currentCredentialExpiresAt,
         credentialCapability: queue.credentialCapability,
@@ -626,7 +642,9 @@ final class TacuaSDKStartLifecycleCoordinator {
         resumeRequirement: resumeRequirement,
         transportConfigurationMatchesBuild: transportConfigurationMatchesBuild,
         operationCount: queue.operations.count,
-        queuedOperationCount: queue.operations.filter { $0.state == .queued }.count,
+        queuedOperationCount: queue.operations.filter {
+          $0.state == .prepared || $0.state == .outcomeUnknown
+        }.count,
         storedResponseCount: queue.operations.filter { $0.state == .responseStored }.count,
         boundLocalPayloadCount: queue.operations.reduce(0) {
           $0 + ($1.localPayloadBindings?.count ?? 0)
@@ -662,8 +680,12 @@ final class TacuaSDKStartLifecycleCoordinator {
           // Re-persist and fsync the exact queue successfully before removing recovery evidence.
           try queueStore.persistInitial(existing)
           try removeJournalDurably(journal)
+          try retentionChecker?.requireActiveHoldingLifecycleLease(
+            localSessionID: localSessionID
+          )
           return try startedSession(from: existing)
         }
+        try retentionChecker?.requireActiveHoldingLifecycleLease(localSessionID: localSessionID)
         return try startedSession(from: existing)
       }
       guard let journal else { throw TacuaSDKStartLifecycleError.nothingToRecover }
@@ -678,6 +700,7 @@ final class TacuaSDKStartLifecycleCoordinator {
         let queue = try committedQueue(from: journal)
         try queueStore.persistInitial(queue)
         try removeJournalDurably(journal)
+        try retentionChecker?.requireActiveHoldingLifecycleLease(localSessionID: localSessionID)
         return try startedSession(from: queue)
       }
     } catch let error as TacuaSDKStartLifecycleError {
@@ -693,6 +716,7 @@ final class TacuaSDKStartLifecycleCoordinator {
     defer { release(localSessionID) }
     let lifecycleLease = try acquireLifecycleLease(localSessionID: localSessionID)
     defer { lifecycleLease.release() }
+    try retentionChecker?.requireActiveHoldingLifecycleLease(localSessionID: localSessionID)
     do {
       try requireNoResumeRecovery(localSessionID: localSessionID)
       guard try queueStore.load(localSessionID: localSessionID) == nil else {
@@ -730,7 +754,7 @@ final class TacuaSDKStartLifecycleCoordinator {
   }
 
   private func validateInput(_ input: TacuaSDKStartSessionInput) throws
-    -> (buildIdentity: TacuaJSONValue, scope: TacuaJSONValue)
+    -> TacuaDurableSessionArtifacts
   {
     guard !input.approvedLaunchID.isEmpty,
       input.buildIdentityJSON.count <= TacuaSDKStartSessionInput.maximumArtifactBytes,
@@ -738,21 +762,18 @@ final class TacuaSDKStartLifecycleCoordinator {
     else { throw TacuaSDKStartLifecycleError.invalidInput }
     do {
       _ = try TacuaTransportQueueV3(localSessionID: input.localSessionID)
-      let buildIdentity = try TacuaCanonicalJSON.parse(
-        input.buildIdentityJSON,
-        maximumBytes: TacuaSDKStartSessionInput.maximumArtifactBytes
-      )
-      let scope = try TacuaCanonicalJSON.parse(
-        input.scopeJSON,
-        maximumBytes: TacuaSDKStartSessionInput.maximumArtifactBytes
+      let artifacts = try TacuaDurableSessionArtifacts.canonicalizing(
+        buildIdentityJSON: input.buildIdentityJSON,
+        scopeJSON: input.scopeJSON
       )
       try TacuaSDKBackendRequests.validateStartArtifacts(
-        buildIdentity: buildIdentity,
-        scope: scope,
+        buildIdentity: artifacts.buildIdentity,
+        scope: artifacts.scope,
         requestedAt: input.requestedAt,
         configuration: configuration
       )
-      return (buildIdentity, scope)
+      try configuration.validateBuildIdentityBinding(artifacts.buildIdentity)
+      return artifacts
     } catch {
       throw TacuaSDKStartLifecycleError.invalidInput
     }
@@ -795,13 +816,18 @@ final class TacuaSDKStartLifecycleCoordinator {
       let receipt = journal.validatedReceipt
     else { throw TacuaSDKStartLifecycleError.recoveryStateMismatch }
     var queue = try TacuaTransportQueueV3(localSessionID: journal.localSessionID)
+    let artifacts: TacuaDurableSessionArtifacts?
+    do { artifacts = try journal.durableSessionArtifacts() }
+    catch { throw TacuaSDKStartLifecycleError.recoveryStateMismatch }
     try queue.applyRecoveredStart(
       remoteSessionID: receipt.remoteSessionID,
       scopeDigest: receipt.scopeDigest,
       credentialID: journal.credentialID,
       transportConfigurationDigest: journal.transportConfigurationDigest,
       expiresAt: receipt.credentialExpiresAt,
-      timeAnchor: receipt.timeAnchor
+      timeAnchor: receipt.timeAnchor,
+      sessionRetentionAuthority: receipt.sessionRetentionAuthority,
+      sessionArtifacts: artifacts
     )
     try queue.validate()
     return queue
@@ -820,6 +846,9 @@ final class TacuaSDKStartLifecycleCoordinator {
       queue.currentCredentialExpiresAt == receipt.credentialExpiresAt,
       queue.transportConfigurationDigest == journal.transportConfigurationDigest,
       queue.timeAnchor.map({ anchorPreservesOrigin($0, receipt.timeAnchor) }) == true,
+      queue.sessionRetentionAuthority == receipt.sessionRetentionAuthority,
+      queue.buildIdentityJSON == journal.buildIdentityJSON,
+      queue.captureScopeJSON == journal.captureScopeJSON,
       queue.credentialCapability == .active
     else { throw TacuaSDKStartLifecycleError.recoveryStateMismatch }
   }
@@ -835,6 +864,30 @@ final class TacuaSDKStartLifecycleCoordinator {
       && queueAnchor.minimumEpochMilliseconds >= journalAnchor.minimumEpochMilliseconds
   }
 
+  private func sessionRetentionAuthority(
+    receivedAt: String,
+    scope: TacuaJSONValue
+  ) throws -> TacuaSessionRetentionAuthority {
+    guard let receivedEpoch = TacuaProtocolTimestamp.parseMilliseconds(receivedAt),
+      let retention = scope.objectValue?["retention"]?.objectValue,
+      let rawDays = retention["raw_media_days"]?.integerValue,
+      let derivedDays = retention["derived_data_days"]?.integerValue,
+      (1...30).contains(rawDays), (1...365).contains(derivedDays)
+    else { throw TacuaSDKStartLifecycleError.exchangeOutcomeUnknown }
+    let dayMilliseconds: Int64 = 24 * 60 * 60 * 1_000
+    let authority = TacuaSessionRetentionAuthority(
+      sessionReceivedAt: receivedAt,
+      rawMediaExpiresAt: TacuaProtocolTimestamp.format(
+        milliseconds: receivedEpoch + rawDays * dayMilliseconds
+      ),
+      derivedDataExpiresAt: TacuaProtocolTimestamp.format(
+        milliseconds: receivedEpoch + derivedDays * dayMilliseconds
+      )
+    )
+    try authority.validate()
+    return authority
+  }
+
   private func startedSession(from queue: TacuaTransportQueueV3) throws
     -> TacuaSDKStartedSession
   {
@@ -842,6 +895,7 @@ final class TacuaSDKStartLifecycleCoordinator {
       let scopeDigest = queue.scopeDigest,
       let credentialID = queue.currentCredentialID,
       let expiresAt = queue.currentCredentialExpiresAt,
+      let rawMediaExpiresAt = queue.sessionRetentionAuthority?.rawMediaExpiresAt,
       queue.credentialCapability == .active
     else { throw TacuaSDKStartLifecycleError.recoveryStateMismatch }
     let availability = credentialAvailability(queue.currentCredentialID)
@@ -851,6 +905,7 @@ final class TacuaSDKStartLifecycleCoordinator {
       scopeDigest: scopeDigest,
       credentialID: credentialID,
       credentialExpiresAt: expiresAt,
+      rawMediaExpiresAt: rawMediaExpiresAt,
       credentialCapability: queue.credentialCapability,
       credentialAvailability: availability,
       queueSchemaVersion: queue.schemaVersion,

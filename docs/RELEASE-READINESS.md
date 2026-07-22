@@ -1,0 +1,124 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
+# Tacua release readiness
+
+Tacua is a pre-release, self-hosted foundation. It is not yet an
+Internet-facing production service or a generally released mobile SDK. This
+document separates code and deterministic test coverage from the external
+evidence still needed for an authorized pilot and production promotion.
+
+The presence of a test or workflow is not itself a passing result. A release
+candidate is repository-verified only when the complete `Verify` workflow is
+green for the exact immutable commit being promoted. Synthetic fixtures,
+simulator builds, and one-component device experiments are useful evidence, but
+none substitutes for the physical capture-to-approved-ticket workflow.
+
+The implemented V1 architecture's repository-owned source/design threat review
+is complete in the [security model](SECURITY-MODEL.md). That static review does
+not close the production gate: the exact mobile integration, processor,
+connectors, agent runtime, credentials, host, network, storage, and operations
+still require the model's deployment-specific overlays and live validation.
+
+## Current implementation boundary
+
+| Area | Implemented foundation | Proof boundary |
+| --- | --- | --- |
+| iOS capture | App-only ReplayKit capture, narration and app audio, bounded segmentation, issue marks and gaps, a 30-minute design limit, interruption recovery, and scoped local deletion. | The capture candidate passed its documented synthetic-data campaign on one physical iPhone. That campaign predates the complete SDK-to-backend path and is not a supported-device matrix. |
+| Mobile SDK lifecycle | A QA-build-only gate; sealed build, backend, consent, scope, and retention profile; consent-gated START and RESUME exchange; crash journals; native session discovery independent of prior JavaScript state; exact replay; stopped-capture admission; diagnostic projection; upload, completion, local retirement, server-anchored local expiry sweeping, and backend deletion. | Swift, TypeScript, config-plugin, and generated Expo/iOS build checks cover the implementation. The full lifecycle has not yet passed on a physical QA build. Upload uses an in-process foreground session: suspension or termination can stop progress, and the host must drain the durable queue again after relaunch. Expiry is checked when discovery or another lifecycle boundary runs. A reboot before the raw deadline blocks raw-data use until authenticated RESUME establishes a current-boot server-time anchor; this is deliberate fail-closed behavior, not continuous background enforcement. |
+| Self-hosted backend | A single-organization, single-process Python/SQLite service whose current pilot configuration pins exactly one project, application, tested build, reviewer identity, and administrator credential per deployment; exact SDK receipts; integrity-checked storage; retention and deletion; immutable job and candidate histories; atomic candidate publication and handoff export; sealed configuration; health, preflight, backup, restore, and smoke tooling; hardened Docker definitions. Backup manifest v2 binds and recomputes the earliest retained raw/derived session-evidence deadline and refuses verification plus dry-run or applied restore at expiry. This singular deployment scope is an implementation limit, not a narrowing of the product's future multi-project/member boundary. | Unit and contract suites plus the checked-in Docker CI job exercise these boundaries. Expiry refusal does not destroy off-host bytes, and this is not evidence that a real host, TLS proxy, firewall, storage device, backup destination, destruction lifecycle, or upgrade procedure has been operated successfully. |
+| Processing | Durable processing jobs and an opt-in, provider-neutral, shell-free local command adapter with bounded canonical input and output. Normal backend startup is inert and default-deny for egress. | No transcription model, LLM, repository connector, telemetry connector, API provider, or command is selected. The current local worker is an exclusive operator command that runs while the HTTP service is stopped; it is not an unattended production worker. |
+| Reviewer app | Secure self-hosted configuration; display of the single registered build projection and launch-code orchestration; recovery guidance; session, evidence, preview, and job views; candidate editing and clarification; exact-version approval; integrity-checked canonical Markdown/JSON sharing. | Deterministic tests include a rendered candidate-route regression for combined ticket, screenshot, SDK-timeline, and approval-lock states; TypeScript checks and iOS export cover their respective boundaries. A physical reviewer-to-QA-app-to-review run remains outstanding. Split and merge controls are intentionally absent pending the decision below. |
+| Handoff | Immutable candidate versions, evidence binding, exact approval, canonical Markdown/JSON export, and a separate execution-trust assertion contract. | Structural fixtures do not authorize an agent. [ADR-011](decisions/ADR-011-approved-handoff.md) remains proposed until a trusted real consumer trial and execution policy are accepted. |
+| SDK distribution | A pre-release `@tacua/mobile-sdk` tarball boundary, checksum validator, and tag-triggered GitHub prerelease workflow. Registry publication remains disabled; this does not make the Apache-2.0 source private. | No SDK release exists until the protected, signed release tag is pushed from a verification-green default-branch commit and the release workflow succeeds. See the [maintainer runbook](maintainers/MOBILE_SDK_RELEASE.md). |
+
+## Product-owner decisions still open
+
+These decisions cannot be inferred from the implementation:
+
+1. **Candidate split and merge.** [ADR-015](decisions/ADR-015-candidate-split-merge-semantics.md) is only a proposal. Accept its recommended atomic replacement and exact evidence-union semantics, or specify a different source disposition and lossless evidence rule. Until then, split/merge endpoints and controls remain absent.
+2. **Real processing boundary.** Select a trusted local processor or an external provider, define the exact transcription/research behavior, and approve its evidence and network access. An external provider also needs a credential and egress design. An untrusted local processor needs a separate UID, container, or sandbox with read-only inputs, no network by default, and CPU, memory, time, and disk limits; the same-UID adapter is for trusted operator-selected code only.
+3. **Execution trust.** Choose how short-lived registry assertions are issued, signed, revoked, and scoped to repositories, builds, and evidence. Define which agent runtime is allowed to consume them. Approval alone must remain non-executable.
+4. **Measured capture acceptance.** Either eliminate the 121 app-audio boundary drops observed across 77,523 append attempts in the 30-minute device run (about 0.156%), or define and enforce an explicit acceptable threshold.
+
+## Operator inputs and credentials still required
+
+A real deployment or pilot must supply its own values; none should be committed:
+
+- an immutable QA build identity and sealed SDK profile;
+- Apple signing and TestFlight or other authorized QA-distribution access;
+- the self-hosted HTTPS origin, DNS, trusted certificate, reverse proxy, host
+  and provider firewall rules, and a digest-pinned backend image;
+- a high-entropy administrator secret, durable local storage, and encrypted,
+  access-controlled off-host backup storage;
+- least-privilege, read-only repository and observability credentials for each
+  connector that is actually selected; and
+- model/API credentials only if an explicitly authorized external processing
+  design is selected.
+
+Follow the backend [configuration](../services/backend/CONFIGURATION.md),
+[operations](../services/backend/OPERATIONS.md), and
+[processing-adapter](../services/backend/PROCESSING_ADAPTER.md) runbooks. Their
+preflight checks do not configure or prove DNS, TLS ownership, firewalls,
+off-host backup transfer or destruction, provider authorization, or host monitoring.
+
+## Required evidence before an authorized private pilot
+
+- The exact commit passes every repository job, including contracts, backend,
+  reviewer, SDK, generated iOS compilation, Docker build/smoke, single-writer
+  exclusion, backup, and restore.
+- The SDK prerelease tarball and checksum are generated from that commit and
+  integrated only into the authorized QA target; the ordinary production/App
+  Store target proves that the SDK and recording permissions are absent.
+- On a physical iPhone, the reviewer app launches the QA app, the tested app
+  obtains truthful consent, capture records narration and issues, lifecycle
+  interruptions are represented as gaps, relaunch discovers pending work, and
+  foreground queue draining completes without losing exact evidence.
+- The selected real processor produces zero, one, and several grounded
+  candidates from authorized test data. Screenshots, diagnostic context,
+  clarification, edits, approval, canonical export, and rejection all work
+  without exposing credentials or unrelated evidence.
+- Completion and explicit deletion retire the intended local and backend data;
+  retention expiry is observed end to end. Locked-device protected-file
+  behavior and an authenticated, user-visible recovery/reset path for corrupt
+  local state are verified. The SDK's lifecycle and relaunch boundaries sweep
+  expired local capture, journals, credentials, and queue state crash-safely;
+  verify that behavior, including pre-deadline reboot reconciliation through
+  authenticated RESUME, on the signed physical QA build.
+- Backup manifest v2 recomputes and matches the copied database's earliest
+  raw/derived evidence deadline, then refuses verification and both restore
+  modes at that boundary; the selected off-host system also proves that every
+  bundle and replica is physically destroyed by that deadline.
+- A real coding agent consumes one approved handoff under a trusted,
+  least-privilege assertion and completes a scoped pilot task without treating
+  structural approval as authorization.
+
+Use synthetic or explicitly approved QA data for these gates. Do not publish
+recordings, credentials, private source, production telemetry, personal data,
+or stable device identifiers as evidence.
+
+## Additional gates before Internet-facing production
+
+- Operate the digest-pinned image behind the intended TLS proxy and firewalls;
+  run preflight and exact-origin smoke checks from a representative QA-device
+  network.
+- Exercise backup, integrity verification, non-destructive restore, applied
+  restore, upgrade, rollback, retention alerts, storage exhaustion, and host
+  restart on the selected infrastructure. Exercise candidate-image startup
+  against an isolated restored copy as a separate compatibility gate; the
+  backend intentionally has no migration for schema 1 or the earlier
+  unconstrained schema-v2 credential table.
+- Apply the security model's [deployment overlay](SECURITY-MODEL.md#deployment-overlay)
+  to the exact environment and selected integrations. Validate abuse and
+  request-size limits, secret recovery/rotation, processor isolation, dependency
+  and image provenance, log redaction, incident response, and data-erasure
+  evidence in operation; remediate or explicitly accept the resulting findings.
+- Resolve or explicitly gate fail-closed recovery states that currently need
+  operator intervention, including indeterminate RESUME exchange reconciliation
+  and corrupt local-session recovery.
+- Run a supported-device and supported-iOS compatibility/resource campaign on
+  the production integration rather than relying on the original capture spike.
+
+Android, whole-device capture, tracker synchronization, cross-customer
+multi-tenancy, a hosted Tacua control plane, and autonomous execution without
+human approval remain explicitly deferred. They are not hidden V1 release
+gates.

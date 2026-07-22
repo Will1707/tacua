@@ -25,7 +25,10 @@ enum SDKBackendProtocolTests {
     let fixtureRoot = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
     try validatesEveryPositiveLifecyclePair(fixtureRoot)
     try rejectsNonCanonicalAndUnboundedResponses(fixtureRoot)
+    try validatesOnlyExactlyBoundHistoricalMissErrors(fixtureRoot)
     try rejectsUnknownFieldsAndReboundIdentifiers(fixtureRoot)
+    try buildAndScopeProjectionMatchesFrozenSchema(fixtureRoot)
+    try boundedTextUsesUnicodeCodePoints(fixtureRoot)
     try completionAuthorityComesFromExactReceipt(fixtureRoot)
     try resealedIncompleteCompletionCannotAuthorizeCleanup(fixtureRoot)
     try resealedManifestReceiptSetMismatchCannotAuthorizeCleanup(fixtureRoot)
@@ -106,6 +109,187 @@ enum SDKBackendProtocolTests {
     }
   }
 
+  private static func validatesOnlyExactlyBoundHistoricalMissErrors(_ root: URL) throws {
+    let request = try canonicalFixture(root, "diagnostic-upload-request")
+    let authenticatedCredentialID = "credential_current"
+    let response = try historicalMissError(
+      for: request,
+      authenticatedCredentialID: authenticatedCredentialID
+    )
+    let validated = try TacuaSDKBackendProtocol.validateErrorResponse(
+      response,
+      statusCode: 403,
+      contentType: TacuaSDKBackendProtocol.backendErrorMediaType,
+      forCanonicalRequest: request,
+      authenticatedCredentialID: authenticatedCredentialID
+    )
+    try require(validated.statusCode == 403, "Typed error must retain its status")
+    try require(validated.code == .operationNotAuthorized, "Only the allowlisted code may surface")
+    try require(
+      validated.reconciliationOutcome == .historicalOperationNotFound,
+      "Typed error must describe one historical durable-lookup miss"
+    )
+    try require(validated.operationKind == .diagnostic, "Request kind must bind the error")
+    try require(validated.remoteSessionID == "session_synthetic", "Session must remain bound")
+    try require(
+      validated.operationID == "upload_diagnostic_synthetic",
+      "Operation ID must remain bound"
+    )
+    try require(
+      validated.requestCredentialID == "credential_receiving_resume"
+        && validated.authenticatedCredentialID == authenticatedCredentialID,
+      "Historical and authenticating credentials must remain distinct and bound"
+    )
+    for (requestName, expectedKind) in [
+      ("segment-upload-intent", TacuaBackendOperationKind.segment),
+      ("completion-request", TacuaBackendOperationKind.completion),
+    ] {
+      let additionalRequest = try canonicalFixture(root, requestName)
+      let additionalError = try historicalMissError(
+        for: additionalRequest,
+        authenticatedCredentialID: authenticatedCredentialID
+      )
+      let additionalValidated = try TacuaSDKBackendProtocol.validateErrorResponse(
+        additionalError,
+        statusCode: 403,
+        contentType: TacuaSDKBackendProtocol.backendErrorMediaType,
+        forCanonicalRequest: additionalRequest,
+        authenticatedCredentialID: authenticatedCredentialID
+      )
+      try require(
+        additionalValidated.operationKind == expectedKind,
+        "Every recoverable historical operation kind must validate exactly"
+      )
+    }
+
+    try expectFailure {
+      _ = try TacuaSDKBackendProtocol.validateErrorResponse(
+        response,
+        statusCode: 409,
+        contentType: TacuaSDKBackendProtocol.backendErrorMediaType,
+        forCanonicalRequest: request,
+        authenticatedCredentialID: authenticatedCredentialID
+      )
+    }
+    try expectFailure {
+      _ = try TacuaSDKBackendProtocol.validateErrorResponse(
+        response,
+        statusCode: 403,
+        contentType: "application/json",
+        forCanonicalRequest: request,
+        authenticatedCredentialID: authenticatedCredentialID
+      )
+    }
+    try expectFailure {
+      _ = try TacuaSDKBackendProtocol.validateErrorResponse(
+        response + Data([0x0A]),
+        statusCode: 403,
+        contentType: TacuaSDKBackendProtocol.backendErrorMediaType,
+        forCanonicalRequest: request,
+        authenticatedCredentialID: authenticatedCredentialID
+      )
+    }
+    try expectFailure {
+      _ = try TacuaSDKBackendProtocol.validateErrorResponse(
+        Data(repeating: 0x20, count: TacuaSDKBackendProtocol.maximumBackendErrorBytes + 1),
+        statusCode: 403,
+        contentType: TacuaSDKBackendProtocol.backendErrorMediaType,
+        forCanonicalRequest: request,
+        authenticatedCredentialID: authenticatedCredentialID
+      )
+    }
+
+    let reboundFields = [
+      ("code", "NOT_ALLOWLISTED"),
+      ("session_id", "session_other"),
+      ("operation_kind", "segment"),
+      ("operation_id", "upload_other"),
+      ("request_digest", "sha256:" + String(repeating: "0", count: 64)),
+      ("request_credential_id", "credential_other"),
+      ("authenticated_credential_id", "credential_other"),
+      ("outcome", "unknown"),
+    ]
+    for (field, value) in reboundFields {
+      var root = try rootObject(response)
+      guard case .object(var error) = root["error"] else {
+        throw ProtocolTestFailure.assertion("Missing structured error")
+      }
+      if field == "code" {
+        error[field] = .string(value)
+      } else {
+        guard case .object(var reconciliation) = error["reconciliation"] else {
+          throw ProtocolTestFailure.assertion("Missing reconciliation")
+        }
+        reconciliation[field] = .string(value)
+        error["reconciliation"] = .object(reconciliation)
+      }
+      root["error"] = .object(error)
+      let rebound = try TacuaCanonicalJSON.data(.object(root))
+      try expectFailure {
+        _ = try TacuaSDKBackendProtocol.validateErrorResponse(
+          rebound,
+          statusCode: 403,
+          contentType: TacuaSDKBackendProtocol.backendErrorMediaType,
+          forCanonicalRequest: request,
+          authenticatedCredentialID: authenticatedCredentialID
+        )
+      }
+    }
+
+    var extra = try rootObject(response)
+    extra["ignored"] = .bool(true)
+    try expectFailure {
+      _ = try TacuaSDKBackendProtocol.validateErrorResponse(
+        try TacuaCanonicalJSON.data(.object(extra)),
+        statusCode: 403,
+        contentType: TacuaSDKBackendProtocol.backendErrorMediaType,
+        forCanonicalRequest: request,
+        authenticatedCredentialID: authenticatedCredentialID
+      )
+    }
+    try expectFailure {
+      _ = try TacuaSDKBackendProtocol.validateErrorResponse(
+        response,
+        statusCode: 403,
+        contentType: TacuaSDKBackendProtocol.backendErrorMediaType,
+        forCanonicalRequest: canonicalFixture(root, "completion-request"),
+        authenticatedCredentialID: authenticatedCredentialID
+      )
+    }
+  }
+
+  private static func historicalMissError(
+    for requestData: Data,
+    authenticatedCredentialID: String
+  ) throws -> Data {
+    let request = try rootObject(requestData)
+    let kind = try TacuaSDKBackendProtocol.validateRequest(requestData)
+    let digestField = kind == .segment ? "intent_digest" : "request_digest"
+    let operationIDField = kind == .completion ? "completion_id" : "upload_id"
+    let message = kind == .completion
+      ? TacuaSDKBackendProtocol.backendCompletionErrorMessage
+      : TacuaSDKBackendProtocol.backendErrorMessage
+    let value = TacuaJSONValue.object([
+      "contract_version": .string(TacuaSDKBackendProtocol.backendErrorContract),
+      "media_type": .string(TacuaSDKBackendProtocol.backendErrorMediaType),
+      "protocol_version": .string(TacuaSDKBackendProtocol.version),
+      "error": .object([
+        "code": .string("OPERATION_NOT_AUTHORIZED"),
+        "message": .string(message),
+        "reconciliation": .object([
+          "outcome": .string("historical_operation_not_found"),
+          "session_id": request["session_id"]!,
+          "operation_kind": .string(kind.rawValue),
+          "operation_id": request[operationIDField]!,
+          "request_digest": request[digestField]!,
+          "request_credential_id": request["credential_id"]!,
+          "authenticated_credential_id": .string(authenticatedCredentialID),
+        ]),
+      ]),
+    ])
+    return try TacuaCanonicalJSON.data(value)
+  }
+
   private static func rejectsUnknownFieldsAndReboundIdentifiers(_ root: URL) throws {
     let startRequest = try canonicalFixture(root, "launch-exchange-request")
     let startResponse = try canonicalFixture(root, "launch-exchange-receipt")
@@ -124,6 +308,87 @@ enum SDKBackendProtocolTests {
     try expectFailure {
       _ = try TacuaSDKBackendProtocol.validateResponse(rebound, forCanonicalRequest: resumeRequest)
     }
+  }
+
+  private static func buildAndScopeProjectionMatchesFrozenSchema(_ root: URL) throws {
+    for mutation in 0..<5 {
+      var request = try rootObject(canonicalFixture(root, "launch-exchange-request"))
+      guard case .object(var build) = request["build_identity"],
+        case .object(var scope) = request["scope"]
+      else { throw ProtocolTestFailure.assertion("Missing launch build or scope") }
+      switch mutation {
+      case 0:
+        build["native_version"] = .string("1.0 invalid")
+      case 1:
+        build["bundle_identifier"] = .string(
+          String(repeating: "a.", count: 127) + "aaa"
+        )
+      case 2:
+        guard case .object(var expo) = build["expo"] else {
+          throw ProtocolTestFailure.assertion("Missing Expo build identity")
+        }
+        expo["update_id"] = .null
+        build["expo"] = .object(expo)
+      case 3:
+        guard case .object(var consent) = scope["consent"] else {
+          throw ProtocolTestFailure.assertion("Missing consent policy")
+        }
+        consent["policy_version"] = .string("invalid policy")
+        scope["consent"] = .object(consent)
+      default:
+        guard case .object(var retention) = scope["retention"] else {
+          throw ProtocolTestFailure.assertion("Missing retention policy")
+        }
+        retention["policy_version"] = .string("invalid policy")
+        scope["retention"] = .object(retention)
+      }
+      try resealLaunchRequest(&request, build: &build, scope: &scope)
+      try expectFailure {
+        _ = try TacuaSDKBackendProtocol.validateRequest(
+          try TacuaCanonicalJSON.data(.object(request))
+        )
+      }
+    }
+  }
+
+  private static func boundedTextUsesUnicodeCodePoints(_ root: URL) throws {
+    var request = try rootObject(canonicalFixture(root, "launch-exchange-request"))
+    guard case .object(var build) = request["build_identity"],
+      case .object(var scope) = request["scope"],
+      case .object(var expo) = build["expo"]
+    else { throw ProtocolTestFailure.assertion("Missing Expo launch identity") }
+    expo["update_id"] = .string(String(repeating: "é", count: 512))
+    build["expo"] = .object(expo)
+    try resealLaunchRequest(&request, build: &build, scope: &scope)
+    _ = try TacuaSDKBackendProtocol.validateRequest(
+      try TacuaCanonicalJSON.data(.object(request))
+    )
+
+    guard case .object(var oversizedExpo) = build["expo"] else {
+      throw ProtocolTestFailure.assertion("Missing resealed Expo identity")
+    }
+    oversizedExpo["update_id"] = .string(String(repeating: "é", count: 513))
+    build["expo"] = .object(oversizedExpo)
+    try resealLaunchRequest(&request, build: &build, scope: &scope)
+    try expectFailure {
+      _ = try TacuaSDKBackendProtocol.validateRequest(
+        try TacuaCanonicalJSON.data(.object(request))
+      )
+    }
+  }
+
+  private static func resealLaunchRequest(
+    _ request: inout [String: TacuaJSONValue],
+    build: inout [String: TacuaJSONValue],
+    scope: inout [String: TacuaJSONValue]
+  ) throws {
+    try reseal(&build, field: "build_identity_digest")
+    scope["build_id"] = build["build_id"]
+    scope["build_identity_digest"] = build["build_identity_digest"]
+    try reseal(&scope, field: "scope_digest")
+    request["build_identity"] = .object(build)
+    request["scope"] = .object(scope)
+    try reseal(&request, field: "request_digest")
   }
 
   private static func resumeReceiptCannotPredatePriorAuthority(_ root: URL) throws {
@@ -401,23 +666,88 @@ enum SDKBackendProtocolTests {
 
   private static func resealedProcessingJobNestedFieldsAreRejected(_ root: URL) throws {
     let request = try canonicalFixture(root, "completion-request")
-    var response = try rootObject(canonicalFixture(root, "completion-receipt"))
-    guard case .object(var job) = response["processing_job"],
-      case .object(var execution) = job["execution"],
-      case .object(var egress) = execution["egress"]
-    else { throw ProtocolTestFailure.assertion("Missing processing egress") }
-    egress["ignored"] = .bool(true)
-    execution["egress"] = .object(egress)
-    job["execution"] = .object(execution)
-    try reseal(&job, field: "job_digest")
-    response["processing_job"] = .object(job)
-    try reseal(&response, field: "completion_receipt_digest")
+    let unknownEgress = try resealedProcessingJobResponse(root) { job in
+      guard case .object(var execution) = job["execution"],
+        case .object(var egress) = execution["egress"]
+      else { throw ProtocolTestFailure.assertion("Missing processing egress") }
+      egress["ignored"] = .bool(true)
+      execution["egress"] = .object(egress)
+      job["execution"] = .object(execution)
+    }
     try expectFailure {
       _ = try TacuaSDKBackendProtocol.validateResponse(
-        try TacuaCanonicalJSON.data(.object(response)),
+        unknownEgress,
         forCanonicalRequest: request
       )
     }
+
+    let laterVersion = try resealedProcessingJobResponse(root) { job in
+      job["job_version"] = .integer(2)
+      job["previous_job_digest"] = job["job_digest"]
+    }
+    try expectFailure {
+      _ = try TacuaSDKBackendProtocol.validateResponse(
+        laterVersion, forCanonicalRequest: request
+      )
+    }
+
+    let reorderedStages = try resealedProcessingJobResponse(root) { job in
+      guard case .object(var pipeline) = job["pipeline"],
+        case .array(var stages) = pipeline["stages"]
+      else { throw ProtocolTestFailure.assertion("Missing processing stages") }
+      stages.swapAt(0, 1)
+      pipeline["stages"] = .array(stages)
+      job["pipeline"] = .object(pipeline)
+    }
+    try expectFailure {
+      _ = try TacuaSDKBackendProtocol.validateResponse(
+        reorderedStages, forCanonicalRequest: request
+      )
+    }
+
+    let attemptedStage = try resealedProcessingJobResponse(root) { job in
+      guard case .object(var pipeline) = job["pipeline"],
+        case .array(var stages) = pipeline["stages"],
+        case .object(var firstStage) = stages.first
+      else { throw ProtocolTestFailure.assertion("Missing processing stages") }
+      firstStage["attempt_count"] = .integer(1)
+      stages[0] = .object(firstStage)
+      pipeline["stages"] = .array(stages)
+      job["pipeline"] = .object(pipeline)
+    }
+    try expectFailure {
+      _ = try TacuaSDKBackendProtocol.validateResponse(
+        attemptedStage, forCanonicalRequest: request
+      )
+    }
+
+    let changedExecution = try resealedProcessingJobResponse(root) { job in
+      guard case .object(var execution) = job["execution"] else {
+        throw ProtocolTestFailure.assertion("Missing processing execution")
+      }
+      execution["max_attempts"] = .integer(4)
+      job["execution"] = .object(execution)
+    }
+    try expectFailure {
+      _ = try TacuaSDKBackendProtocol.validateResponse(
+        changedExecution, forCanonicalRequest: request
+      )
+    }
+  }
+
+  private static func resealedProcessingJobResponse(
+    _ root: URL,
+    mutate: (inout [String: TacuaJSONValue]) throws -> Void
+  ) throws -> Data {
+    var response = try rootObject(canonicalFixture(root, "completion-receipt"))
+    guard case .object(var job) = response["processing_job"] else {
+      throw ProtocolTestFailure.assertion("Missing processing job")
+    }
+    try mutate(&job)
+    try reseal(&job, field: "job_digest")
+    response["processing_job"] = .object(job)
+    try reseal(&response, field: "completion_receipt_digest")
+    return try TacuaCanonicalJSON.data(.object(response))
   }
 
   private static func requireValue<T>(_ value: T?, _ message: String) throws -> T {

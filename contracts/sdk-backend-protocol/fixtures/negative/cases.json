@@ -96,6 +96,21 @@
       "mode": "validate"
     },
     {
+      "expected_code": "COMPLETION_JOB_NOT_INITIAL",
+      "file": "completion-job-not-initial-version.json",
+      "mode": "validate"
+    },
+    {
+      "expected_code": "COMPLETION_JOB_NOT_INITIAL",
+      "file": "completion-job-not-initial-stage.json",
+      "mode": "validate"
+    },
+    {
+      "expected_code": "COMPLETION_JOB_NOT_INITIAL",
+      "file": "completion-job-not-initial-execution.json",
+      "mode": "validate"
+    },
+    {
       "expected_code": "LOCAL_CLEANUP_BINDING_MISMATCH",
       "file": "completion-cleanup-mismatch.json",
       "mode": "completion_pair"

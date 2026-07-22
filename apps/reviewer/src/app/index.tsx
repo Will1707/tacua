@@ -14,7 +14,7 @@ import { colors } from "@/theme/colors";
 import { formatDate } from "@/utils/format";
 
 export default function ReviewsRoute() {
-  const { client, config, loading: configLoading } = useBackend();
+  const { client, config, error: backendError, loading: configLoading } = useBackend();
   const [sessions, setSessions] = useState<readonly CaptureSession[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -94,12 +94,19 @@ export default function ReviewsRoute() {
     return () => subscription.remove();
   }, [refresh]);
 
-  if (configLoading) return <View style={{ flex: 1, justifyContent: "center" }}><ActivityIndicator /></View>;
+  if (configLoading) return <View accessible accessibilityLabel="Loading secure backend configuration" accessibilityRole="progressbar" style={{ flex: 1, justifyContent: "center" }}><ActivityIndicator /></View>;
   if (!config || !client) {
     return (
-      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 20 }}>
-        <MessageState title="Connect your Tacua backend" detail="Configure the HTTPS endpoint and mounted administrator credential for this single-organization deployment." />
-        <Link href="/settings" asChild><Pressable style={{ backgroundColor: colors.primary, minHeight: 44, borderRadius: 12, borderCurve: "continuous", alignItems: "center", justifyContent: "center" }}><Text style={{ color: colors.onPrimary, fontWeight: "700", fontSize: 16 }}>Configure backend</Text></Pressable></Link>
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 20, gap: 12 }}>
+        <MessageState
+          title={backendError ? "Secure configuration unavailable" : "Connect your Tacua backend"}
+          detail={backendError ?? "Configure the HTTPS endpoint and mounted administrator credential for this single-organization deployment."}
+        />
+        <Link href="/settings" asChild>
+          <Pressable accessibilityRole="link" style={{ backgroundColor: colors.primary, minHeight: 44, borderRadius: 12, borderCurve: "continuous", alignItems: "center", justifyContent: "center", paddingHorizontal: 16, paddingVertical: 10 }}>
+            <Text style={{ color: colors.onPrimary, fontWeight: "700", fontSize: 16, textAlign: "center" }}>Configure backend</Text>
+          </Pressable>
+        </Link>
       </ScrollView>
     );
   }
@@ -110,12 +117,23 @@ export default function ReviewsRoute() {
       refreshControl={<RefreshControl refreshing={loading} onRefresh={() => void refresh()} />}
       contentContainerStyle={{ padding: 16, gap: 12 }}
     >
-      <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingBottom: 4 }}>
-        <Text selectable style={{ color: colors.secondaryLabel, flex: 1 }} numberOfLines={1}>{config.baseUrl}</Text>
-        <Link href="/settings" style={{ color: colors.primary, fontWeight: "700" }}>Settings</Link>
+      <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start", gap: 8, paddingBottom: 4 }}>
+        <Text selectable style={{ color: colors.secondaryLabel, flex: 1 }}>{config.baseUrl}</Text>
+        <Link href="/settings" asChild>
+          <Pressable accessibilityRole="link" hitSlop={4} style={{ minHeight: 44, minWidth: 44, justifyContent: "center", alignItems: "flex-end", paddingHorizontal: 4 }}>
+            <Text style={{ color: colors.primary, fontWeight: "700" }}>Settings</Text>
+          </Pressable>
+        </Link>
       </View>
       <LaunchReviewCard client={client} targetScheme={config.targetScheme} />
-      {error ? <MessageState title="Could not load sessions" detail={error} /> : null}
+      {error ? (
+        <MessageState
+          title={sessions.length ? "Could not refresh sessions" : "Could not load sessions"}
+          detail={sessions.length
+            ? `${error} Previously loaded sessions remain below; pull down to verify them again.`
+            : error}
+        />
+      ) : null}
       {!error && !loading && sessions.length === 0 ? <MessageState title="No review sessions yet" detail="A session will appear here after the QA build exchanges a launch code with this backend." /> : null}
       {sessions.map((session) => (
         <Link key={session.session_id} href={{ pathname: "/sessions/[session-id]", params: { "session-id": session.session_id } }} asChild>

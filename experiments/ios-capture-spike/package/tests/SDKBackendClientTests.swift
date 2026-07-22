@@ -32,12 +32,21 @@ private final class MockURLProtocol: URLProtocol {
   private static var responseHandler: ((URLRequest) -> MockResponse)?
   private static var observedRequests: [URLRequest] = []
   private static var observedBodies: [Data?] = []
+  private static var responseDelayMilliseconds = 0
+  private static var stopLoadingCount = 0
+  private let lifecycleLock = NSLock()
+  private var stopped = false
 
-  static func install(_ handler: @escaping (URLRequest) -> MockResponse) {
+  static func install(
+    responseDelayMilliseconds: Int = 0,
+    _ handler: @escaping (URLRequest) -> MockResponse
+  ) {
     lock.lock()
     responseHandler = handler
     observedRequests = []
     observedBodies = []
+    self.responseDelayMilliseconds = responseDelayMilliseconds
+    stopLoadingCount = 0
     lock.unlock()
   }
 
@@ -53,6 +62,12 @@ private final class MockURLProtocol: URLProtocol {
     return observedBodies
   }
 
+  static func observedStopLoadingCount() -> Int {
+    lock.lock()
+    defer { lock.unlock() }
+    return stopLoadingCount
+  }
+
   override class func canInit(with request: URLRequest) -> Bool { true }
   override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
@@ -62,12 +77,37 @@ private final class MockURLProtocol: URLProtocol {
     Self.observedRequests.append(request)
     Self.observedBodies.append(body)
     let handler = Self.responseHandler
+    let delay = Self.responseDelayMilliseconds
     Self.lock.unlock()
     guard let handler, let url = request.url else {
       client?.urlProtocol(self, didFailWithError: ClientTestFailure.assertion("Missing handler"))
       return
     }
     let response = handler(request)
+    if delay > 0 {
+      DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(delay)) {
+        [weak self] in
+        self?.deliver(response, url: url)
+      }
+      return
+    }
+    deliver(response, url: url)
+  }
+
+  override func stopLoading() {
+    lifecycleLock.lock()
+    stopped = true
+    lifecycleLock.unlock()
+    Self.lock.lock()
+    Self.stopLoadingCount += 1
+    Self.lock.unlock()
+  }
+
+  private func deliver(_ response: MockResponse, url: URL) {
+    lifecycleLock.lock()
+    let shouldDeliver = !stopped
+    lifecycleLock.unlock()
+    guard shouldDeliver else { return }
     let http = HTTPURLResponse(
       url: url,
       statusCode: response.status,
@@ -78,8 +118,6 @@ private final class MockURLProtocol: URLProtocol {
     client?.urlProtocol(self, didLoad: response.data)
     client?.urlProtocolDidFinishLoading(self)
   }
-
-  override func stopLoading() {}
 
   private static func readBody(_ request: URLRequest) -> Data? {
     if let body = request.httpBody { return body }
@@ -101,6 +139,8 @@ private final class MockURLProtocol: URLProtocol {
 enum SDKBackendClientTests {
   static func main() async throws {
     let fixtureRoot = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
+    try transportConfigurationIsExplicitlyProcessBound()
+    try await transportTaskCancellationIsBoundedAndCancelsURLSession()
     try requestBuildersMatchNormativeFixtures(fixtureRoot)
     try await launchIsTransientAndUnauthenticated(fixtureRoot)
     try await rotatedCredentialAuthenticatesExactHistoricalRequest(fixtureRoot)
@@ -108,9 +148,95 @@ enum SDKBackendClientTests {
     try await completionAndDeletionUseExactRoutes(fixtureRoot)
     try await redirectsAreRejectedWithoutForwardingAuthorization(fixtureRoot)
     try await responseBoundsAndContentTypeFailClosed(fixtureRoot)
+    try await structuredErrorsSurfaceOnlyAfterExactValidation(fixtureRoot)
     try await resealedInvalidRequestsNeverReachTransport(fixtureRoot)
+    try await uploadStagingScavengerIsBoundedAndFailClosed(fixtureRoot)
     try await unsafeSegmentSourcesNeverReachTransport(fixtureRoot)
     print("Tacua SDK backend client tests passed")
+  }
+
+  private static func transportConfigurationIsExplicitlyProcessBound() throws {
+    let configuration = TacuaBoundedURLSessionTransport.secureConfiguration()
+    try require(
+      configuration.identifier == nil,
+      "V1 transport must remain process-bound; a background session changes redirect semantics"
+    )
+    try require(
+      configuration.requestCachePolicy == .reloadIgnoringLocalCacheData
+        && configuration.urlCache == nil,
+      "Transport must not persist backend responses in URL loading caches"
+    )
+    try require(
+      configuration.httpCookieStorage == nil
+        && !configuration.httpShouldSetCookies
+        && configuration.httpCookieAcceptPolicy == .never,
+      "Transport must not persist or accept ambient cookies"
+    )
+    try require(
+      configuration.timeoutIntervalForRequest == 60
+        && configuration.timeoutIntervalForResource == 30 * 60,
+      "Transport time bounds changed without updating the V1 execution contract"
+    )
+  }
+
+  private static func transportTaskCancellationIsBoundedAndCancelsURLSession() async throws {
+    let configuration = TacuaBoundedURLSessionTransport.secureConfiguration()
+    configuration.protocolClasses = [MockURLProtocol.self]
+    let transport = TacuaBoundedURLSessionTransport(configuration: configuration)
+    MockURLProtocol.install(responseDelayMilliseconds: 1_000) { request in
+      MockResponse(
+        status: 200,
+        headers: ["Content-Type": "application/json"],
+        data: Data("{}".utf8)
+      )
+    }
+    let request = URLRequest(url: URL(string: "https://qa.tacua.example/cancel")!)
+    let registered = Task { try await transport.data(for: request, uploadFile: nil) }
+    for _ in 0..<500 where MockURLProtocol.requests().isEmpty {
+      try await Task.sleep(nanoseconds: 1_000_000)
+    }
+    try require(!MockURLProtocol.requests().isEmpty, "Cancellation test never registered a task")
+    let cancellationStartedAt = Date()
+    registered.cancel()
+    do {
+      _ = try await registered.value
+      throw ClientTestFailure.assertion("Cancelled URLSession transport returned success")
+    } catch ClientTestFailure.assertion {
+      throw ClientTestFailure.assertion("Cancelled URLSession transport returned success")
+    } catch {}
+    try require(
+      Date().timeIntervalSince(cancellationStartedAt) < 0.5,
+      "Task cancellation waited for the delayed URLProtocol response"
+    )
+    try require(
+      MockURLProtocol.observedStopLoadingCount() >= 1,
+      "Task cancellation did not reach the concrete URLSession task"
+    )
+
+    // Repeated immediate cancellation exercises the before/during-registration race. Every
+    // checked continuation must finish exactly once even when cancellation wins first.
+    MockURLProtocol.install(responseDelayMilliseconds: 1_000) { request in
+      MockResponse(
+        status: 200,
+        headers: ["Content-Type": "application/json"],
+        data: Data("{}".utf8)
+      )
+    }
+    let immediate = (0..<32).map { index in
+      Task {
+        try await transport.data(
+          for: URLRequest(
+            url: URL(string: "https://qa.tacua.example/cancel/\(index)")!
+          ),
+          uploadFile: nil
+        )
+      }
+    }
+    immediate.forEach { $0.cancel() }
+    for task in immediate {
+      do { _ = try await task.value }
+      catch {}
+    }
   }
 
   private static func requestBuildersMatchNormativeFixtures(_ root: URL) throws {
@@ -474,6 +600,123 @@ enum SDKBackendClientTests {
     }
   }
 
+  private static func structuredErrorsSurfaceOnlyAfterExactValidation(_ root: URL) async throws {
+    let requestData = try canonicalFixture(root, "diagnostic-upload-request")
+    let authenticatedCredentialID = "credential_current"
+    let errorData = try historicalMissError(
+      for: requestData,
+      authenticatedCredentialID: authenticatedCredentialID
+    )
+    let credentials = TestCredentialStore()
+    credentials.values[authenticatedCredentialID] = Data(repeating: 0x49, count: 32)
+    MockURLProtocol.install { _ in
+      MockResponse(
+        status: 403,
+        headers: ["Content-Type": TacuaSDKBackendProtocol.backendErrorMediaType],
+        data: errorData
+      )
+    }
+    var client = try makeClient(credentials: credentials)
+    do {
+      _ = try await client.send(
+        diagnosticPrepared(requestData),
+        transportCredentialID: authenticatedCredentialID
+      )
+      throw ClientTestFailure.assertion("Validated backend error must throw")
+    } catch let error as TacuaSDKBackendClientError {
+      guard case .backend(let validated) = error else {
+        throw ClientTestFailure.assertion("Exact backend error must remain typed")
+      }
+      try require(validated.code == .operationNotAuthorized, "Code must be allowlisted")
+      try require(
+        validated.reconciliationOutcome == .historicalOperationNotFound,
+        "Outcome must prove the historical durable lookup missed"
+      )
+      try require(
+        validated.operationID == "upload_diagnostic_synthetic"
+          && validated.authenticatedCredentialID == authenticatedCredentialID,
+        "Typed error must retain exact request and transport bindings"
+      )
+    }
+    let observed = try requireOneRequest()
+    try require(
+      observed.value(forHTTPHeaderField: "Accept")
+        == "application/json, \(TacuaSDKBackendProtocol.backendErrorMediaType)",
+      "Authenticated requests must advertise the structured error media type"
+    )
+
+    let completionData = try canonicalFixture(root, "completion-request")
+    let completionRoot = try rootObject(completionData)
+    let completionError = try historicalMissError(
+      for: completionData,
+      authenticatedCredentialID: authenticatedCredentialID
+    )
+    MockURLProtocol.install { _ in
+      MockResponse(
+        status: 403,
+        headers: ["Content-Type": TacuaSDKBackendProtocol.backendErrorMediaType],
+        data: completionError
+      )
+    }
+    client = try makeClient(credentials: credentials)
+    do {
+      _ = try await client.send(
+        TacuaPreparedBackendRequest(
+          kind: .completion,
+          operationID: completionRoot["completion_id"]!.stringValue!,
+          credentialID: completionRoot["credential_id"]!.stringValue!,
+          canonicalData: completionData,
+          requestDigest: completionRoot["request_digest"]!.stringValue!
+        ),
+        transportCredentialID: authenticatedCredentialID
+      )
+      throw ClientTestFailure.assertion("Validated missing completion must throw")
+    } catch let error as TacuaSDKBackendClientError {
+      guard case .backend(let validated) = error else {
+        throw ClientTestFailure.assertion("Missing completion must remain typed")
+      }
+      try require(
+        validated.operationKind == .completion
+          && validated.operationID == "completion_synthetic",
+        "Completion reconciliation must bind its exact completion request"
+      )
+    }
+
+    let invalidResponses: [(String, Data)] = [
+      ("application/json", errorData),
+      (
+        TacuaSDKBackendProtocol.backendErrorMediaType,
+        try replacingHistoricalMissField(
+          errorData,
+          field: "authenticated_credential_id",
+          value: "credential_other"
+        )
+      ),
+      (
+        TacuaSDKBackendProtocol.backendErrorMediaType,
+        Data(repeating: 0x20, count: TacuaSDKBackendProtocol.maximumBackendErrorBytes + 1)
+      ),
+    ]
+    for (contentType, body) in invalidResponses {
+      MockURLProtocol.install { _ in
+        MockResponse(status: 403, headers: ["Content-Type": contentType], data: body)
+      }
+      client = try makeClient(credentials: credentials)
+      do {
+        _ = try await client.send(
+          diagnosticPrepared(requestData),
+          transportCredentialID: authenticatedCredentialID
+        )
+        throw ClientTestFailure.assertion("Malformed backend error must throw")
+      } catch let error as TacuaSDKBackendClientError {
+        try require(
+          error == .unexpectedStatus(403),
+          "Untrusted non-success bodies must preserve generic status behavior"
+        )
+      }
+    }
+  }
+
   private static func resealedInvalidRequestsNeverReachTransport(_ root: URL) async throws {
     let credentials = TestCredentialStore()
     credentials.values["credential_current"] = Data(repeating: 0x46, count: 32)
@@ -596,6 +839,105 @@ enum SDKBackendClientTests {
     _ = root
   }
 
+  private static func uploadStagingScavengerIsBoundedAndFailClosed(
+    _ root: URL
+  ) async throws {
+    let payload = Data("staging-segment".utf8)
+    let prepared = try TacuaSDKBackendRequests.segment(
+      uploadID: "upload_staging_security",
+      sessionID: "session_synthetic",
+      scopeDigest: "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50",
+      credentialID: "credential_historical",
+      sequence: 9,
+      segmentID: "segment_staging_security",
+      metadata: TacuaSegmentTransportMetadata(
+        contentType: "video/quicktime",
+        sizeBytes: Int64(payload.count),
+        contentDigest: TacuaCanonicalJSON.digest(data: payload),
+        sidecarDigest: "sha256:" + String(repeating: "6", count: 64)
+      ),
+      requestedAt: "2026-07-21T10:01:59Z"
+    )
+    let response = try segmentResponse(for: prepared, fixtureRoot: root)
+    let credentials = TestCredentialStore()
+    credentials.values["credential_current"] = Data(repeating: 0x48, count: 32)
+
+    func makeDirectory(_ suffix: String) throws -> (URL, URL, URL) {
+      let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+        "tacua-staging-\(suffix)-\(UUID().uuidString)",
+        isDirectory: true
+      )
+      try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+      let file = directory.appendingPathComponent("segment.mov")
+      try payload.write(to: file)
+      let staging = directory.appendingPathComponent(".tacua-upload-staging", isDirectory: true)
+      try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: false)
+      return (directory, file, staging)
+    }
+
+    do {
+      let (directory, file, staging) = try makeDirectory("stale")
+      defer { try? FileManager.default.removeItem(at: directory) }
+      let stale = staging.appendingPathComponent(
+        "upload-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.snapshot"
+      )
+      try Data("crash-left-snapshot".utf8).write(to: stale)
+      MockURLProtocol.install { _ in
+        MockResponse(status: 201, headers: ["Content-Type": "application/json"], data: response)
+      }
+      _ = try await makeClient(credentials: credentials).uploadSegment(
+        prepared,
+        fileURL: file,
+        sessionDirectory: directory,
+        transportCredentialID: "credential_current"
+      )
+      let remaining = try FileManager.default.contentsOfDirectory(atPath: staging.path)
+      try require(
+        remaining.isEmpty,
+        "A crash-left recognized snapshot must be scavenged before staging and the live copy removed"
+      )
+    }
+
+    do {
+      let (directory, file, staging) = try makeDirectory("symlink")
+      defer { try? FileManager.default.removeItem(at: directory) }
+      let link = staging.appendingPathComponent(
+        "upload-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.snapshot"
+      )
+      try FileManager.default.createSymbolicLink(at: link, withDestinationURL: file)
+      MockURLProtocol.install { _ in
+        MockResponse(status: 500, headers: ["Content-Type": "application/json"], data: Data())
+      }
+      try await expectAsyncFailure {
+        _ = try await makeClient(credentials: credentials).uploadSegment(
+          prepared,
+          fileURL: file,
+          sessionDirectory: directory,
+          transportCredentialID: "credential_current"
+        )
+      }
+      try require(MockURLProtocol.requests().isEmpty, "A staged symlink must fail before transport")
+    }
+
+    do {
+      let (directory, file, staging) = try makeDirectory("foreign")
+      defer { try? FileManager.default.removeItem(at: directory) }
+      try Data("foreign".utf8).write(to: staging.appendingPathComponent("keep-me.txt"))
+      MockURLProtocol.install { _ in
+        MockResponse(status: 500, headers: ["Content-Type": "application/json"], data: Data())
+      }
+      try await expectAsyncFailure {
+        _ = try await makeClient(credentials: credentials).uploadSegment(
+          prepared,
+          fileURL: file,
+          sessionDirectory: directory,
+          transportCredentialID: "credential_current"
+        )
+      }
+      try require(MockURLProtocol.requests().isEmpty, "A foreign staged name must fail before transport")
+    }
+  }
+
   private static func diagnosticPrepared(_ data: Data) -> TacuaPreparedBackendRequest {
     TacuaPreparedBackendRequest(
       kind: .diagnostic,
@@ -604,6 +946,52 @@ enum SDKBackendClientTests {
       canonicalData: data,
       requestDigest: "sha256:8262c9a2865a735afe517349c57a40bc1b8135e785d0e1db1b3bd9056cc93d68"
     )
+  }
+
+  private static func historicalMissError(
+    for requestData: Data,
+    authenticatedCredentialID: String
+  ) throws -> Data {
+    let request = try rootObject(requestData)
+    let kind = try TacuaSDKBackendProtocol.validateRequest(requestData)
+    let digestField = kind == .segment ? "intent_digest" : "request_digest"
+    let operationIDField = kind == .completion ? "completion_id" : "upload_id"
+    let message = kind == .completion
+      ? TacuaSDKBackendProtocol.backendCompletionErrorMessage
+      : TacuaSDKBackendProtocol.backendErrorMessage
+    return try TacuaCanonicalJSON.data(.object([
+      "contract_version": .string(TacuaSDKBackendProtocol.backendErrorContract),
+      "media_type": .string(TacuaSDKBackendProtocol.backendErrorMediaType),
+      "protocol_version": .string(TacuaSDKBackendProtocol.version),
+      "error": .object([
+        "code": .string("OPERATION_NOT_AUTHORIZED"),
+        "message": .string(message),
+        "reconciliation": .object([
+          "outcome": .string("historical_operation_not_found"),
+          "session_id": request["session_id"]!,
+          "operation_kind": .string(kind.rawValue),
+          "operation_id": request[operationIDField]!,
+          "request_digest": request[digestField]!,
+          "request_credential_id": request["credential_id"]!,
+          "authenticated_credential_id": .string(authenticatedCredentialID),
+        ]),
+      ]),
+    ]))
+  }
+
+  private static func replacingHistoricalMissField(
+    _ data: Data,
+    field: String,
+    value: String
+  ) throws -> Data {
+    var root = try rootObject(data)
+    guard case .object(var error) = root["error"],
+      case .object(var reconciliation) = error["reconciliation"]
+    else { throw ClientTestFailure.assertion("Missing reconciliation error") }
+    reconciliation[field] = .string(value)
+    error["reconciliation"] = .object(reconciliation)
+    root["error"] = .object(error)
+    return try TacuaCanonicalJSON.data(.object(root))
   }
 
   private static func segmentResponse(

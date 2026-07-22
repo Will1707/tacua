@@ -8,9 +8,13 @@ analysis worker. Reviewer/admin routes retain session and job observation.
 
 The implementation is Apache-2.0, dependency-free Python using SQLite and the
 filesystem. It is intentionally one organization per deployment and does not
-implement cross-customer multi-tenancy. Put a bounded TLS reverse proxy in
-front of it outside loopback development; authenticated SDK routes and launch
-exchange must never be redirected.
+implement cross-customer multi-tenancy. Each current pilot deployment also
+pins exactly one project, application, tested build, reviewer identity, and
+administrator credential. Those are current implementation limits, not a
+narrowing of the [product boundary](../../docs/PRODUCT.md), which permits future
+multiple projects and members. Put a bounded TLS reverse proxy in front of it
+outside loopback development; authenticated SDK routes and launch exchange
+must never be redirected.
 
 ## Trust and persistence boundary
 
@@ -36,6 +40,16 @@ exchange must never be redirected.
   second, rotation advances to the next representable second so strict
   half-open authorization history remains replayable. Completed-session
   credentials can only replay their bound completion or request/replay deletion.
+  V1 retains at most 64 credentials per session (initial ordinal `0` through
+  ordinal `63`). Grant creation preflights that bound and exchange rechecks it
+  inside the rotation transaction. A further resume fails with
+  `409 CREDENTIAL_ROTATION_LIMIT_REACHED`; delete that session and start a new
+  capture rather than growing an unbounded credential history.
+  For an authenticated current active credential replaying an exact upload or
+  completion that names a revoked credential from this session's history, a durable lookup miss
+  returns the bounded canonical `tacua.sdk-backend-error@1.0.0` envelope. It
+  binds both credentials and the exact session, operation kind, operation ID, and
+  request digest; it does not authorize a replacement operation.
 - Segment bytes are authenticated before reading, streamed through SHA-256 to
   a temporary file, verified, atomically published, and committed with the
   canonical intent and exact receipt bytes. The wire contract binds a
@@ -53,7 +67,14 @@ exchange must never be redirected.
   backfilled losslessly. A later head without history, a broken chain, or a
   corrupt projection makes startup fail closed.
 - The internal worker boundary is opt-in: normal startup never claims a job,
-  runs a model, or changes the fixed default-deny egress policy. A claim uses one
+  runs a model, or changes the fixed default-deny egress policy. The repository
+  includes a provider-neutral, shell-free local command adapter but no model,
+  API, connector, or command is configured by default. Its exclusive
+  [worker CLI](PROCESSING_ADAPTER.md) revalidates one session-bound evidence
+  snapshot, exposes only read-only evidence descriptors and a canonical sealed
+  input, and accepts an exact bounded result. It shares the state-volume lock,
+  so the HTTP service must be stopped while `--run-once` or `--drain` executes.
+  There is no HTTP worker or result-publication route. A claim uses one
   SQLite `BEGIN IMMEDIATE` transaction to append the running snapshot and store
   one HMAC-verified opaque lease. The oldest eligible job wins; concurrent
   claimers cannot both own it. Leases last five minutes and a live holder may
@@ -61,15 +82,29 @@ exchange must never be redirected.
   remains alive. An expired lease is an immutable failed-attempt checkpoint
   before a bounded reclaim; the old token can never checkpoint or renew the new
   attempt.
+- An injected engine exception records a bounded retryable failure before the
+  runner returns a content-free error. Returning a terminal result on a
+  non-final stage, or failing to return one on `generate_tickets`, is an engine
+  contract violation and durably fails the attempt without leaving a live lease.
 - Version one is exactly `queued` with all five stages `pending`, zero attempts,
   and no timestamps. A retry records a sealed running/failed attempt snapshot,
   then exposes a new `queued` head whose current stage is reset to `pending`,
   retains the attempt count, and has `started_at: null` as required by the frozen
   contract. The next claim increments that count. Non-retryable failure or
-  exhaustion of the fixed three attempts is terminal. Checkpoints currently
-  cover the first four exact stages; final `generate_tickets` success remains
-  deliberately unavailable until the real evidence/output publication boundary
-  is implemented—this foundation does not invent model output or candidates.
+  exhaustion of the fixed three attempts is terminal. Checkpoints cover the
+  first four exact stages. Final `generate_tickets` success is available only
+  through the internal atomic result boundary in
+  [ADR-014](../../docs/decisions/ADR-014-atomic-processing-result-publication.md):
+  manifests and previews are crash-safely staged while reviewer-invisible, then
+  every candidate head/version, the sealed `succeeded` job head, and lease
+  removal commit in one SQLite transaction. `no_issue_detected` is an explicit
+  terminal result with no candidate or evidence references. Startup and admin
+  reads resolve successful outputs back to exact candidate, evidence, and
+  preview bytes. The retired single-candidate `persist_candidate_bundle`
+  boundary rejects with `PROCESSING_PUBLICATION_REQUIRED` before staging
+  anything; no production path reveals a generated head outside the terminal
+  transaction. The local adapter still does not invent model output or select
+  a model/provider implementation.
 - SDK, operator, and retention deletion use a two-phase erasure state. The
   first transaction revokes credentials and processing access. Crash recovery
   finishes filesystem erasure before success can be reported. The final
@@ -120,15 +155,27 @@ erased objects.
 The admin secret also roots launch and credential verifiers. Back it up as a
 deployment secret. Rotating it invalidates outstanding launch codes and SDK
 credentials; perform that as an explicit deployment reset, not as an ordinary
-admin-token rotation.
+admin-token rotation. The mounted value must be 32–4096 ASCII bytes in the RFC
+7235 `token68` alphabet (`A-Z`, `a-z`, `0-9`, `.`, `_`, `~`, `+`, `/`, `-`,
+with at most two trailing `=` padding characters); Unicode, controls,
+whitespace, and embedded padding are rejected before startup.
 
-## Schema reset from the earlier pilot
+## Fail-closed schema adoption
 
 The old server-generated-token pilot used SQLite schema version 1. Those
 credentials cannot be migrated without violating the new client-generated
 secret contract. Startup therefore fails closed when it sees schema 1 and asks
 the operator to back up and use an empty state directory. Fresh protocol V1
 state uses schema version 2. There is no silent or lossy migration.
+
+An earlier development schema also used version 2 before the 64-credential
+limit was enforced in the `credentials` table DDL. Current startup rejects a
+schema-v2 database without the exact `ordinal BETWEEN 0 AND 63` check and
+rejects non-contiguous, oversized, orphaned, or multiply-current persisted
+credential histories. There is no in-place adoption path for that state:
+retain a forensic backup and start the candidate image with an empty state
+directory. Do not rewrite SQLite metadata or credential rows to bypass the
+check.
 
 ## Run tests
 
@@ -152,14 +199,34 @@ the literal HTTP header mapping.
 The processing-job tests additionally cover safe schema-v2 backfill, inert
 startup, exact head/list projections, concurrent claims, atomic lease-write
 rollback, restart and expiry reclaim, rolling bounded heartbeats, stale-token
-denial, retry exhaustion, chain/configuration/storage tampering, and a
-checkpoint-versus-deletion race.
+denial, retry exhaustion, chain/configuration/storage tampering, a
+checkpoint-versus-deletion race, multi-candidate terminal publication, explicit
+no-issue success, invisible staging, final-transaction rollback, staged and
+published deletion, restart recovery, and preview-integrity failure. Local
+adapter tests cover exact argv, no inherited credentials/environment, verified
+read-only descriptors, zero- and multi-candidate results, canonical output,
+timeouts, stdout/stderr caps, symlink output, tampered evidence, crash cleanup,
+and state-lock exclusion.
 
 ## Run with Docker Compose
 
+Generate the public deployment config with the secret-free compiler described
+in [CONFIGURATION.md](CONFIGURATION.md). The checked-in template compiles
+exactly to `config.example.json`.
+
+For a production host, follow the complete
+[single-node operations runbook](OPERATIONS.md). It covers resolved-Compose
+preflight, digest-pinned images, TLS/no-redirect and firewall invariants,
+single-replica enforcement, retention monitoring, atomic offline recovery
+bundles, restore, upgrade, and rollback.
+
 ```sh
 mkdir -p services/backend/local
-cp services/backend/config.example.json services/backend/local/config.json
+cp services/backend/config.template.example.json services/backend/local/config.template.json
+${EDITOR:-vi} services/backend/local/config.template.json
+PYTHONPATH=services/backend/src python3 -B -m tacua_backend.config_tool \
+  services/backend/local/config.template.json \
+  --output services/backend/local/config.json
 openssl rand -base64 48 > services/backend/local/admin-secret
 chmod 600 services/backend/local/admin-secret
 docker compose -f services/backend/compose.yaml up --build
@@ -167,9 +234,14 @@ docker compose -f services/backend/compose.yaml up --build
 
 The example runs as UID/GID `10001`, drops Linux capabilities, uses a read-only
 root filesystem, writes only to `/var/lib/tacua`, and binds port 8080 to host
-loopback. `backend_origin` is the normalized public origin used by the QA build
+loopback. Its `internal: true` Compose network preserves default-deny outbound
+connectivity for the service and any explicitly invoked local processor.
+`backend_origin` is the normalized public origin used by the QA build
 (normally the HTTPS reverse-proxy origin), not the container listener address.
 Its digest must equal `build_identity.transport_configuration_digest`.
+Do not edit any derived digest: leave all four derive markers in the template
+for the compiler. The generated config is public metadata; the admin secret is
+the separate mode-`0600` file mounted through Compose.
 
 The configuration pins one full sealed `build_identity` artifact for this V1
 deployment. Its `transport_configuration_digest` must match `backend_origin`
@@ -207,6 +279,44 @@ are rejected. First durable writes return `201`; exact recovery returns `200`
 with the exact persisted response bytes. ID reuse with another canonical
 request digest returns `409`.
 
+Generic errors remain `application/json`. The only machine-actionable SDK error
+is a `403` historical-upload lookup miss emitted as
+`application/vnd.tacua.sdk-backend-error+json;version=1.0.0`. Its canonical body
+is at most 4 KiB and uses this exact shape:
+
+```json
+{
+  "contract_version": "tacua.sdk-backend-error@1.0.0",
+  "media_type": "application/vnd.tacua.sdk-backend-error+json;version=1.0.0",
+  "protocol_version": "tacua.sdk-backend@1.0.0",
+  "error": {
+    "code": "OPERATION_NOT_AUTHORIZED",
+    "message": "new upload requires the current active credential",
+    "reconciliation": {
+      "outcome": "historical_operation_not_found",
+      "session_id": "session_...",
+      "operation_kind": "segment",
+      "operation_id": "upload_...",
+      "request_digest": "sha256:...",
+      "request_credential_id": "credential_a",
+      "authenticated_credential_id": "credential_b"
+    }
+  }
+}
+```
+
+`operation_kind` is `segment`, `diagnostic`, or `completion`; deletion is not a
+reconciliation outcome. The SDK rejects this envelope
+unless its status, exact media type, canonical schema, size, request digest, and
+all request/credential bindings match. A generic JSON error carrying the same
+textual code is deliberately not machine actionable. Once validated, the SDK
+may rebuild that absent logical operation under the same stable ID, changing
+only its credential, requested timestamp, and derived root digest; every other
+semantic field and local payload binding remains exact. Segment and diagnostic
+misses use the message shown above; a completion miss uses the exact message
+`first completion requires the current active credential`. Messages are
+validated constants but are never used without the complete machine binding.
+
 | Method | Path | Authentication | Purpose |
 | --- | --- | --- | --- |
 | `GET` | `/healthz` | public | Storage/protocol health |
@@ -219,23 +329,39 @@ request digest returns `409`.
 | `PUT` | `/v1/sdk/sessions/{session}/completions/{completion}` | SDK bearer | Complete and queue processing |
 | `PUT` | `/v1/sdk/sessions/{session}/deletions/{deletion}` | SDK bearer | Erase/recover tombstone |
 | `GET` | `/v1/admin/sessions` | admin bearer | List one bounded page of session summaries |
-| `GET` | `/v1/admin/sessions/{session}` | admin bearer | Observe one session and its receipts |
+| `GET` | `/v1/admin/sessions/{session}` | admin bearer | Observe one session and its bounded receipt projection |
 | `GET` | `/v1/admin/sessions/{session}/candidates` | admin bearer | List one bounded page of current candidate summaries |
-| `GET` | `/v1/admin/jobs[/{job}]` | admin bearer | Observe full runtime jobs |
+| `GET` | `/v1/admin/jobs` | admin bearer | List one bounded page of processing-job summaries |
+| `GET` | `/v1/admin/jobs/{job}` | admin bearer | Observe one full, digest-validated runtime job |
 | `GET` | `/v1/admin/candidates/{candidate}/handoff.{json,md}` | admin bearer | Download the current exact approved handoff |
 | `GET` | `/v1/admin/candidates/{candidate}/versions/{version}/handoff.{json,md}` | admin bearer | Download one immutable approved handoff version |
-| `GET` | `/v1/admin/audit-events` | admin bearer | Observe content-free audit events |
+| `GET` | `/v1/admin/audit-events` | admin bearer | List one bounded page of content-free audit events |
 | `DELETE` | `/v1/admin/sessions/{session}` | admin bearer | Operator-requested scoped erasure |
 
-The two admin list routes return exactly
-`{"sessions":[...],"next_cursor":...}` or
-`{"candidates":[...],"next_cursor":...}`. A page contains at most 50 items.
+The four admin list routes return exactly one of
+`{"sessions":[...],"next_cursor":...}`,
+`{"candidates":[...],"next_cursor":...}`,
+`{"jobs":[...],"next_cursor":...}`, or
+`{"events":[...],"next_cursor":...}`. A page contains at most 50 items.
 When `next_cursor` is non-null, send it unchanged as the single
 `Tacua-Page-Cursor` request header. Cursors are opaque, bounded to 512
 characters, scoped to their list kind, and candidate cursors are also scoped
 to the exact session. Empty, duplicate, oversized, non-canonical, cross-kind,
 and cross-session cursors fail with `400 PAGE_CURSOR_INVALID`; query strings
 remain unsupported.
+
+Job pages contain only the seven-field reviewer summary (`job_id`, fixed
+`job_type`, status and three timestamps, plus `failure_code`). Fetch
+`/v1/admin/jobs/{job}` for the full immutable-chain-validated runtime job.
+Job and audit pages are newest-first keysets, so list responses never
+materialize the deployment's full history.
+
+Session detail is intentionally a single response in V1. Its closed shape is
+bounded to 2,048 segment receipts plus projections, 2,048 diagnostic receipts
+plus projections, 64 credential projections, one job summary, and one
+completion receipt. The reviewer therefore uses an explicit 16 MiB byte cap
+(the conservative maximum serialized V1 projection is under 10 MiB), instead
+of inheriting the generic 2 MiB JSON cap or accepting an unbounded response.
 
 A start launch grant body is:
 
@@ -256,7 +382,10 @@ plus the SDK's post-consent sealed `scope`.
 A resume grant body is
 `{"exchange_kind":"resume_session","session_id":"session_..."}`. The
 backend snapshots that session's exact build, scope, state, completion binding,
-and current credential into the grant. Frozen complete examples live in
+and current credential into the grant. A session can contain at most 64
+credentials. Once that recovery bound is reached, the admin route returns
+`409 CREDENTIAL_ROTATION_LIMIT_REACHED`; delete the session and start a new
+capture. Frozen complete examples live in
 `contracts/sdk-backend-protocol/fixtures/positive/`.
 
 The binary segment route reconstructs `segment_upload_intent` from route fields

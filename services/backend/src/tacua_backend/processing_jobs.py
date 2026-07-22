@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Append-only processing-job history and internal worker leases.
 
 This module deliberately does not run a worker or select a model.  It owns the
@@ -30,7 +32,7 @@ from .contracts import (
 
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 JOB_STAGES = ("transcribe", "align", "correlate", "research", "generate_tickets")
-FOUNDATION_STATUSES = frozenset({"queued", "running", "failed"})
+FOUNDATION_STATUSES = frozenset({"queued", "running", "succeeded", "failed"})
 LEASE_SECONDS = 300
 MAX_CLAIM_SCAN = 50
 ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{2,63}$")
@@ -93,6 +95,27 @@ class ProcessingJobClaimResult:
 
     claim: ProcessingJobClaim | None
     retry_required: bool = False
+
+
+@dataclass(frozen=True)
+class PublicationCandidate:
+    """One processor-produced candidate bundle awaiting atomic publication."""
+
+    candidate: dict[str, Any]
+    evidence_manifest: dict[str, Any]
+    previews: tuple[dict[str, Any], ...] = ()
+
+
+@dataclass(frozen=True)
+class ProcessingResult:
+    """The closed terminal result a configured internal processor may return."""
+
+    disposition: str
+    summary: str
+    candidates: tuple[PublicationCandidate, ...] = ()
+
+
+SuccessfulOutputValidator = Callable[[sqlite3.Connection, dict[str, Any]], None]
 
 
 def _timestamp(value: datetime) -> str:
@@ -522,7 +545,59 @@ def _validate_snapshot_semantics(job: dict[str, Any]) -> None:
     if any(stage["attempt_count"] > maximum for stage in stages):
         raise ValueError("processing-job stage exceeded max_attempts")
     if current is None:
-        raise ValueError("successful terminal processing is not implemented by this foundation")
+        if (
+            job["status"] != "succeeded"
+            or any(
+                stage["state"] != "succeeded"
+                or stage["attempt_count"] < 1
+                or stage["started_at"] is None
+                or stage["completed_at"] is None
+                for stage in stages
+            )
+            or job["started_at"] is None
+            or job["completed_at"] is None
+            or job["outputs"] is None
+            or job["failure"] is not None
+        ):
+            raise ValueError("successful processing-job terminal snapshot is inconsistent")
+        requested = _parse_timestamp(job["requested_at"])
+        started = _parse_timestamp(job["started_at"])
+        completed = _parse_timestamp(job["completed_at"])
+        if started < requested or completed < started:
+            raise ValueError("successful processing-job chronology is inconsistent")
+        previous_completed = started
+        for stage in stages:
+            stage_started = _parse_timestamp(stage["started_at"])
+            stage_completed = _parse_timestamp(stage["completed_at"])
+            if stage_started < previous_completed or stage_completed < stage_started:
+                raise ValueError("successful processing stages are not chronological")
+            previous_completed = stage_completed
+        if completed != previous_completed:
+            raise ValueError("processing-job completion differs from its final stage")
+        outputs = job["outputs"]
+        candidate_refs = outputs["candidate_refs"]
+        evidence_refs = outputs["derived_evidence_refs"]
+        sorted_candidate_refs = sorted(
+            candidate_refs,
+            key=lambda item: (item["candidate_id"], item["candidate_version"]),
+        )
+        unique_candidate_refs = {
+            (item["candidate_id"], item["candidate_version"])
+            for item in candidate_refs
+        }
+        if candidate_refs != sorted_candidate_refs or len(unique_candidate_refs) != len(
+            candidate_refs
+        ):
+            raise ValueError("processing-job candidate output references are not canonical")
+        if evidence_refs != sorted(evidence_refs) or len(set(evidence_refs)) != len(
+            evidence_refs
+        ):
+            raise ValueError("processing-job evidence output references are not canonical")
+        if outputs["disposition"] == "no_issue_detected" and (
+            candidate_refs or evidence_refs
+        ):
+            raise ValueError("no-issue processing result cannot publish artifacts")
+        return
     for index, stage in enumerate(stages):
         if index < current:
             if (
@@ -572,7 +647,7 @@ def _validate_snapshot_semantics(job: dict[str, Any]) -> None:
             or job["failure"] is not None
         ):
             raise ValueError("running processing-job stage is inconsistent")
-    else:
+    elif job["status"] == "failed":
         failure = job["failure"]
         if (
             active["state"] != "failed"
@@ -592,6 +667,8 @@ def _validate_snapshot_semantics(job: dict[str, Any]) -> None:
             )
         ):
             raise ValueError("terminal processing-job failure is inconsistent")
+    else:  # pragma: no cover - successful jobs returned above
+        raise ValueError("processing-job status is inconsistent with its active stage")
 
     requested = _parse_timestamp(job["requested_at"])
     if job["started_at"] is not None and _parse_timestamp(job["started_at"]) < requested:
@@ -737,7 +814,31 @@ def _validate_transition(before: dict[str, Any], after: dict[str, Any]) -> None:
         and after["failure"]["detail"] == new["detail"]
         and after["outputs"] is None
     )
-    if not (claim or checkpoint or attempt_failed or retry_queued or terminal_failure):
+    terminal_success = (
+        before["status"] == "running"
+        and old["state"] == "running"
+        and old["name"] == JOB_STAGES[-1]
+        and after["status"] == "succeeded"
+        and new
+        == {
+            **old,
+            "state": "succeeded",
+            "completed_at": new["completed_at"],
+            "detail": new["detail"],
+        }
+        and new["completed_at"] is not None
+        and after["completed_at"] == new["completed_at"]
+        and after["outputs"] is not None
+        and after["failure"] is None
+    )
+    if not (
+        claim
+        or checkpoint
+        or attempt_failed
+        or retry_queued
+        or terminal_failure
+        or terminal_success
+    ):
         raise ValueError("processing-job state transition is not allowed")
 
 
@@ -753,6 +854,7 @@ class ProcessingJobStore:
         now: Callable[[], datetime],
         token_verifier: Callable[[str, int, str], str],
         token_factory: Callable[[], str],
+        successful_output_validator: SuccessfulOutputValidator | None = None,
     ):
         self.connection = connection
         self.organization_id = organization_id
@@ -760,6 +862,7 @@ class ProcessingJobStore:
         self.now = now
         self.token_verifier = token_verifier
         self.token_factory = token_factory
+        self.successful_output_validator = successful_output_validator
 
     def _require_transaction(self) -> None:
         if not self.connection.in_transaction:
@@ -855,6 +958,13 @@ class ProcessingJobStore:
             head = snapshots[-1]
             _validate_head_projection(row, head)
             _validate_completion_anchor(self.connection, row, snapshots[0])
+            if head["status"] == "succeeded" and self.successful_output_validator:
+                try:
+                    self.successful_output_validator(self.connection, copy.deepcopy(head))
+                except Exception as error:
+                    raise ValueError(
+                        "successful processing outputs failed publication validation"
+                    ) from error
             lease = self.connection.execute(
                 """SELECT claimed_job_version,worker_id,stage_name,token_verifier,
                           acquired_at,renewed_at,expires_at
@@ -1146,6 +1256,42 @@ class ProcessingJobStore:
             )
         return history, lease
 
+    @_map_sqlite_errors
+    def validate_stage_lease(
+        self, job_id: str, stage_name: str, lease_token: str
+    ) -> tuple[dict[str, Any], str]:
+        """Read-validate one exact live stage lease without mutating it."""
+
+        self._require_transaction()
+        if stage_name not in JOB_STAGES:
+            raise ProcessingJobStoreError(
+                409,
+                "PROCESSING_STAGE_MISMATCH",
+                "processing stage is not lease-owned",
+            )
+        history, lease = self._assert_lease(
+            job_id, stage_name, lease_token, self._now()
+        )
+        return copy.deepcopy(history[-1]), lease["worker_id"]
+
+    @_map_sqlite_errors
+    def validate_publication_lease(
+        self, job_id: str, lease_token: str
+    ) -> tuple[dict[str, Any], str]:
+        """Read-validate the exact live final-stage lease without mutating it."""
+
+        job, worker_id = self.validate_stage_lease(
+            job_id, JOB_STAGES[-1], lease_token
+        )
+        current = _current_stage_index(job)
+        if current != len(JOB_STAGES) - 1:
+            raise ProcessingJobStoreError(
+                409,
+                "PROCESSING_STAGE_MISMATCH",
+                "processing result is only valid for the final stage",
+            )
+        return job, worker_id
+
     def _record_retryable_failure(
         self,
         history: list[dict[str, Any]],
@@ -1202,7 +1348,7 @@ class ProcessingJobStore:
                         ON leases.job_id = jobs.job_id
                 WHERE jobs.organization_id = ? AND jobs.project_id = ?
                   AND (
-                      jobs.status NOT IN ('queued','running','failed')
+                      jobs.status NOT IN ('queued','running','succeeded','failed')
                       OR (jobs.status = 'running' AND leases.job_id IS NULL)
                       OR (jobs.status != 'running' AND leases.job_id IS NOT NULL)
                       OR (
@@ -1426,8 +1572,8 @@ class ProcessingJobStore:
         if current is None or current == len(JOB_STAGES) - 1:
             raise ProcessingJobStoreError(
                 409,
-                "PROCESSING_COMPLETION_NOT_IMPLEMENTED",
-                "final processing completion requires the later real-output boundary",
+                "PROCESSING_PUBLICATION_REQUIRED",
+                "final processing completion requires an atomic processing result",
             )
         if detail is not None and (
             not isinstance(detail, str)
@@ -1447,6 +1593,62 @@ class ProcessingJobStore:
         self.connection.execute(
             "DELETE FROM tacua_processing_job_leases WHERE job_id = ?", (job_id,)
         )
+        return copy.deepcopy(result)
+
+    @_map_sqlite_errors
+    def succeed(
+        self,
+        job_id: str,
+        stage_name: str,
+        lease_token: str,
+        *,
+        outputs: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Append the one terminal success snapshot and release its exact lease.
+
+        Candidate/evidence persistence is intentionally owned by the caller's
+        same SQLite transaction. This method only seals the job-side half of
+        that publication boundary.
+        """
+
+        self._require_transaction()
+        if not isinstance(outputs, dict) or set(outputs) != {
+            "disposition",
+            "candidate_refs",
+            "derived_evidence_refs",
+            "summary",
+        }:
+            raise ProcessingJobStoreError(
+                400, "PROCESSING_RESULT_INVALID", "processing result is invalid"
+            )
+        now = self._now()
+        history, _lease = self._assert_lease(job_id, stage_name, lease_token, now)
+        current = _current_stage_index(history[-1])
+        if current is None or current != len(JOB_STAGES) - 1:
+            raise ProcessingJobStoreError(
+                409,
+                "PROCESSING_STAGE_MISMATCH",
+                "processing result is only valid for the final stage",
+            )
+        event_time = self._event_time(history)
+        succeeded = copy.deepcopy(history[-1])
+        succeeded["status"] = "succeeded"
+        succeeded["completed_at"] = _timestamp(event_time)
+        succeeded["outputs"] = copy.deepcopy(outputs)
+        stage = succeeded["pipeline"]["stages"][current]
+        stage.update(
+            state="succeeded",
+            completed_at=_timestamp(event_time),
+            detail="The processing result was published atomically.",
+        )
+        result = self._append(history, succeeded, event_time)
+        removed = self.connection.execute(
+            "DELETE FROM tacua_processing_job_leases WHERE job_id = ?", (job_id,)
+        )
+        if removed.rowcount != 1:
+            raise ProcessingJobStoreError(
+                409, "PROCESSING_LEASE_STALE", "processing-job lease is stale"
+            )
         return copy.deepcopy(result)
 
     @_map_sqlite_errors

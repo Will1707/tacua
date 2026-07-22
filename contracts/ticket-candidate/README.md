@@ -57,8 +57,9 @@ draft → needs_clarification → ready_for_review → approved | rejected
 ```
 
 An approved or rejected snapshot is never edited. Reopening creates a later
-`draft` version. Version one may be `generated`, `split` or `merged`; later
-versions name exactly one same-candidate predecessor and use `edited`,
+`draft` version. Version one may be `generated`, `split` or `merged`; split and
+merge creation always records a human actor. Later versions name exactly one
+same-candidate predecessor and use `edited`,
 `clarification_answered`, `reviewed`, `approved`, `rejected` or `reopened`.
 Split and merge parents are represented now so those UI operations can be added
 without weakening provenance, but this package does not implement their
@@ -116,7 +117,7 @@ python3 -B scripts/regenerate_fixtures.py
 ```
 
 The validator implements the strict JSON Schema subset used here plus semantic
-checks for canonical SHA-256 integrity, safe integers/NFC, secret-like values,
+checks for canonical SHA-256 integrity, safe integers/NFC, forbidden NULs, secret-like values,
 scope-bound evidence, claim grounding, choice presentation, lifecycle,
 chronology, immutable version chains and exact human approval/rejection.
 Unknown fields and contract versions fail closed.
@@ -143,7 +144,9 @@ writes, merge, deployment or external model egress.
   revocation and compare-and-swap concurrency are backend responsibilities.
 - This package binds an evidence-manifest digest and inventory but does not
   validate or resolve evidence bytes.
-- It models split/merge lineage but does not choose split/merge UX or semantics.
+- It models human split/merge lineage but does not choose whether source heads
+  remain actionable or become superseded, how a merged evidence manifest is
+  formed, or the atomic backend/UI operation that creates the new candidates.
 - It does not render Markdown/JSON handoffs; that remains the separately
   versioned approved-handoff contract.
 - Runtime DLP must supplement the bundled obvious credential-pattern checks.

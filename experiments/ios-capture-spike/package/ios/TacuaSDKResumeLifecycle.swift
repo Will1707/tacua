@@ -95,6 +95,7 @@ struct TacuaSDKResumedSession: Equatable {
   let scopeDigest: String
   let credentialID: String
   let credentialExpiresAt: String
+  let rawMediaExpiresAt: String
   let backendSessionState: TacuaSDKResumeExpectedSessionState
   let credentialCapability: TacuaTransportCredentialCapability
   let replayCompletionID: String?
@@ -147,7 +148,9 @@ final class TacuaSDKResumeLifecycleCoordinator {
   private let queueStore: TacuaSDKResumeQueueStoring
   private let startJournalStore: TacuaSDKStartJournalPersisting
   private let journalStore: TacuaSDKResumeJournalPersisting
+  private let retentionChecker: TacuaSDKLocalRetentionChecking?
   private let clock: TacuaMonotonicClock
+  private let preparedQueueEncodedByteLimit: Int
   private let operationLock = NSLock()
   private var activeLocalSessionIDs = Set<String>()
 
@@ -159,8 +162,14 @@ final class TacuaSDKResumeLifecycleCoordinator {
     queueStore: TacuaSDKResumeQueueStoring,
     startJournalStore: TacuaSDKStartJournalPersisting,
     journalStore: TacuaSDKResumeJournalPersisting,
-    clock: TacuaMonotonicClock = TacuaSystemMonotonicClock()
+    retentionChecker: TacuaSDKLocalRetentionChecking? = nil,
+    clock: TacuaMonotonicClock = TacuaSystemMonotonicClock(),
+    preparedQueueEncodedByteLimit: Int = TacuaTransportQueueV3.maximumEncodedBytes
   ) {
+    precondition(
+      preparedQueueEncodedByteLimit > Self.maximumServerAnchorEncodingGrowthBytes
+        && preparedQueueEncodedByteLimit <= TacuaTransportQueueV3.maximumEncodedBytes
+    )
     self.configuration = configuration
     self.consentGate = consentGate
     self.credentialFactory = credentialFactory
@@ -168,7 +177,9 @@ final class TacuaSDKResumeLifecycleCoordinator {
     self.queueStore = queueStore
     self.startJournalStore = startJournalStore
     self.journalStore = journalStore
+    self.retentionChecker = retentionChecker
     self.clock = clock
+    self.preparedQueueEncodedByteLimit = preparedQueueEncodedByteLimit
   }
 
   func resume(_ input: TacuaSDKResumeSessionInput) async throws -> TacuaSDKResumedSession {
@@ -226,6 +237,8 @@ final class TacuaSDKResumeLifecycleCoordinator {
           expectedSessionState: expectedState,
           expectedCompletionID: requirement.expectedCompletionID,
           transportConfigurationDigest: self.configuration.configurationDigest,
+          buildIdentityJSON: String(decoding: artifacts.buildIdentityJSON, as: UTF8.self),
+          captureScopeJSON: String(decoding: artifacts.scopeJSON, as: UTF8.self),
           exchangeID: exchangeID,
           newCredentialID: credentialID,
           newCredentialOwnershipDigest: ownershipDigest,
@@ -373,6 +386,7 @@ final class TacuaSDKResumeLifecycleCoordinator {
         else { throw TacuaSDKResumeLifecycleError.recoveryStateMismatch }
       }
       var queue = baseQueue
+      try queue.bindDurableSessionArtifacts(artifacts)
       try queue.applyRecoveredResume(
         expectedCurrentCredentialID: previousCredentialID,
         newCredentialID: preparedCredential.credentialID,
@@ -420,6 +434,12 @@ final class TacuaSDKResumeLifecycleCoordinator {
     }
     do { try removeJournalDurably(receiptJournal) }
     catch { throw TacuaSDKResumeLifecycleError.journalCleanupRequired }
+    // RESUME is the only raw-data lifecycle operation allowed to cross a reboot without a valid
+    // local anchor. Its new server receipt has now installed a current-boot anchor; enforce the
+    // immutable START deadline before returning any renewed capture/transport authority.
+    try retentionChecker?.requireActiveHoldingLifecycleLease(
+      localSessionID: input.localSessionID
+    )
     return try finishCommittedQueue(candidate)
   }
 
@@ -429,6 +449,7 @@ final class TacuaSDKResumeLifecycleCoordinator {
     defer { release(localSessionID) }
     let lifecycleLease = try acquireLifecycleLease(localSessionID: localSessionID)
     defer { lifecycleLease.release() }
+    try retentionChecker?.requireActiveHoldingLifecycleLease(localSessionID: localSessionID)
     do {
       try requireNoStartRecovery(localSessionID: localSessionID)
       let journal = try journalStore.load(localSessionID: localSessionID)
@@ -505,6 +526,7 @@ final class TacuaSDKResumeLifecycleCoordinator {
       }
       try commitQueueDurably(base: current, replacement: candidate, journal: journal)
       try removeJournalDurably(journal)
+      try retentionChecker?.requireActiveHoldingLifecycleLease(localSessionID: localSessionID)
       return try finishCommittedQueue(candidate)
     } catch let error as TacuaSDKResumeLifecycleError {
       throw error
@@ -546,7 +568,7 @@ final class TacuaSDKResumeLifecycleCoordinator {
   }
 
   private func parseInput(_ input: TacuaSDKResumeSessionInput) throws
-    -> (buildIdentity: TacuaJSONValue, scope: TacuaJSONValue)
+    -> TacuaDurableSessionArtifacts
   {
     guard !input.approvedLaunchID.isEmpty,
       input.buildIdentityJSON.count <= TacuaSDKResumeSessionInput.maximumArtifactBytes,
@@ -554,15 +576,9 @@ final class TacuaSDKResumeLifecycleCoordinator {
     else { throw TacuaSDKResumeLifecycleError.invalidInput }
     do {
       _ = try TacuaTransportQueueV3(localSessionID: input.localSessionID)
-      return (
-        try TacuaCanonicalJSON.parse(
-          input.buildIdentityJSON,
-          maximumBytes: TacuaSDKResumeSessionInput.maximumArtifactBytes
-        ),
-        try TacuaCanonicalJSON.parse(
-          input.scopeJSON,
-          maximumBytes: TacuaSDKResumeSessionInput.maximumArtifactBytes
-        )
+      return try TacuaDurableSessionArtifacts.canonicalizing(
+        buildIdentityJSON: input.buildIdentityJSON,
+        scopeJSON: input.scopeJSON
       )
     } catch {
       throw TacuaSDKResumeLifecycleError.invalidInput
@@ -571,7 +587,7 @@ final class TacuaSDKResumeLifecycleCoordinator {
 
   private func validateArtifactsAndRequirement(
     input: TacuaSDKResumeSessionInput,
-    artifacts: (buildIdentity: TacuaJSONValue, scope: TacuaJSONValue),
+    artifacts: TacuaDurableSessionArtifacts,
     queue: TacuaTransportQueueV3
   ) throws -> TacuaSDKResumeRequirement {
     let requirement = resumeRequirement(queue)
@@ -579,7 +595,7 @@ final class TacuaSDKResumeLifecycleCoordinator {
       let remoteSessionID = queue.remoteSessionID,
       let previousCredentialID = queue.currentCredentialID,
       let expectedSessionState = requirement.expectedSessionState,
-      artifacts.scope.objectValue?["scope_digest"]?.stringValue == queue.scopeDigest
+      artifacts.scopeDigest == queue.scopeDigest
     else {
       if requirement.kind != .resumeSession {
         throw TacuaSDKResumeLifecycleError.resumeNotAuthorized(requirement.reason)
@@ -587,6 +603,11 @@ final class TacuaSDKResumeLifecycleCoordinator {
       throw TacuaSDKResumeLifecycleError.invalidInput
     }
     do {
+      if let durable = try queue.durableSessionArtifacts() {
+        guard durable.buildIdentityJSON == artifacts.buildIdentityJSON,
+          durable.scopeJSON == artifacts.scopeJSON
+        else { throw TacuaSDKResumeLifecycleError.invalidInput }
+      }
       try TacuaSDKBackendRequests.validateResumeArtifacts(
         expectedSessionID: remoteSessionID,
         expectedSessionState: expectedSessionState,
@@ -597,6 +618,7 @@ final class TacuaSDKResumeLifecycleCoordinator {
         requestedAt: input.requestedAt,
         configuration: configuration
       )
+      try configuration.validateBuildIdentityBinding(artifacts.buildIdentity)
       return requirement
     } catch {
       throw TacuaSDKResumeLifecycleError.invalidInput
@@ -632,6 +654,9 @@ final class TacuaSDKResumeLifecycleCoordinator {
       throw TacuaSDKResumeLifecycleError.recoveryStateMismatch
     }
     var candidate = base
+    if let artifacts = try journal.durableSessionArtifacts() {
+      try candidate.bindDurableSessionArtifacts(artifacts)
+    }
     try candidate.applyRecoveredResume(
       expectedCurrentCredentialID: journal.previousCredentialID,
       newCredentialID: journal.newCredentialID,
@@ -659,6 +684,9 @@ final class TacuaSDKResumeLifecycleCoordinator {
       clock: clock
     )
     var candidate = base
+    if let artifacts = try journal.durableSessionArtifacts() {
+      try candidate.bindDurableSessionArtifacts(artifacts)
+    }
     try candidate.applyRecoveredResume(
       expectedCurrentCredentialID: journal.previousCredentialID,
       newCredentialID: journal.newCredentialID,
@@ -672,7 +700,7 @@ final class TacuaSDKResumeLifecycleCoordinator {
     )
     let encoded = try candidate.encoded()
     guard encoded.count
-      <= TacuaTransportQueueV3.maximumEncodedBytes
+      <= preparedQueueEncodedByteLimit
         - Self.maximumServerAnchorEncodingGrowthBytes
     else { throw TacuaSDKResumeLifecycleError.invalidInput }
   }
@@ -743,6 +771,8 @@ final class TacuaSDKResumeLifecycleCoordinator {
       queue.credentialCapability == receipt.credentialCapability,
       queue.pendingRevokedCredentialRemovals.contains(journal.previousCredentialID),
       queue.timeAnchor == receipt.timeAnchor,
+      queue.buildIdentityJSON == journal.buildIdentityJSON,
+      queue.captureScopeJSON == journal.captureScopeJSON,
       TacuaCanonicalJSON.digest(data: try queue.encoded()) == receipt.resultQueueDigest
     else { throw TacuaSDKResumeLifecycleError.recoveryStateMismatch }
   }
@@ -766,13 +796,13 @@ final class TacuaSDKResumeLifecycleCoordinator {
       let scopeDigest = queue.scopeDigest,
       let credentialID = queue.currentCredentialID,
       let expiresAt = queue.currentCredentialExpiresAt,
+      let rawMediaExpiresAt = queue.sessionRetentionAuthority?.rawMediaExpiresAt,
       queue.credentialCapability == .active
         || queue.credentialCapability == .completionReplayOrDeleteOnly
     else { throw TacuaSDKResumeLifecycleError.recoveryStateMismatch }
     let state: TacuaSDKResumeExpectedSessionState = queue.credentialCapability == .active
       ? .receiving : .completed
-    let replayCompletionID = state == .completed
-      ? queue.completionCleanupAuthority?.completionID : nil
+    let replayCompletionID = state == .completed ? queue.authorizedCompletionReplayID : nil
     guard (state == .completed) == (replayCompletionID != nil) else {
       throw TacuaSDKResumeLifecycleError.recoveryStateMismatch
     }
@@ -786,6 +816,7 @@ final class TacuaSDKResumeLifecycleCoordinator {
       scopeDigest: scopeDigest,
       credentialID: credentialID,
       credentialExpiresAt: expiresAt,
+      rawMediaExpiresAt: rawMediaExpiresAt,
       backendSessionState: state,
       credentialCapability: queue.credentialCapability,
       replayCompletionID: replayCompletionID,

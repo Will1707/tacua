@@ -31,17 +31,37 @@ struct TacuaSDKStartReceiptRecovery: Equatable {
   let scopeDigest: String
   let credentialExpiresAt: String
   let timeAnchor: TacuaServerTimeAnchor
+  let sessionRetentionAuthority: TacuaSessionRetentionAuthority?
+
+  init(
+    remoteSessionID: String,
+    scopeDigest: String,
+    credentialExpiresAt: String,
+    timeAnchor: TacuaServerTimeAnchor,
+    sessionRetentionAuthority: TacuaSessionRetentionAuthority? = nil
+  ) {
+    self.remoteSessionID = remoteSessionID
+    self.scopeDigest = scopeDigest
+    self.credentialExpiresAt = credentialExpiresAt
+    self.timeAnchor = timeAnchor
+    self.sessionRetentionAuthority = sessionRetentionAuthority
+  }
 }
 
 struct TacuaSDKStartJournal: Equatable {
-  static let schemaVersion: Int64 = 1
-  static let maximumEncodedBytes = 16 * 1_024
+  static let schemaVersion: Int64 = 2
+  private static let legacySchemaVersion: Int64 = 1
+  static let maximumEncodedBytes = 2 * 1_024 * 1_024
 
   let localSessionID: String
   let exchangeID: String
   let credentialID: String
   let credentialOwnershipDigest: String
   let transportConfigurationDigest: String
+  /// Canonical public artifacts only. Legacy schema-1 journals decode as nil/nil; no launch code,
+  /// transient request, or credential secret is ever accepted by this structure.
+  let buildIdentityJSON: String?
+  let captureScopeJSON: String?
   let createdAt: String
   let state: TacuaSDKStartJournalState
   let validatedReceipt: TacuaSDKStartReceiptRecovery?
@@ -52,6 +72,8 @@ struct TacuaSDKStartJournal: Equatable {
     credentialID: String,
     credentialOwnershipDigest: String,
     transportConfigurationDigest: String,
+    buildIdentityJSON: String? = nil,
+    captureScopeJSON: String? = nil,
     createdAt: String,
     state: TacuaSDKStartJournalState,
     validatedReceipt: TacuaSDKStartReceiptRecovery? = nil
@@ -61,6 +83,8 @@ struct TacuaSDKStartJournal: Equatable {
     self.credentialID = credentialID
     self.credentialOwnershipDigest = credentialOwnershipDigest
     self.transportConfigurationDigest = transportConfigurationDigest
+    self.buildIdentityJSON = buildIdentityJSON
+    self.captureScopeJSON = captureScopeJSON
     self.createdAt = createdAt
     self.state = state
     self.validatedReceipt = validatedReceipt
@@ -89,6 +113,8 @@ struct TacuaSDKStartJournal: Equatable {
       credentialID: credentialID,
       credentialOwnershipDigest: credentialOwnershipDigest,
       transportConfigurationDigest: transportConfigurationDigest,
+      buildIdentityJSON: buildIdentityJSON,
+      captureScopeJSON: captureScopeJSON,
       createdAt: createdAt,
       state: state,
       validatedReceipt: validatedReceipt
@@ -99,9 +125,22 @@ struct TacuaSDKStartJournal: Equatable {
     try validate()
     let receipt: TacuaJSONValue
     if let validatedReceipt {
+      let retention: TacuaJSONValue
+      if let authority = validatedReceipt.sessionRetentionAuthority {
+        retention = .object([
+          "derived_data_expires_at": .string(authority.derivedDataExpiresAt),
+          "raw_media_expires_at": .string(authority.rawMediaExpiresAt),
+          "session_received_at": .string(authority.sessionReceivedAt),
+        ])
+      } else {
+        // Backward-compatible recovery for a journal written before START retention was retained.
+        // Its resulting queue remains usable only for exact replay/deletion, not completion.
+        retention = .null
+      }
       receipt = .object([
         "credential_expires_at": .string(validatedReceipt.credentialExpiresAt),
         "remote_session_id": .string(validatedReceipt.remoteSessionID),
+        "session_retention_authority": retention,
         "scope_digest": .string(validatedReceipt.scopeDigest),
         "time_anchor": .object([
           "boot_session_id": .string(validatedReceipt.timeAnchor.bootSessionID),
@@ -122,6 +161,8 @@ struct TacuaSDKStartJournal: Equatable {
     }
     let data = try TacuaCanonicalJSON.data(.object([
       "created_at": .string(createdAt),
+      "build_identity_json": buildIdentityJSON.map(TacuaJSONValue.string) ?? .null,
+      "capture_scope_json": captureScopeJSON.map(TacuaJSONValue.string) ?? .null,
       "credential_id": .string(credentialID),
       "credential_ownership_digest": .string(credentialOwnershipDigest),
       "exchange_id": .string(exchangeID),
@@ -142,12 +183,19 @@ struct TacuaSDKStartJournal: Equatable {
     guard try TacuaCanonicalJSON.data(value) == data else {
       throw TacuaSDKStartJournalError.invalidJournal
     }
-    let root = try value.requiringObject(keys: [
+    guard let schema = value.objectValue?["schema_version"]?.integerValue,
+      schema == schemaVersion || schema == legacySchemaVersion
+    else { throw TacuaSDKStartJournalError.invalidJournal }
+    let root = try value.requiringObject(keys: schema == schemaVersion ? [
+      "build_identity_json", "capture_scope_json", "created_at", "credential_id",
+      "credential_ownership_digest", "exchange_id", "local_session_id", "schema_version",
+      "state", "transport_configuration_digest", "validated_receipt",
+    ] : [
       "created_at", "credential_id", "credential_ownership_digest", "exchange_id",
       "local_session_id", "schema_version", "state", "transport_configuration_digest",
       "validated_receipt",
     ])
-    guard root["schema_version"]?.integerValue == schemaVersion,
+    guard
       let localSessionID = root["local_session_id"]?.stringValue,
       let exchangeID = root["exchange_id"]?.stringValue,
       let credentialID = root["credential_id"]?.stringValue,
@@ -158,12 +206,28 @@ struct TacuaSDKStartJournal: Equatable {
       let transportConfigurationDigest = root["transport_configuration_digest"]?.stringValue,
       let receiptValue = root["validated_receipt"]
     else { throw TacuaSDKStartJournalError.invalidJournal }
+    let buildIdentityJSON: String?
+    let captureScopeJSON: String?
+    if schema == schemaVersion {
+      guard let buildValue = root["build_identity_json"],
+        let scopeValue = root["capture_scope_json"]
+      else { throw TacuaSDKStartJournalError.invalidJournal }
+      buildIdentityJSON = try nullableString(buildValue)
+      captureScopeJSON = try nullableString(scopeValue)
+    } else {
+      buildIdentityJSON = nil
+      captureScopeJSON = nil
+    }
     let receipt: TacuaSDKStartReceiptRecovery?
     switch receiptValue {
     case .null:
       receipt = nil
     case .object:
-      let object = try receiptValue.requiringObject(keys: [
+      let hasRetentionAuthority = receiptValue.objectValue?["session_retention_authority"] != nil
+      let object = try receiptValue.requiringObject(keys: hasRetentionAuthority ? [
+        "credential_expires_at", "remote_session_id", "session_retention_authority",
+        "scope_digest", "time_anchor",
+      ] : [
         "credential_expires_at", "remote_session_id", "scope_digest", "time_anchor",
       ])
       guard let remoteSessionID = object["remote_session_id"]?.stringValue,
@@ -181,6 +245,30 @@ struct TacuaSDKStartJournal: Equatable {
         let minimumEpochMilliseconds = anchor["minimum_epoch_milliseconds"]?.integerValue,
         let uptimeMillisecondsAtIssue = anchor["uptime_milliseconds_at_issue"]?.integerValue
       else { throw TacuaSDKStartJournalError.invalidJournal }
+      let retentionAuthority: TacuaSessionRetentionAuthority?
+      if let retentionValue = object["session_retention_authority"] {
+        switch retentionValue {
+        case .null:
+          retentionAuthority = nil
+        case .object:
+          let retention = try retentionValue.requiringObject(keys: [
+            "derived_data_expires_at", "raw_media_expires_at", "session_received_at",
+          ])
+          guard let receivedAt = retention["session_received_at"]?.stringValue,
+            let rawExpiresAt = retention["raw_media_expires_at"]?.stringValue,
+            let derivedExpiresAt = retention["derived_data_expires_at"]?.stringValue
+          else { throw TacuaSDKStartJournalError.invalidJournal }
+          retentionAuthority = TacuaSessionRetentionAuthority(
+            sessionReceivedAt: receivedAt,
+            rawMediaExpiresAt: rawExpiresAt,
+            derivedDataExpiresAt: derivedExpiresAt
+          )
+        default:
+          throw TacuaSDKStartJournalError.invalidJournal
+        }
+      } else {
+        retentionAuthority = nil
+      }
       receipt = TacuaSDKStartReceiptRecovery(
         remoteSessionID: remoteSessionID,
         scopeDigest: scopeDigest,
@@ -191,7 +279,8 @@ struct TacuaSDKStartJournal: Equatable {
           uptimeMillisecondsAtIssue: uptimeMillisecondsAtIssue,
           bootSessionID: bootSessionID,
           minimumEpochMilliseconds: minimumEpochMilliseconds
-        )
+        ),
+        sessionRetentionAuthority: retentionAuthority
       )
     default:
       throw TacuaSDKStartJournalError.invalidJournal
@@ -202,6 +291,8 @@ struct TacuaSDKStartJournal: Equatable {
       credentialID: credentialID,
       credentialOwnershipDigest: credentialOwnershipDigest,
       transportConfigurationDigest: transportConfigurationDigest,
+      buildIdentityJSON: buildIdentityJSON,
+      captureScopeJSON: captureScopeJSON,
       createdAt: createdAt,
       state: state,
       validatedReceipt: receipt
@@ -214,6 +305,25 @@ struct TacuaSDKStartJournal: Equatable {
       Self.validDigest(transportConfigurationDigest),
       Self.validTimestamp(createdAt)
     else { throw TacuaSDKStartJournalError.invalidJournal }
+    let artifacts: TacuaDurableSessionArtifacts?
+    switch (buildIdentityJSON, captureScopeJSON) {
+    case (nil, nil):
+      artifacts = nil
+    case (.some(let build), .some(let scope)):
+      do {
+        artifacts = try TacuaDurableSessionArtifacts.exactCanonical(
+          buildIdentityJSON: build,
+          scopeJSON: scope
+        )
+      } catch {
+        throw TacuaSDKStartJournalError.invalidJournal
+      }
+      guard artifacts?.transportConfigurationDigest == transportConfigurationDigest else {
+        throw TacuaSDKStartJournalError.invalidJournal
+      }
+    default:
+      throw TacuaSDKStartJournalError.invalidJournal
+    }
     switch state {
     case .credentialPrepared, .exchangeOutcomeUnknown,
       .credentialPreparedResetPending, .exchangeOutcomeUnknownResetPending:
@@ -232,6 +342,39 @@ struct TacuaSDKStartJournal: Equatable {
         receipt.timeAnchor.bootSessionID.utf8.count <= 255,
         receipt.timeAnchor.minimumEpochMilliseconds >= issuedEpoch
       else { throw TacuaSDKStartJournalError.invalidJournal }
+      if let artifacts, artifacts.scopeDigest != receipt.scopeDigest {
+        throw TacuaSDKStartJournalError.invalidJournal
+      }
+      do {
+        try receipt.sessionRetentionAuthority?.validate()
+      } catch {
+        throw TacuaSDKStartJournalError.invalidJournal
+      }
+    }
+  }
+
+  func durableSessionArtifacts() throws -> TacuaDurableSessionArtifacts? {
+    guard let buildIdentityJSON, let captureScopeJSON else {
+      guard self.buildIdentityJSON == nil, self.captureScopeJSON == nil else {
+        throw TacuaSDKStartJournalError.invalidJournal
+      }
+      return nil
+    }
+    do {
+      return try TacuaDurableSessionArtifacts.exactCanonical(
+        buildIdentityJSON: buildIdentityJSON,
+        scopeJSON: captureScopeJSON
+      )
+    } catch {
+      throw TacuaSDKStartJournalError.invalidJournal
+    }
+  }
+
+  private static func nullableString(_ value: TacuaJSONValue) throws -> String? {
+    switch value {
+    case .null: return nil
+    case .string(let value): return value
+    default: throw TacuaSDKStartJournalError.invalidJournal
     }
   }
 
@@ -362,6 +505,48 @@ final class TacuaSDKStartJournalFileStore: TacuaSDKStartJournalPersisting {
     }
   }
 
+  /// Returns only identifiers backed by a no-follow, single-link regular START journal. This is a
+  /// discovery snapshot; the authoritative recovery state must be loaded under the lifecycle
+  /// lease before the host chooses an action.
+  func listLocalSessionIDs() throws -> [String] {
+    let suffix = ".start-v1.json"
+    var enumerationError: Error?
+    guard let enumerator = fileManager.enumerator(
+      at: rootDirectory,
+      includingPropertiesForKeys: nil,
+      options: [.skipsSubdirectoryDescendants],
+      errorHandler: { _, error in
+        enumerationError = error
+        return false
+      }
+    ) else { throw TacuaSDKStartJournalError.invalidJournal }
+    var scannedEntryCount = 0
+    var localSessionIDs: [String] = []
+    while let value = enumerator.nextObject() {
+      guard let entry = value as? URL else { throw TacuaSDKStartJournalError.invalidJournal }
+      scannedEntryCount += 1
+      guard scannedEntryCount <= 4_096 else { throw TacuaSDKStartJournalError.invalidJournal }
+      let name = entry.lastPathComponent
+      guard name.hasSuffix(suffix) else { continue }
+      let localSessionID = String(name.dropLast(suffix.count))
+      guard localSessionID.range(
+        of: "^[a-z][a-z0-9_-]{2,63}$", options: .regularExpression
+      ) != nil else { continue }
+      var metadata = stat()
+      guard lstat(entry.path, &metadata) == 0 else {
+        if errno == ENOENT { continue }
+        throw TacuaSDKStartJournalError.invalidJournal
+      }
+      guard
+        (metadata.st_mode & S_IFMT) == S_IFREG,
+        metadata.st_nlink == 1
+      else { throw TacuaSDKStartJournalError.invalidJournal }
+      localSessionIDs.append(localSessionID)
+    }
+    if enumerationError != nil { throw TacuaSDKStartJournalError.invalidJournal }
+    return localSessionIDs.sorted()
+  }
+
   func create(_ journal: TacuaSDKStartJournal) throws {
     try withSessionLock(localSessionID: journal.localSessionID, exclusive: true) {
       try createLocked(journal)
@@ -389,7 +574,9 @@ final class TacuaSDKStartJournalFileStore: TacuaSDKStartJournalPersisting {
       expected.exchangeID == replacement.exchangeID,
       expected.credentialID == replacement.credentialID,
       expected.credentialOwnershipDigest == replacement.credentialOwnershipDigest,
-      expected.transportConfigurationDigest == replacement.transportConfigurationDigest
+      expected.transportConfigurationDigest == replacement.transportConfigurationDigest,
+      expected.buildIdentityJSON == replacement.buildIdentityJSON,
+      expected.captureScopeJSON == replacement.captureScopeJSON
     else { throw TacuaSDKStartJournalError.stateConflict }
     try withSessionLock(localSessionID: expected.localSessionID, exclusive: true) {
       guard try loadUnlocked(localSessionID: expected.localSessionID) == expected else {
@@ -406,6 +593,19 @@ final class TacuaSDKStartJournalFileStore: TacuaSDKStartJournalPersisting {
       }
       let url = try journalURL(localSessionID: expected.localSessionID)
       guard unlink(url.path) == 0 else {
+        throw TacuaSDKStartJournalError.stateConflict
+      }
+      try syncDirectory()
+    }
+  }
+
+  /// Retention cleanup owns the per-session lifecycle lease and may need to retire an unreadable
+  /// journal. Unlinking the exact bounded name is safe even when its contents cannot be trusted.
+  func retire(localSessionID: String) throws {
+    try withSessionLock(localSessionID: localSessionID, exclusive: true) {
+      let url = try journalURL(localSessionID: localSessionID)
+      let result = unlink(url.path)
+      guard result == 0 || errno == ENOENT else {
         throw TacuaSDKStartJournalError.stateConflict
       }
       try syncDirectory()

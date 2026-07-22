@@ -244,6 +244,28 @@ enum SDKResumeJournalTests {
         TacuaCanonicalJSON.data(.object(wrongOptional))
       )
     }
+    var legacy = try rootWithoutUnexpected(encoded)
+    legacy["schema_version"] = .integer(1)
+    legacy.removeValue(forKey: "build_identity_json")
+    legacy.removeValue(forKey: "capture_scope_json")
+    let migrated = try TacuaSDKResumeJournal.decode(
+      TacuaCanonicalJSON.data(.object(legacy))
+    )
+    let migratedArtifacts = try migrated.durableSessionArtifacts()
+    try require(
+      migratedArtifacts == nil,
+      "Schema-1 resume journal migration invented session artifacts"
+    )
+    var halfArtifact = try rootWithoutUnexpected(encoded)
+    halfArtifact["build_identity_json"] = .string("{}")
+    try expectJournalFailure {
+      _ = try TacuaSDKResumeJournal.decode(
+        TacuaCanonicalJSON.data(.object(halfArtifact))
+      )
+    }
+    try expectJournalFailure {
+      _ = try TacuaSDKResumeJournal.decode(Data(encoded.dropLast()))
+    }
     try expectJournalFailure {
       _ = try TacuaSDKResumeJournal.decode(
         Data(repeating: 0x7b, count: TacuaSDKResumeJournal.maximumEncodedBytes + 1)

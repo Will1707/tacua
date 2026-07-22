@@ -12,6 +12,8 @@ public struct TacuaCaptureStartOptions: Record {
   @Field public var handoffId: String = ""
   @Field public var handoffTokenIdentifier: String?
   @Field public var expiresAt: String = ""
+  /// Immutable backend START raw-media deadline. RESUME must return this exact value unchanged.
+  @Field public var rawMediaExpiresAt: String = ""
   @Field public var consentVersion: String = ""
   @Field public var expectedApplicationId: String = ""
   @Field public var expectedBuildNumber: String = ""
@@ -34,9 +36,35 @@ public struct TacuaCaptureRecoveryOptions: Record {
   public init() {}
 }
 
-/// The public TypeScript wrapper accepts typed protocol objects and serializes them only for this
-/// native bridge. Native code parses, canonicalizes, and validates both objects before consent is
-/// consumed or Keychain is mutated.
+/// Primary START surface: the host supplies only the one-shot reviewer approval and its chosen
+/// bounded segment duration. Native code generates every identity, scope, timestamp, and handoff.
+public struct TacuaCreateCaptureSessionPlanNativeOptions: Record {
+  @Field public var approvedLaunchId: String = ""
+  @Field public var segmentDurationSeconds: Double = 10
+
+  public init() {}
+}
+
+/// Primary RESUME surface. Build/scope artifacts are loaded from the durable queue, never JS.
+public struct TacuaResumeCaptureSessionPlanNativeOptions: Record {
+  @Field public var approvedLaunchId: String = ""
+  @Field public var localSessionId: String = ""
+  @Field public var segmentDurationSeconds: Double = 10
+
+  public init() {}
+}
+
+/// Receipt recovery does not consume a launch code. The local identifier selects the journal and
+/// queue; the duration is the only host-selected capture tuning field.
+public struct TacuaRecoverCaptureSessionPlanNativeOptions: Record {
+  @Field public var localSessionId: String = ""
+  @Field public var segmentDurationSeconds: Double = 10
+
+  public init() {}
+}
+
+/// Advanced migration/testing primitive. Normal host integration must use the native-generated
+/// plan APIs above; this surface exists only for old queues missing durable public artifacts.
 public struct TacuaBackendStartSessionNativeOptions: Record {
   @Field public var approvedLaunchId: String = ""
   @Field public var localSessionId: String = ""
@@ -47,8 +75,7 @@ public struct TacuaBackendStartSessionNativeOptions: Record {
   public init() {}
 }
 
-/// RESUME derives remote session state and both credential identifiers from the committed queue;
-/// callers may provide only the same validated build/scope artifacts and an approved launch.
+/// Advanced migration/testing primitive for a queue without durable build/scope artifacts.
 public struct TacuaBackendResumeSessionNativeOptions: Record {
   @Field public var approvedLaunchId: String = ""
   @Field public var localSessionId: String = ""
@@ -57,6 +84,70 @@ public struct TacuaBackendResumeSessionNativeOptions: Record {
   @Field public var requestedAt: String = ""
 
   public init() {}
+}
+
+/// Admission is explicit and secret-free. Native code verifies these exact artifacts against the
+/// committed backend queue and the finalized capture before atomically adding upload operations.
+public struct TacuaBackendAdmitFinalizedCaptureNativeOptions: Record {
+  @Field public var localSessionId: String = ""
+  @Field public var buildIdentityJson: String?
+  @Field public var scopeJson: String?
+
+  public init() {}
+}
+
+public struct TacuaBackendProcessAdmittedCaptureNativeOptions: Record {
+  public init() {}
+
+  @Field public var localSessionId: String = ""
+}
+
+/// Authenticated deletion is intentionally scoped by the committed local queue. Callers select
+/// only the local session; native code derives the remote session, current credential, stable
+/// deletion identifier, exact replay bytes, and fixed `user_requested` reason from durable state.
+public struct TacuaBackendDeleteSessionNativeOptions: Record {
+  public init() {}
+
+  @Field public var localSessionId: String = ""
+}
+
+public struct TacuaDiagnosticRouteTransitionOptions: Record {
+  public init() {}
+  @Field public var fromRoute: String?
+  @Field public var toRoute: String = ""
+  @Field public var trigger: String = "unknown"
+}
+
+public struct TacuaDiagnosticUserInteractionOptions: Record {
+  public init() {}
+  @Field public var action: String = ""
+  @Field public var target: String = ""
+}
+
+public struct TacuaDiagnosticRuntimeErrorOptions: Record {
+  public init() {}
+  @Field public var errorClass: String = ""
+  @Field public var sanitizedMessage: String = ""
+  @Field public var stackTraceDigest: String?
+  @Field public var handled: Bool = false
+}
+
+public struct TacuaDiagnosticNetworkCompletionOptions: Record {
+  public init() {}
+  @Field public var method: String = ""
+  @Field public var host: String = ""
+  @Field public var pathTemplate: String = ""
+  @Field public var statusCode: Int = 0
+  @Field public var durationMilliseconds: Int = 0
+  @Field public var traceId: String?
+}
+
+/// Custom state is content-addressed. The SDK never accepts or persists the raw state value.
+public struct TacuaDiagnosticCustomStateOptions: Record {
+  public init() {}
+  @Field public var providerId: String = ""
+  @Field public var snapshotDigest: String?
+  @Field public var collectionStatus: String = "unavailable"
 }
 
 struct CaptureSegment: Codable {
@@ -102,6 +193,9 @@ struct CaptureCalibration: Codable {
 
 struct CaptureManifest: Codable {
   let schemaVersion: Int
+  /// Durable boot identity for every host-uptime value in schema 3. Schema-2 manifests decode
+  /// nil for local recovery but are deliberately ineligible for backend admission.
+  let bootSessionId: String?
   let sessionId: String
   let organizationId: String?
   let projectId: String?
@@ -109,6 +203,7 @@ struct CaptureManifest: Codable {
   let handoffId: String?
   var handoffTokenIdentifier: String?
   var expiresAt: String?
+  var rawMediaExpiresAt: String?
   let consentVersion: String?
   let expectedApplicationId: String?
   let expectedBuildNumber: String?
@@ -140,12 +235,15 @@ enum TacuaCaptureSpikeError: Error {
   case invalidSegmentDuration
   case invalidHandoffField(String)
   case handoffExpired
+  case retentionExpired
+  case retentionAuthorityInvalid
   case handoffApplicationMismatch
   case handoffBuildMismatch
   case unsupportedConsentVersion
   case handoffManifestMismatch
   case sessionNotRecoverable
   case sessionHasNoVerifiedSegments
+  case captureDisabledForBuild
   case captureUnavailable
   case captureAlreadyRunning
   case noCaptureRunning
@@ -161,12 +259,17 @@ enum TacuaCaptureSpikeError: Error {
   case moduleDestroyed
   case insufficientStorage
   case invalidMarkerLabel
+  case markerLimitReached
   case storageIO(String)
   case recoveryIO(String)
   case writerCreation(String)
   case writerFailed(String)
   case writerTimeout
   case rotationLimitExceeded
+  case diagnosticInvalid
+  case diagnosticPrivacyViolation
+  case diagnosticUnavailable
+  case diagnosticEventLimitReached
 
   var code: String {
     switch self {
@@ -174,12 +277,15 @@ enum TacuaCaptureSpikeError: Error {
     case .invalidSegmentDuration: return "ERR_TACUA_CAPTURE_SEGMENT_DURATION"
     case .invalidHandoffField: return "ERR_TACUA_CAPTURE_HANDOFF_INVALID"
     case .handoffExpired: return "ERR_TACUA_CAPTURE_HANDOFF_EXPIRED"
+    case .retentionExpired: return "ERR_TACUA_CAPTURE_RETENTION_EXPIRED"
+    case .retentionAuthorityInvalid: return "ERR_TACUA_CAPTURE_RETENTION_AUTHORITY"
     case .handoffApplicationMismatch: return "ERR_TACUA_CAPTURE_APPLICATION_MISMATCH"
     case .handoffBuildMismatch: return "ERR_TACUA_CAPTURE_BUILD_MISMATCH"
     case .unsupportedConsentVersion: return "ERR_TACUA_CAPTURE_CONSENT_VERSION"
     case .handoffManifestMismatch: return "ERR_TACUA_CAPTURE_HANDOFF_MISMATCH"
     case .sessionNotRecoverable: return "ERR_TACUA_CAPTURE_SESSION_NOT_RECOVERABLE"
     case .sessionHasNoVerifiedSegments: return "ERR_TACUA_CAPTURE_NO_VERIFIED_SEGMENTS"
+    case .captureDisabledForBuild: return "ERR_TACUA_CAPTURE_BUILD_DISABLED"
     case .captureUnavailable: return "ERR_TACUA_CAPTURE_UNAVAILABLE"
     case .captureAlreadyRunning: return "ERR_TACUA_CAPTURE_BUSY"
     case .noCaptureRunning: return "ERR_TACUA_CAPTURE_NOT_RUNNING"
@@ -195,12 +301,17 @@ enum TacuaCaptureSpikeError: Error {
     case .moduleDestroyed: return "ERR_TACUA_CAPTURE_MODULE_DESTROYED"
     case .insufficientStorage: return "ERR_TACUA_CAPTURE_STORAGE_LOW"
     case .invalidMarkerLabel: return "ERR_TACUA_CAPTURE_MARKER_LABEL"
+    case .markerLimitReached: return "ERR_TACUA_CAPTURE_MARKER_LIMIT"
     case .storageIO: return "ERR_TACUA_CAPTURE_STORAGE_IO"
     case .recoveryIO: return "ERR_TACUA_CAPTURE_RECOVERY_IO"
     case .writerCreation: return "ERR_TACUA_CAPTURE_WRITER_CREATE"
     case .writerFailed: return "ERR_TACUA_CAPTURE_WRITER_FINISH"
     case .writerTimeout: return "ERR_TACUA_CAPTURE_WRITER_TIMEOUT"
     case .rotationLimitExceeded: return "ERR_TACUA_CAPTURE_ROTATION_LIMIT"
+    case .diagnosticInvalid: return "ERR_TACUA_DIAGNOSTIC_INVALID"
+    case .diagnosticPrivacyViolation: return "ERR_TACUA_DIAGNOSTIC_PRIVACY"
+    case .diagnosticUnavailable: return "ERR_TACUA_DIAGNOSTIC_UNAVAILABLE"
+    case .diagnosticEventLimitReached: return "ERR_TACUA_DIAGNOSTIC_EVENT_LIMIT"
     }
   }
 
@@ -214,6 +325,10 @@ enum TacuaCaptureSpikeError: Error {
       return "The candidate handoff field \(field) is malformed."
     case .handoffExpired:
       return "The candidate handoff has expired."
+    case .retentionExpired:
+      return "The backend raw-media retention deadline has expired."
+    case .retentionAuthorityInvalid:
+      return "The backend raw-media retention deadline is missing or inconsistent."
     case .handoffApplicationMismatch:
       return "The candidate handoff does not match this application identifier."
     case .handoffBuildMismatch:
@@ -226,6 +341,8 @@ enum TacuaCaptureSpikeError: Error {
       return "The stored capture session is not in a recoverable state."
     case .sessionHasNoVerifiedSegments:
       return "The stored capture session has no verified segment to submit as partial."
+    case .captureDisabledForBuild:
+      return "Tacua capture is disabled because this binary is not an explicitly configured QA build."
     case .captureUnavailable:
       return "ReplayKit capture is unavailable on this device."
     case .captureAlreadyRunning:
@@ -256,6 +373,8 @@ enum TacuaCaptureSpikeError: Error {
       return "At least 256 MiB of free device storage is required to start or rotate a capture segment."
     case .invalidMarkerLabel:
       return "Marker labels use 1-80 ASCII letters, digits, dots, underscores, or hyphens."
+    case .markerLimitReached:
+      return "The capture reached its bounded manual issue-marker limit."
     case .storageIO(let detail), .recoveryIO(let detail):
       return detail
     case .writerCreation(let detail), .writerFailed(let detail):
@@ -264,6 +383,14 @@ enum TacuaCaptureSpikeError: Error {
       return "The current capture segment did not finalize within the bounded writer window."
     case .rotationLimitExceeded:
       return "ReplayKit emitted a media-clock jump too large to segment safely."
+    case .diagnosticInvalid:
+      return "The diagnostic event does not match Tacua's bounded typed schema."
+    case .diagnosticPrivacyViolation:
+      return "The diagnostic event may contain a secret or untemplated private value."
+    case .diagnosticUnavailable:
+      return "The native diagnostic journal is unavailable or failed its integrity checks."
+    case .diagnosticEventLimitReached:
+      return "The native diagnostic journal reached its bounded event limit."
     }
   }
 }

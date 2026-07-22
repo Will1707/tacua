@@ -3,6 +3,7 @@
 import Foundation
 
 private enum QueueTestFailure: Error { case assertion(String) }
+private enum InjectedRemovalError: Error { case failed }
 
 private func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
   if !condition() { throw QueueTestFailure.assertion(message) }
@@ -48,7 +49,20 @@ private final class MemoryPersistence: TacuaTransportQueuePersisting {
 
 private final class MemoryPayloadRemover: TacuaLocalPayloadRemoving {
   var removed: [TacuaLocalPayloadBinding] = []
-  func removePayload(_ binding: TacuaLocalPayloadBinding) throws { removed.append(binding) }
+  var failAtRemoval: Int?
+  func removePayload(_ binding: TacuaLocalPayloadBinding) throws {
+    if failAtRemoval == removed.count { throw InjectedRemovalError.failed }
+    removed.append(binding)
+  }
+}
+
+private final class MemorySessionRetirer: TacuaLocalSessionRetiring {
+  var callCount = 0
+  var shouldFail = false
+  func retireSession() throws {
+    callCount += 1
+    if shouldFail { throw InjectedRemovalError.failed }
+  }
 }
 
 private final class MemoryCredentialStore: TacuaCredentialStoring {
@@ -79,15 +93,21 @@ enum TransportQueueTests {
     let fixtureRoot = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
     try migrationDropsLegacyGrantAuthority()
     try migrationFromV2RequiresCurrentTransportRebind()
+    try migrationFromV3DistrustsPreparedDispatchClaims()
     try migrationFromV2DropsUnavailableBootAnchor()
     try migrationFromV2BackfillsStoredResponseArtifactDigest(fixtureRoot)
     try migrationFromV2PreservesFullyCleanedDeletion(fixtureRoot)
+    try durableSessionArtifactBindingIsClosed(fixtureRoot)
     try queueNeverPersistsSecretsOrLaunchCodes()
     try strictIdentifierAndSensitiveKeyBounds()
     try persistedDecodeBoundsCollectionsAndStrings()
     try timeAnchorSurvivesRestartAndRejectsReboot()
     try expiredCredentialsRequireResumeAtHalfOpenBoundary()
     try exactRetryKeepsHistoricalBodyCredentialAfterRotation()
+    try exactReplayReceiptReanchorsAfterReboot(fixtureRoot)
+    try exactSegmentReceiptOlderThanResumeAnchorStillCommits(fixtureRoot)
+    try completedResumeAuthorizesOnlyExactUnknownCompletion(fixtureRoot)
+    try credentialRotationRebindsOnlyKnownOrProvenUnsentRequests(fixtureRoot)
     try recoveredReceivingResumePreservesImmutableQueue()
     try recoveredResumeRejectsAuthoritativeTimeRegression()
     try recoveredCompletedResumeRequiresExactAuthority(fixtureRoot)
@@ -181,10 +201,126 @@ enum TransportQueueTests {
   private static func migrationDropsLegacyGrantAuthority() throws {
     let legacy = Data(#"{"schemaVersion":1,"localSessionId":"session_local_001","remoteSessionId":"session_remote_001","organizationId":"org_local","projectId":"project_local","buildId":"build_local","grantIdentifier":"grant_old","grantExpiresAt":"2027-01-01T00:00:00Z","items":[{"objectId":"segment_001","objectKind":"segment","segmentIndex":0,"contentDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","byteLength":42,"state":"queued","attemptCount":0,"nextAttemptAt":null,"lastErrorCode":null,"receipt":null}]}"#.utf8)
     let queue = try TacuaTransportQueueV3.decodeOrMigrate(legacy)
-    try require(queue.schemaVersion == 3, "Migration must emit queue schema v3")
+    try require(queue.schemaVersion == 4, "Migration must emit queue schema v4")
     try require(queue.credentialCapability == .requiresExchange, "A legacy grant is not a V1 credential")
     try require(queue.currentCredentialID == nil && queue.remoteSessionID == nil, "Legacy remote authority must be discarded")
     try require(queue.localPayloadPaths == ["legacy/segment_001"], "Local payload inventory must survive migration")
+  }
+
+  private static func durableSessionArtifactBindingIsClosed(_ fixtureRoot: URL) throws {
+    let buildData = try Data(
+      contentsOf: fixtureRoot.appendingPathComponent("build-identity.json")
+    )
+    let scopeData = try Data(
+      contentsOf: fixtureRoot.appendingPathComponent("capture-scope.json")
+    )
+    let artifacts = try TacuaDurableSessionArtifacts.canonicalizing(
+      buildIdentityJSON: buildData,
+      scopeJSON: scopeData
+    )
+    var queue = try TacuaTransportQueueV3(localSessionID: "session_artifacts_001")
+    try queue.applyRecoveredStart(
+      remoteSessionID: "session_remote_artifacts_001",
+      scopeDigest: artifacts.scopeDigest,
+      credentialID: "credential_artifacts_001",
+      transportConfigurationDigest: artifacts.transportConfigurationDigest,
+      expiresAt: "2026-08-20T10:00:00Z",
+      timeAnchor: try TacuaServerTimeAnchor.establish(
+        issuedAt: "2026-07-21T10:00:00Z",
+        clock: TestClock(uptimeMilliseconds: 100_000, bootSessionID: "boot_artifacts_001")
+      ),
+      sessionArtifacts: artifacts
+    )
+    let roundTrip = try TacuaTransportQueueV3.decodeOrMigrate(queue.encoded())
+    let roundTripArtifacts = try requireValue(
+      roundTrip.durableSessionArtifacts(),
+      "Queue round-trip lost durable session artifacts"
+    )
+    try require(
+      roundTripArtifacts == artifacts,
+      "Queue round-trip changed canonical session artifacts"
+    )
+    let persisted = String(decoding: try queue.encoded(), as: UTF8.self).lowercased()
+    try require(
+      !persisted.contains("launch_code") && !persisted.contains("\"secret\""),
+      "Public session-artifact retention persisted transient authority"
+    )
+
+    guard var legacyObject = try JSONSerialization.jsonObject(
+      with: queue.encoded()
+    ) as? [String: Any] else {
+      throw QueueTestFailure.assertion("Could not construct artifact migration fixture")
+    }
+    legacyObject["schemaVersion"] = 3
+    legacyObject.removeValue(forKey: "buildIdentityJSON")
+    legacyObject.removeValue(forKey: "captureScopeJSON")
+    let legacyData = try JSONSerialization.data(
+      withJSONObject: legacyObject,
+      options: [.sortedKeys]
+    )
+    var migrated = try TacuaTransportQueueV3.decodeOrMigrate(legacyData)
+    try require(
+      !migrated.hasDurableSessionArtifacts,
+      "Legacy queue migration invented build/scope artifacts"
+    )
+    try migrated.bindDurableSessionArtifacts(artifacts)
+    try migrated.bindDurableSessionArtifacts(artifacts)
+    try require(
+      migrated.hasDurableSessionArtifacts,
+      "Exact artifact backfill was not idempotent"
+    )
+
+    guard case .object(var changedScope) = artifacts.scope,
+      case .object(var consent)? = changedScope["consent"]
+    else { throw QueueTestFailure.assertion("Scope fixture is malformed") }
+    consent["granted_at"] = .string("2026-07-21T09:58:00Z")
+    changedScope["consent"] = .object(consent)
+    changedScope["scope_digest"] = .string(
+      try TacuaCanonicalJSON.digest(
+        .object(changedScope),
+        omittingRootField: "scope_digest"
+      )
+    )
+    let substituted = try TacuaDurableSessionArtifacts.canonicalizing(
+      buildIdentityJSON: artifacts.buildIdentityJSON,
+      scopeJSON: TacuaCanonicalJSON.data(.object(changedScope))
+    )
+    try expectQueueError(.operationConflict) {
+      try migrated.bindDurableSessionArtifacts(substituted)
+    }
+    let retainedArtifacts = try migrated.durableSessionArtifacts()
+    try require(
+      retainedArtifacts == artifacts,
+      "Rejected artifact substitution partially mutated the queue"
+    )
+
+    guard var tampered = try JSONSerialization.jsonObject(
+      with: queue.encoded()
+    ) as? [String: Any] else {
+      throw QueueTestFailure.assertion("Could not construct artifact tamper fixture")
+    }
+    tampered["captureScopeJSON"] = "{}"
+    try expectAnyFailure {
+      _ = try TacuaTransportQueueV3.decodeOrMigrate(
+        JSONSerialization.data(withJSONObject: tampered, options: [.sortedKeys])
+      )
+    }
+    tampered["captureScopeJSON"] = NSNull()
+    try expectAnyFailure {
+      _ = try TacuaTransportQueueV3.decodeOrMigrate(
+        JSONSerialization.data(withJSONObject: tampered, options: [.sortedKeys])
+      )
+    }
+    tampered["captureScopeJSON"] = String(decoding: artifacts.scopeJSON, as: UTF8.self)
+    tampered["buildIdentityJSON"] = String(
+      repeating: "x",
+      count: TacuaDurableSessionArtifacts.maximumArtifactBytes + 1
+    )
+    try expectAnyFailure {
+      _ = try TacuaTransportQueueV3.decodeOrMigrate(
+        JSONSerialization.data(withJSONObject: tampered, options: [.sortedKeys])
+      )
+    }
   }
 
   private static func migrationFromV2RequiresCurrentTransportRebind() throws {
@@ -205,7 +341,7 @@ enum TransportQueueTests {
     let v2 = try JSONSerialization.data(withJSONObject: v2Object, options: [.sortedKeys])
 
     var migrated = try TacuaTransportQueueV3.decodeOrMigrate(v2)
-    try require(migrated.schemaVersion == 3, "V2 migration must emit queue schema v3")
+    try require(migrated.schemaVersion == 4, "V2 migration must emit queue schema v4")
     try require(
       migrated.credentialCapability == .requiresTransportRebind,
       "V2 transport authority must require a build-pinned rebind"
@@ -220,7 +356,7 @@ enum TransportQueueTests {
       )
     }
     try expectQueueError(.transportConfigurationMismatch) {
-      _ = try migrated.attempt(
+      _ = try migrated.outcomeUnknownAttempt(
         operationID: "upload_migrated_001",
         expectedTransportConfigurationDigest: transportDigest,
         clock: TestClock(uptimeMilliseconds: 102_000, bootSessionID: "boot_001")
@@ -245,7 +381,7 @@ enum TransportQueueTests {
         && migrated.timeAnchor == recoveredAnchor,
       "A recovered V2 resume must bind the current transport and preserve its exact anchor"
     )
-    let attempt = try migrated.attempt(
+    let attempt = try migrated.outcomeUnknownAttempt(
       operationID: "upload_migrated_001",
       expectedTransportConfigurationDigest: transportDigest,
       clock: TestClock(uptimeMilliseconds: 401_000, bootSessionID: "boot_001")
@@ -254,6 +390,47 @@ enum TransportQueueTests {
       attempt.immutableRequestCredentialID == "credential_first"
         && attempt.transportCredentialID == "credential_rebound",
       "Current-digest rebind must resume exact sends without rewriting request authority"
+    )
+  }
+
+  private static func migrationFromV3DistrustsPreparedDispatchClaims() throws {
+    var source = try makeActiveQueue()
+    try enqueue(
+      .diagnostic,
+      id: "upload_migrated_prepared",
+      credentialID: "credential_first",
+      queue: &source
+    )
+    try enqueue(
+      .diagnostic,
+      id: "upload_migrated_unknown",
+      credentialID: "credential_first",
+      queue: &source
+    )
+    _ = try source.beginAttempt(
+      operationID: "upload_migrated_unknown",
+      expectedTransportConfigurationDigest: transportDigest,
+      clock: TestClock(uptimeMilliseconds: 102_000, bootSessionID: "boot_001")
+    )
+    let v4RoundTrip = try TacuaTransportQueueV3.decodeOrMigrate(source.encoded())
+    try require(
+      v4RoundTrip.operations.first(where: { $0.operationID == "upload_migrated_prepared" })?
+        .state == .prepared,
+      "Queue v4 must preserve a durably journaled prepared claim"
+    )
+
+    guard var v3Object = try JSONSerialization.jsonObject(
+      with: source.encoded()
+    ) as? [String: Any] else {
+      throw QueueTestFailure.assertion("Could not construct a queue-v3 migration fixture")
+    }
+    v3Object["schemaVersion"] = 3
+    let v3 = try JSONSerialization.data(withJSONObject: v3Object, options: [.sortedKeys])
+    let migrated = try TacuaTransportQueueV3.decodeOrMigrate(v3)
+    try require(migrated.schemaVersion == 4, "V3 migration must emit queue schema v4")
+    try require(
+      migrated.operations.allSatisfy({ $0.state == .outcomeUnknown }),
+      "V3 had no pre-network journal and cannot prove any operation was unsent"
     )
   }
 
@@ -376,7 +553,7 @@ enum TransportQueueTests {
     var cleanupPending = try TacuaTransportQueueV3.decodeOrMigrate(
       v2Bytes(cleanupPendingSource)
     )
-    try require(cleanupPending.schemaVersion == 3, "Cleanup-pending V2 deletion did not migrate")
+    try require(cleanupPending.schemaVersion == 4, "Cleanup-pending V2 deletion did not migrate")
     try require(
       cleanupPending.credentialCapability == .deletionReplayOnly,
       "Cleanup-pending V2 deletion was converted into an impossible credential rebind"
@@ -391,7 +568,7 @@ enum TransportQueueTests {
       "V2 migration invented transport binding for cleanup-pending deletion"
     )
     try expectQueueError(.transportConfigurationMismatch) {
-      _ = try cleanupPending.attempt(
+      _ = try cleanupPending.storedResponseReplayAttempt(
         operationID: "deletion_synthetic",
         expectedTransportConfigurationDigest: transportDigest,
         clock: TestClock(uptimeMilliseconds: 101_000, bootSessionID: "boot_fixture")
@@ -400,6 +577,11 @@ enum TransportQueueTests {
     let pendingPersistence = MemoryPersistence()
     let pendingCredentials = MemoryCredentialStore()
     pendingCredentials.values["credential_receiving_resume"] = Data(repeating: 7, count: 32)
+    try TacuaTransportCleanup.retireAuthorizedSession(
+      queue: &cleanupPending,
+      persistence: pendingPersistence,
+      retirer: MemorySessionRetirer()
+    )
     try TacuaTransportCleanup.removeAuthorizedCredential(
       queue: &cleanupPending,
       persistence: pendingPersistence,
@@ -413,16 +595,14 @@ enum TransportQueueTests {
     _ = try cleanupPending.encoded()
 
     var cleanedSource = source
-    let cleanupPersistence = MemoryPersistence()
-    let cleanupCredentials = MemoryCredentialStore()
-    cleanupCredentials.values["credential_receiving_resume"] = Data(repeating: 7, count: 32)
-    try TacuaTransportCleanup.removeAuthorizedCredential(
-      queue: &cleanedSource,
-      persistence: cleanupPersistence,
-      credentialStore: cleanupCredentials
-    )
+    // This fixture represents a queue written by a pre-v4 build which had already removed the
+    // credential before whole-session retirement became mandatory. Migration must preserve that
+    // terminal fact without using the legacy order for any new cleanup.
+    cleanedSource.credentialCleanupState = .credentialRemoved
+    cleanedSource.currentCredentialID = nil
+    cleanedSource.currentCredentialExpiresAt = nil
     let cleaned = try TacuaTransportQueueV3.decodeOrMigrate(v2Bytes(cleanedSource))
-    try require(cleaned.schemaVersion == 3, "Credential-removed V2 deletion did not migrate")
+    try require(cleaned.schemaVersion == 4, "Credential-removed V2 deletion did not migrate")
     try require(
       cleaned.credentialCapability == .deletionReplayOnly,
       "Credential-removed V2 deletion was converted into an impossible rebind"
@@ -437,7 +617,7 @@ enum TransportQueueTests {
       "V2 migration invented transport binding for terminal cleanup state"
     )
     try expectQueueError(.missingCredential) {
-      _ = try cleaned.attempt(
+      _ = try cleaned.storedResponseReplayAttempt(
         operationID: "deletion_synthetic",
         expectedTransportConfigurationDigest: transportDigest,
         clock: TestClock(uptimeMilliseconds: 101_000, bootSessionID: "boot_fixture")
@@ -567,6 +747,11 @@ enum TransportQueueTests {
   private static func exactRetryKeepsHistoricalBodyCredentialAfterRotation() throws {
     var queue = try makeActiveQueue()
     try enqueue(.segment, id: "upload_segment_001", credentialID: "credential_first", queue: &queue)
+    _ = try queue.beginAttempt(
+      operationID: "upload_segment_001",
+      expectedTransportConfigurationDigest: transportDigest,
+      clock: TestClock(uptimeMilliseconds: 101_000, bootSessionID: "boot_001")
+    )
     try queue.applyExchange(
       remoteSessionID: "session_remote_001",
       scopeDigest: digestA,
@@ -578,7 +763,7 @@ enum TransportQueueTests {
       issuedAt: "2026-07-21T10:05:00Z",
       clock: TestClock(uptimeMilliseconds: 400_000, bootSessionID: "boot_001")
     )
-    let attempt = try queue.attempt(
+    let attempt = try queue.outcomeUnknownAttempt(
       operationID: "upload_segment_001",
       expectedTransportConfigurationDigest: transportDigest,
       clock: TestClock(uptimeMilliseconds: 401_000, bootSessionID: "boot_001")
@@ -589,16 +774,496 @@ enum TransportQueueTests {
     try require(body.objectValue?["credential_id"]?.stringValue == "credential_first", "Historical request bytes must remain exact")
   }
 
+  private static func exactReplayReceiptReanchorsAfterReboot(_ root: URL) throws {
+    let requestData = try canonicalFixture(root, "segment-upload-intent")
+    let responseData = try canonicalFixture(root, "segment-upload-receipt")
+    let requestValue = try TacuaCanonicalJSON.parse(requestData)
+    guard let request = requestValue.objectValue,
+      let sessionID = request["session_id"]?.stringValue,
+      let scopeDigest = request["scope_digest"]?.stringValue,
+      let credentialID = request["credential_id"]?.stringValue,
+      let operationID = request["upload_id"]?.stringValue,
+      let requestDigest = request["intent_digest"]?.stringValue
+    else { throw QueueTestFailure.assertion("Invalid segment fixture") }
+    var queue = try TacuaTransportQueueV3(localSessionID: "session_reboot_replay")
+    try queue.applyExchange(
+      remoteSessionID: sessionID,
+      scopeDigest: scopeDigest,
+      credentialID: credentialID,
+      transportConfigurationDigest: transportDigest,
+      expiresAt: "2026-08-20T10:00:00Z",
+      capability: .active,
+      issuedAt: "2026-07-21T10:00:00Z",
+      clock: TestClock(uptimeMilliseconds: 100_000, bootSessionID: "boot_before_replay")
+    )
+    try queue.enqueueNewOperation(
+      kind: .segment,
+      operationID: operationID,
+      requestCredentialID: credentialID,
+      request: requestValue,
+      requestDigest: requestDigest,
+      clock: TestClock(uptimeMilliseconds: 101_000, bootSessionID: "boot_before_replay")
+    )
+    _ = try queue.beginAttempt(
+      operationID: operationID,
+      expectedTransportConfigurationDigest: transportDigest,
+      clock: TestClock(uptimeMilliseconds: 101_000, bootSessionID: "boot_before_replay")
+    )
+    queue = try TacuaTransportQueueV3.decodeOrMigrate(queue.encoded())
+    let rebootClock = TestClock(uptimeMilliseconds: 5_000, bootSessionID: "boot_after_replay")
+    _ = try queue.outcomeUnknownAttempt(
+      operationID: operationID,
+      expectedTransportConfigurationDigest: transportDigest,
+      clock: rebootClock
+    )
+    let receipt = try TacuaSDKBackendProtocol.validateResponse(
+      responseData,
+      forCanonicalRequest: requestData
+    )
+    try queue.storeValidatedReceipt(receipt)
+    try queue.observeAuthoritativeReceiptTimestamp(receipt.authoritativeTimestamp, clock: rebootClock)
+    try queue.validate()
+    try require(
+      queue.timeAnchor?.bootSessionID == rebootClock.bootSessionID
+        && queue.timeAnchor?.minimumEpochMilliseconds
+          == TacuaProtocolTimestamp.parseMilliseconds(receipt.authoritativeTimestamp),
+      "A validated exact-replay receipt must safely establish the current boot anchor"
+    )
+    try require(
+      queue.operations.first(where: { $0.operationID == operationID })?.state == .responseStored,
+      "The exact-replay receipt must become durable after reboot"
+    )
+    let establishedAnchor = queue.timeAnchor
+    try queue.observeAuthoritativeReceiptTimestamp(
+      "2026-07-21T09:59:59Z",
+      clock: rebootClock
+    )
+    try require(
+      queue.timeAnchor == establishedAnchor,
+      "An older exact receipt must not rewind an established time anchor"
+    )
+  }
+
+  private static func exactSegmentReceiptOlderThanResumeAnchorStillCommits(
+    _ root: URL
+  ) throws {
+    let requestData = try canonicalFixture(root, "segment-upload-intent")
+    let responseData = try canonicalFixture(root, "segment-upload-receipt")
+    let requestValue = try TacuaCanonicalJSON.parse(requestData)
+    guard let request = requestValue.objectValue,
+      let sessionID = request["session_id"]?.stringValue,
+      let scopeDigest = request["scope_digest"]?.stringValue,
+      let credentialID = request["credential_id"]?.stringValue,
+      let operationID = request["upload_id"]?.stringValue,
+      let requestDigest = request["intent_digest"]?.stringValue
+    else { throw QueueTestFailure.assertion("Invalid segment fixture") }
+    var queue = try TacuaTransportQueueV3(localSessionID: "session_segment_post_resume")
+    try queue.applyExchange(
+      remoteSessionID: sessionID,
+      scopeDigest: scopeDigest,
+      credentialID: credentialID,
+      transportConfigurationDigest: transportDigest,
+      expiresAt: "2026-08-20T10:00:00Z",
+      capability: .active,
+      issuedAt: "2026-07-21T10:00:00Z",
+      clock: TestClock(uptimeMilliseconds: 100_000, bootSessionID: "boot_segment_old")
+    )
+    try queue.enqueueNewOperation(
+      kind: .segment,
+      operationID: operationID,
+      requestCredentialID: credentialID,
+      request: requestValue,
+      requestDigest: requestDigest,
+      clock: TestClock(uptimeMilliseconds: 101_000, bootSessionID: "boot_segment_old")
+    )
+    _ = try queue.beginAttempt(
+      operationID: operationID,
+      expectedTransportConfigurationDigest: transportDigest,
+      clock: TestClock(uptimeMilliseconds: 101_000, bootSessionID: "boot_segment_old")
+    )
+    let resumeAnchor = try TacuaServerTimeAnchor.establish(
+      issuedAt: "2026-07-21T10:10:00Z",
+      clock: TestClock(uptimeMilliseconds: 10_000, bootSessionID: "boot_segment_new")
+    )
+    try queue.applyRecoveredResume(
+      expectedCurrentCredentialID: credentialID,
+      newCredentialID: "credential_segment_resumed",
+      transportConfigurationDigest: transportDigest,
+      expiresAt: "2026-08-20T10:10:00Z",
+      capability: .active,
+      replayCompletionID: nil,
+      timeAnchor: resumeAnchor
+    )
+    _ = try queue.outcomeUnknownAttempt(
+      operationID: operationID,
+      expectedTransportConfigurationDigest: transportDigest,
+      clock: TestClock(uptimeMilliseconds: 11_000, bootSessionID: "boot_segment_new")
+    )
+    let receipt = try TacuaSDKBackendProtocol.validateResponse(
+      responseData,
+      forCanonicalRequest: requestData
+    )
+    try queue.storeValidatedReceipt(receipt)
+    try queue.observeAuthoritativeReceiptTimestamp(
+      receipt.authoritativeTimestamp,
+      clock: TestClock(uptimeMilliseconds: 11_000, bootSessionID: "boot_segment_new")
+    )
+    try require(queue.timeAnchor == resumeAnchor, "An old segment receipt rewound RESUME time")
+    try require(
+      queue.operations.first(where: { $0.operationID == operationID })?.state == .responseStored,
+      "An old exact segment receipt did not commit after RESUME"
+    )
+  }
+
+  private static func completedResumeAuthorizesOnlyExactUnknownCompletion(
+    _ root: URL
+  ) throws {
+    let segmentRequest = try canonicalFixture(root, "segment-upload-intent")
+    let segmentRoot = try TacuaCanonicalJSON.parse(segmentRequest).objectValue
+    guard let sessionID = segmentRoot?["session_id"]?.stringValue,
+      let scopeDigest = segmentRoot?["scope_digest"]?.stringValue
+    else { throw QueueTestFailure.assertion("Invalid segment fixture") }
+    var preparedQueue = try TacuaTransportQueueV3(localSessionID: "session_completion_replay")
+    try preparedQueue.applyExchange(
+      remoteSessionID: sessionID,
+      scopeDigest: scopeDigest,
+      credentialID: "credential_synthetic",
+      transportConfigurationDigest: transportDigest,
+      expiresAt: "2026-08-20T10:00:00Z",
+      capability: .active,
+      issuedAt: "2026-07-21T10:00:00Z",
+      clock: TestClock(uptimeMilliseconds: 100_000, bootSessionID: "boot_fixture")
+    )
+    try enqueueFixtureUpload(
+      root,
+      requestName: "segment-upload-intent",
+      responseName: "segment-upload-receipt",
+      kind: .segment,
+      bindings: [
+        TacuaLocalPayloadBinding(
+          role: .segmentMedia,
+          relativePath: "segments/000.mov",
+          contentDigest: "sha256:" + String(repeating: "3", count: 64)
+        ),
+        TacuaLocalPayloadBinding(
+          role: .segmentSidecar,
+          relativePath: "segments/000.sidecar.json",
+          contentDigest: "sha256:" + String(repeating: "4", count: 64)
+        ),
+      ],
+      queue: &preparedQueue,
+      clock: TestClock(uptimeMilliseconds: 101_000, bootSessionID: "boot_fixture")
+    )
+    try preparedQueue.applyExchange(
+      remoteSessionID: sessionID,
+      scopeDigest: scopeDigest,
+      credentialID: "credential_receiving_resume",
+      transportConfigurationDigest: transportDigest,
+      expiresAt: "2026-08-20T10:00:00Z",
+      previousCredentialID: "credential_synthetic",
+      capability: .active,
+      issuedAt: "2026-07-21T10:01:00Z",
+      clock: TestClock(uptimeMilliseconds: 160_000, bootSessionID: "boot_fixture")
+    )
+    try enqueueFixtureUpload(
+      root,
+      requestName: "diagnostic-upload-request",
+      responseName: "diagnostic-upload-receipt",
+      kind: .diagnostic,
+      bindings: [
+        TacuaLocalPayloadBinding(
+          role: .diagnosticEnvelope,
+          relativePath: "diagnostics/events.json",
+          contentDigest: "sha256:6f395bf765e73eac49e90ff444ce8965ce31b452a683f26e03e8554497e4efbf"
+        )
+      ],
+      queue: &preparedQueue,
+      clock: TestClock(uptimeMilliseconds: 163_000, bootSessionID: "boot_fixture")
+    )
+    let completionRequest = try canonicalFixture(root, "completion-request")
+    let completionValue = try TacuaCanonicalJSON.parse(completionRequest)
+    guard let completionRoot = completionValue.objectValue,
+      let completionID = completionRoot["completion_id"]?.stringValue,
+      let completionCredential = completionRoot["credential_id"]?.stringValue,
+      let completionDigest = completionRoot["request_digest"]?.stringValue
+    else { throw QueueTestFailure.assertion("Invalid completion fixture") }
+    try preparedQueue.enqueueNewOperation(
+      kind: .completion,
+      operationID: completionID,
+      requestCredentialID: completionCredential,
+      request: completionValue,
+      requestDigest: completionDigest,
+      clock: TestClock(uptimeMilliseconds: 165_000, bootSessionID: "boot_fixture")
+    )
+    let completedAnchor = try TacuaServerTimeAnchor.establish(
+      issuedAt: "2026-07-21T10:10:00Z",
+      clock: TestClock(uptimeMilliseconds: 10_000, bootSessionID: "boot_completed")
+    )
+    try expectQueueError(.cleanupNotAuthorized) {
+      var candidate = preparedQueue
+      try candidate.applyRecoveredResume(
+        expectedCurrentCredentialID: completionCredential,
+        newCredentialID: "credential_completed_prepared",
+        transportConfigurationDigest: transportDigest,
+        expiresAt: "2026-08-20T10:10:00Z",
+        capability: .completionReplayOrDeleteOnly,
+        replayCompletionID: completionID,
+        timeAnchor: completedAnchor
+      )
+    }
+
+    var queue = preparedQueue
+    _ = try queue.beginAttempt(
+      operationID: completionID,
+      expectedTransportConfigurationDigest: transportDigest,
+      clock: TestClock(uptimeMilliseconds: 165_000, bootSessionID: "boot_fixture")
+    )
+    try expectQueueError(.cleanupNotAuthorized) {
+      var candidate = queue
+      try candidate.applyRecoveredResume(
+        expectedCurrentCredentialID: completionCredential,
+        newCredentialID: "credential_completed_mismatch",
+        transportConfigurationDigest: transportDigest,
+        expiresAt: "2026-08-20T10:10:00Z",
+        capability: .completionReplayOrDeleteOnly,
+        replayCompletionID: "completion_wrong",
+        timeAnchor: completedAnchor
+      )
+    }
+    try expectQueueError(.cleanupNotAuthorized) {
+      var candidate = queue
+      try enqueue(
+        .completion,
+        id: "completion_extra",
+        credentialID: completionCredential,
+        queue: &candidate,
+        clock: TestClock(uptimeMilliseconds: 166_000, bootSessionID: "boot_fixture")
+      )
+      _ = try candidate.beginAttempt(
+        operationID: "completion_extra",
+        expectedTransportConfigurationDigest: transportDigest,
+        clock: TestClock(uptimeMilliseconds: 166_000, bootSessionID: "boot_fixture")
+      )
+      try candidate.applyRecoveredResume(
+        expectedCurrentCredentialID: completionCredential,
+        newCredentialID: "credential_completed_multiple",
+        transportConfigurationDigest: transportDigest,
+        expiresAt: "2026-08-20T10:10:00Z",
+        capability: .completionReplayOrDeleteOnly,
+        replayCompletionID: completionID,
+        timeAnchor: completedAnchor
+      )
+    }
+
+    try queue.applyRecoveredResume(
+      expectedCurrentCredentialID: completionCredential,
+      newCredentialID: "credential_completed_resume",
+      transportConfigurationDigest: transportDigest,
+      expiresAt: "2026-08-20T10:10:00Z",
+      capability: .completionReplayOrDeleteOnly,
+      replayCompletionID: completionID,
+      timeAnchor: completedAnchor
+    )
+    queue = try TacuaTransportQueueV3.decodeOrMigrate(queue.encoded())
+    try require(
+      queue.pendingCompletionReplayID == completionID
+        && queue.completionCleanupAuthority == nil,
+      "Completed RESUME did not durably authorize only the exact pending completion replay"
+    )
+    let replay = try queue.outcomeUnknownAttempt(
+      operationID: completionID,
+      expectedTransportConfigurationDigest: transportDigest,
+      clock: TestClock(uptimeMilliseconds: 11_000, bootSessionID: "boot_completed")
+    )
+    try require(
+      replay.canonicalRequest == completionRequest
+        && replay.transportCredentialID == "credential_completed_resume",
+      "Completed RESUME did not return the exact historical completion body"
+    )
+    let completionReceiptData = try canonicalFixture(root, "completion-receipt")
+    let receipt = try TacuaSDKBackendProtocol.validateResponse(
+      completionReceiptData,
+      forCanonicalRequest: completionRequest
+    )
+    try queue.storeValidatedReceipt(receipt)
+    try queue.observeAuthoritativeReceiptTimestamp(
+      receipt.authoritativeTimestamp,
+      clock: TestClock(uptimeMilliseconds: 11_000, bootSessionID: "boot_completed")
+    )
+    try require(queue.timeAnchor == completedAnchor, "Old completion receipt rewound RESUME time")
+    try require(
+      queue.pendingCompletionReplayID == nil
+        && queue.completionCleanupAuthority?.completionID == completionID,
+      "Validated replay receipt did not replace pending replay authority with cleanup authority"
+    )
+  }
+
+  private static func credentialRotationRebindsOnlyKnownOrProvenUnsentRequests(
+    _ root: URL
+  ) throws {
+    let requestData = try canonicalFixture(root, "segment-upload-intent")
+    let requestValue = try TacuaCanonicalJSON.parse(requestData)
+    guard let request = requestValue.objectValue,
+      let sessionID = request["session_id"]?.stringValue,
+      let scopeDigest = request["scope_digest"]?.stringValue,
+      let credentialID = request["credential_id"]?.stringValue,
+      let operationID = request["upload_id"]?.stringValue,
+      let requestDigest = request["intent_digest"]?.stringValue
+    else { throw QueueTestFailure.assertion("Invalid segment fixture") }
+
+    func queueWithPreparedOperation() throws -> TacuaTransportQueueV3 {
+      var queue = try TacuaTransportQueueV3(localSessionID: "session_rebind_001")
+      try queue.applyExchange(
+        remoteSessionID: sessionID,
+        scopeDigest: scopeDigest,
+        credentialID: credentialID,
+        transportConfigurationDigest: transportDigest,
+        expiresAt: "2026-08-20T10:00:00Z",
+        capability: .active,
+        issuedAt: "2026-07-21T10:00:00Z",
+        clock: TestClock(uptimeMilliseconds: 100_000, bootSessionID: "boot_rebind")
+      )
+      try queue.enqueueNewOperation(
+        kind: .segment,
+        operationID: operationID,
+        requestCredentialID: credentialID,
+        request: requestValue,
+        requestDigest: requestDigest,
+        clock: TestClock(uptimeMilliseconds: 101_000, bootSessionID: "boot_rebind")
+      )
+      return queue
+    }
+
+    func rotate(_ queue: inout TacuaTransportQueueV3) throws {
+      try queue.applyExchange(
+        remoteSessionID: sessionID,
+        scopeDigest: scopeDigest,
+        credentialID: "credential_rebound",
+        transportConfigurationDigest: transportDigest,
+        expiresAt: "2026-08-21T10:00:00Z",
+        previousCredentialID: credentialID,
+        capability: .active,
+        issuedAt: "2026-07-21T10:05:00Z",
+        clock: TestClock(uptimeMilliseconds: 400_000, bootSessionID: "boot_rebind")
+      )
+    }
+
+    func replacement(
+      mutating mutation: ((inout [String: TacuaJSONValue]) -> Void)? = nil
+    ) throws -> TacuaPreparedBackendRequest {
+      var object = request
+      object["credential_id"] = .string("credential_rebound")
+      object["requested_at"] = .string("2026-07-21T10:05:01Z")
+      object.removeValue(forKey: "intent_digest")
+      mutation?(&object)
+      let digest = try TacuaCanonicalJSON.digest(.object(object))
+      object["intent_digest"] = .string(digest)
+      return TacuaPreparedBackendRequest(
+        kind: .segment,
+        operationID: operationID,
+        credentialID: "credential_rebound",
+        canonicalData: try TacuaCanonicalJSON.data(.object(object)),
+        requestDigest: digest
+      )
+    }
+
+    var knownUnsent = try queueWithPreparedOperation()
+    try rotate(&knownUnsent)
+    try knownUnsent.rebindPreparedOperation(
+      operationID: operationID,
+      replacement: replacement(),
+      clock: TestClock(uptimeMilliseconds: 401_000, bootSessionID: "boot_rebind")
+    )
+    try require(
+      knownUnsent.operations[0].state == .prepared
+        && knownUnsent.operations[0].requestCredentialID == "credential_rebound",
+      "A durably unsent request did not rebind to the rotated credential"
+    )
+
+    var unknown = try queueWithPreparedOperation()
+    _ = try unknown.beginAttempt(
+      operationID: operationID,
+      expectedTransportConfigurationDigest: transportDigest,
+      clock: TestClock(uptimeMilliseconds: 101_000, bootSessionID: "boot_rebind")
+    )
+    try rotate(&unknown)
+    let proof = TacuaValidatedBackendError(
+      statusCode: 403,
+      code: .operationNotAuthorized,
+      reconciliationOutcome: .historicalOperationNotFound,
+      operationKind: .segment,
+      remoteSessionID: sessionID,
+      operationID: operationID,
+      requestDigest: requestDigest,
+      requestCredentialID: credentialID,
+      authenticatedCredentialID: "credential_rebound"
+    )
+    let baseline = unknown
+    let mismatchedProof = TacuaValidatedBackendError(
+      statusCode: proof.statusCode,
+      code: proof.code,
+      reconciliationOutcome: proof.reconciliationOutcome,
+      operationKind: proof.operationKind,
+      remoteSessionID: proof.remoteSessionID,
+      operationID: proof.operationID,
+      requestDigest: digestB,
+      requestCredentialID: proof.requestCredentialID,
+      authenticatedCredentialID: proof.authenticatedCredentialID
+    )
+    try expectQueueError(.operationConflict) {
+      try unknown.rebindProvenMissingHistoricalOperation(
+        operationID: operationID,
+        replacement: replacement(),
+        proof: mismatchedProof,
+        clock: TestClock(uptimeMilliseconds: 401_000, bootSessionID: "boot_rebind")
+      )
+    }
+    try require(unknown == baseline, "A mismatched backend proof rewrote an unknown request")
+    try expectQueueError(.operationConflict) {
+      try unknown.rebindProvenMissingHistoricalOperation(
+        operationID: operationID,
+        replacement: replacement(mutating: {
+          $0["segment_id"] = .string("segment_other")
+        }),
+        proof: proof,
+        clock: TestClock(uptimeMilliseconds: 401_000, bootSessionID: "boot_rebind")
+      )
+    }
+    try require(unknown == baseline, "A semantic request change bypassed reconciliation")
+    try unknown.rebindProvenMissingHistoricalOperation(
+      operationID: operationID,
+      replacement: replacement(),
+      proof: proof,
+      clock: TestClock(uptimeMilliseconds: 401_000, bootSessionID: "boot_rebind")
+    )
+    try require(
+      unknown.operations[0].state == .prepared
+        && unknown.operations[0].requestCredentialID == "credential_rebound",
+      "A request-bound historical miss did not permit safe rebinding"
+    )
+  }
+
   private static func recoveredReceivingResumePreservesImmutableQueue() throws {
     var queue = try makeActiveQueue()
+    queue.sessionRetentionAuthority = TacuaSessionRetentionAuthority(
+      sessionReceivedAt: "2026-07-21T10:00:00Z",
+      rawMediaExpiresAt: "2026-08-20T10:00:00Z",
+      derivedDataExpiresAt: "2027-07-21T10:00:00Z"
+    )
     try enqueue(
       .diagnostic,
       id: "upload_resume_immutable",
       credentialID: "credential_first",
       queue: &queue
     )
+    _ = try queue.beginAttempt(
+      operationID: "upload_resume_immutable",
+      expectedTransportConfigurationDigest: transportDigest,
+      clock: TestClock(uptimeMilliseconds: 101_000, bootSessionID: "boot_001")
+    )
     let originalOperations = queue.operations
     let originalPayloadPaths = queue.localPayloadPaths
+    let originalRetentionAuthority = queue.sessionRetentionAuthority
     let anchor = try TacuaServerTimeAnchor.establish(
       issuedAt: "2026-07-21T10:06:00Z",
       clock: TestClock(uptimeMilliseconds: 460_000, bootSessionID: "boot_resume")
@@ -620,6 +1285,10 @@ enum TransportQueueTests {
     try require(queue.operations == originalOperations, "Resume rewrote immutable queued operations")
     try require(queue.localPayloadPaths == originalPayloadPaths, "Resume rewrote local payload inventory")
     try require(
+      queue.sessionRetentionAuthority == originalRetentionAuthority,
+      "Resume moved the immutable START retention deadlines"
+    )
+    try require(
       queue.pendingRevokedCredentialRemovals == ["credential_first"],
       "Resume did not durably journal the revoked credential"
     )
@@ -630,7 +1299,7 @@ enum TransportQueueTests {
         && recovered.timeAnchor == anchor,
       "Encoded recovery lost credential cleanup or anchor state"
     )
-    let attempt = try recovered.attempt(
+    let attempt = try recovered.outcomeUnknownAttempt(
       operationID: "upload_resume_immutable",
       expectedTransportConfigurationDigest: transportDigest,
       clock: TestClock(uptimeMilliseconds: 461_000, bootSessionID: "boot_resume")
@@ -740,7 +1409,7 @@ enum TransportQueueTests {
       queue.pendingRevokedCredentialRemovals.contains("credential_receiving_resume"),
       "Completed resume did not journal its prior credential"
     )
-    let attempt = try queue.attempt(
+    let attempt = try queue.storedResponseReplayAttempt(
       operationID: "completion_synthetic",
       expectedTransportConfigurationDigest: transportDigest,
       clock: TestClock(
@@ -879,7 +1548,7 @@ enum TransportQueueTests {
       clock: TestClock(uptimeMilliseconds: 101_999, bootSessionID: "boot_expiry")
     )
     try expectQueueError(.resumeRequired) {
-      _ = try queue.attempt(
+      _ = try queue.beginAttempt(
         operationID: "upload_before_expiry",
         expectedTransportConfigurationDigest: transportDigest,
         clock: TestClock(uptimeMilliseconds: 102_000, bootSessionID: "boot_expiry")
@@ -983,6 +1652,29 @@ enum TransportQueueTests {
   }
 
   private static func completionAloneAuthorizesCrashSafePayloadCleanup(_ root: URL) throws {
+    var syncFailureQueue = try fixtureQueue(
+      root,
+      requestName: "completion-request",
+      kind: .completion,
+      operationID: "completion_synthetic",
+      responseName: "completion-receipt"
+    )
+    let failurePersistence = MemoryPersistence()
+    let failureRetirer = MemorySessionRetirer()
+    failureRetirer.shouldFail = true
+    try expectAnyFailure {
+      try TacuaTransportCleanup.retireAuthorizedSession(
+        queue: &syncFailureQueue,
+        persistence: failurePersistence,
+        retirer: failureRetirer
+      )
+    }
+    try require(
+      syncFailureQueue.payloadCleanupState == .tombstoneWritten
+        && failurePersistence.snapshots.last?.payloadCleanupState == .tombstoneWritten,
+      "A removal/directory-sync failure must never advance the queue to payloadsRemoved"
+    )
+
     var queue = try fixtureQueue(
       root,
       requestName: "completion-request",
@@ -991,28 +1683,22 @@ enum TransportQueueTests {
       responseName: "completion-receipt"
     )
     let persistence = MemoryPersistence()
-    let remover = MemoryPayloadRemover()
-    let authorizedBindings = try queue.authorizedLocalPayloadBindings()
-    try TacuaTransportCleanup.removeAuthorizedPayloads(
-      queue: &queue, persistence: persistence, remover: remover
+    let retirer = MemorySessionRetirer()
+    try TacuaTransportCleanup.retireAuthorizedSession(
+      queue: &queue, persistence: persistence, retirer: retirer
     )
     try require(persistence.snapshots.first?.payloadCleanupState == .tombstoneWritten, "Cleanup tombstone must be durable before deletion")
-    try require(remover.removed == authorizedBindings, "Only receipt-bound payloads may be removed")
-    try require(
-      !remover.removed.map(\.relativePath).contains("legacy/unbound-must-survive.bin"),
-      "Legacy queue inventory must never grant deletion authority"
-    )
+    try require(retirer.callCount == 1, "Receipt-authorized session retirement did not run")
     try require(queue.payloadCleanupState == .payloadsRemoved, "Cleanup must finish durably")
     try require(queue.currentCredentialID == "credential_receiving_resume", "Completion must retain the deletion credential")
 
     var recovered = persistence.snapshots[0]
     let retryPersistence = MemoryPersistence()
-    let retryRemover = MemoryPayloadRemover()
-    let recoveredBindings = try recovered.authorizedLocalPayloadBindings()
-    try TacuaTransportCleanup.removeAuthorizedPayloads(
-      queue: &recovered, persistence: retryPersistence, remover: retryRemover
+    let retryRetirer = MemorySessionRetirer()
+    try TacuaTransportCleanup.retireAuthorizedSession(
+      queue: &recovered, persistence: retryPersistence, retirer: retryRetirer
     )
-    try require(retryRemover.removed == recoveredBindings, "A tombstoned crash must resume idempotent removal")
+    try require(retryRetirer.callCount == 1, "A tombstoned crash must resume retirement")
   }
 
   private static func deletionAloneAuthorizesCredentialRemoval(_ root: URL) throws {
@@ -1026,10 +1712,21 @@ enum TransportQueueTests {
     let persistence = MemoryPersistence()
     let credentials = MemoryCredentialStore()
     credentials.values["credential_receiving_resume"] = Data(repeating: 7, count: 32)
+    try TacuaTransportCleanup.retireAuthorizedSession(
+      queue: &queue,
+      persistence: persistence,
+      retirer: MemorySessionRetirer()
+    )
     try TacuaTransportCleanup.removeAuthorizedCredential(
       queue: &queue, persistence: persistence, credentialStore: credentials
     )
-    try require(persistence.snapshots.first?.credentialCleanupState == .tombstoneWritten, "Credential tombstone must precede Keychain removal")
+    try require(
+      persistence.snapshots.contains(where: {
+        $0.credentialCleanupState == .tombstoneWritten
+          && $0.currentCredentialID == "credential_receiving_resume"
+      }),
+      "Credential tombstone must precede Keychain removal"
+    )
     try require(credentials.removals == ["credential_receiving_resume"], "Deletion must remove only the bound credential")
     try require(queue.currentCredentialID == nil && queue.credentialCleanupState == .credentialRemoved, "Credential cleanup must finish durably")
     _ = try queue.encoded()
@@ -1061,7 +1758,7 @@ enum TransportQueueTests {
     )
     // The immutable B receipt expiry is validated from B's ledger entry, not C's expiry.
     try queue.storeValidatedReceipt(receipt)
-    let attempt = try queue.attempt(
+    let attempt = try queue.storedResponseReplayAttempt(
       operationID: "completion_synthetic",
       expectedTransportConfigurationDigest: transportDigest,
       clock: TestClock(uptimeMilliseconds: 281_000, bootSessionID: "boot_fixture")
@@ -1245,6 +1942,14 @@ enum TransportQueueTests {
         bootSessionID: "boot_fixture"
       )
     )
+    _ = try queue.beginAttempt(
+      operationID: operationID,
+      expectedTransportConfigurationDigest: transportDigest,
+      clock: TestClock(
+        uptimeMilliseconds: kind == .completion ? 165_000 : 101_000,
+        bootSessionID: "boot_fixture"
+      )
+    )
     let responseData = try canonicalFixture(root, responseName)
     let receipt = try TacuaSDKBackendProtocol.validateResponse(
       responseData,
@@ -1277,6 +1982,11 @@ enum TransportQueueTests {
       request: requestValue,
       requestDigest: digest,
       localPayloadBindings: bindings,
+      clock: clock
+    )
+    _ = try queue.beginAttempt(
+      operationID: operationID,
+      expectedTransportConfigurationDigest: transportDigest,
       clock: clock
     )
     let responseData = try canonicalFixture(root, responseName)

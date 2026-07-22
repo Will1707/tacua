@@ -110,6 +110,9 @@ The backend keeps the ordered, server-issued credential history for the
 session. Rotation never rewrites an already durable request or receipt: partial
 uploads accepted under an earlier credential remain valid when their receipt's
 server acceptance time falls inside that credential's validity interval.
+V1 retains at most 64 credentials per session, with zero-based ordinals
+`0...63`; recovery at that bound returns
+`CREDENTIAL_ROTATION_LIMIT_REACHED` and requires a new capture session.
 Completion and first deletion must use the single current credential at their
 respective server acceptance times. Segment receipts repeat sequence, segment
 ID, content type, sidecar digest, byte size, and byte digest. Completion
@@ -132,8 +135,11 @@ new-operation rules apply: the body and Authorization credential IDs must both
 name the current credential, so the SDK creates a new operation under that
 credential rather than rewriting the old request.
 
-A completion atomically creates the full queued
-`tacua.processing-job@1.0.0` artifact and transitions that same credential to
+A completion atomically creates the exact version-one queued
+`tacua.processing-job@1.0.0` baseline: it has no predecessor, every ordered
+pipeline stage is pending at attempt zero with null timestamps and detail,
+root start/completion/output/failure fields are null, and execution remains the
+V1 asynchronous three-attempt default-deny policy. It transitions that same credential to
 `completion_replay_or_delete_only`. It can replay only the same completion
 request or authorize the first SDK deletion; it grants no upload, evidence, or
 processing access. Durable deletion erases session data, revokes all such

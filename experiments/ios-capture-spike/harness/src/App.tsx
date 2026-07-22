@@ -1,4 +1,6 @@
-import * as TacuaCapture from '@tacua/ios-capture-spike';
+// SPDX-License-Identifier: Apache-2.0
+
+import * as TacuaCapture from '@tacua/mobile-sdk';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
@@ -151,6 +153,11 @@ export default function App(): React.JSX.Element {
       handoffId: `handoff_${sessionId}`,
       handoffTokenIdentifier: `opaque_${sessionId}`,
       expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+      // Synthetic fault-campaign input only. Supported host capture uses the exact value returned
+      // by createCaptureSessionPlan/resumeCaptureSessionPlan, backed by a committed START queue.
+      rawMediaExpiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000)
+        .toISOString()
+        .replace(/\.\d{3}Z$/u, 'Z'),
       consentVersion: 'tacua-local-capture-consent-v1',
       expectedApplicationId: APPLICATION_ID,
       expectedBuildNumber: BUILD_NUMBER,

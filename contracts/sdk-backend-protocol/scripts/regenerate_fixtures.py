@@ -581,6 +581,34 @@ bad["processing_job"] = runtime.seal(bad["processing_job"])
 invalid("completion-job-not-queued.json", protocol.seal(bad), "JOB_NOT_QUEUED")
 
 bad = clone(completion_receipt)
+bad["processing_job"]["job_version"] = 2
+bad["processing_job"]["previous_job_digest"] = bad["processing_job"]["job_digest"]
+bad["processing_job"] = runtime.seal(bad["processing_job"])
+invalid(
+    "completion-job-not-initial-version.json",
+    protocol.seal(bad),
+    "COMPLETION_JOB_NOT_INITIAL",
+)
+
+bad = clone(completion_receipt)
+bad["processing_job"]["pipeline"]["stages"][0]["attempt_count"] = 1
+bad["processing_job"] = runtime.seal(bad["processing_job"])
+invalid(
+    "completion-job-not-initial-stage.json",
+    protocol.seal(bad),
+    "COMPLETION_JOB_NOT_INITIAL",
+)
+
+bad = clone(completion_receipt)
+bad["processing_job"]["execution"]["max_attempts"] = 4
+bad["processing_job"] = runtime.seal(bad["processing_job"])
+invalid(
+    "completion-job-not-initial-execution.json",
+    protocol.seal(bad),
+    "COMPLETION_JOB_NOT_INITIAL",
+)
+
+bad = clone(completion_receipt)
 bad["local_cleanup"]["segment_receipt_digests"] = ["sha256:" + "8" * 64]
 invalid("completion-cleanup-mismatch.json", protocol.seal(bad), "LOCAL_CLEANUP_BINDING_MISMATCH", "completion_pair")
 

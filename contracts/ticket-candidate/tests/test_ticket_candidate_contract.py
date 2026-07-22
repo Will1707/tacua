@@ -37,6 +37,33 @@ def chain() -> list[dict]:
     return [load_json(POSITIVE / name) for name in POSITIVE_NAMES]
 
 
+def reviewer_creation(operation: str, parents: list[dict], *, actor_type: str = "human") -> dict:
+    candidate = copy.deepcopy(chain()[0])
+    candidate["candidate_id"] = f"candidate_{operation}_result"
+    candidate["lineage"] = {
+        "operation": operation,
+        "parents": copy.deepcopy(parents),
+    }
+    candidate["transition"] = {
+        "from_state": None,
+        "to_state": "draft",
+        "actor": {
+            "actor_type": actor_type,
+            "actor_id": "reviewer_owner" if actor_type == "human" else "worker_local",
+        },
+        "occurred_at": candidate["version_created_at"],
+        "reason": f"reviewer_{operation}_candidate",
+    }
+    candidate["review"] = {
+        "status": "in_review",
+        "reviewer_action_required": True,
+        "last_human_actor_id": "reviewer_owner",
+        "last_reviewed_at": candidate["version_created_at"],
+        "notes": [],
+    }
+    return seal(candidate)
+
+
 class TicketCandidateContractTests(unittest.TestCase):
     def test_contract_identity_has_one_schema_owner(self) -> None:
         authoritative = json.loads(
@@ -124,6 +151,67 @@ class TicketCandidateContractTests(unittest.TestCase):
         self.assertEqual("text", unresolved["choices"][1]["presentation"]["kind"])
         self.assertEqual("choice_use_approved", resolved["selected_choice_id"])
         self.assertEqual("human", ready["transition"]["actor"]["actor_type"])
+
+    def test_split_and_merge_creation_lineage_is_human_and_bounded(self) -> None:
+        source = chain()[2]
+        source_ref = {
+            "candidate_id": source["candidate_id"],
+            "candidate_version": source["candidate_version"],
+            "candidate_digest": source["candidate_digest"],
+        }
+        other_ref = {
+            "candidate_id": "candidate_other_issue",
+            "candidate_version": 2,
+            "candidate_digest": "sha256:" + "c" * 64,
+        }
+
+        split = reviewer_creation("split", [source_ref])
+        merged = reviewer_creation("merged", [source_ref, other_ref])
+        validate_chain([split])
+        validate_chain([merged])
+        self.assertEqual("human", split["transition"]["actor"]["actor_type"])
+        self.assertEqual(2, len(merged["lineage"]["parents"]))
+
+        for operation, parents in (
+            ("split", []),
+            ("split", [source_ref, other_ref]),
+            ("merged", [source_ref]),
+            ("merged", [source_ref] * 17),
+        ):
+            with self.subTest(operation=operation, parent_count=len(parents)):
+                invalid = reviewer_creation(operation, parents)
+                with self.assertRaises(ContractError):
+                    validate(invalid)
+
+        duplicate_merge = reviewer_creation("merged", [source_ref, source_ref])
+        with self.assertRaises(ContractError):
+            validate(duplicate_merge)
+
+    def test_split_and_merge_creation_reject_machine_actors(self) -> None:
+        source = chain()[2]
+        source_ref = {
+            "candidate_id": source["candidate_id"],
+            "candidate_version": source["candidate_version"],
+            "candidate_digest": source["candidate_digest"],
+        }
+        other_ref = {
+            "candidate_id": "candidate_other_issue",
+            "candidate_version": 2,
+            "candidate_digest": "sha256:" + "c" * 64,
+        }
+        for operation, parents in (
+            ("split", [source_ref]),
+            ("merged", [source_ref, other_ref]),
+        ):
+            with self.subTest(operation=operation):
+                machine_created = reviewer_creation(
+                    operation,
+                    parents,
+                    actor_type="system",
+                )
+                with self.assertRaises(ContractError) as raised:
+                    validate(machine_created)
+                self.assertEqual("HUMAN_TRANSITION_REQUIRED", raised.exception.code)
 
     def test_all_checked_negative_fixtures_fail_with_stable_codes(self) -> None:
         descriptors = json.loads((NEGATIVE / "expected.json").read_text(encoding="utf-8"))
@@ -251,6 +339,14 @@ class TicketCandidateContractTests(unittest.TestCase):
             with self.assertRaises(ContractError) as raised:
                 load_json(path)
             self.assertEqual("DUPLICATE_JSON_KEY", raised.exception.code)
+
+    def test_nul_strings_are_rejected_before_handoff_projection(self) -> None:
+        candidate = copy.deepcopy(chain()[0])
+        candidate["content"]["title"] = "invalid\x00title"
+        candidate = seal(candidate)
+        with self.assertRaises(ContractError) as raised:
+            validate(candidate)
+        self.assertEqual("CONTROL_CHARACTER", raised.exception.code)
 
     def test_cli_validates_chain_and_never_claims_execution_authority(self) -> None:
         result = subprocess.run(

@@ -25,8 +25,10 @@ private func expectValidationError(
 @main
 enum CapturePolicyTests {
   static func main() throws {
+    try boundedArtifactCapacity()
     try terminalClassification()
     try storageAndLifecycleAdmission()
+    try sessionOriginSurvivesResume()
     try deadlineAndMicrophoneContinuity()
     try videoClockContinuity()
     try segmentRotation()
@@ -34,6 +36,97 @@ enum CapturePolicyTests {
     try candidateHandoffValidation()
     try deletionAuthorizationAndStopSafety()
     print("Tacua capture core policy tests passed")
+  }
+
+  private static func boundedArtifactCapacity() throws {
+    try expect(
+      TacuaCapturePolicy.maximumDiagnosticJournalEvents == 9_998,
+      "The journal must reserve one summary slot and one overflow-signal slot"
+    )
+    try expect(
+      TacuaCapturePolicy.maximumManifestGaps == 2_048,
+      "The persisted capture gap cap drifted from the runtime contract"
+    )
+    try expect(
+      TacuaCapturePolicy.maximumManifestMarkers == 2_048,
+      "The persisted capture marker cap drifted from the runtime contract"
+    )
+    try expect(
+      TacuaCapturePolicy.captureGapInsertionDisposition(
+        existingCount: 2_046,
+        overflowSentinelPresent: false
+      ) == .append,
+      "Ordinary gaps stopped before the reserved overflow slot"
+    )
+    try expect(
+      TacuaCapturePolicy.captureGapInsertionDisposition(
+        existingCount: 2_047,
+        overflowSentinelPresent: false
+      ) == .appendOverflowSentinel,
+      "The final gap slot was not converted to an explicit overflow signal"
+    )
+    try expect(
+      TacuaCapturePolicy.captureGapInsertionDisposition(
+        existingCount: 2_048,
+        overflowSentinelPresent: true
+      ) == .coalesceIntoOverflowSentinel,
+      "Later gaps did not coalesce into the bounded overflow signal"
+    )
+    try expect(
+      TacuaCapturePolicy.captureGapInsertionDisposition(
+        existingCount: 2_048,
+        overflowSentinelPresent: false
+      ) == .replaceLastWithOverflowSentinel,
+      "A legacy full manifest could not migrate to bounded coalescing"
+    )
+    try expect(
+      TacuaCapturePolicy.captureGapInsertionDisposition(
+        existingCount: 2_049,
+        overflowSentinelPresent: false
+      ) == nil,
+      "An already-invalid gap collection was accepted"
+    )
+  }
+
+  private static func sessionOriginSurvivesResume() throws {
+    try expect(
+      TacuaCapturePolicy.preservedSessionStartHostUptime(
+        existing: 1_060,
+        resumeCandidate: 1_600
+      ) == 1_060,
+      "Same-boot resume replaced the original session host-uptime origin"
+    )
+    try expect(
+      TacuaCapturePolicy.preservedSessionStartHostUptime(
+        existing: nil,
+        resumeCandidate: 1_060
+      ) == 1_060,
+      "First capture start did not establish the session host-uptime origin"
+    )
+    try expect(
+      TacuaCapturePolicy.canResumeStoredSession(
+        schemaVersion: 3,
+        storedBootSessionID: "boot_current",
+        currentBootSessionID: "boot_current"
+      ),
+      "Schema-3 capture from the current boot was not resumable"
+    )
+    try expect(
+      !TacuaCapturePolicy.canResumeStoredSession(
+        schemaVersion: 2,
+        storedBootSessionID: nil,
+        currentBootSessionID: "boot_current"
+      ),
+      "Bootless schema-2 capture was allowed to restart ReplayKit"
+    )
+    try expect(
+      !TacuaCapturePolicy.canResumeStoredSession(
+        schemaVersion: 3,
+        storedBootSessionID: "boot_previous",
+        currentBootSessionID: "boot_current"
+      ),
+      "Cross-boot schema-3 capture was allowed to restart ReplayKit"
+    )
   }
 
   private static func storageAndLifecycleAdmission() throws {

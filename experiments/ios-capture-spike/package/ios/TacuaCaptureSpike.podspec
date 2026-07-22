@@ -7,13 +7,16 @@ package = JSON.parse(File.read(File.join(__dir__, '..', 'package.json')))
 Pod::Spec.new do |s|
   s.name             = 'TacuaCaptureSpike'
   s.version          = package['version']
-  s.summary          = 'ReplayKit capture and segmented-recovery probe for Tacua.'
-  s.description      = 'Experiment-only Expo module for Tacua EXP-001/EXP-005. It is not a production SDK contract.'
+  s.summary          = 'iOS capture, diagnostics, recovery, and transport for Tacua QA builds.'
+  s.description      = 'Pre-release Expo native module for consent-gated ReplayKit capture and authenticated transport to a self-hosted Tacua backend.'
   s.author           = 'Tacua contributors'
-  s.homepage         = 'https://tacua.invalid'
+  s.homepage         = 'https://github.com/Will1707/tacua'
   s.license          = { :type => 'Apache-2.0' }
   s.platforms        = { :ios => '17.0' }
-  s.source           = { :git => '' }
+  s.source           = {
+    :git => 'https://github.com/Will1707/tacua.git',
+    :tag => "mobile-sdk-v#{s.version}"
+  }
   s.static_framework = true
   s.swift_version = '5.9'
 

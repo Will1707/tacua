@@ -160,6 +160,11 @@ function parseCanonicalJson(serialized: string, artifact: boolean): JsonObject {
   return parsed;
 }
 
+/** Parse one response object encoded as exact Tacua Canonical JSON bytes. */
+export function parseTacuaCanonicalJson(serialized: string): Record<string, unknown> {
+  return parseCanonicalJson(serialized, false) as Record<string, unknown>;
+}
+
 function exactObject(value: unknown, path: string, keys: readonly string[]): JsonObject {
   requireValue(isRecord(value), "SCHEMA_TYPE", path, "expected object");
   const actual = Object.keys(value).sort(compareUnicodeCodePoints);
@@ -392,7 +397,232 @@ function uniqueField(items: readonly JsonObject[], field: string, path: string):
   uniqueStrings(values, path);
 }
 
+function validateCandidateApproval(value: unknown, path: string): JsonObject {
+  const approval = exactObject(value, path, [
+    "approval_id", "actor_type", "actor_id", "approved_at", "reviewed_candidate_version", "reviewed_candidate_digest",
+    "approved_candidate_version", "candidate_content_digest", "evidence_manifest_digest", "authorized_evidence_ids", "immutable",
+  ]);
+  identifier(approval.approval_id, `${path}.approval_id`);
+  requireValue(approval.actor_type === "human", "SCHEMA_CONST", `${path}.actor_type`, "approval actor must be human");
+  identifier(approval.actor_id, `${path}.actor_id`);
+  timestamp(approval.approved_at, `${path}.approved_at`);
+  integerValue(approval.reviewed_candidate_version, `${path}.reviewed_candidate_version`, 1, maximumSafeInteger);
+  digestValue(approval.reviewed_candidate_digest, `${path}.reviewed_candidate_digest`);
+  integerValue(approval.approved_candidate_version, `${path}.approved_candidate_version`, 2, maximumSafeInteger);
+  digestValue(approval.candidate_content_digest, `${path}.candidate_content_digest`);
+  digestValue(approval.evidence_manifest_digest, `${path}.evidence_manifest_digest`);
+  idList(approval.authorized_evidence_ids, `${path}.authorized_evidence_ids`, 1, 128);
+  requireValue(approval.immutable === true, "SCHEMA_CONST", `${path}.immutable`, "approval must be immutable");
+  return approval;
+}
+
+function validateCandidateRejection(value: unknown, path: string): JsonObject {
+  const rejection = exactObject(value, path, [
+    "actor_type", "actor_id", "rejected_at", "reviewed_candidate_version", "reviewed_candidate_digest",
+    "rejected_candidate_version", "candidate_content_digest", "reason", "immutable",
+  ]);
+  requireValue(rejection.actor_type === "human", "SCHEMA_CONST", `${path}.actor_type`, "rejection actor must be human");
+  identifier(rejection.actor_id, `${path}.actor_id`);
+  timestamp(rejection.rejected_at, `${path}.rejected_at`);
+  integerValue(rejection.reviewed_candidate_version, `${path}.reviewed_candidate_version`, 1, maximumSafeInteger);
+  digestValue(rejection.reviewed_candidate_digest, `${path}.reviewed_candidate_digest`);
+  integerValue(rejection.rejected_candidate_version, `${path}.rejected_candidate_version`, 2, maximumSafeInteger);
+  digestValue(rejection.candidate_content_digest, `${path}.candidate_content_digest`);
+  stringValue(rejection.reason, `${path}.reason`, 1, 4096);
+  requireValue(rejection.immutable === true, "SCHEMA_CONST", `${path}.immutable`, "rejection must be immutable");
+  return rejection;
+}
+
+/**
+ * Validate one immutable ticket-candidate snapshot in any lifecycle state.
+ * This mirrors the frozen Python contract used by the backend and verifies
+ * both content and complete-snapshot digests before the reviewer consumes it.
+ */
+export async function validateTicketCandidateSnapshot(
+  value: unknown,
+  digest: DigestBytes,
+): Promise<Record<string, unknown>> {
+  validateJsonValues(value);
+  const candidate = exactObject(value, "$", [
+    "contract_version", "media_type", "organization_id", "project_id", "build_id", "build_identity_digest",
+    "session_id", "evidence_manifest", "candidate_id", "candidate_version", "previous_candidate_digest", "state",
+    "candidate_created_at", "version_created_at", "lineage", "transition", "content", "review", "approval",
+    "rejection", "candidate_content_digest", "candidate_digest",
+  ]);
+  requireValue(encoder.encode(`${canonicalJson(candidate)}\n`).byteLength <= 1_048_576, "ARTIFACT_TOO_LARGE", "$", "candidate exceeds 1 MiB");
+  requireValue(candidate.contract_version === candidateContractVersion, "UNSUPPORTED_VERSION", "$.contract_version", "unsupported candidate contract");
+  requireValue(candidate.media_type === candidateMediaType, "SCHEMA_CONST", "$.media_type", "unsupported candidate media type");
+  ["organization_id", "project_id", "build_id", "session_id", "candidate_id"].forEach((field) => identifier(candidate[field], `$.${field}`));
+  digestValue(candidate.build_identity_digest, "$.build_identity_digest");
+  const version = integerValue(candidate.candidate_version, "$.candidate_version", 1, maximumSafeInteger);
+  nullableDigest(candidate.previous_candidate_digest, "$.previous_candidate_digest");
+  const state = enumValue(candidate.state, "$.state", ["draft", "needs_clarification", "ready_for_review", "approved", "rejected"] as const);
+  const createdAt = timestampMilliseconds(candidate.candidate_created_at, "$.candidate_created_at");
+  const versionCreatedAt = timestampMilliseconds(candidate.version_created_at, "$.version_created_at");
+  digestValue(candidate.candidate_content_digest, "$.candidate_content_digest");
+  digestValue(candidate.candidate_digest, "$.candidate_digest");
+
+  const manifest = exactObject(candidate.evidence_manifest, "$.evidence_manifest", ["manifest_id", "manifest_digest", "evidence_ids"]);
+  identifier(manifest.manifest_id, "$.evidence_manifest.manifest_id");
+  digestValue(manifest.manifest_digest, "$.evidence_manifest.manifest_digest");
+  const manifestIds = idList(manifest.evidence_ids, "$.evidence_manifest.evidence_ids", 1, 128);
+
+  const lineage = exactObject(candidate.lineage, "$.lineage", ["operation", "parents"]);
+  const operation = enumValue(lineage.operation, "$.lineage.operation", [
+    "generated", "split", "merged", "edited", "clarification_answered", "reviewed", "approved", "rejected", "reopened",
+  ] as const);
+  const parents = arrayValue(lineage.parents, "$.lineage.parents", 0, 16).map((parentValue, index) => {
+    const path = `$.lineage.parents[${index}]`;
+    const parent = exactObject(parentValue, path, ["candidate_id", "candidate_version", "candidate_digest"]);
+    identifier(parent.candidate_id, `${path}.candidate_id`);
+    integerValue(parent.candidate_version, `${path}.candidate_version`, 1, maximumSafeInteger);
+    digestValue(parent.candidate_digest, `${path}.candidate_digest`);
+    return parent;
+  });
+  uniqueStrings(parents.map((parent) => canonicalJson(parent)), "$.lineage.parents");
+
+  const transition = exactObject(candidate.transition, "$.transition", ["from_state", "to_state", "actor", "occurred_at", "reason"]);
+  const fromState = transition.from_state === null
+    ? null
+    : enumValue(transition.from_state, "$.transition.from_state", ["draft", "needs_clarification", "ready_for_review", "approved", "rejected"] as const);
+  const toState = enumValue(transition.to_state, "$.transition.to_state", ["draft", "needs_clarification", "ready_for_review", "approved", "rejected"] as const);
+  const actor = exactObject(transition.actor, "$.transition.actor", ["actor_type", "actor_id"]);
+  const actorType = enumValue(actor.actor_type, "$.transition.actor.actor_type", ["human", "system", "model"] as const);
+  identifier(actor.actor_id, "$.transition.actor.actor_id");
+  const transitionedAt = timestampMilliseconds(transition.occurred_at, "$.transition.occurred_at");
+  stringValue(transition.reason, "$.transition.reason", 1, 256);
+  requireValue(toState === state, "STATE_TRANSITION_MISMATCH", "$.transition.to_state", "transition differs from snapshot state");
+
+  const content = validateCandidateContent(candidate.content, "$.content");
+  const review = exactObject(candidate.review, "$.review", ["status", "reviewer_action_required", "last_human_actor_id", "last_reviewed_at", "notes"]);
+  const reviewStatus = enumValue(review.status, "$.review.status", ["unreviewed", "in_review", "reviewed"] as const);
+  requireValue(typeof review.reviewer_action_required === "boolean", "SCHEMA_TYPE", "$.review.reviewer_action_required", "expected boolean");
+  if (review.last_human_actor_id !== null) identifier(review.last_human_actor_id, "$.review.last_human_actor_id");
+  if (review.last_reviewed_at !== null) timestamp(review.last_reviewed_at, "$.review.last_reviewed_at");
+  textList(review.notes, "$.review.notes", 0, 64);
+
+  let approval: JsonObject | null = null;
+  let rejection: JsonObject | null = null;
+  if (state === "approved") {
+    approval = validateCandidateApproval(candidate.approval, "$.approval");
+    requireValue(candidate.rejection === null, "SCHEMA_CONST", "$.rejection", "approved candidate cannot be rejected");
+  } else if (state === "rejected") {
+    rejection = validateCandidateRejection(candidate.rejection, "$.rejection");
+    requireValue(candidate.approval === null, "SCHEMA_CONST", "$.approval", "rejected candidate cannot be approved");
+  } else {
+    requireValue(candidate.approval === null && candidate.rejection === null, "SCHEMA_CONST", "$", "non-terminal candidate cannot contain approval or rejection");
+  }
+
+  const contentSubject = {
+    contract_version: candidate.contract_version,
+    organization_id: candidate.organization_id,
+    project_id: candidate.project_id,
+    build_id: candidate.build_id,
+    build_identity_digest: candidate.build_identity_digest,
+    session_id: candidate.session_id,
+    evidence_manifest: candidate.evidence_manifest,
+    candidate_id: candidate.candidate_id,
+    content: candidate.content,
+  };
+  requireValue(candidate.candidate_content_digest === await sha256Canonical(contentSubject, digest), "CONTENT_DIGEST_MISMATCH", "$.candidate_content_digest", "candidate content or bound scope changed");
+  requireValue(candidate.candidate_digest === await sha256Canonical(candidate, digest, "candidate_digest"), "CANDIDATE_DIGEST_MISMATCH", "$.candidate_digest", "candidate snapshot changed");
+
+  if (version === 1) {
+    requireValue(candidate.previous_candidate_digest === null, "VERSION_CHAIN_MISMATCH", "$.previous_candidate_digest", "version one has no predecessor");
+    requireValue(fromState === null && state === "draft", "FIRST_VERSION_MUST_BE_DRAFT", "$.state", "new candidates begin as drafts");
+    requireValue(["generated", "split", "merged"].includes(operation), "LINEAGE_OPERATION_MISMATCH", "$.lineage.operation", "invalid first-version operation");
+    const parentRange = operation === "generated" ? [0, 0] : operation === "split" ? [1, 1] : [2, 16];
+    requireValue(parents.length >= (parentRange[0] ?? 0) && parents.length <= (parentRange[1] ?? 0), "LINEAGE_PARENT_MISMATCH", "$.lineage.parents", "first-version parent count is invalid");
+  } else {
+    requireValue(candidate.previous_candidate_digest !== null, "VERSION_CHAIN_MISMATCH", "$.previous_candidate_digest", "later versions require a predecessor");
+    requireValue(fromState !== null, "STATE_TRANSITION_MISMATCH", "$.transition.from_state", "later versions require a prior state");
+    requireValue(!["generated", "split", "merged"].includes(operation), "LINEAGE_OPERATION_MISMATCH", "$.lineage.operation", "creation operation used after version one");
+    requireValue(parents.length === 1, "LINEAGE_PARENT_MISMATCH", "$.lineage.parents", "later versions require one predecessor");
+    const parent = parents[0] as JsonObject;
+    requireValue(parent.candidate_id === candidate.candidate_id, "LINEAGE_PARENT_MISMATCH", "$.lineage.parents[0].candidate_id", "predecessor has another candidate ID");
+    requireValue(parent.candidate_version === version - 1, "LINEAGE_PARENT_MISMATCH", "$.lineage.parents[0].candidate_version", "predecessor version is not contiguous");
+    requireValue(parent.candidate_digest === candidate.previous_candidate_digest, "LINEAGE_PARENT_MISMATCH", "$.lineage.parents[0].candidate_digest", "predecessor digest is inconsistent");
+  }
+
+  const allowedTransitions: Record<string, readonly string[]> = {
+    null: ["draft"],
+    draft: ["draft", "needs_clarification", "ready_for_review"],
+    needs_clarification: ["draft", "needs_clarification", "ready_for_review", "rejected"],
+    ready_for_review: ["draft", "needs_clarification", "ready_for_review", "approved", "rejected"],
+    approved: ["draft"],
+    rejected: ["draft"],
+  };
+  requireValue(allowedTransitions[fromState ?? "null"]?.includes(state), "ILLEGAL_STATE_TRANSITION", "$.transition", "candidate transition is not allowed");
+  if (["split", "merged", "clarification_answered", "reviewed", "approved", "rejected", "reopened"].includes(operation)) {
+    requireValue(actorType === "human", "HUMAN_TRANSITION_REQUIRED", "$.transition.actor", `${operation} requires a human`);
+  }
+  if (operation === "approved") requireValue(state === "approved", "LINEAGE_OPERATION_MISMATCH", "$.lineage.operation", "approval operation must create approved state");
+  if (operation === "rejected") requireValue(state === "rejected", "LINEAGE_OPERATION_MISMATCH", "$.lineage.operation", "rejection operation must create rejected state");
+  if (operation === "reopened") requireValue((fromState === "approved" || fromState === "rejected") && state === "draft", "LINEAGE_OPERATION_MISMATCH", "$.lineage.operation", "reopen must create a draft from a terminal state");
+
+  const claims = content.claims as JsonObject[];
+  const claimIds = claims.map((claim) => claim.claim_id as string);
+  uniqueStrings(claimIds, "$.content.claims");
+  uniqueField(content.reproduction.preconditions, "precondition_id", "$.content.reproduction.preconditions");
+  uniqueField(content.reproduction.steps, "step_id", "$.content.reproduction.steps");
+  uniqueField(content.acceptance_criteria, "criterion_id", "$.content.acceptance_criteria");
+  uniqueField(content.uncertainty.items, "uncertainty_id", "$.content.uncertainty.items");
+  uniqueField(content.clarifications, "clarification_id", "$.content.clarifications");
+  claims.forEach((claim, index) => {
+    if (claim.support === "direct" || claim.support === "inferred") {
+      requireValue(claim.evidence_refs.length > 0, "SUPPORTED_CLAIM_REQUIRES_EVIDENCE", `$.content.claims[${index}].evidence_refs`, "supported claim requires evidence");
+    }
+  });
+  for (const ref of collectClaimRefs(content)) requireValue(claimIds.includes(ref), "UNKNOWN_CLAIM_REFERENCE", "$.content", ref);
+  const usedEvidence = collectEvidenceRefs(content);
+  requireValue([...usedEvidence].every((ref) => manifestIds.includes(ref)), "UNKNOWN_EVIDENCE_REFERENCE", "$.content", "content cites evidence outside its manifest");
+
+  const blocking = (content.clarifications as JsonObject[]).filter((clarification) => clarification.impact === "blocking" && clarification.status === "unresolved");
+  for (const [index, clarification] of (content.clarifications as JsonObject[]).entries()) {
+    if (clarification.status !== "resolved") continue;
+    const selected = (clarification.choices as JsonObject[]).find((choice) => choice.choice_id === clarification.selected_choice_id);
+    requireValue(selected, "UNKNOWN_CLARIFICATION_CHOICE", `$.content.clarifications[${index}].selected_choice_id`, "resolved choice is missing");
+    if (selected.requires_note) requireValue(typeof clarification.resolution_note === "string", "CLARIFICATION_NOTE_REQUIRED", `$.content.clarifications[${index}].resolution_note`, "selected choice requires a note");
+  }
+  if (state === "ready_for_review" || state === "approved") requireValue(blocking.length === 0, "UNRESOLVED_BLOCKING_CLARIFICATION", "$.content.clarifications", "blocking questions must be resolved");
+  if (state === "needs_clarification") requireValue(blocking.length > 0, "CLARIFICATION_STATE_MISMATCH", "$.state", "state requires an unresolved blocking question");
+
+  if (reviewStatus === "unreviewed") {
+    requireValue(review.last_human_actor_id === null && review.last_reviewed_at === null, "REVIEW_STATE_MISMATCH", "$.review", "unreviewed candidate cannot name a reviewer");
+  } else {
+    requireValue(review.last_human_actor_id !== null && review.last_reviewed_at !== null, "REVIEW_STATE_MISMATCH", "$.review", "review activity requires a human and time");
+  }
+  if (state === "needs_clarification" || state === "ready_for_review") requireValue(review.reviewer_action_required === true, "REVIEW_ACTION_MISMATCH", "$.review.reviewer_action_required", "reviewable state requires action");
+  if (state === "approved" || state === "rejected") requireValue(review.reviewer_action_required === false, "REVIEW_ACTION_MISMATCH", "$.review.reviewer_action_required", "terminal state cannot require action");
+  requireValue(createdAt <= versionCreatedAt, "INVALID_CHRONOLOGY", "$.version_created_at", "version predates candidate");
+  requireValue(versionCreatedAt === transitionedAt, "TRANSITION_CHRONOLOGY_MISMATCH", "$.transition.occurred_at", "transition must create this version");
+  if (review.last_reviewed_at !== null) {
+    const reviewedAt = timestampMilliseconds(review.last_reviewed_at, "$.review.last_reviewed_at");
+    requireValue(createdAt <= reviewedAt && reviewedAt <= versionCreatedAt, "INVALID_CHRONOLOGY", "$.review.last_reviewed_at", "review time is outside the snapshot");
+  }
+
+  if (state === "approved") {
+    requireValue(approval !== null && operation === "approved" && fromState === "ready_for_review", "APPROVAL_TRANSITION_REQUIRED", "$.transition", "approval requires a ready candidate");
+    requireValue(actorType === "human" && actor.actor_id === approval.actor_id, "APPROVAL_ACTOR_MISMATCH", "$.approval.actor_id", "approval actor differs from transition");
+    requireValue(approval.approved_at === candidate.version_created_at, "APPROVAL_CHRONOLOGY_MISMATCH", "$.approval.approved_at", "approval time must create approved version");
+    requireValue(approval.reviewed_candidate_version === version - 1 && approval.reviewed_candidate_digest === candidate.previous_candidate_digest, "APPROVAL_BINDING_MISMATCH", "$.approval", "approval did not bind the reviewed predecessor");
+    requireValue(approval.approved_candidate_version === version && approval.candidate_content_digest === candidate.candidate_content_digest && approval.evidence_manifest_digest === manifest.manifest_digest, "APPROVAL_BINDING_MISMATCH", "$.approval", "approval does not bind this candidate and manifest");
+    requireValue(sameSet(approval.authorized_evidence_ids, usedEvidence), "APPROVAL_EVIDENCE_BINDING_MISMATCH", "$.approval.authorized_evidence_ids", "approval must authorize exact referenced evidence");
+    requireValue(reviewStatus === "reviewed", "REVIEW_REQUIRED", "$.review.status", "approved candidate requires completed review");
+  }
+  if (state === "rejected") {
+    requireValue(rejection !== null && operation === "rejected" && (fromState === "needs_clarification" || fromState === "ready_for_review"), "REJECTION_TRANSITION_REQUIRED", "$.transition", "rejection requires a reviewable candidate");
+    requireValue(actorType === "human" && actor.actor_id === rejection.actor_id, "REJECTION_ACTOR_MISMATCH", "$.rejection.actor_id", "rejection actor differs from transition");
+    requireValue(rejection.rejected_at === candidate.version_created_at, "REJECTION_CHRONOLOGY_MISMATCH", "$.rejection.rejected_at", "rejection time must create rejected version");
+    requireValue(rejection.reviewed_candidate_version === version - 1 && rejection.reviewed_candidate_digest === candidate.previous_candidate_digest, "REJECTION_BINDING_MISMATCH", "$.rejection", "rejection did not bind predecessor");
+    requireValue(rejection.rejected_candidate_version === version && rejection.candidate_content_digest === candidate.candidate_content_digest, "REJECTION_BINDING_MISMATCH", "$.rejection", "rejection does not bind this candidate");
+  }
+
+  return candidate as Record<string, unknown>;
+}
+
 async function validateApprovedCandidate(candidate: JsonObject, digest: DigestBytes): Promise<void> {
+  await validateTicketCandidateSnapshot(candidate, digest);
   exactObject(candidate, "$.source_candidate.canonical_json", [
     "contract_version", "media_type", "organization_id", "project_id", "build_id", "build_identity_digest",
     "session_id", "evidence_manifest", "candidate_id", "candidate_version", "previous_candidate_digest", "state",

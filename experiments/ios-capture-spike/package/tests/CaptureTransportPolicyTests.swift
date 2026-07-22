@@ -44,7 +44,7 @@ enum CaptureTransportPolicyTests {
       localSessionId: "session_local_001",
       remoteSessionId: "session_remote_001",
       organizationId: "org_local",
-      projectId: "project_kuzaba",
+      projectId: "project_example",
       buildId: "build_preview_001",
       grantIdentifier: "grant_001",
       grantExpiresAt: "2027-01-15T08:00:00Z",

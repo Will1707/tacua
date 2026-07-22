@@ -291,6 +291,7 @@ def validate_basics(candidate: dict[str, Any]) -> None:
             require(abs(child) <= MAX_SAFE_INTEGER, "UNSAFE_INTEGER", path, "integer exceeds interoperable range")
         if isinstance(child, str):
             require(unicodedata.normalize("NFC", child) == child, "NON_NFC_STRING", path, "string must be NFC")
+            require("\x00" not in child, "CONTROL_CHARACTER", path, "NUL is forbidden")
             for pattern in SECRET_PATTERNS:
                 if pattern.search(child):
                     raise ContractError("SECRET_VALUE_DETECTED", path, "credential-like value is forbidden")
@@ -398,7 +399,15 @@ def validate(candidate: dict[str, Any]) -> None:
     }
     require(state in allowed[transition["from_state"]], "ILLEGAL_STATE_TRANSITION", "$.transition", "candidate transition is not allowed")
     actor = transition["actor"]
-    if operation in {"clarification_answered", "reviewed", "approved", "rejected", "reopened"}:
+    if operation in {
+        "split",
+        "merged",
+        "clarification_answered",
+        "reviewed",
+        "approved",
+        "rejected",
+        "reopened",
+    }:
         require(actor["actor_type"] == "human", "HUMAN_TRANSITION_REQUIRED", "$.transition.actor", f"{operation} requires a human")
     if operation == "approved":
         require(state == "approved", "LINEAGE_OPERATION_MISMATCH", "$.lineage.operation", "approval operation must create approved state")

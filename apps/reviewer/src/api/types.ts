@@ -20,18 +20,39 @@ export type DiagnosticSummary = {
   readonly envelope_id: string;
   readonly size_bytes: number;
   readonly content_digest: string;
-  readonly envelope_digest?: string;
+  readonly envelope_digest: string;
   readonly received_at: string;
 };
 
 export type ProcessingJob = {
   readonly job_id: string;
-  readonly job_type?: string;
-  readonly status: "queued" | "running" | "waiting_for_clarification" | "succeeded" | "failed" | "cancelled";
+  readonly job_type: "process_session";
+  readonly status: "queued" | "running" | "succeeded" | "failed";
   readonly requested_at: string;
   readonly started_at: string | null;
   readonly completed_at: string | null;
-  readonly failure_code?: string | null;
+  readonly failure_code: string | null;
+};
+
+export type JobPage = {
+  readonly jobs: readonly ProcessingJob[];
+  readonly next_cursor: string | null;
+};
+
+export type AuditEvent = {
+  readonly event_id: string;
+  readonly event_type: string;
+  readonly actor_kind: string;
+  readonly organization_id: string;
+  readonly project_id: string;
+  readonly session_id: string | null;
+  readonly outcome: string;
+  readonly occurred_at: string;
+};
+
+export type AuditEventPage = {
+  readonly events: readonly AuditEvent[];
+  readonly next_cursor: string | null;
 };
 
 export type CaptureSession = {
@@ -85,15 +106,26 @@ export type RegisteredBuild = {
   readonly build_identity_digest: string;
 };
 
-export type LaunchGrant = {
+type LaunchGrantBase = {
   readonly launch_id: string;
   readonly launch_code: string;
-  readonly exchange_kind: "start_session";
-  readonly session_id: null;
   readonly build_identity_digest: string;
-  readonly scope_policy_digest: string;
   readonly expires_at: string;
 };
+
+export type StartLaunchGrant = LaunchGrantBase & {
+  readonly exchange_kind: "start_session";
+  readonly session_id: null;
+  readonly scope_policy_digest: string;
+};
+
+export type ResumeLaunchGrant = LaunchGrantBase & {
+  readonly exchange_kind: "resume_session";
+  readonly session_id: string;
+  readonly scope_digest: string;
+};
+
+export type LaunchGrant = StartLaunchGrant | ResumeLaunchGrant;
 
 export type ClarificationChoice = {
   readonly choice_id: string;
@@ -383,6 +415,8 @@ export type EvidencePreview = {
   readonly contentType: "image/png" | "image/jpeg" | "image/webp";
   readonly sizeBytes: number;
   readonly contentDigest: string;
+  /** Releases the native object backing `uri`. Safe to call more than once. */
+  readonly release: () => void;
 };
 
 export type ApprovedHandoffArtifact = {

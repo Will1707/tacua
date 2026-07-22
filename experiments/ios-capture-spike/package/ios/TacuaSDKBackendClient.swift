@@ -8,6 +8,7 @@ enum TacuaSDKBackendClientError: Error, Equatable {
   case invalidRequest
   case invalidResponse
   case responseTooLarge
+  case backend(TacuaValidatedBackendError)
   case unexpectedStatus(Int)
   case unexpectedContentType
   case localPayloadMissing
@@ -22,9 +23,45 @@ protocol TacuaBoundedHTTPTransporting {
     -> (Data, HTTPURLResponse)
 }
 
+protocol TacuaSDKBackendOperationSending {
+  func send(
+    _ request: TacuaPreparedBackendRequest,
+    transportCredentialID: String
+  ) async throws -> TacuaValidatedBackendReceipt
+  func uploadSegment(
+    _ request: TacuaPreparedBackendRequest,
+    fileURL: URL,
+    sessionDirectory: URL,
+    transportCredentialID: String
+  ) async throws -> TacuaValidatedBackendReceipt
+}
+
 final class TacuaBoundedURLSessionTransport: NSObject, TacuaBoundedHTTPTransporting,
   URLSessionDataDelegate, URLSessionTaskDelegate
 {
+  private final class TaskCancellationHandle: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: URLSessionTask?
+    private var cancellationRequested = false
+
+    /// Returns false when cancellation won before URLSession task registration.
+    func install(_ task: URLSessionTask) -> Bool {
+      lock.lock()
+      self.task = task
+      let shouldRun = !cancellationRequested
+      lock.unlock()
+      return shouldRun
+    }
+
+    func cancel() {
+      lock.lock()
+      cancellationRequested = true
+      let task = task
+      lock.unlock()
+      task?.cancel()
+    }
+  }
+
   private final class TaskState {
     var data = Data()
     var response: HTTPURLResponse?
@@ -70,17 +107,27 @@ final class TacuaBoundedURLSessionTransport: NSObject, TacuaBoundedHTTPTransport
   func data(for request: URLRequest, uploadFile: URL? = nil) async throws
     -> (Data, HTTPURLResponse)
   {
-    try await withCheckedThrowingContinuation { continuation in
-      let task: URLSessionTask
-      if let uploadFile {
-        task = session.uploadTask(with: request, fromFile: uploadFile)
-      } else {
-        task = session.dataTask(with: request)
+    let cancellation = TaskCancellationHandle()
+    return try await withTaskCancellationHandler {
+      try Task.checkCancellation()
+      return try await withCheckedThrowingContinuation { continuation in
+        let task: URLSessionTask
+        if let uploadFile {
+          task = session.uploadTask(with: request, fromFile: uploadFile)
+        } else {
+          task = session.dataTask(with: request)
+        }
+        // Register the continuation before making the task visible to cancellation. If cancellation
+        // already won, resume-then-cancel guarantees URLSession delivers one terminal callback.
+        stateLock.lock()
+        states[task.taskIdentifier] = TaskState(continuation: continuation)
+        stateLock.unlock()
+        let shouldRun = cancellation.install(task)
+        task.resume()
+        if !shouldRun { task.cancel() }
       }
-      stateLock.lock()
-      states[task.taskIdentifier] = TaskState(continuation: continuation)
-      stateLock.unlock()
-      task.resume()
+    } onCancel: {
+      cancellation.cancel()
     }
   }
 
@@ -204,7 +251,12 @@ final class TacuaSDKBackendClient {
     )
     // Launch codes and new secrets exist only in this transient request body.
     urlRequest.setValue("no-store", forHTTPHeaderField: "Cache-Control")
-    return try await execute(urlRequest, requestData: request.canonicalData, uploadFile: nil)
+    return try await execute(
+      urlRequest,
+      requestData: request.canonicalData,
+      uploadFile: nil,
+      authenticatedCredentialID: nil
+    )
   }
 
   func send(
@@ -236,7 +288,12 @@ final class TacuaSDKBackendClient {
       idempotencyKey: request.operationID,
       transportCredentialID: transportCredentialID
     )
-    return try await execute(urlRequest, requestData: request.canonicalData, uploadFile: nil)
+    return try await execute(
+      urlRequest,
+      requestData: request.canonicalData,
+      uploadFile: nil,
+      authenticatedCredentialID: transportCredentialID
+    )
   }
 
   func uploadSegment(
@@ -259,7 +316,6 @@ final class TacuaSDKBackendClient {
       expectedSize: expectedSize,
       expectedDigest: expectedDigest
     )
-    defer { try? FileManager.default.removeItem(at: uploadSnapshot) }
     let sessionID = try requiredString(intent, "session_id")
     let segmentID = try requiredString(intent, "segment_id")
     let sequence = try requiredInteger(intent, "sequence")
@@ -280,13 +336,25 @@ final class TacuaSDKBackendClient {
     urlRequest.setValue(try requiredString(transportObject, "content_type"), forHTTPHeaderField: "Content-Type")
     urlRequest.setValue(String(expectedSize), forHTTPHeaderField: "Content-Length")
     urlRequest.setValue(expectedDigest, forHTTPHeaderField: "Tacua-Content-Digest")
-    urlRequest.setValue("application/json", forHTTPHeaderField: "Accept")
+    urlRequest.setValue(Self.acceptHeader, forHTTPHeaderField: "Accept")
     urlRequest.setValue("no-store", forHTTPHeaderField: "Cache-Control")
-    return try await execute(
-      urlRequest,
-      requestData: request.canonicalData,
-      uploadFile: uploadSnapshot
-    )
+    let receipt: TacuaValidatedBackendReceipt
+    do {
+      receipt = try await execute(
+        urlRequest,
+        requestData: request.canonicalData,
+        uploadFile: uploadSnapshot,
+        authenticatedCredentialID: transportCredentialID
+      )
+    } catch {
+      // Cancellation and transport errors still release the immutable private copy. If durable
+      // unlink cannot be confirmed, the next serialized upload scavenges the recognizable orphan.
+      try? removeUploadSnapshotDurably(uploadSnapshot, sessionDirectory: sessionDirectory)
+      throw error
+    }
+    do { try removeUploadSnapshotDurably(uploadSnapshot, sessionDirectory: sessionDirectory) }
+    catch { throw TacuaSDKBackendClientError.transportFailure }
+    return receipt
   }
 
   private func makeRequest(
@@ -300,7 +368,7 @@ final class TacuaSDKBackendClient {
     request.httpMethod = method
     request.httpBody = canonicalJSON
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue(Self.acceptHeader, forHTTPHeaderField: "Accept")
     request.setValue(TacuaSDKBackendProtocol.version, forHTTPHeaderField: "Tacua-Protocol-Version")
     request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key")
     request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
@@ -321,10 +389,22 @@ final class TacuaSDKBackendClient {
   private func execute(
     _ request: URLRequest,
     requestData: Data,
-    uploadFile: URL?
+    uploadFile: URL?,
+    authenticatedCredentialID: String?
   ) async throws -> TacuaValidatedBackendReceipt {
     let (data, response) = try await transport.data(for: request, uploadFile: uploadFile)
     guard response.statusCode == 200 || response.statusCode == 201 else {
+      if let authenticatedCredentialID,
+        let validated = try? TacuaSDKBackendProtocol.validateErrorResponse(
+          data,
+          statusCode: response.statusCode,
+          contentType: response.value(forHTTPHeaderField: "Content-Type"),
+          forCanonicalRequest: requestData,
+          authenticatedCredentialID: authenticatedCredentialID
+        )
+      {
+        throw TacuaSDKBackendClientError.backend(validated)
+      }
       throw TacuaSDKBackendClientError.unexpectedStatus(response.statusCode)
     }
     guard Self.isJSON(response.value(forHTTPHeaderField: "Content-Type")) else {
@@ -427,16 +507,30 @@ final class TacuaSDKBackendClient {
     guard mkdirResult == 0 || errno == EEXIST else {
       throw TacuaSDKBackendClientError.unsafeLocalPayload
     }
+    let stagingWasCreated = mkdirResult == 0
     let stagingDescriptor = stagingName.withCString {
-      openat(rootDescriptor, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+      openat(rootDescriptor, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
     }
     guard stagingDescriptor >= 0 else {
       throw TacuaSDKBackendClientError.unsafeLocalPayload
     }
     defer { close(stagingDescriptor) }
-    guard fchmod(stagingDescriptor, 0o700) == 0 else {
+    var stagingStat = stat()
+    guard fstat(stagingDescriptor, &stagingStat) == 0,
+      (stagingStat.st_mode & S_IFMT) == S_IFDIR,
+      fchmod(stagingDescriptor, 0o700) == 0
+    else {
       throw TacuaSDKBackendClientError.unsafeLocalPayload
     }
+    // `mkdirat` is not a durable publication until the newly created directory and its parent
+    // have both reached stable storage. Otherwise a successful upload can leave a queue pointing
+    // at a snapshot whose staging directory disappeared after a crash.
+    if stagingWasCreated {
+      guard fsync(stagingDescriptor) == 0, fsync(rootDescriptor) == 0 else {
+        throw TacuaSDKBackendClientError.transportFailure
+      }
+    }
+    try scavengeUploadSnapshots(stagingDescriptor: stagingDescriptor)
     let fileName = "upload-\(UUID().uuidString.lowercased()).snapshot"
     let outputDescriptor = fileName.withCString {
       openat(stagingDescriptor, $0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
@@ -449,7 +543,12 @@ final class TacuaSDKBackendClient {
     var keepSnapshot = false
     defer {
       close(outputDescriptor)
-      if !keepSnapshot { _ = fileName.withCString { unlinkat(stagingDescriptor, $0, 0) } }
+      if !keepSnapshot {
+        _ = fileName.withCString { unlinkat(stagingDescriptor, $0, 0) }
+        // Failure cleanup is itself crash-safe. A failed copy or metadata transition must not
+        // resurrect an untrusted partial snapshot after reboot.
+        _ = fsync(stagingDescriptor)
+      }
     }
 
     guard lseek(sourceDescriptor, 0, SEEK_SET) >= 0 else {
@@ -485,9 +584,33 @@ final class TacuaSDKBackendClient {
     guard "sha256:\(digest)" == expectedDigest else {
       throw TacuaSDKBackendClientError.localPayloadMismatch
     }
-    guard fsync(outputDescriptor) == 0, fchmod(outputDescriptor, 0o400) == 0,
+    // Make the final read-only mode part of the file's durable state; syncing before chmod would
+    // allow a crash to recover the snapshot with its temporary writable mode.
+    guard fchmod(outputDescriptor, 0o400) == 0 else {
+      throw TacuaSDKBackendClientError.transportFailure
+    }
+    var snapshotStat = stat()
+    guard fstat(outputDescriptor, &snapshotStat) == 0,
+      (snapshotStat.st_mode & S_IFMT) == S_IFREG,
+      (snapshotStat.st_mode & 0o777) == 0o400,
+      snapshotStat.st_nlink == 1,
+      snapshotStat.st_size == expectedSize,
+      fsync(outputDescriptor) == 0,
       fsync(stagingDescriptor) == 0
     else { throw TacuaSDKBackendClientError.transportFailure }
+
+    // FileManager's protection API is path based. Bind that path to the descriptor-created inode
+    // immediately before applying protection, then reopen without following links and prove the
+    // exact same inode still occupies the name before allowing URLSession to see the URL.
+    var pathStatBeforeProtection = stat()
+    guard fileName.withCString({
+      fstatat(stagingDescriptor, $0, &pathStatBeforeProtection, AT_SYMLINK_NOFOLLOW)
+    }) == 0,
+      pathStatBeforeProtection.st_dev == snapshotStat.st_dev,
+      pathStatBeforeProtection.st_ino == snapshotStat.st_ino,
+      (pathStatBeforeProtection.st_mode & S_IFMT) == S_IFREG,
+      pathStatBeforeProtection.st_nlink == 1
+    else { throw TacuaSDKBackendClientError.unsafeLocalPayload }
     try FileManager.default.setAttributes(
       [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
       ofItemAtPath: stagingURL.path
@@ -496,8 +619,126 @@ final class TacuaSDKBackendClient {
     values.isExcludedFromBackup = true
     var stagingDirectoryURL = stagingURL.deletingLastPathComponent()
     try? stagingDirectoryURL.setResourceValues(values)
+
+    let verificationDescriptor = fileName.withCString {
+      openat(stagingDescriptor, $0, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+    }
+    guard verificationDescriptor >= 0 else {
+      throw TacuaSDKBackendClientError.unsafeLocalPayload
+    }
+    defer { close(verificationDescriptor) }
+    var descriptorStatAfterProtection = stat()
+    var pathStatAfterProtection = stat()
+    var stagingPathStat = stat()
+    guard fstat(verificationDescriptor, &descriptorStatAfterProtection) == 0,
+      fileName.withCString({
+        fstatat(stagingDescriptor, $0, &pathStatAfterProtection, AT_SYMLINK_NOFOLLOW)
+      }) == 0,
+      stagingName.withCString({
+        fstatat(rootDescriptor, $0, &stagingPathStat, AT_SYMLINK_NOFOLLOW)
+      }) == 0,
+      descriptorStatAfterProtection.st_dev == snapshotStat.st_dev,
+      descriptorStatAfterProtection.st_ino == snapshotStat.st_ino,
+      pathStatAfterProtection.st_dev == snapshotStat.st_dev,
+      pathStatAfterProtection.st_ino == snapshotStat.st_ino,
+      stagingPathStat.st_dev == stagingStat.st_dev,
+      stagingPathStat.st_ino == stagingStat.st_ino,
+      (descriptorStatAfterProtection.st_mode & S_IFMT) == S_IFREG,
+      (descriptorStatAfterProtection.st_mode & 0o777) == 0o400,
+      descriptorStatAfterProtection.st_nlink == 1,
+      descriptorStatAfterProtection.st_size == expectedSize,
+      fsync(verificationDescriptor) == 0,
+      fsync(stagingDescriptor) == 0
+    else { throw TacuaSDKBackendClientError.unsafeLocalPayload }
     keepSnapshot = true
     return stagingURL
+  }
+
+  /// Removes only snapshots from a prior interrupted upload. The staging directory is SDK-owned:
+  /// an unexpected name, link, or file type is evidence that its trust boundary is no longer
+  /// intact, so the client fails closed instead of guessing what it may remove.
+  private func scavengeUploadSnapshots(stagingDescriptor: Int32) throws {
+    let duplicate = dup(stagingDescriptor)
+    guard duplicate >= 0, let directory = fdopendir(duplicate) else {
+      if duplicate >= 0 { close(duplicate) }
+      throw TacuaSDKBackendClientError.unsafeLocalPayload
+    }
+    defer { closedir(directory) }
+    var names: [String] = []
+    while let entry = readdir(directory) {
+      let name = withUnsafePointer(to: &entry.pointee.d_name) {
+        $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXNAMLEN) + 1) {
+          String(cString: $0)
+        }
+      }
+      if name == "." || name == ".." { continue }
+      guard names.count < 128,
+        name.range(
+          of: "^upload-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\\.snapshot$",
+          options: .regularExpression
+        ) != nil
+      else { throw TacuaSDKBackendClientError.unsafeLocalPayload }
+      var metadata = stat()
+      let status = name.withCString {
+        fstatat(stagingDescriptor, $0, &metadata, AT_SYMLINK_NOFOLLOW)
+      }
+      guard status == 0, (metadata.st_mode & S_IFMT) == S_IFREG,
+        metadata.st_nlink == 1,
+        metadata.st_size >= 0,
+        metadata.st_size <= TacuaSDKBackendProtocol.maximumUploadBytes
+      else { throw TacuaSDKBackendClientError.unsafeLocalPayload }
+      names.append(name)
+    }
+    for name in names {
+      guard name.withCString({ unlinkat(stagingDescriptor, $0, 0) }) == 0 else {
+        throw TacuaSDKBackendClientError.transportFailure
+      }
+    }
+    // The removal set (including the empty set) is observed durably before a new snapshot is
+    // created. A crash can therefore leave at most one bounded, recognizable snapshot behind.
+    guard fsync(stagingDescriptor) == 0 else {
+      throw TacuaSDKBackendClientError.transportFailure
+    }
+  }
+
+  private func removeUploadSnapshotDurably(
+    _ snapshot: URL,
+    sessionDirectory: URL
+  ) throws {
+    let root = sessionDirectory.standardizedFileURL
+    let expectedDirectory = root.appendingPathComponent(
+      ".tacua-upload-staging",
+      isDirectory: true
+    ).standardizedFileURL
+    guard snapshot.isFileURL,
+      snapshot.deletingLastPathComponent().standardizedFileURL == expectedDirectory,
+      snapshot.lastPathComponent.range(
+        of: "^upload-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\\.snapshot$",
+        options: .regularExpression
+      ) != nil
+    else { throw TacuaSDKBackendClientError.unsafeLocalPayload }
+    let rootDescriptor = open(root.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+    guard rootDescriptor >= 0 else { throw TacuaSDKBackendClientError.unsafeLocalPayload }
+    defer { close(rootDescriptor) }
+    let stagingDescriptor = ".tacua-upload-staging".withCString {
+      openat(rootDescriptor, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+    }
+    guard stagingDescriptor >= 0 else { throw TacuaSDKBackendClientError.unsafeLocalPayload }
+    defer { close(stagingDescriptor) }
+    var metadata = stat()
+    let status = snapshot.lastPathComponent.withCString {
+      fstatat(stagingDescriptor, $0, &metadata, AT_SYMLINK_NOFOLLOW)
+    }
+    if status == 0 {
+      guard (metadata.st_mode & S_IFMT) == S_IFREG, metadata.st_nlink == 1,
+        snapshot.lastPathComponent.withCString({ unlinkat(stagingDescriptor, $0, 0) }) == 0
+      else { throw TacuaSDKBackendClientError.unsafeLocalPayload }
+    } else if errno != ENOENT {
+      throw TacuaSDKBackendClientError.transportFailure
+    }
+    guard fsync(stagingDescriptor) == 0 else {
+      throw TacuaSDKBackendClientError.transportFailure
+    }
   }
 
   private func writeAll(descriptor: Int32, bytes: [UInt8], count: Int) throws {
@@ -520,6 +761,9 @@ final class TacuaSDKBackendClient {
       || (mediaType.hasPrefix("application/vnd.tacua.") && mediaType.hasSuffix("+json"))
   }
 
+  private static let acceptHeader =
+    "application/json, \(TacuaSDKBackendProtocol.backendErrorMediaType)"
+
   private func base64URL(_ value: Data) -> String {
     value.base64EncodedString()
       .replacingOccurrences(of: "+", with: "-")
@@ -527,3 +771,5 @@ final class TacuaSDKBackendClient {
       .replacingOccurrences(of: "=", with: "")
   }
 }
+
+extension TacuaSDKBackendClient: TacuaSDKBackendOperationSending {}

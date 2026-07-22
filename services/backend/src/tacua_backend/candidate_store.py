@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Durable immutable ticket-candidate versions and reviewer transitions."""
 
 from __future__ import annotations
@@ -236,6 +238,113 @@ class CandidateStore:
                 ),
             )
         return copy.deepcopy(document)
+
+    def insert_generated_many_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Publish generated heads on a caller-owned atomic commit boundary.
+
+        The processing-result publisher stages evidence before calling this
+        method, then appends the terminal job snapshot on the same connection.
+        No nested connection or commit is allowed here.
+        """
+
+        if (
+            not isinstance(connection, sqlite3.Connection)
+            or not connection.in_transaction
+        ):
+            raise CandidateStoreError(
+                500,
+                "CANDIDATE_TRANSACTION_REQUIRED",
+                "candidate publication requires one active transaction",
+            )
+        if not isinstance(candidates, list) or not 1 <= len(candidates) <= 256:
+            raise CandidateStoreError(
+                400, "INVALID_CANDIDATE_SET", "generated candidate set is invalid"
+            )
+        documents = [copy.deepcopy(candidate) for candidate in candidates]
+        identifiers: set[str] = set()
+        digests: set[str] = set()
+        for document in documents:
+            try:
+                TICKET_CONTRACT.validate_chain([document])
+            except ContractError as exc:
+                raise CandidateStoreError(
+                    400, "INVALID_CANDIDATE", "generated candidate is invalid"
+                ) from exc
+            if (
+                document["organization_id"] != self.organization_id
+                or document["project_id"] != self.project_id
+            ):
+                raise CandidateStoreError(
+                    403,
+                    "CANDIDATE_SCOPE_MISMATCH",
+                    "candidate is outside this deployment",
+                )
+            if (
+                document["candidate_version"] != 1
+                or document["previous_candidate_digest"] is not None
+                or document["lineage"]["operation"] != "generated"
+                or document["lineage"]["parents"]
+                or document["state"] != "draft"
+            ):
+                raise CandidateStoreError(
+                    409,
+                    "INVALID_GENERATED_HEAD",
+                    "candidate is not a generated first version",
+                )
+            if (
+                document["candidate_id"] in identifiers
+                or document["candidate_digest"] in digests
+            ):
+                raise CandidateStoreError(
+                    409,
+                    "DUPLICATE_GENERATED_CANDIDATE",
+                    "processing result contains duplicate candidates",
+                )
+            identifiers.add(document["candidate_id"])
+            digests.add(document["candidate_digest"])
+
+        placeholders = ",".join("?" for _ in identifiers)
+        existing = connection.execute(
+            f"""SELECT candidate_id FROM candidate_versions
+                  WHERE candidate_id IN ({placeholders}) LIMIT 1""",
+            sorted(identifiers),
+        ).fetchone()
+        if existing is not None:
+            raise CandidateStoreError(
+                409,
+                "CANDIDATE_ALREADY_EXISTS",
+                "candidate ID is already in use",
+            )
+
+        for document in documents:
+            if self._generated_insert_guard is not None:
+                self._invoke_guard(
+                    self._generated_insert_guard,
+                    connection,
+                    copy.deepcopy(document),
+                )
+        for document in documents:
+            self._insert_version(connection, document)
+            connection.execute(
+                """INSERT INTO candidate_heads
+                   (candidate_id, candidate_version, candidate_digest, organization_id,
+                    project_id, session_id, state)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    document["candidate_id"],
+                    document["candidate_version"],
+                    document["candidate_digest"],
+                    document["organization_id"],
+                    document["project_id"],
+                    document["session_id"],
+                    document["state"],
+                ),
+            )
+        return copy.deepcopy(documents)
 
     def list_current(self, session_id: str) -> list[dict[str, Any]]:
         session_id = _require_id(session_id, "session_id")
@@ -552,8 +661,8 @@ class CandidateStore:
             encoded = _canonical_json(body)
         except (TypeError, ValueError) as exc:
             raise CandidateStoreError(400, "INVALID_TRANSITION_BODY", "transition body is not canonical JSON data") from exc
-        if len(encoded.encode("utf-8")) > 16_384:
-            raise CandidateStoreError(413, "TRANSITION_BODY_TOO_LARGE", "transition body exceeds 16 KiB")
+        if len(encoded.encode("utf-8")) > 1_048_576:
+            raise CandidateStoreError(413, "TRANSITION_BODY_TOO_LARGE", "transition body exceeds 1 MiB")
         if unicodedata.normalize("NFC", encoded) != encoded:
             raise CandidateStoreError(400, "INVALID_TRANSITION_BODY", "transition text must be NFC-normalized")
 
@@ -567,7 +676,9 @@ class CandidateStore:
             "actor_id",
             "reason",
         }
-        if action == "resolve_clarification":
+        if action == "edit_content":
+            allowed = required = common | {"content"}
+        elif action == "resolve_clarification":
             allowed = common | {"clarification_id", "selected_choice_id", "resolution_note"}
             required = common | {"clarification_id", "selected_choice_id"}
         elif action in {"mark_ready", "approve", "reject"}:
@@ -591,7 +702,9 @@ class CandidateStore:
             "expected_evidence_manifest_digest": body["evidence_manifest_digest"],
             "reason": body["reason"],
         }
-        if body["action"] == "resolve_clarification":
+        if body["action"] == "edit_content":
+            result["content"] = body["content"]
+        elif body["action"] == "resolve_clarification":
             result.update(
                 {
                     "clarification_id": body["clarification_id"],

@@ -41,8 +41,9 @@ struct TacuaSDKResumeReceiptRecovery: Equatable {
 }
 
 struct TacuaSDKResumeJournal: Equatable {
-  static let schemaVersion: Int64 = 1
-  static let maximumEncodedBytes = 24 * 1_024
+  static let schemaVersion: Int64 = 2
+  private static let legacySchemaVersion: Int64 = 1
+  static let maximumEncodedBytes = 2 * 1_024 * 1_024
 
   let localSessionID: String
   let baseQueueDigest: String
@@ -52,6 +53,10 @@ struct TacuaSDKResumeJournal: Equatable {
   let expectedSessionState: TacuaSDKResumeExpectedSessionState
   let expectedCompletionID: String?
   let transportConfigurationDigest: String
+  /// Canonical public artifacts required to reproduce a migrated-queue backfill after a crash.
+  /// Credential material and the transient launch request are intentionally absent.
+  let buildIdentityJSON: String?
+  let captureScopeJSON: String?
   let exchangeID: String
   let newCredentialID: String
   let newCredentialOwnershipDigest: String
@@ -69,6 +74,8 @@ struct TacuaSDKResumeJournal: Equatable {
     expectedSessionState: TacuaSDKResumeExpectedSessionState,
     expectedCompletionID: String?,
     transportConfigurationDigest: String,
+    buildIdentityJSON: String? = nil,
+    captureScopeJSON: String? = nil,
     exchangeID: String,
     newCredentialID: String,
     newCredentialOwnershipDigest: String,
@@ -85,6 +92,8 @@ struct TacuaSDKResumeJournal: Equatable {
     self.expectedSessionState = expectedSessionState
     self.expectedCompletionID = expectedCompletionID
     self.transportConfigurationDigest = transportConfigurationDigest
+    self.buildIdentityJSON = buildIdentityJSON
+    self.captureScopeJSON = captureScopeJSON
     self.exchangeID = exchangeID
     self.newCredentialID = newCredentialID
     self.newCredentialOwnershipDigest = newCredentialOwnershipDigest
@@ -164,6 +173,8 @@ struct TacuaSDKResumeJournal: Equatable {
     }
     let data = try TacuaCanonicalJSON.data(.object([
       "base_queue_digest": .string(baseQueueDigest),
+      "build_identity_json": buildIdentityJSON.map(TacuaJSONValue.string) ?? .null,
+      "capture_scope_json": captureScopeJSON.map(TacuaJSONValue.string) ?? .null,
       "created_at": .string(createdAt),
       "exchange_id": .string(exchangeID),
       "expected_completion_id": expectedCompletionID.map(TacuaJSONValue.string) ?? .null,
@@ -195,14 +206,23 @@ struct TacuaSDKResumeJournal: Equatable {
       guard try TacuaCanonicalJSON.data(value) == data else {
         throw TacuaSDKResumeJournalError.invalidJournal
       }
-      let root = try value.requiringObject(keys: [
+      guard let schema = value.objectValue?["schema_version"]?.integerValue,
+        schema == schemaVersion || schema == legacySchemaVersion
+      else { throw TacuaSDKResumeJournalError.invalidJournal }
+      let root = try value.requiringObject(keys: schema == schemaVersion ? [
+        "base_queue_digest", "build_identity_json", "capture_scope_json", "created_at",
+        "exchange_id", "expected_completion_id", "expected_session_state", "local_session_id",
+        "new_credential_id", "new_credential_ownership_digest", "previous_credential_id",
+        "remote_session_id", "request_digest", "schema_version", "scope_digest", "state",
+        "transport_configuration_digest", "validated_receipt",
+      ] : [
         "base_queue_digest", "created_at", "exchange_id", "expected_completion_id",
         "expected_session_state", "local_session_id", "new_credential_id",
         "new_credential_ownership_digest", "previous_credential_id", "remote_session_id",
         "request_digest", "schema_version", "scope_digest", "state",
         "transport_configuration_digest", "validated_receipt",
       ])
-      guard root["schema_version"]?.integerValue == schemaVersion,
+      guard
         let localSessionID = root["local_session_id"]?.stringValue,
         let baseQueueDigest = root["base_queue_digest"]?.stringValue,
         let previousCredentialID = root["previous_credential_id"]?.stringValue,
@@ -221,6 +241,19 @@ struct TacuaSDKResumeJournal: Equatable {
         let requestDigestValue = root["request_digest"],
         let receiptValue = root["validated_receipt"]
       else { throw TacuaSDKResumeJournalError.invalidJournal }
+
+      let buildIdentityJSON: String?
+      let captureScopeJSON: String?
+      if schema == schemaVersion {
+        guard let buildValue = root["build_identity_json"],
+          let scopeValue = root["capture_scope_json"]
+        else { throw TacuaSDKResumeJournalError.invalidJournal }
+        buildIdentityJSON = try nullableString(buildValue)
+        captureScopeJSON = try nullableString(scopeValue)
+      } else {
+        buildIdentityJSON = nil
+        captureScopeJSON = nil
+      }
 
       let expectedCompletionID = try nullableString(expectedCompletionValue)
       let requestDigest = try nullableString(requestDigestValue)
@@ -277,6 +310,8 @@ struct TacuaSDKResumeJournal: Equatable {
         expectedSessionState: expectedSessionState,
         expectedCompletionID: expectedCompletionID,
         transportConfigurationDigest: transportConfigurationDigest,
+        buildIdentityJSON: buildIdentityJSON,
+        captureScopeJSON: captureScopeJSON,
         exchangeID: exchangeID,
         newCredentialID: newCredentialID,
         newCredentialOwnershipDigest: newCredentialOwnershipDigest,
@@ -316,6 +351,8 @@ struct TacuaSDKResumeJournal: Equatable {
       expectedSessionState: expectedSessionState,
       expectedCompletionID: expectedCompletionID,
       transportConfigurationDigest: transportConfigurationDigest,
+      buildIdentityJSON: buildIdentityJSON,
+      captureScopeJSON: captureScopeJSON,
       exchangeID: exchangeID,
       newCredentialID: newCredentialID,
       newCredentialOwnershipDigest: newCredentialOwnershipDigest,
@@ -335,6 +372,8 @@ struct TacuaSDKResumeJournal: Equatable {
       && expectedSessionState == other.expectedSessionState
       && expectedCompletionID == other.expectedCompletionID
       && transportConfigurationDigest == other.transportConfigurationDigest
+      && buildIdentityJSON == other.buildIdentityJSON
+      && captureScopeJSON == other.captureScopeJSON
       && exchangeID == other.exchangeID
       && newCredentialID == other.newCredentialID
       && newCredentialOwnershipDigest == other.newCredentialOwnershipDigest
@@ -350,6 +389,25 @@ struct TacuaSDKResumeJournal: Equatable {
       Self.validDigest(newCredentialOwnershipDigest), Self.timestampMilliseconds(createdAt) != nil,
       requestDigest.map(Self.validDigest) ?? true
     else { throw TacuaSDKResumeJournalError.invalidJournal }
+    let artifacts: TacuaDurableSessionArtifacts?
+    switch (buildIdentityJSON, captureScopeJSON) {
+    case (nil, nil):
+      artifacts = nil
+    case (.some(let build), .some(let scope)):
+      do {
+        artifacts = try TacuaDurableSessionArtifacts.exactCanonical(
+          buildIdentityJSON: build,
+          scopeJSON: scope
+        )
+      } catch {
+        throw TacuaSDKResumeJournalError.invalidJournal
+      }
+      guard artifacts?.scopeDigest == scopeDigest,
+        artifacts?.transportConfigurationDigest == transportConfigurationDigest
+      else { throw TacuaSDKResumeJournalError.invalidJournal }
+    default:
+      throw TacuaSDKResumeJournalError.invalidJournal
+    }
     switch expectedSessionState {
     case .receiving:
       guard expectedCompletionID == nil else {
@@ -374,6 +432,23 @@ struct TacuaSDKResumeJournal: Equatable {
         throw TacuaSDKResumeJournalError.invalidJournal
       }
       try validate(receipt: validatedReceipt)
+    }
+  }
+
+  func durableSessionArtifacts() throws -> TacuaDurableSessionArtifacts? {
+    guard let buildIdentityJSON, let captureScopeJSON else {
+      guard self.buildIdentityJSON == nil, self.captureScopeJSON == nil else {
+        throw TacuaSDKResumeJournalError.invalidJournal
+      }
+      return nil
+    }
+    do {
+      return try TacuaDurableSessionArtifacts.exactCanonical(
+        buildIdentityJSON: buildIdentityJSON,
+        scopeJSON: captureScopeJSON
+      )
+    } catch {
+      throw TacuaSDKResumeJournalError.invalidJournal
     }
   }
 
@@ -491,6 +566,37 @@ final class TacuaSDKResumeJournalFileStore: TacuaSDKResumeJournalPersisting,
     try load(localSessionID: localSessionID) != nil
   }
 
+  /// Bounded exact-name discovery for relaunch retention. Content and inode safety are validated
+  /// by `load`; deliberately returning a syntactically valid corrupt name lets the retention
+  /// coordinator fail closed and unlink that exact leaf instead of letting malformed bytes hide.
+  func listLocalSessionIDs() throws -> [String] {
+    let suffix = ".resume-v1.json"
+    var enumerationError: Error?
+    guard let enumerator = fileManager.enumerator(
+      at: rootDirectory,
+      includingPropertiesForKeys: nil,
+      options: [.skipsSubdirectoryDescendants],
+      errorHandler: { _, error in
+        enumerationError = error
+        return false
+      }
+    ) else { throw TacuaSDKResumeJournalError.invalidJournal }
+    var scannedEntryCount = 0
+    var localSessionIDs = Set<String>()
+    while let value = enumerator.nextObject() {
+      guard let entry = value as? URL else { throw TacuaSDKResumeJournalError.invalidJournal }
+      scannedEntryCount += 1
+      guard scannedEntryCount <= 4_096 else { throw TacuaSDKResumeJournalError.invalidJournal }
+      let name = entry.lastPathComponent
+      guard name.hasSuffix(suffix) else { continue }
+      let localSessionID = String(name.dropLast(suffix.count))
+      guard Self.validLocalSessionID(localSessionID) else { continue }
+      localSessionIDs.insert(localSessionID)
+    }
+    if enumerationError != nil { throw TacuaSDKResumeJournalError.invalidJournal }
+    return localSessionIDs.sorted()
+  }
+
   func create(_ journal: TacuaSDKResumeJournal) throws {
     try withSessionLock(localSessionID: journal.localSessionID) {
       try createLocked(journal)
@@ -532,6 +638,19 @@ final class TacuaSDKResumeJournalFileStore: TacuaSDKResumeJournalPersisting,
       }
       let url = try journalURL(localSessionID: expected.localSessionID)
       guard unlink(url.path) == 0 else {
+        throw TacuaSDKResumeJournalError.stateConflict
+      }
+      try syncDirectory()
+    }
+  }
+
+  /// Retention cleanup owns the shared lifecycle lease and uses this exact-name unlink when a
+  /// journal is corrupt and therefore cannot participate in the ordinary value-CAS removal.
+  func retire(localSessionID: String) throws {
+    try withSessionLock(localSessionID: localSessionID) {
+      let url = try journalURL(localSessionID: localSessionID)
+      let result = unlink(url.path)
+      guard result == 0 || errno == ENOENT else {
         throw TacuaSDKResumeJournalError.stateConflict
       }
       try syncDirectory()

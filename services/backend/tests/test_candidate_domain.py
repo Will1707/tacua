@@ -58,6 +58,10 @@ def transition_body(parent: dict, action: str, **values: object) -> dict:
         )
     elif action == "approve":
         body["approval_id"] = "approval_candidate_transition"
+    elif action == "edit_content":
+        content = copy.deepcopy(parent["content"])
+        content["title"] = "Reviewer-corrected ticket title"
+        body["content"] = content
     body.update(values)
     return body
 
@@ -72,6 +76,45 @@ class CandidateDomainTests(unittest.TestCase):
             callback()
         self.assertEqual(code, caught.exception.code)
         return caught.exception
+
+    def test_human_edit_creates_a_draft_and_preserves_evidence_authority(self) -> None:
+        stored = chain(3)
+        parent = stored[-1]
+        body = transition_body(parent, "edit_content")
+        body["content"]["summary"]["text"] = "The reviewer corrected the observed symptom."
+
+        result = apply_transition(
+            stored,
+            REVIEWER,
+            body,
+            at("2026-07-21T10:04:00Z"),
+        )
+
+        self.assertEqual("draft", result["state"])
+        self.assertEqual("edited", result["lineage"]["operation"])
+        self.assertEqual(body["content"], result["content"])
+        self.assertEqual(parent["evidence_manifest"], result["evidence_manifest"])
+        self.assertNotEqual(
+            parent["candidate_content_digest"],
+            result["candidate_content_digest"],
+        )
+        self.assertEqual("in_review", result["review"]["status"])
+        self.assertTrue(result["review"]["reviewer_action_required"])
+        self.assertIsNone(result["approval"])
+        self.assertIsNone(result["rejection"])
+        TICKET_CONTRACT.validate_chain([*stored, result])
+
+        unchanged = transition_body(parent, "edit_content")
+        unchanged["content"] = copy.deepcopy(parent["content"])
+        self.assert_error(
+            "EDIT_CONTENT_UNCHANGED",
+            lambda: apply_transition(
+                stored,
+                REVIEWER,
+                unchanged,
+                at("2026-07-21T10:04:00Z"),
+            ),
+        )
 
     def test_resolve_clarification_changes_only_declared_resolution(self) -> None:
         stored = chain(2)

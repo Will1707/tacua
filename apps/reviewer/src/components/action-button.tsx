@@ -29,11 +29,12 @@ export function ActionButton({ label, onPress, disabled = false, loading = false
         alignItems: "center",
         justifyContent: "center",
         paddingHorizontal: 16,
+        paddingVertical: 10,
         backgroundColor: tint,
         opacity: disabled ? 0.4 : pressed ? 0.75 : 1,
       })}
     >
-      {loading ? <ActivityIndicator color={foreground} /> : <Text style={{ color: foreground, fontSize: 16, fontWeight: "700" }}>{label}</Text>}
+      {loading ? <ActivityIndicator color={foreground} /> : <Text style={{ color: foreground, fontSize: 16, fontWeight: "700", textAlign: "center" }}>{label}</Text>}
     </Pressable>
   );
 }

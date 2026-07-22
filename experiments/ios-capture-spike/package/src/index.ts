@@ -3,10 +3,17 @@
 import {
   TacuaCaptureSpikeModule,
   type ApprovedBackendLaunch,
+  type BackendAdmitFinalizedCaptureOptions,
   type BackendBuildIdentity,
+  type BackendCaptureAdmission,
   type BackendCaptureScope,
+  type BackendDeletedSession,
+  type BackendDeleteSessionOptions,
   type BackendLaunchConsentRequest,
   type BackendQueueStatus,
+  type BackendSessionDiscoveryRecord,
+  type BackendProcessAdmittedCaptureOptions,
+  type BackendProcessedCapture,
   type BackendResumedSession,
   type BackendResumeRecoveryStatus,
   type BackendResumeRequirement,
@@ -24,16 +31,37 @@ import {
   type CaptureSegmentEvent,
   type CaptureStartOptions,
   type CaptureStatus,
+  type CreateCaptureSessionPlanOptions,
+  type DiagnosticCustomStateOptions,
+  type DiagnosticEventReceipt,
+  type DiagnosticInteractionAction,
+  type DiagnosticNetworkCompletionOptions,
+  type DiagnosticNetworkMethod,
+  type DiagnosticRouteTransitionOptions,
+  type DiagnosticRouteTrigger,
+  type DiagnosticRuntimeErrorOptions,
+  type DiagnosticUserInteractionOptions,
   type RecoverableSession,
+  type RecoverCaptureSessionPlanOptions,
+  type ResumedCaptureSessionPlan,
+  type ResumeCaptureSessionPlanOptions,
+  type StartedCaptureSessionPlan,
 } from "./TacuaCaptureSpikeModule";
 import { type EventSubscription } from "expo-modules-core";
 
 export type {
   ApprovedBackendLaunch,
+  BackendAdmitFinalizedCaptureOptions,
   BackendBuildIdentity,
+  BackendCaptureAdmission,
   BackendCaptureScope,
+  BackendDeletedSession,
+  BackendDeleteSessionOptions,
   BackendLaunchConsentRequest,
   BackendQueueStatus,
+  BackendSessionDiscoveryRecord,
+  BackendProcessAdmittedCaptureOptions,
+  BackendProcessedCapture,
   BackendResumedSession,
   BackendResumeRecoveryStatus,
   BackendResumeRequirement,
@@ -51,7 +79,21 @@ export type {
   CaptureSegmentEvent,
   CaptureStartOptions,
   CaptureStatus,
+  CreateCaptureSessionPlanOptions,
+  DiagnosticCustomStateOptions,
+  DiagnosticEventReceipt,
+  DiagnosticInteractionAction,
+  DiagnosticNetworkCompletionOptions,
+  DiagnosticNetworkMethod,
+  DiagnosticRouteTransitionOptions,
+  DiagnosticRouteTrigger,
+  DiagnosticRuntimeErrorOptions,
+  DiagnosticUserInteractionOptions,
   RecoverableSession,
+  RecoverCaptureSessionPlanOptions,
+  ResumedCaptureSessionPlan,
+  ResumeCaptureSessionPlanOptions,
+  StartedCaptureSessionPlan,
 };
 
 export function getCapabilities(): CaptureCapabilities {
@@ -66,6 +108,16 @@ export function getBackendQueueStatus(
   localSessionId: string,
 ): Promise<BackendQueueStatus> {
   return TacuaCaptureSpikeModule.getBackendQueueStatus(localSessionId);
+}
+
+/**
+ * Discovers durable native START identifiers after relaunch. For every returned identifier, read
+ * queue and START-recovery status before resuming, recovering, uploading, or deleting.
+ */
+export function listBackendSessions(): Promise<
+  readonly BackendSessionDiscoveryRecord[]
+> {
+  return TacuaCaptureSpikeModule.listBackendSessions();
 }
 
 export function prepareBackendLaunch(
@@ -88,7 +140,39 @@ export function cancelBackendLaunch(requestId: string): void {
   TacuaCaptureSpikeModule.cancelBackendLaunch(requestId);
 }
 
-export function startBackendSession(
+/**
+ * Commits backend START before returning. The host should retain `localSessionId`, then pass the
+ * returned `captureOptions` to `start`; ReplayKit has not started when this promise resolves.
+ */
+export function createCaptureSessionPlan(
+  options: CreateCaptureSessionPlanOptions,
+): Promise<StartedCaptureSessionPlan> {
+  return TacuaCaptureSpikeModule.createCaptureSessionPlan(options);
+}
+
+/** Rotates backend authority using the queue-owned build/scope and returns updated capture fields. */
+export function resumeCaptureSessionPlan(
+  options: ResumeCaptureSessionPlanOptions,
+): Promise<ResumedCaptureSessionPlan> {
+  return TacuaCaptureSpikeModule.resumeCaptureSessionPlan(options);
+}
+
+/** Finishes a crash-interrupted START receipt commit without consuming another launch code. */
+export function recoverStartedCaptureSessionPlan(
+  options: RecoverCaptureSessionPlanOptions,
+): Promise<StartedCaptureSessionPlan> {
+  return TacuaCaptureSpikeModule.recoverStartedCaptureSessionPlan(options);
+}
+
+/** Finishes a crash-interrupted RESUME receipt commit without consuming another launch code. */
+export function recoverResumedCaptureSessionPlan(
+  options: RecoverCaptureSessionPlanOptions,
+): Promise<ResumedCaptureSessionPlan> {
+  return TacuaCaptureSpikeModule.recoverResumedCaptureSessionPlan(options);
+}
+
+/** @advanced Legacy migration/testing only; normal hosts use `createCaptureSessionPlan`. */
+export function advancedStartBackendSession(
   options: BackendStartSessionOptions,
 ): Promise<BackendStartedSession> {
   return TacuaCaptureSpikeModule.startBackendSession({
@@ -100,7 +184,8 @@ export function startBackendSession(
   });
 }
 
-export function resumeBackendSession(
+/** @advanced Legacy migration/testing only; normal hosts use `resumeCaptureSessionPlan`. */
+export function advancedResumeBackendSession(
   options: BackendResumeSessionOptions,
 ): Promise<BackendResumedSession> {
   return TacuaCaptureSpikeModule.resumeBackendSession({
@@ -110,6 +195,51 @@ export function resumeBackendSession(
     scopeJson: JSON.stringify(options.scope),
     requestedAt: options.requestedAt,
   });
+}
+
+/**
+ * Verifies a stopped local capture, materializes its sanitized diagnostic, and atomically admits
+ * immutable segment/diagnostic requests to the durable queue. This performs no network I/O.
+ */
+export function admitFinalizedCapture(
+  localSessionId: string,
+): Promise<BackendCaptureAdmission> {
+  return TacuaCaptureSpikeModule.admitFinalizedCapture({ localSessionId });
+}
+
+/** @advanced Backfills build/scope for a queue migrated from an older SDK. */
+export function advancedAdmitFinalizedCapture(
+  options: BackendAdmitFinalizedCaptureOptions,
+): Promise<BackendCaptureAdmission> {
+  return TacuaCaptureSpikeModule.admitFinalizedCapture({
+    localSessionId: options.localSessionId,
+    buildIdentityJson: options.buildIdentity
+      ? JSON.stringify(options.buildIdentity)
+      : undefined,
+    scopeJson: options.scope ? JSON.stringify(options.scope) : undefined,
+  });
+}
+
+/**
+ * Drives every admitted upload, session completion, receipt commit, and receipt-authorized local
+ * payload cleanup. It is safe to call again after interruption; unknown outcomes replay the exact
+ * durable request.
+ */
+export function processAdmittedCapture(
+  options: BackendProcessAdmittedCaptureOptions,
+): Promise<BackendProcessedCapture> {
+  return TacuaCaptureSpikeModule.processAdmittedCapture(options);
+}
+
+/**
+ * Authenticates a fixed `user_requested` deletion, durably stores the backend tombstone, retires
+ * the entire local capture directory, removes its Keychain credential, and finally retires the
+ * sensitive transport queue. Interrupted calls retry the exact durable deletion request.
+ */
+export function deleteBackendSession(
+  options: BackendDeleteSessionOptions,
+): Promise<BackendDeletedSession> {
+  return TacuaCaptureSpikeModule.deleteBackendSession(options);
 }
 
 export function getBackendResumeRecoveryStatus(
@@ -171,6 +301,36 @@ export function stop(): Promise<CaptureStatus> {
 
 export function mark(label: string): Promise<CaptureMarker> {
   return TacuaCaptureSpikeModule.mark(label);
+}
+
+export function recordRouteTransition(
+  options: DiagnosticRouteTransitionOptions,
+): Promise<DiagnosticEventReceipt> {
+  return TacuaCaptureSpikeModule.recordRouteTransition(options);
+}
+
+export function recordUserInteraction(
+  options: DiagnosticUserInteractionOptions,
+): Promise<DiagnosticEventReceipt> {
+  return TacuaCaptureSpikeModule.recordUserInteraction(options);
+}
+
+export function recordRuntimeError(
+  options: DiagnosticRuntimeErrorOptions,
+): Promise<DiagnosticEventReceipt> {
+  return TacuaCaptureSpikeModule.recordRuntimeError(options);
+}
+
+export function recordNetworkRequestCompleted(
+  options: DiagnosticNetworkCompletionOptions,
+): Promise<DiagnosticEventReceipt> {
+  return TacuaCaptureSpikeModule.recordNetworkRequestCompleted(options);
+}
+
+export function recordCustomState(
+  options: DiagnosticCustomStateOptions,
+): Promise<DiagnosticEventReceipt> {
+  return TacuaCaptureSpikeModule.recordCustomState(options);
 }
 
 export function listRecoverableSessions(): Promise<

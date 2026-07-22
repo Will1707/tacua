@@ -20,6 +20,21 @@ from tacua_backend.http_api import PilotRequestHandler
 from tacua_backend.service import ApiError
 
 
+class SummaryOnlyJobStore:
+    """Test double proving the list route requests only bounded head summaries."""
+
+    def __init__(self, jobs: dict[str, dict]):
+        self.jobs = jobs
+        self.requested: list[str] = []
+
+    def validate_population(self) -> None:
+        return None
+
+    def get(self, job_id: str) -> dict:
+        self.requested.append(job_id)
+        return copy.deepcopy(self.jobs[job_id])
+
+
 class PaginationDataMixin:
     backend: object
 
@@ -114,6 +129,60 @@ class PaginationDataMixin:
                 )
                 candidates[candidate_id] = candidate
         return candidates
+
+    def _seed_jobs(self, session_ids: list[str]) -> dict[str, dict]:
+        assert isinstance(self, BackendHarness)
+        jobs: dict[str, dict] = {}
+        requested_at = "2026-07-21T10:02:05Z"
+        with self.backend._connect() as connection:
+            for index, session_id in enumerate(session_ids):
+                job_id = f"job_page_{index:03d}"
+                jobs[job_id] = {
+                    "job_id": job_id,
+                    "status": "queued",
+                    "requested_at": requested_at,
+                    "started_at": None,
+                    "completed_at": None,
+                    "failure": None,
+                }
+                connection.execute(
+                    """INSERT INTO jobs
+                       (job_id,session_id,organization_id,project_id,status,requested_at,job_json)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (
+                        job_id,
+                        session_id,
+                        self.backend.config.organization_id,
+                        self.backend.config.project_id,
+                        "queued",
+                        requested_at,
+                        "{}",
+                    ),
+                )
+        return jobs
+
+    def _seed_audit_events(self, count: int = 52) -> list[str]:
+        assert isinstance(self, BackendHarness)
+        event_ids = [f"audit_page_{index:03d}" for index in range(count)]
+        with self.backend._connect() as connection:
+            connection.execute("DELETE FROM audit_events")
+            for event_id in event_ids:
+                connection.execute(
+                    """INSERT INTO audit_events
+                       (event_id,event_type,actor_kind,organization_id,project_id,session_id,outcome,occurred_at)
+                       VALUES (?,?,?,?,?,?,?,?)""",
+                    (
+                        event_id,
+                        "session_completed",
+                        "sdk",
+                        self.backend.config.organization_id,
+                        self.backend.config.project_id,
+                        None,
+                        "succeeded",
+                        "2026-07-21T10:02:06Z",
+                    ),
+                )
+        return event_ids
 
     def _transition_candidate_head(self, parent: dict) -> dict:
         assert isinstance(self, BackendHarness)
@@ -396,11 +465,103 @@ class PaginationServiceTests(PaginationDataMixin, BackendHarness):
         self.assertEqual(2, changed_second["candidates"][0]["candidate_version"])
         self.assertEqual("needs_clarification", changed_second["candidates"][0]["state"])
 
+    def test_job_keyset_page_is_fifty_exact_summaries_and_detail_stays_separate(self) -> None:
+        session_ids = self._seed_sessions()
+        jobs = self._seed_jobs(session_ids)
+        store = SummaryOnlyJobStore(jobs)
+        statements: list[str] = []
+        original_connect = self.backend._connect
+
+        def traced_connection():
+            connection = original_connect()
+            connection.set_trace_callback(statements.append)
+            return connection
+
+        with (
+            patch.object(self.backend, "_connect", side_effect=traced_connection),
+            patch.object(self.backend, "_processing_job_store", return_value=store),
+        ):
+            first = self.backend.list_jobs()
+            second = self.backend.list_jobs(first["next_cursor"])
+
+        expected_ids = sorted(jobs, reverse=True)
+        self.assertEqual(expected_ids[:50], [job["job_id"] for job in first["jobs"]])
+        self.assertEqual(expected_ids[50:], [job["job_id"] for job in second["jobs"]])
+        self.assertEqual(expected_ids, store.requested)
+        self.assertIsNotNone(first["next_cursor"])
+        self.assertIsNone(second["next_cursor"])
+        self.assertTrue(
+            all(
+                set(job)
+                == {
+                    "job_id", "job_type", "status", "requested_at",
+                    "started_at", "completed_at", "failure_code",
+                }
+                for job in first["jobs"] + second["jobs"]
+            )
+        )
+        normalized = [" ".join(statement.upper().split()) for statement in statements]
+        list_statements = [
+            statement for statement in normalized
+            if "SELECT JOBS.JOB_ID,JOBS.REQUESTED_AT FROM JOBS" in statement
+        ]
+        self.assertEqual(2, len(list_statements))
+        self.assertTrue(all("LIMIT 51" in statement for statement in list_statements))
+        self.assertTrue(all("OFFSET" not in statement for statement in list_statements))
+
+    def test_audit_event_keyset_page_is_bounded_newest_first(self) -> None:
+        event_ids = self._seed_audit_events()
+        statements: list[str] = []
+        original_connect = self.backend._connect
+
+        def traced_connection():
+            connection = original_connect()
+            connection.set_trace_callback(statements.append)
+            return connection
+
+        with patch.object(self.backend, "_connect", side_effect=traced_connection):
+            first = self.backend.list_audit_events()
+            second = self.backend.list_audit_events(first["next_cursor"])
+
+        expected_ids = sorted(event_ids, reverse=True)
+        self.assertEqual(expected_ids[:50], [event["event_id"] for event in first["events"]])
+        self.assertEqual(expected_ids[50:], [event["event_id"] for event in second["events"]])
+        self.assertIsNotNone(first["next_cursor"])
+        self.assertIsNone(second["next_cursor"])
+        normalized = [" ".join(statement.upper().split()) for statement in statements]
+        list_statements = [
+            statement for statement in normalized
+            if "FROM AUDIT_EVENTS LEFT JOIN SESSIONS" in statement
+        ]
+        self.assertEqual(2, len(list_statements))
+        self.assertTrue(all("LIMIT 51" in statement for statement in list_statements))
+        self.assertTrue(all("OFFSET" not in statement for statement in list_statements))
+
     def test_service_rejects_malformed_cross_kind_and_cross_session_cursors(self) -> None:
         session_ids = self._seed_sessions()
         candidates = self._seed_candidates(session_ids[-1])
         session_cursor = self.backend.list_sessions()["next_cursor"]
         candidate_cursor = self.backend.list_candidates(session_ids[-1])["next_cursor"]
+        job_cursor = base64.urlsafe_b64encode(
+            canonical_json(
+                {
+                    "version": 1,
+                    "kind": "jobs",
+                    "requested_at": "2026-07-21T10:02:05Z",
+                    "job_id": "job_page_050",
+                }
+            ).encode()
+        ).rstrip(b"=").decode("ascii")
+        audit_cursor = base64.urlsafe_b64encode(
+            canonical_json(
+                {
+                    "version": 1,
+                    "kind": "audit_events",
+                    "occurred_at": "2026-07-21T10:02:06Z",
+                    "event_id": "audit_page_050",
+                }
+            ).encode()
+        ).rstrip(b"=").decode("ascii")
         self.assertIsNotNone(session_cursor)
         self.assertIsNotNone(candidate_cursor)
         self.assertEqual(52, len(candidates))
@@ -409,6 +570,10 @@ class PaginationServiceTests(PaginationDataMixin, BackendHarness):
             lambda: self.backend.list_sessions(candidate_cursor),
             lambda: self.backend.list_candidates(session_ids[-1], session_cursor),
             lambda: self.backend.list_candidates(session_ids[-2], candidate_cursor),
+            lambda: self.backend.list_jobs(session_cursor),
+            lambda: self.backend.list_sessions(job_cursor),
+            lambda: self.backend.list_audit_events(job_cursor),
+            lambda: self.backend.list_jobs(audit_cursor),
             lambda: self.backend.list_sessions("="),
             lambda: self.backend.list_sessions("A"),
             lambda: self.backend.list_sessions("not*base64"),
@@ -450,6 +615,8 @@ class PaginationHTTPTests(PaginationDataMixin, BackendHarness):
     def test_http_pages_and_strict_cursor_header_rejections(self) -> None:
         session_ids = self._seed_sessions()
         self._seed_candidates(session_ids[-1])
+        jobs = self._seed_jobs(session_ids)
+        audit_event_ids = self._seed_audit_events()
         sessions_first = self._dispatch_json("/v1/admin/sessions")
         sessions_second = self._dispatch_json(
             "/v1/admin/sessions",
@@ -466,6 +633,35 @@ class PaginationHTTPTests(PaginationDataMixin, BackendHarness):
         )
         self.assertEqual(50, len(candidates_first["candidates"]))
         self.assertEqual(2, len(candidates_second["candidates"]))
+
+        with patch.object(
+            self.backend,
+            "_processing_job_store",
+            return_value=SummaryOnlyJobStore(jobs),
+        ):
+            jobs_first = self._dispatch_json("/v1/admin/jobs")
+            jobs_second = self._dispatch_json(
+                "/v1/admin/jobs",
+                jobs_first["next_cursor"],
+            )
+        self.assertEqual(50, len(jobs_first["jobs"]))
+        self.assertEqual(2, len(jobs_second["jobs"]))
+        self.assertEqual(
+            sorted(jobs, reverse=True),
+            [job["job_id"] for job in jobs_first["jobs"] + jobs_second["jobs"]],
+        )
+
+        audit_first = self._dispatch_json("/v1/admin/audit-events")
+        audit_second = self._dispatch_json(
+            "/v1/admin/audit-events",
+            audit_first["next_cursor"],
+        )
+        self.assertEqual(50, len(audit_first["events"]))
+        self.assertEqual(2, len(audit_second["events"]))
+        self.assertEqual(
+            sorted(audit_event_ids, reverse=True),
+            [event["event_id"] for event in audit_first["events"] + audit_second["events"]],
+        )
 
         invalid_handlers: list[PilotRequestHandler] = []
         duplicate = self.handler("/v1/admin/sessions")
@@ -489,6 +685,12 @@ class PaginationHTTPTests(PaginationDataMixin, BackendHarness):
         )
         cross_session.headers["Tacua-Page-Cursor"] = candidates_first["next_cursor"]
         invalid_handlers.append(cross_session)
+        job_cross_kind = self.handler("/v1/admin/jobs")
+        job_cross_kind.headers["Tacua-Page-Cursor"] = audit_first["next_cursor"]
+        invalid_handlers.append(job_cross_kind)
+        audit_cross_kind = self.handler("/v1/admin/audit-events")
+        audit_cross_kind.headers["Tacua-Page-Cursor"] = candidates_first["next_cursor"]
+        invalid_handlers.append(audit_cross_kind)
 
         for handler in invalid_handlers:
             with self.subTest(path=handler.path), self.assertRaises(ApiError) as captured:

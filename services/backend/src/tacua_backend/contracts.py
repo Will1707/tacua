@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Load Tacua's frozen dependency-free protocol implementation.
 
 The backend intentionally imports the repository validator instead of carrying

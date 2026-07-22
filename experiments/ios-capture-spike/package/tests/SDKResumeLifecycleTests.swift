@@ -359,7 +359,8 @@ private func makeResumeHarness(
   uuidValues: [UUID] = [
     UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
     UUID(uuidString: "00000000-0000-0000-0000-000000000002")!,
-  ]
+  ],
+  preparedQueueEncodedByteLimit: Int = TacuaTransportQueueV3.maximumEncodedBytes
 ) throws -> ResumeLifecycleHarness {
   let configuration = try TacuaBackendConfiguration(
     buildConfiguredOrigin: "https://qa.tacua.example",
@@ -394,7 +395,8 @@ private func makeResumeHarness(
     queueStore: queues,
     startJournalStore: startJournals,
     journalStore: resumeJournals,
-    clock: clock
+    clock: clock,
+    preparedQueueEncodedByteLimit: preparedQueueEncodedByteLimit
   )
   return ResumeLifecycleHarness(
     configuration: configuration,
@@ -414,10 +416,12 @@ private func makeResumeHarness(
 
 private func approveResumeLaunch(
   _ gate: TacuaLaunchConsentGate,
-  code: String
+  code: String,
+  expectedSessionID: String? = "session_remote_receiving"
 ) throws -> String {
+  let sessionQuery = expectedSessionID.map { "&session_id=\($0)" } ?? ""
   let pending = try gate.prepare(
-    rawURL: "configured-target-scheme://tacua/start?launch_code=\(code)",
+    rawURL: "configured-target-scheme://tacua/start?launch_code=\(code)\(sessionQuery)",
     configuration: try TacuaLaunchLinkConfiguration(
       buildConfiguredScheme: "configured-target-scheme"
     )
@@ -457,9 +461,13 @@ private func startInput(
 
 private func retainedLaunchCode(
   _ gate: TacuaLaunchConsentGate,
-  approved: String
+  approved: String,
+  expectedSessionID: String? = "session_remote_receiving"
 ) throws -> String {
-  try gate.withApprovedLaunchCode(approvedLaunchID: approved) { $0 }
+  try gate.withApprovedLaunchCode(
+    approvedLaunchID: approved,
+    expectedSessionID: expectedSessionID
+  ) { $0 }
 }
 
 private func fixtureValue(_ root: URL, _ name: String) throws -> TacuaJSONValue {
@@ -478,6 +486,18 @@ private func fixtureScopeDigest(_ harness: ResumeLifecycleHarness) throws -> Str
     value.objectValue?["scope_digest"]?.stringValue,
     "Fixture scope digest is missing"
   )
+}
+
+private func scopeWithChangedConsent(_ data: Data) throws -> Data {
+  guard case .object(var scope) = try TacuaCanonicalJSON.parse(data),
+    case .object(var consent)? = scope["consent"]
+  else { throw ResumeLifecycleTestFailure.assertion("Scope fixture is malformed") }
+  consent["granted_at"] = .string("2026-07-21T09:58:00Z")
+  scope["consent"] = .object(consent)
+  scope["scope_digest"] = .string(
+    try TacuaCanonicalJSON.digest(.object(scope), omittingRootField: "scope_digest")
+  )
+  return try TacuaCanonicalJSON.data(.object(scope))
 }
 
 private func makeReceivingBaseQueue(
@@ -504,6 +524,8 @@ private func makeReceivingBaseQueue(
       bootSessionID: harness.clock.bootSessionID
     )
   )
+  queue.sessionRetentionAuthority = currentTestRetentionAuthority()
+  try queue.validate()
   if installCurrentCredential {
     harness.credentials.values[currentCredentialID] = Data(repeating: 0x41, count: 32)
   }
@@ -538,12 +560,25 @@ private func enqueueFixtureUpload(
     localPayloadBindings: bindings,
     clock: clock
   )
+  _ = try queue.beginAttempt(
+    operationID: operationID,
+    expectedTransportConfigurationDigest: queue.transportConfigurationDigest!,
+    clock: clock
+  )
   let responseData = try canonicalFixture(root, responseName)
   let receipt = try TacuaSDKBackendProtocol.validateResponse(
     responseData,
     forCanonicalRequest: requestData
   )
   try queue.storeValidatedReceipt(receipt)
+}
+
+private func currentTestRetentionAuthority() -> TacuaSessionRetentionAuthority {
+  TacuaSessionRetentionAuthority(
+    sessionReceivedAt: "2026-07-21T10:00:00Z",
+    rawMediaExpiresAt: "2026-08-20T10:00:00Z",
+    derivedDataExpiresAt: "2026-10-21T10:00:00Z"
+  )
 }
 
 private func makeCompletedBaseQueue(
@@ -579,6 +614,7 @@ private func makeCompletedBaseQueue(
       bootSessionID: harness.clock.bootSessionID
     )
   )
+  queue.sessionRetentionAuthority = currentTestRetentionAuthority()
   try enqueueFixtureUpload(
     fixtureRoot,
     requestName: "segment-upload-intent",
@@ -616,6 +652,7 @@ private func makeCompletedBaseQueue(
       bootSessionID: harness.clock.bootSessionID
     )
   )
+  queue.sessionRetentionAuthority = currentTestRetentionAuthority()
   try enqueueFixtureUpload(
     fixtureRoot,
     requestName: "diagnostic-upload-request",
@@ -641,6 +678,14 @@ private func makeCompletedBaseQueue(
     requestCredentialID: credentialID,
     request: completionRequestValue,
     requestDigest: requestDigest,
+    clock: ResumeTestClock(
+      uptimeMilliseconds: 165_000,
+      bootSessionID: harness.clock.bootSessionID
+    )
+  )
+  _ = try queue.beginAttempt(
+    operationID: completionID,
+    expectedTransportConfigurationDigest: harness.configuration.configurationDigest,
     clock: ResumeTestClock(
       uptimeMilliseconds: 165_000,
       bootSessionID: harness.clock.bootSessionID
@@ -686,12 +731,21 @@ private func makeDeletionBaseQueue(
       bootSessionID: harness.clock.bootSessionID
     )
   )
+  queue.sessionRetentionAuthority = currentTestRetentionAuthority()
   try queue.enqueueNewOperation(
     kind: .deletion,
     operationID: deletionID,
     requestCredentialID: credentialID,
     request: requestValue,
     requestDigest: requestDigest,
+    clock: ResumeTestClock(
+      uptimeMilliseconds: 101_000,
+      bootSessionID: harness.clock.bootSessionID
+    )
+  )
+  _ = try queue.beginAttempt(
+    operationID: deletionID,
+    expectedTransportConfigurationDigest: harness.configuration.configurationDigest,
     clock: ResumeTestClock(
       uptimeMilliseconds: 101_000,
       bootSessionID: harness.clock.bootSessionID
@@ -742,6 +796,7 @@ enum SDKResumeLifecycleTests {
     let fixtureRoot = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
     try await receivingResumeCommitsAndCleansRevokedCredential(fixtureRoot)
     try await completedResumePreservesExactAuthority(fixtureRoot)
+    try await exactSessionHintRejectsWrongQueueWithoutConsumption(fixtureRoot)
     try await preConsentRejectionsRetainLaunch(fixtureRoot)
     try await deterministicFailuresCleanPreparedCredentialBeforeNetwork(fixtureRoot)
     try await networkFailureQuarantinesBothCredentials(fixtureRoot)
@@ -759,6 +814,48 @@ enum SDKResumeLifecycleTests {
 }
 
 private extension SDKResumeLifecycleTests {
+  static func exactSessionHintRejectsWrongQueueWithoutConsumption(
+    _ fixtureRoot: URL
+  ) async throws {
+    let harness = try makeResumeHarness(fixtureRoot)
+    let localSessionID = "local_resume_wrong_hint_001"
+    _ = try makeReceivingBaseQueue(
+      harness,
+      localSessionID: localSessionID,
+      currentCredentialID: "credential_wrong_hint_old"
+    )
+    let launchCode = String(repeating: "R", count: 43)
+    let intendedSessionID = "session_different_queue_001"
+    let approved = try approveResumeLaunch(
+      harness.gate,
+      code: launchCode,
+      expectedSessionID: intendedSessionID
+    )
+
+    do {
+      _ = try await harness.coordinator.resume(
+        resumeInput(harness, approved: approved, localSessionID: localSessionID)
+      )
+      throw ResumeLifecycleTestFailure.assertion("RESUME accepted the wrong local queue")
+    } catch let error as ResumeLifecycleTestFailure {
+      throw error
+    } catch let error as TacuaSDKResumeLifecycleError {
+      try require(
+        error == .launchRequestRejected,
+        "Wrong-queue RESUME surfaced the wrong error"
+      )
+    }
+
+    let retained = try retainedLaunchCode(
+      harness.gate,
+      approved: approved,
+      expectedSessionID: intendedSessionID
+    )
+    try require(retained == launchCode, "Wrong queue consumed the RESUME launch handle")
+    try require(harness.exchanger.requests.isEmpty, "Wrong queue reached the backend")
+    try require(harness.resumeJournals.journals.isEmpty, "Wrong queue retained a journal")
+  }
+
   static func receivingResumeCommitsAndCleansRevokedCredential(
     _ fixtureRoot: URL
   ) async throws {
@@ -797,6 +894,16 @@ private extension SDKResumeLifecycleTests {
       queue.transportConfigurationDigest == harness.configuration.configurationDigest,
       "Result queue lost its transport binding"
     )
+    let durable = try requireValue(
+      queue.durableSessionArtifacts(),
+      "Successful RESUME did not backfill migrated session artifacts"
+    )
+    let expectedBuild = try TacuaCanonicalJSON.data(TacuaCanonicalJSON.parse(harness.build))
+    let expectedScope = try TacuaCanonicalJSON.data(TacuaCanonicalJSON.parse(harness.scope))
+    try require(
+      durable.buildIdentityJSON == expectedBuild && durable.scopeJSON == expectedScope,
+      "RESUME backfill changed the validated canonical artifacts"
+    )
     try require(
       harness.credentials.values[previousCredentialID] == nil,
       "Revoked credential A survived durable queue commit"
@@ -828,7 +935,8 @@ private extension SDKResumeLifecycleTests {
     )
     let approved = try approveResumeLaunch(
       harness.gate,
-      code: String(repeating: "B", count: 43)
+      code: String(repeating: "B", count: 43),
+      expectedSessionID: "session_synthetic"
     )
 
     let resumed = try await harness.coordinator.resume(
@@ -911,6 +1019,53 @@ private extension SDKResumeLifecycleTests {
     try require(invalidScopeHarness.credentials.stores.isEmpty, "Invalid scope prepared credential B")
     try require(invalidScopeHarness.resumeJournals.journals.isEmpty, "Invalid scope created a journal")
     try require(invalidScopeHarness.exchanger.requests.isEmpty, "Invalid scope reached the network")
+
+    let mismatchHarness = try makeResumeHarness(fixtureRoot)
+    let mismatchSession = "local_resume_artifact_mismatch_001"
+    var mismatchQueue = try makeReceivingBaseQueue(
+      mismatchHarness,
+      localSessionID: mismatchSession,
+      installCurrentCredential: false
+    )
+    let durableArtifacts = try TacuaDurableSessionArtifacts.canonicalizing(
+      buildIdentityJSON: mismatchHarness.build,
+      scopeJSON: mismatchHarness.scope
+    )
+    try mismatchQueue.bindDurableSessionArtifacts(durableArtifacts)
+    mismatchHarness.queues.queues[mismatchSession] = mismatchQueue
+    let mismatchCode = String(repeating: "M", count: 43)
+    let mismatchApproval = try approveResumeLaunch(
+      mismatchHarness.gate,
+      code: mismatchCode
+    )
+    do {
+      _ = try await mismatchHarness.coordinator.resume(
+        resumeInput(
+          mismatchHarness,
+          approved: mismatchApproval,
+          localSessionID: mismatchSession,
+          scope: try scopeWithChangedConsent(mismatchHarness.scope)
+        )
+      )
+      throw ResumeLifecycleTestFailure.assertion("RESUME accepted substituted session artifacts")
+    } catch let error as ResumeLifecycleTestFailure {
+      throw error
+    } catch let error as TacuaSDKResumeLifecycleError {
+      try require(error == .invalidInput, "Artifact mismatch surfaced the wrong error")
+    }
+    let retainedMismatch = try retainedLaunchCode(
+      mismatchHarness.gate,
+      approved: mismatchApproval
+    )
+    try require(
+      retainedMismatch == mismatchCode,
+      "Artifact mismatch consumed reviewer consent"
+    )
+    try require(
+      mismatchHarness.resumeJournals.journals.isEmpty
+        && mismatchHarness.exchanger.requests.isEmpty,
+      "Artifact mismatch created recovery or reached the network"
+    )
 
     let readyHarness = try makeResumeHarness(fixtureRoot)
     let readySession = "local_resume_ready_001"
@@ -1003,7 +1158,11 @@ private extension SDKResumeLifecycleTests {
       localSessionID: deletionSession
     )
     let deletionCode = String(repeating: "F", count: 43)
-    let deletionApproval = try approveResumeLaunch(deletionHarness.gate, code: deletionCode)
+    let deletionApproval = try approveResumeLaunch(
+      deletionHarness.gate,
+      code: deletionCode,
+      expectedSessionID: "session_synthetic"
+    )
     do {
       _ = try await deletionHarness.coordinator.resume(
         resumeInput(
@@ -1021,7 +1180,8 @@ private extension SDKResumeLifecycleTests {
     }
     let retainedDeletion = try retainedLaunchCode(
       deletionHarness.gate,
-      approved: deletionApproval
+      approved: deletionApproval,
+      expectedSessionID: "session_synthetic"
     )
     try require(
       retainedDeletion == deletionCode,
@@ -1131,7 +1291,8 @@ private extension SDKResumeLifecycleTests {
     let collisionCode = String(repeating: "H", count: 43)
     let collisionApproval = try approveResumeLaunch(
       collisionHarness.gate,
-      code: collisionCode
+      code: collisionCode,
+      expectedSessionID: "session_history_collision"
     )
     do {
       _ = try await collisionHarness.coordinator.resume(
@@ -1164,7 +1325,8 @@ private extension SDKResumeLifecycleTests {
     try require(collisionHarness.exchanger.requests.isEmpty, "Historical collision reached network")
     let retainedCollision = try retainedLaunchCode(
       collisionHarness.gate,
-      approved: collisionApproval
+      approved: collisionApproval,
+      expectedSessionID: "session_history_collision"
     )
     try require(
       retainedCollision == collisionCode,
@@ -1318,6 +1480,10 @@ private extension SDKResumeLifecycleTests {
       receiptJournal.state == .receiptValidatedQueueCommitPending,
       "Installed receipt was not discoverable after CAS ambiguity"
     )
+    try require(
+      receiptJournal.buildIdentityJSON != nil && receiptJournal.captureScopeJSON != nil,
+      "RESUME receipt journal cannot reproduce a migrated-artifact backfill"
+    )
     let status = try harness.coordinator.recoveryStatus(localSessionID: localSessionID)
     try require(
       status.state == .receiptValidatedQueueCommitPending && status.canRecoverWithoutLaunch,
@@ -1334,6 +1500,10 @@ private extension SDKResumeLifecycleTests {
     try require(
       recovered.credentialID == receiptJournal.newCredentialID,
       "Receipt recovery committed the wrong credential"
+    )
+    try require(
+      harness.queues.queues[localSessionID]?.hasDurableSessionArtifacts == true,
+      "Headless RESUME recovery dropped its artifact backfill"
     )
     try require(
       harness.credentials.values[previousCredentialID] == nil,
@@ -1629,12 +1799,17 @@ private extension SDKResumeLifecycleTests {
   static func nearLimitV2ResumeReservesReceiptAnchorGrowth(
     _ fixtureRoot: URL
   ) async throws {
-    let harness = try makeResumeHarness(fixtureRoot)
+    // The coordinator's internal byte ceiling is lowered for this boundary test so CI crosses the
+    // exact serialized reserve without repeatedly parsing a synthetic 32 MiB queue.
+    let maximumBytes = 256 * 1_024
+    let harness = try makeResumeHarness(
+      fixtureRoot,
+      preparedQueueEncodedByteLimit: maximumBytes
+    )
     let localSessionID = "local_resume_v2_anchor_reserve_001"
     let previousCredentialID = "credential_v2_reserve_old"
     let generatedCredentialID = "credential_00000000000000000000000000000002"
     let requestedAt = "2026-07-21T10:05:00Z"
-    let maximumBytes = TacuaTransportQueueV3.maximumEncodedBytes
     let requiredGrowthReserve = 56
 
     func queue(paddingByteCount: Int) throws -> TacuaTransportQueueV3 {
@@ -1652,6 +1827,7 @@ private extension SDKResumeLifecycleTests {
           bootSessionID: harness.clock.bootSessionID
         )
       )
+      value.sessionRetentionAuthority = currentTestRetentionAuthority()
       func request(paddingByteCount: Int) throws -> (Data, String) {
         var object: [String: TacuaJSONValue] = [
           "padding": .string(String(repeating: "p", count: paddingByteCount)),
@@ -1677,33 +1853,22 @@ private extension SDKResumeLifecycleTests {
           canonicalRequest: canonicalRequest,
           localPayloadPath: nil,
           localPayloadBindings: nil,
-          state: .queued,
+          state: .outcomeUnknown,
           canonicalResponse: nil,
           responseDigest: nil,
           responseArtifactDigest: nil
         )
       }
-      // Canonical queue artifacts are individually capped at 4 MiB. Seven shared 3 MB requests
-      // provide most of the bulk; only the eighth request changes during boundary calibration.
-      let fixedRequestCount = 7
-      let fixedPaddingBytes = 3_000_000
-      let variablePaddingBytes = paddingByteCount - fixedRequestCount * fixedPaddingBytes
+      // A single request is sufficient because this test uses the coordinator's lower internal
+      // ceiling; production continues to use the queue's full 32 MiB maximum by default.
+      let variablePaddingBytes = paddingByteCount
       guard variablePaddingBytes > 0 else {
         throw ResumeLifecycleTestFailure.assertion("Reserve fixture padding is too small")
       }
-      let fixed = try request(paddingByteCount: fixedPaddingBytes)
-      var operations = (0..<fixedRequestCount).map {
-        operation(index: $0, canonicalRequest: fixed.0, requestDigest: fixed.1)
-      }
       let variable = try request(paddingByteCount: variablePaddingBytes)
-      operations.append(
-        operation(
-          index: fixedRequestCount,
-          canonicalRequest: variable.0,
-          requestDigest: variable.1
-        )
-      )
-      value.operations = operations
+      value.operations = [
+        operation(index: 0, canonicalRequest: variable.0, requestDigest: variable.1)
+      ]
       value.transportConfigurationDigest = nil
       value.credentialCapability = .requiresTransportRebind
       try value.validate()
@@ -1740,7 +1905,7 @@ private extension SDKResumeLifecycleTests {
 
     // Queue Data is base64 in the durable JSON, so three padding bytes change the encoded queue
     // by four bytes. Calibrate once toward the middle of the final 56-byte window.
-    let seedPaddingBytes = 25_000_000
+    let seedPaddingBytes = 150_000
     let seedSize = try oldSyntheticSize(queue(paddingByteCount: seedPaddingBytes))
     let targetSize = maximumBytes - 28
     let calibratedPaddingBytes = seedPaddingBytes + ((targetSize - seedSize) * 3 / 4)
@@ -1762,7 +1927,11 @@ private extension SDKResumeLifecycleTests {
     harness.credentials.values[previousCredentialID] = Data(repeating: 0x31, count: 32)
     harness.queues.queues[localSessionID] = base
     let launchCode = String(repeating: "P", count: 43)
-    let approved = try approveResumeLaunch(harness.gate, code: launchCode)
+    let approved = try approveResumeLaunch(
+      harness.gate,
+      code: launchCode,
+      expectedSessionID: "session_v2_anchor_reserve"
+    )
 
     do {
       _ = try await harness.coordinator.resume(
@@ -1784,7 +1953,11 @@ private extension SDKResumeLifecycleTests {
       harness.exchanger.requests.isEmpty,
       "Growth-reserve refusal reached the network"
     )
-    let retained = try retainedLaunchCode(harness.gate, approved: approved)
+    let retained = try retainedLaunchCode(
+      harness.gate,
+      approved: approved,
+      expectedSessionID: "session_v2_anchor_reserve"
+    )
     try require(retained == launchCode, "Growth-reserve refusal consumed reviewer consent")
     try require(
       harness.credentials.values[previousCredentialID] != nil,
@@ -1842,7 +2015,11 @@ private extension SDKResumeLifecycleTests {
       clock: harness.clock
     )
     let code = String(repeating: "O", count: 43)
-    let approved = try approveResumeLaunch(harness.gate, code: code)
+    let approved = try approveResumeLaunch(
+      harness.gate,
+      code: code,
+      expectedSessionID: nil
+    )
 
     do {
       _ = try await startCoordinator.start(
@@ -1855,7 +2032,11 @@ private extension SDKResumeLifecycleTests {
         "START cross-gate surfaced the wrong error"
       )
     }
-    let retainedStart = try retainedLaunchCode(harness.gate, approved: approved)
+    let retainedStart = try retainedLaunchCode(
+      harness.gate,
+      approved: approved,
+      expectedSessionID: nil
+    )
     try require(
       retainedStart == code,
       "START cross-gate consumed reviewer consent"

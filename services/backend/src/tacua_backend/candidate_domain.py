@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Production ticket-candidate transitions over immutable stored chains.
 
 This module constructs only the next version.  The canonical ticket-candidate
@@ -42,7 +44,13 @@ ContractError = TICKET_CONTRACT.ContractError
 
 _ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{2,63}$")
 _DIGEST_PATTERN = re.compile(r"^sha256:[a-f0-9]{64}$")
-_ACTIONS = {"resolve_clarification", "mark_ready", "approve", "reject"}
+_ACTIONS = {
+    "edit_content",
+    "resolve_clarification",
+    "mark_ready",
+    "approve",
+    "reject",
+}
 _COMMON_FIELDS = {
     "action",
     "actor_id",
@@ -54,6 +62,7 @@ _COMMON_FIELDS = {
     "reason",
 }
 _ACTION_FIELDS = {
+    "edit_content": {"content"},
     "resolve_clarification": {
         "clarification_id",
         "choice_id",
@@ -155,6 +164,13 @@ def _validate_body(body: Any, authenticated_reviewer_id: str) -> dict[str, Any]:
             _require_text(note, "$.resolution_note", 4096)
     elif action == "approve":
         _require_id(body["approval_id"], "$.approval_id")
+    elif action == "edit_content":
+        _require(
+            isinstance(body["content"], dict),
+            "TRANSITION_FIELD_INVALID",
+            "$.content",
+            "edited candidate content must be an object",
+        )
     return body
 
 
@@ -286,6 +302,18 @@ def _resolve_clarification(
 
 def _target_state(candidate: dict[str, Any], body: dict[str, Any]) -> str:
     action = body["action"]
+    if action == "edit_content":
+        _require(
+            candidate["state"] in {"draft", "needs_clarification", "ready_for_review"},
+            "ILLEGAL_TRANSITION_ACTION",
+            "$.action",
+            "content editing requires a non-terminal candidate",
+        )
+        return (
+            "needs_clarification"
+            if _unresolved_blocking(candidate["content"])
+            else "draft"
+        )
     if action == "resolve_clarification":
         return _resolve_clarification(candidate, body)
     if action == "mark_ready":
@@ -345,7 +373,15 @@ def _assert_payload_preserved(
         )
 
     expected_content = copy.deepcopy(parent["content"])
-    if body["action"] == "resolve_clarification":
+    if body["action"] == "edit_content":
+        expected_content = copy.deepcopy(body["content"])
+        _require(
+            expected_content != parent["content"],
+            "EDIT_CONTENT_UNCHANGED",
+            "$.content",
+            "content edit must change the candidate",
+        )
+    elif body["action"] == "resolve_clarification":
         clarification = next(
             item
             for item in expected_content["clarifications"]
@@ -388,6 +424,7 @@ def apply_transition(
     candidate["lineage"] = {
         "operation": {
             "resolve_clarification": "clarification_answered",
+            "edit_content": "edited",
             "mark_ready": "reviewed",
             "approve": "approved",
             "reject": "rejected",
@@ -401,6 +438,8 @@ def apply_transition(
         ],
     }
 
+    if request["action"] == "edit_content":
+        candidate["content"] = copy.deepcopy(request["content"])
     target_state = _target_state(candidate, request)
     _assert_payload_preserved(parent, candidate, request)
     candidate["state"] = target_state
@@ -419,7 +458,7 @@ def apply_transition(
         {
             "status": (
                 "in_review"
-                if target_state == "needs_clarification"
+                if target_state in {"draft", "needs_clarification"}
                 else "reviewed"
             ),
             "reviewer_action_required": target_state

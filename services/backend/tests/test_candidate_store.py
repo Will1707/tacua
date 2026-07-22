@@ -72,6 +72,10 @@ def body(parent: dict, action: str, **changes: object) -> dict:
                 "selected_choice_id": "choice_use_approved",
             }
         )
+    elif action == "edit_content":
+        content = copy.deepcopy(parent["content"])
+        content["title"] = "Reviewer-corrected ticket title"
+        result["content"] = content
     result.update(changes)
     return result
 
@@ -141,6 +145,68 @@ class CandidateStoreTests(unittest.TestCase):
             "CANDIDATE_ALREADY_EXISTS",
             lambda: self.store.insert_generated(conflict),
         )
+
+    def test_split_and_merge_shapes_cannot_bypass_the_unimplemented_review_operation(self) -> None:
+        source_ref = {
+            "candidate_id": self.generated["candidate_id"],
+            "candidate_version": self.generated["candidate_version"],
+            "candidate_digest": self.generated["candidate_digest"],
+        }
+        other_ref = {
+            "candidate_id": "candidate_other_issue",
+            "candidate_version": 1,
+            "candidate_digest": "sha256:" + "c" * 64,
+        }
+        for operation, parents in (
+            ("split", [source_ref]),
+            ("merged", [source_ref, other_ref]),
+        ):
+            with self.subTest(operation=operation):
+                candidate = copy.deepcopy(self.generated)
+                candidate["candidate_id"] = f"candidate_{operation}_result"
+                candidate["lineage"] = {
+                    "operation": operation,
+                    "parents": copy.deepcopy(parents),
+                }
+                candidate["transition"] = {
+                    "from_state": None,
+                    "to_state": "draft",
+                    "actor": {
+                        "actor_type": "human",
+                        "actor_id": REVIEWER,
+                    },
+                    "occurred_at": candidate["version_created_at"],
+                    "reason": f"reviewer_{operation}_candidate",
+                }
+                candidate["review"] = {
+                    "status": "in_review",
+                    "reviewer_action_required": True,
+                    "last_human_actor_id": REVIEWER,
+                    "last_reviewed_at": candidate["version_created_at"],
+                    "notes": [],
+                }
+                candidate = TICKET_CONTRACT.seal(candidate)
+                TICKET_CONTRACT.validate_chain([candidate])
+                self.assert_store_error(
+                    409,
+                    "INVALID_GENERATED_HEAD",
+                    lambda candidate=candidate: self.store.insert_generated(candidate),
+                )
+
+        self.insert()
+        for action in ("split", "merge"):
+            with self.subTest(action=action):
+                request = body(self.generated, action)
+                self.assert_store_error(
+                    400,
+                    "INVALID_TRANSITION_ACTION",
+                    lambda request=request: self.store.transition(
+                        self.generated["candidate_id"],
+                        if_match=self.generated["candidate_digest"],
+                        idempotency_key=f"{action}:not-implemented",
+                        body=request,
+                    ),
+                )
 
     def test_generated_insert_guard_runs_atomically_before_candidate_writes(self) -> None:
         with closing(self.connect()) as connection, connection:
@@ -237,6 +303,31 @@ class CandidateStoreTests(unittest.TestCase):
         TICKET_CONTRACT.validate_chain(
             [self.store.get(self.generated["candidate_id"], version) for version in (1, 2, 3)]
         )
+
+    def test_content_edit_is_a_durable_bound_version_and_exact_retry(self) -> None:
+        parent = self.insert()
+        request = body(parent, "edit_content")
+        response = self.store.transition(
+            parent["candidate_id"],
+            if_match=parent["candidate_digest"],
+            idempotency_key="edit:001",
+            body=request,
+        )
+        edited = json.loads(response.body)
+        self.assertEqual("needs_clarification", edited["state"])
+        self.assertEqual("edited", edited["lineage"]["operation"])
+        self.assertEqual(request["content"], edited["content"])
+        self.assertNotEqual(
+            parent["candidate_content_digest"], edited["candidate_content_digest"]
+        )
+        replay = self.store.transition(
+            parent["candidate_id"],
+            if_match=parent["candidate_digest"],
+            idempotency_key="edit:001",
+            body=copy.deepcopy(request),
+        )
+        self.assertEqual(response.body, replay.body)
+        TICKET_CONTRACT.validate_chain([parent, edited])
 
     def test_approval_guard_runs_on_exact_parent_and_rolls_back_its_writes(self) -> None:
         self.insert()

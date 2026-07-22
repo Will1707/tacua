@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import * as TacuaCapture from "@tacua/ios-capture-spike";
+import * as TacuaCapture from "@tacua/mobile-sdk";
 
 const buildIdentity: TacuaCapture.BackendBuildIdentity = {
   protocol_version: "tacua.sdk-backend@1.0.0",
@@ -69,6 +69,31 @@ const resumeOptions: TacuaCapture.BackendResumeSessionOptions = {
   requestedAt: "2026-07-21T10:57:00Z",
 };
 
+const createPlanOptions: TacuaCapture.CreateCaptureSessionPlanOptions = {
+  approvedLaunchId: "approved_fixture",
+  segmentDurationSeconds: 10,
+};
+
+const createPlanCannotChooseIdentity: TacuaCapture.CreateCaptureSessionPlanOptions =
+  {
+    ...createPlanOptions,
+    // @ts-expect-error Build identity is generated and validated by native code.
+    buildIdentity,
+  };
+
+const resumePlanOptions: TacuaCapture.ResumeCaptureSessionPlanOptions = {
+  approvedLaunchId: "approved_resume_fixture",
+  localSessionId: "local_fixture",
+  segmentDurationSeconds: 10,
+};
+
+const resumePlanCannotChooseScope: TacuaCapture.ResumeCaptureSessionPlanOptions =
+  {
+    ...resumePlanOptions,
+    // @ts-expect-error Scope is loaded from the durable native queue.
+    scope,
+  };
+
 const resumeOptionsCannotChooseSessionState: TacuaCapture.BackendResumeSessionOptions =
   {
     ...resumeOptions,
@@ -81,6 +106,13 @@ const resumeOptionsCannotChooseCredential: TacuaCapture.BackendResumeSessionOpti
     ...resumeOptions,
     // @ts-expect-error The previous credential is derived from the committed queue.
     previousCredentialId: "credential_host_must_not_choose",
+  };
+
+const deletionOptionsCannotChooseReason: TacuaCapture.BackendDeleteSessionOptions =
+  {
+    localSessionId: "local_fixture",
+    // @ts-expect-error V1 deletion is always the fixed user_requested operation.
+    deletionReason: "operator_requested",
   };
 
 const resumeRecoveryStates: Record<
@@ -150,18 +182,38 @@ const recoveryStates: Record<
 export async function typecheckBackendContract(): Promise<void> {
   const transport: TacuaCapture.BackendTransportConfiguration =
     TacuaCapture.getBackendTransportConfiguration();
-  const queueSchemaVersion: 3 = transport.queueSchemaVersion;
+  const queueSchemaVersion: 4 = transport.queueSchemaVersion;
+  const sdkProfileContractVersion: "tacua.sdk-profile@1.0.0" =
+    transport.sdkProfileContractVersion;
+  const sdkProfileDigest: string = transport.sdkProfileDigest;
+  const discovered: readonly TacuaCapture.BackendSessionDiscoveryRecord[] =
+    await TacuaCapture.listBackendSessions();
+  for (const record of discovered) {
+    const discoveredQueue: TacuaCapture.BackendQueueStatus =
+      await TacuaCapture.getBackendQueueStatus(record.localSessionId);
+    const discoveredStartRecovery: TacuaCapture.BackendStartRecoveryStatus =
+      await TacuaCapture.getBackendStartRecoveryStatus(record.localSessionId);
+    void discoveredQueue;
+    void discoveredStartRecovery;
+  }
 
   const pending: TacuaCapture.BackendLaunchConsentRequest =
     TacuaCapture.prepareBackendLaunch(
       "tacua-fixture://tacua/start?launch_code=opaque",
     );
+  const expectedLaunchSession: string | null = pending.expectedSessionId;
+  void expectedLaunchSession;
   const approved: TacuaCapture.ApprovedBackendLaunch =
     TacuaCapture.confirmBackendLaunchConsent(pending.consentRequestId, true);
   TacuaCapture.cancelBackendLaunch(approved.approvedLaunchId);
 
+  const startedPlan: TacuaCapture.StartedCaptureSessionPlan =
+    await TacuaCapture.createCaptureSessionPlan(createPlanOptions);
   const started: TacuaCapture.BackendStartedSession =
-    await TacuaCapture.startBackendSession(startOptions);
+    startedPlan.backendSession;
+  const generatedStartOptions: TacuaCapture.CaptureStartOptions =
+    startedPlan.captureOptions;
+  const surfacedLocalSessionId: string = startedPlan.localSessionId;
   const activeCapability: "active" = started.credentialCapability;
   const startedCredentialAvailability:
     | Exclude<
@@ -173,8 +225,10 @@ export async function typecheckBackendContract(): Promise<void> {
   const uploadsConnected: false = started.uploadsConnected;
   const completionConnected: false = started.completionConnected;
 
+  const resumedPlan: TacuaCapture.ResumedCaptureSessionPlan =
+    await TacuaCapture.resumeCaptureSessionPlan(resumePlanOptions);
   const resumed: TacuaCapture.BackendResumedSession =
-    await TacuaCapture.resumeBackendSession(resumeOptions);
+    resumedPlan.backendSession;
   const resumedCredentialAvailability:
     | Exclude<
         NonNullable<TacuaCapture.BackendQueueStatus["credentialAvailability"]>,
@@ -206,6 +260,13 @@ export async function typecheckBackendContract(): Promise<void> {
       void exhaustive;
     }
   }
+
+  if (resumedPlan.captureOptions === null) {
+    // Completed RESUME authority deliberately cannot restart ReplayKit.
+    return;
+  }
+  const generatedResumeOptions: TacuaCapture.CaptureStartOptions =
+    resumedPlan.captureOptions;
 
   const resumeRecovery: TacuaCapture.BackendResumeRecoveryStatus =
     await TacuaCapture.getBackendResumeRecoveryStatus(resumed.localSessionId);
@@ -239,6 +300,11 @@ export async function typecheckBackendContract(): Promise<void> {
   }
   const recoveredResume: TacuaCapture.BackendResumedSession =
     await TacuaCapture.recoverBackendResume(resumed.localSessionId);
+  const recoveredResumePlan: TacuaCapture.ResumedCaptureSessionPlan =
+    await TacuaCapture.recoverResumedCaptureSessionPlan({
+      localSessionId: resumed.localSessionId,
+      segmentDurationSeconds: generatedResumeOptions.segmentDurationSeconds,
+    });
   await TacuaCapture.resetPreparedBackendResume(resumed.localSessionId);
 
   const recovery: TacuaCapture.BackendStartRecoveryStatus =
@@ -262,7 +328,18 @@ export async function typecheckBackendContract(): Promise<void> {
 
   const recovered: TacuaCapture.BackendStartedSession =
     await TacuaCapture.recoverBackendStart(started.localSessionId);
+  const recoveredStartPlan: TacuaCapture.StartedCaptureSessionPlan =
+    await TacuaCapture.recoverStartedCaptureSessionPlan({
+      localSessionId: started.localSessionId,
+      segmentDurationSeconds: generatedStartOptions.segmentDurationSeconds,
+    });
   await TacuaCapture.abandonBackendStart(recovered.localSessionId, true);
+
+  // Explicitly named advanced surfaces remain available only for legacy migration tooling.
+  const advancedStarted: TacuaCapture.BackendStartedSession =
+    await TacuaCapture.advancedStartBackendSession(startOptions);
+  const advancedResumed: TacuaCapture.BackendResumedSession =
+    await TacuaCapture.advancedResumeBackendSession(resumeOptions);
 
   const queue: TacuaCapture.BackendQueueStatus =
     await TacuaCapture.getBackendQueueStatus(started.localSessionId);
@@ -325,10 +402,77 @@ export async function typecheckBackendContract(): Promise<void> {
     }
   }
 
+  const admission: TacuaCapture.BackendCaptureAdmission =
+    await TacuaCapture.admitFinalizedCapture(started.localSessionId);
+  const migratedAdmission: TacuaCapture.BackendCaptureAdmission =
+    await TacuaCapture.advancedAdmitFinalizedCapture({
+      localSessionId: started.localSessionId,
+      buildIdentity,
+      scope,
+    });
+
+  const deleted: TacuaCapture.BackendDeletedSession =
+    await TacuaCapture.deleteBackendSession({
+      localSessionId: started.localSessionId,
+    });
+  const deletionId: "deletion_user_requested_000001" = deleted.deletionId;
+  const deletionReason: "user_requested" = deleted.deletionReason;
+  const remoteDataDeleted: true = deleted.remoteDataDeleted;
+  const localSessionRetired: true = deleted.localSessionRetired;
+  const credentialRemoved: true = deleted.credentialRemoved;
+
   const eventMap: TacuaCapture.CaptureEventMap = {} as TacuaCapture.CaptureEventMap;
   const stateEvent: TacuaCapture.CaptureStatus = eventMap.onState;
+  const diagnosticEventCount: number = stateEvent.diagnosticEventCount;
+  const diagnosticContainsCollectionGap: boolean =
+    stateEvent.diagnosticContainsCollectionGap;
+  const routeReceipt: TacuaCapture.DiagnosticEventReceipt =
+    await TacuaCapture.recordRouteTransition({
+      fromRoute: "/projects/{project_id}",
+      toRoute: "/projects/{project_id}/review",
+      trigger: "user",
+    });
+  const interactionReceipt: TacuaCapture.DiagnosticEventReceipt =
+    await TacuaCapture.recordUserInteraction({
+      action: "tap",
+      target: "review_submit",
+    });
+  const runtimeReceipt: TacuaCapture.DiagnosticEventReceipt =
+    await TacuaCapture.recordRuntimeError({
+      errorClass: "ui_render",
+      sanitizedMessage: "The review view could not render.",
+      stackTraceDigest: `sha256:${"d".repeat(64)}`,
+      handled: true,
+    });
+  const networkReceipt: TacuaCapture.DiagnosticEventReceipt =
+    await TacuaCapture.recordNetworkRequestCompleted({
+      method: "POST",
+      host: "api.example.test",
+      pathTemplate: "/reviews/{review_id}",
+      statusCode: 503,
+      durationMilliseconds: 250,
+      traceId: "e".repeat(32),
+    });
+  const customReceipt: TacuaCapture.DiagnosticEventReceipt =
+    await TacuaCapture.recordCustomState({
+      providerId: "navigation_snapshot",
+      collectionStatus: "available",
+      snapshotDigest: `sha256:${"f".repeat(64)}`,
+    });
+  await TacuaCapture.recordCustomState({
+    providerId: "navigation_snapshot",
+    collectionStatus: "unavailable",
+  });
+  // @ts-expect-error Available custom state must truthfully provide a digest.
+  const invalidAvailableCustomState: TacuaCapture.DiagnosticCustomStateOptions = {
+    providerId: "navigation_snapshot",
+    collectionStatus: "available",
+    snapshotDigest: undefined,
+  };
 
   void queueSchemaVersion;
+  void sdkProfileContractVersion;
+  void sdkProfileDigest;
   void activeCapability;
   void startedCredentialAvailability;
   void receivingState;
@@ -342,8 +486,18 @@ export async function typecheckBackendContract(): Promise<void> {
   void resumedCompletionConnected;
   void resumeRecoveryStateIsKnown;
   void recoveredResume;
+  void recoveredResumePlan;
+  void recoveredStartPlan;
+  void advancedStarted;
+  void advancedResumed;
+  void createPlanCannotChooseIdentity;
+  void resumePlanCannotChooseScope;
+  void generatedStartOptions;
+  void generatedResumeOptions;
+  void surfacedLocalSessionId;
   void resumeOptionsCannotChooseSessionState;
   void resumeOptionsCannotChooseCredential;
+  void deletionOptionsCannotChooseReason;
   void recoveryStateIsKnown;
   void nullableResume;
   void nullableTransportMatch;
@@ -354,5 +508,20 @@ export async function typecheckBackendContract(): Promise<void> {
   void resumeRequired;
   void transportMatches;
   void resumeRequirement;
+  void admission;
+  void migratedAdmission;
+  void deletionId;
+  void deletionReason;
+  void remoteDataDeleted;
+  void localSessionRetired;
+  void credentialRemoved;
   void stateEvent;
+  void diagnosticEventCount;
+  void diagnosticContainsCollectionGap;
+  void routeReceipt;
+  void interactionReceipt;
+  void runtimeReceipt;
+  void networkReceipt;
+  void customReceipt;
+  void invalidAvailableCustomState;
 }

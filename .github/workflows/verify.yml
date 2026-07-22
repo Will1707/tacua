@@ -2,6 +2,8 @@ name: Verify
 
 on:
   push:
+    branches:
+      - '**'
   pull_request:
 
 permissions:
@@ -10,7 +12,7 @@ permissions:
 jobs:
   contracts-and-harnesses:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -20,13 +22,23 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
-          python-version: '3.13'
+          python-version: '3.13.14'
 
       - name: Set up Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          node-version: '22'
+          node-version: '22.22.2'
           package-manager-cache: false
+
+      - name: Validate release artifact input boundaries
+        run: |
+          node --test .github/scripts/check-markdown-links.test.mjs
+          node --test .github/scripts/package-mobile-sdk.test.mjs
+          node --test .github/scripts/validate-backend-image-inputs.test.mjs
+          node --test .github/scripts/validate-mobile-sdk-release-run.test.mjs
+          node --test .github/scripts/verify-backend-container.test.mjs
+          node .github/scripts/check-markdown-links.mjs
+          node .github/scripts/validate-backend-image-inputs.mjs
 
       - name: Validate approved-handoff candidate
         working-directory: contracts/approved-handoff
@@ -58,6 +70,12 @@ jobs:
       - name: Validate the pilot backend boundary
         run: PYTHONWARNINGS=error python3 -B -m unittest discover -s services/backend/tests -v
 
+      - name: Verify the sealed backend config example
+        run: >-
+          PYTHONPATH=services/backend/src python3 -B -m tacua_backend.config_tool
+          services/backend/config.template.example.json
+          --output services/backend/config.example.json --check
+
       - name: Validate synthetic evaluation harness
         working-directory: experiments/eval-harness
         run: |
@@ -78,34 +96,68 @@ jobs:
         working-directory: apps/reviewer
         run: |
           npm ci --ignore-scripts --no-audit --no-fund
+          npm test
           npm run typecheck
-          npx expo export --platform ios --output-dir /tmp/tacua-reviewer-export
+          ./node_modules/.bin/expo export --platform ios --output-dir /tmp/tacua-reviewer-export
+
+      - name: Build and smoke-test the self-hosted backend image
+        run: bash .github/scripts/verify-backend-container.sh
 
       - name: Ensure verification artifacts are reproducible
-        run: git diff --exit-code
+        run: |
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=all)"
 
   ios-capture-boundary:
     runs-on: macos-15
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
-      - name: Run platform-independent capture policy tests
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '22.22.2'
+          package-manager-cache: false
+
+      - name: Install physical-device harness dependencies
+        working-directory: experiments/ios-capture-spike/harness
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Run SDK core and harness type checks
         working-directory: experiments/ios-capture-spike/package
         run: sh tests/run-core-tests.sh
 
-      - name: Type-check the physical-device harness
+      - name: Verify the SDK release-package boundary and reproducibility
+        run: |
+          sdk_version="$(node -p "require('./experiments/ios-capture-spike/package/package.json').version")"
+          node .github/scripts/package-mobile-sdk.mjs \
+            --tag "mobile-sdk-v${sdk_version}" \
+            --out-dir "$RUNNER_TEMP/tacua-mobile-sdk-verification" \
+            > "$RUNNER_TEMP/tacua-mobile-sdk-verification.json"
+
+      - name: Compile the SDK through a generated Expo iOS project
         working-directory: experiments/ios-capture-spike/harness
         run: |
-          npm ci --ignore-scripts --no-audit
-          npm run typecheck
+          ./node_modules/.bin/expo prebuild --platform ios --no-install
+          cd ios
+          pod install
+          xcodebuild -quiet \
+            -workspace TacuaCaptureLab.xcworkspace \
+            -scheme TacuaCaptureLab \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO \
+            build
 
       - name: Compile the ReplayKit API boundary
         run: |
           xcrun swiftc -typecheck \
+            -module-cache-path "$RUNNER_TEMP/tacua-replaykit-module-cache" \
             -target arm64-apple-ios17.0 \
             -sdk "$(xcrun --sdk iphoneos --show-sdk-path)" \
             experiments/ios-capture-api-probe/CaptureAPIProbe.swift

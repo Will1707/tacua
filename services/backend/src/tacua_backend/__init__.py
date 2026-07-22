@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Dependency-free self-hosted Tacua backend."""
 
 __version__ = "0.2.0"

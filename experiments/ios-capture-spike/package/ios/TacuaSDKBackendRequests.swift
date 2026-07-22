@@ -19,14 +19,6 @@ struct TacuaTransientLaunchRequest: Equatable {
   let requestDigest: String
 }
 
-struct TacuaPreparedBackendRequest: Equatable {
-  let kind: TacuaQueuedOperationKind
-  let operationID: String
-  let credentialID: String
-  let canonicalData: Data
-  let requestDigest: String
-}
-
 struct TacuaSegmentTransportMetadata: Equatable {
   let contentType: String
   let sizeBytes: Int64
@@ -124,7 +116,10 @@ enum TacuaSDKBackendRequests {
     requestedAt: String,
     configuration: TacuaBackendConfiguration
   ) throws -> TacuaTransientLaunchRequest {
-    try consentGate.withApprovedLaunchCode(approvedLaunchID: approvedLaunchID) { launchCode in
+    try consentGate.withApprovedLaunchCode(
+      approvedLaunchID: approvedLaunchID,
+      expectedSessionID: expectedSessionID
+    ) { launchCode in
       try launchAfterConsent(
         preparedCredential: preparedCredential,
         launchCode: launchCode,
@@ -362,6 +357,47 @@ enum TacuaSDKBackendRequests {
     ]
     let digest = try digestAndSeal(&object, field: "request_digest")
     return try prepared(.deletion, deletionID, credentialID, object, digest)
+  }
+
+  /// Rebinds an already durable request without allowing its semantic operation identity to
+  /// change. The queue independently compares the old and replacement values before installing
+  /// this candidate; this helper provides the one canonical way to reseal the permitted fields.
+  static func rebound(
+    _ operation: TacuaQueuedOperation,
+    credentialID: String,
+    requestedAt: String
+  ) throws -> TacuaPreparedBackendRequest {
+    guard validIdentifier(credentialID), validIdentifier(operation.operationID) else {
+      throw TacuaSDKBackendRequestError.invalidIdentifier
+    }
+    try validateTimestamp(requestedAt)
+    let validatedKind = try TacuaSDKBackendProtocol.validateRequest(operation.canonicalRequest)
+    let expectedKind: TacuaBackendOperationKind
+    switch operation.kind {
+    case .segment: expectedKind = .segment
+    case .diagnostic: expectedKind = .diagnostic
+    case .completion: expectedKind = .completion
+    case .deletion: expectedKind = .deletion
+    }
+    guard validatedKind == expectedKind,
+      case .object(var object) = try TacuaCanonicalJSON.parse(operation.canonicalRequest)
+    else { throw TacuaSDKBackendRequestError.invalidArtifact }
+    let digestField = operation.kind == .segment ? "intent_digest" : "request_digest"
+    object["credential_id"] = .string(credentialID)
+    object["requested_at"] = .string(requestedAt)
+    object.removeValue(forKey: digestField)
+    let digest = try digestAndSeal(&object, field: digestField)
+    let candidate = try prepared(
+      operation.kind,
+      operation.operationID,
+      credentialID,
+      object,
+      digest
+    )
+    guard try TacuaSDKBackendProtocol.validateRequest(candidate.canonicalData) == expectedKind else {
+      throw TacuaSDKBackendRequestError.invalidArtifact
+    }
+    return candidate
   }
 
   private static func prepared(

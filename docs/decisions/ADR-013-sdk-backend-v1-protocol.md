@@ -45,7 +45,12 @@ artifacts. The protocol has these properties:
    resumed completed session gets only completion-replay-or-delete capability.
    Deleted sessions cannot resume. The server retains ordered credential
    history, so a rotation does not invalidate receipts accepted earlier under
-   the credential that was current at that server acceptance time.
+   the credential that was current at that server acceptance time. V1 bounds
+   that history to 64 credentials with zero-based ordinals `0...63`. Resume
+   grant creation preflights the bound and the exchange transaction rechecks
+   it so concurrent one-time grants cannot create a 65th credential. Once the
+   bound is reached, recovery returns `CREDENTIAL_ROTATION_LIMIT_REACHED`; the
+   operator deletes the bounded session and starts a new capture.
 4. Every operation has a client-generated ID and canonical request digest.
    Exact retries return the exact durable receipt; same-ID conflicts fail. The
    backend first verifies the current bearer against its server-owned route,
@@ -55,8 +60,25 @@ artifacts. The protocol has these properties:
    credential may recover an exact upload accepted under an earlier credential
    in the same rotation history without rewriting the stored request or
    receipt. A current completed-session credential may recover only its bound
-   exact completion (and delete), never an upload. A lookup miss requires a new
-   operation whose body and Authorization both name the current credential.
+   exact completion (and delete), never an upload. A lookup miss requires the
+   absent logical operation to be rebuilt so its body and Authorization both
+   name the current credential.
+   When a current active receiving credential authenticates an exact upload or
+   completion body naming a revoked credential from the same session history,
+   the backend performs the durable operation-ID lookup first. A miss may return one
+   `403 OPERATION_NOT_AUTHORIZED` reconciliation envelope with media type
+   `application/vnd.tacua.sdk-backend-error+json;version=1.0.0`. That canonical
+   envelope is bounded to 4 KiB and binds the session, operation kind, operation
+   ID, canonical request digest, historical request credential, and current
+   authenticating credential. The SDK exposes that one allowlisted machine
+   outcome only when status, media type, schema, canonical bytes, and every
+   binding match its exact request. Recoverable kinds are segment, diagnostic,
+   and completion; deletion is excluded. Every other non-success body remains an
+   untrusted generic HTTP status. Only after that exact proof may the SDK reuse
+   the same stable operation ID and replace `credential_id`, `requested_at`, and
+   the root request digest. Every other semantic field and every local payload
+   binding must remain identical. The outcome never authorizes an arbitrary
+   rewrite, a second logical operation, or deletion recovery.
 5. Segment IDs and sequence numbers are SDK-generated and appear in the route,
    intent, durable receipt, and runtime capture manifest. Segment ID, sequence,
    content type, sidecar digest, size, and content digest bind exactly across
@@ -99,6 +121,32 @@ artifacts. The protocol has these properties:
     Launch and resume `requested_at` are non-authoritative because those
     exchanges establish or repair the anchor. Persisted offline requests keep
     their original anchor-derived timestamp for exact retry.
+11. Before any upload, completion, or deletion request reaches the network, the
+    SDK durably records the exact canonical bytes and transitions that operation
+    to outcome-unknown. Cancellation, suspension, termination, and transport
+    failure never rewind it to prepared. Recovery replays those exact bytes;
+    only the independently authenticated historical-miss proof described above
+    can authorize the bounded same-ID rebuild, and deletion has no such rebuild
+    path in V1.
+12. A validated completion receipt independently binds every admitted local
+    payload before authorizing whole-session local retirement. A validated
+    `session_all_data` deletion tombstone may authorize the same retirement
+    without trusting a readable local manifest, followed by Keychain removal.
+    Local retirement uses an atomic hidden rename, descriptor-relative
+    no-follow traversal, and directory fsync recovery. Deletion writes a minimal
+    finalization proof before unlinking the sensitive queue, so an idempotent
+    retry never needs to repeat network deletion.
+13. START canonicalizes the exact validated `build_identity` and `capture_scope`
+    and retains only those bounded public artifacts in its secret-free crash
+    journal and queue-v4 snapshot. A validated START receipt is therefore
+    recoverable into a fully bound queue after relaunch without host memory.
+    RESUME exact-matches an existing pair or backfills a migrated nil/nil pair;
+    its journal retains the pair so receipt recovery produces the same result
+    digest. Admission defaults to queue authority and rejects host substitution.
+    A legacy nil/nil queue requires both explicitly validated artifacts until a
+    successful RESUME backfill. Launch codes, one-time approval handles,
+    credential secrets, Authorization values, and full launch requests are never
+    members of any of these durable structures.
 
 ## Consequences
 
@@ -116,6 +164,23 @@ artifacts. The protocol has these properties:
   rule that completion and deletion use the current credential.
 - Lost upload and completion responses remain recoverable after rotation, but
   the exception cannot authorize a new operation or mutate historical IDs.
+- The iOS client currently uses an ephemeral, process-bound `URLSession`, not a
+  durable background transfer. Exact queue replay provides crash recovery, but
+  V1 does not promise upload progress while the host process is suspended or
+  terminated.
+- A background `URLSession` is not a configuration-only replacement for that
+  transport. iOS background sessions follow redirects without invoking the
+  task redirect delegate and survive process exit only for file-backed uploads,
+  which conflicts with V1's redirect rejection and its mix of file and JSON
+  requests. Any future background design must separately define durable OS-task
+  identity and response publication, live snapshot ownership across relaunch,
+  app-delegate event forwarding, locked-device credential access, and
+  force-quit recovery before it can preserve the same security and replay
+  guarantees.
+- Receipt-authorized cleanup retires the full local capture namespace, including
+  corrupt, partial, protected, or unexpected remnants, without following a
+  symlink outside that namespace. Credential removal cannot precede confirmed
+  local retirement.
 - Device wall-clock changes do not participate in authorization or post-launch
   lifecycle chronology.
 - A launch code or deep link cannot select a different backend origin, and

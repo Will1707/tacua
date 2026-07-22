@@ -37,6 +37,7 @@ private enum TacuaQueueBounds {
   static let maximumLegacyItems = 4_097
   static let maximumLegacyObjectKindBytes = 64
   static let maximumPayloadBindingsPerOperation = 2
+  static let maximumSessionArtifactBytes = 256 * 1_024
 
   /// Older builds used this value when `kern.boottime` failed. It is not a boot identity: accepting
   /// it on two failures would incorrectly make distinct or unknown boot sessions compare equal.
@@ -45,6 +46,83 @@ private enum TacuaQueueBounds {
   static func validBootSessionID(_ value: String) -> Bool {
     !value.isEmpty && value != unavailableBootSessionID
       && value.utf8.count <= maximumBootSessionIDBytes
+  }
+}
+
+/// The only launch-request values retained outside Keychain. These are public, self-digesting
+/// protocol artifacts: the one-time launch code, credential secret, and complete launch request
+/// are deliberately not represented here.
+struct TacuaDurableSessionArtifacts: Equatable {
+  static let maximumArtifactBytes = TacuaQueueBounds.maximumSessionArtifactBytes
+
+  let buildIdentity: TacuaJSONValue
+  let scope: TacuaJSONValue
+  let buildIdentityJSON: Data
+  let scopeJSON: Data
+  let buildIdentityDigest: String
+  let scopeDigest: String
+  let transportConfigurationDigest: String
+
+  static func canonicalizing(
+    buildIdentityJSON: Data,
+    scopeJSON: Data
+  ) throws -> TacuaDurableSessionArtifacts {
+    guard !buildIdentityJSON.isEmpty, !scopeJSON.isEmpty,
+      buildIdentityJSON.count <= maximumArtifactBytes,
+      scopeJSON.count <= maximumArtifactBytes
+    else { throw TacuaTransportQueueError.invalidQueue }
+    let build = try TacuaCanonicalJSON.parse(
+      buildIdentityJSON,
+      maximumBytes: maximumArtifactBytes
+    )
+    let scope = try TacuaCanonicalJSON.parse(scopeJSON, maximumBytes: maximumArtifactBytes)
+    return try validated(buildIdentity: build, scope: scope)
+  }
+
+  static func exactCanonical(
+    buildIdentityJSON: String,
+    scopeJSON: String
+  ) throws -> TacuaDurableSessionArtifacts {
+    let buildData = Data(buildIdentityJSON.utf8)
+    let scopeData = Data(scopeJSON.utf8)
+    let artifacts = try canonicalizing(
+      buildIdentityJSON: buildData,
+      scopeJSON: scopeData
+    )
+    guard artifacts.buildIdentityJSON == buildData, artifacts.scopeJSON == scopeData else {
+      throw TacuaTransportQueueError.invalidQueue
+    }
+    return artifacts
+  }
+
+  private static func validated(
+    buildIdentity: TacuaJSONValue,
+    scope: TacuaJSONValue
+  ) throws -> TacuaDurableSessionArtifacts {
+    try TacuaSDKBackendProtocol.validateBuildIdentity(buildIdentity)
+    let scopeDigest = try TacuaSDKBackendProtocol.validateScope(scope)
+    guard let build = buildIdentity.objectValue,
+      let scopeObject = scope.objectValue,
+      let buildID = build["build_id"]?.stringValue,
+      let buildIdentityDigest = build["build_identity_digest"]?.stringValue,
+      let transportConfigurationDigest = build["transport_configuration_digest"]?.stringValue,
+      scopeObject["build_id"]?.stringValue == buildID,
+      scopeObject["build_identity_digest"]?.stringValue == buildIdentityDigest
+    else { throw TacuaTransportQueueError.invalidQueue }
+    let canonicalBuild = try TacuaCanonicalJSON.data(buildIdentity)
+    let canonicalScope = try TacuaCanonicalJSON.data(scope)
+    guard canonicalBuild.count <= maximumArtifactBytes,
+      canonicalScope.count <= maximumArtifactBytes
+    else { throw TacuaTransportQueueError.invalidQueue }
+    return TacuaDurableSessionArtifacts(
+      buildIdentity: buildIdentity,
+      scope: scope,
+      buildIdentityJSON: canonicalBuild,
+      scopeJSON: canonicalScope,
+      buildIdentityDigest: buildIdentityDigest,
+      scopeDigest: scopeDigest,
+      transportConfigurationDigest: transportConfigurationDigest
+    )
   }
 }
 
@@ -165,7 +243,12 @@ enum TacuaQueuedOperationKind: String, Codable, Equatable {
 }
 
 enum TacuaQueuedOperationState: String, Codable, Equatable {
-  case queued
+  /// The immutable request is durable and is known not to have reached the network yet.
+  case prepared
+  /// The request may have reached the backend. The legacy raw value is deliberately retained:
+  /// queues written before dispatch journaling could not prove that a `queued` request was never
+  /// attempted, so decoding one must conservatively treat its delivery outcome as unknown.
+  case outcomeUnknown = "queued"
   case responseStored = "response_stored"
 }
 
@@ -255,6 +338,7 @@ enum TacuaLocalPayloadRole: String, Codable, Equatable, Hashable {
   case segmentMedia = "segment_media"
   case segmentSidecar = "segment_sidecar"
   case diagnosticEnvelope = "diagnostic_envelope"
+  case diagnosticSourceJournal = "diagnostic_source_journal"
 }
 
 struct TacuaLocalPayloadBinding: Codable, Equatable, Hashable {
@@ -375,6 +459,49 @@ extension TacuaServerTimeAnchor {
   }
 }
 
+/// Immutable backend session policy established by START. RESUME rotates transport authority but
+/// must never move these deadlines: the backend derives both from the first launch `received_at`
+/// and rejects a completion manifest whose retention binding differs by even one second.
+struct TacuaSessionRetentionAuthority: Codable, Equatable {
+  let sessionReceivedAt: String
+  let rawMediaExpiresAt: String
+  let derivedDataExpiresAt: String
+
+  private enum CodingKeys: String, CodingKey {
+    case sessionReceivedAt
+    case rawMediaExpiresAt
+    case derivedDataExpiresAt
+  }
+}
+
+extension TacuaSessionRetentionAuthority {
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    sessionReceivedAt = try container.decodeBoundedString(
+      forKey: .sessionReceivedAt,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumTimestampBytes
+    )
+    rawMediaExpiresAt = try container.decodeBoundedString(
+      forKey: .rawMediaExpiresAt,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumTimestampBytes
+    )
+    derivedDataExpiresAt = try container.decodeBoundedString(
+      forKey: .derivedDataExpiresAt,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumTimestampBytes
+    )
+  }
+
+  func validate() throws {
+    guard let received = TacuaProtocolTimestamp.parseMilliseconds(sessionReceivedAt),
+      let raw = TacuaProtocolTimestamp.parseMilliseconds(rawMediaExpiresAt),
+      let derived = TacuaProtocolTimestamp.parseMilliseconds(derivedDataExpiresAt),
+      raw > received, derived > received,
+      raw - received <= 30 * 24 * 60 * 60 * 1_000,
+      derived - received <= 365 * 24 * 60 * 60 * 1_000
+    else { throw TacuaTransportQueueError.invalidQueue }
+  }
+}
+
 protocol TacuaMonotonicClock {
   var uptimeMilliseconds: Int64 { get }
   var bootSessionID: String { get }
@@ -487,7 +614,10 @@ enum TacuaCredentialCleanupState: String, Codable, Equatable {
 }
 
 struct TacuaTransportQueueV3: Codable, Equatable {
-  static let schemaVersion = 3
+  // The Swift type keeps its historical name for this experiment-only module, but the persisted
+  // wire snapshot is V4. V4 is the first queue schema which can durably prove that an operation is
+  // prepared and has never reached the network.
+  static let schemaVersion = 4
   static let maximumEncodedBytes = TacuaQueueBounds.maximumEncodedBytes
   static let maximumLocalPayloadPaths = TacuaQueueBounds.maximumLocalPayloadPaths
 
@@ -500,6 +630,10 @@ struct TacuaTransportQueueV3: Codable, Equatable {
   var transportConfigurationDigest: String?
   var remoteSessionID: String?
   var scopeDigest: String?
+  /// Exact canonical, public protocol artifacts. Nil/nil is retained only for migrated queues;
+  /// current START and successful RESUME always install both atomically.
+  var buildIdentityJSON: String?
+  var captureScopeJSON: String?
   var currentCredentialID: String?
   var currentCredentialExpiresAt: String?
   /// Historical expiry is immutable request-validation context. It lets a response for credential
@@ -508,9 +642,17 @@ struct TacuaTransportQueueV3: Codable, Equatable {
   var pendingRevokedCredentialRemovals: [String]
   var credentialCapability: TacuaTransportCredentialCapability
   var timeAnchor: TacuaServerTimeAnchor?
+  /// Nil only for queues created by older SDK builds or synthetic low-level tests. Such a queue
+  /// can still replay exact operations and delete data, but capture completion must fail closed
+  /// until this immutable START authority is available.
+  var sessionRetentionAuthority: TacuaSessionRetentionAuthority?
   var operations: [TacuaQueuedOperation]
   var localPayloadPaths: [String]
   var completionCleanupAuthority: TacuaCompletionCleanupAuthority?
+  /// A completed-session RESUME may authorize replay of one exact outcome-unknown completion even
+  /// when its receipt was lost locally. This ID is not cleanup authority; only the validated replay
+  /// receipt can install `completionCleanupAuthority`.
+  var pendingCompletionReplayID: String?
   var deletionCleanupAuthority: TacuaDeletionCleanupAuthority?
   var payloadCleanupState: TacuaPayloadCleanupState
   var credentialCleanupState: TacuaCredentialCleanupState
@@ -521,15 +663,19 @@ struct TacuaTransportQueueV3: Codable, Equatable {
     case transportConfigurationDigest
     case remoteSessionID
     case scopeDigest
+    case buildIdentityJSON
+    case captureScopeJSON
     case currentCredentialID
     case currentCredentialExpiresAt
     case credentialExpiryLedger
     case pendingRevokedCredentialRemovals
     case credentialCapability
     case timeAnchor
+    case sessionRetentionAuthority
     case operations
     case localPayloadPaths
     case completionCleanupAuthority
+    case pendingCompletionReplayID
     case deletionCleanupAuthority
     case payloadCleanupState
     case credentialCleanupState
@@ -553,6 +699,14 @@ struct TacuaTransportQueueV3: Codable, Equatable {
     scopeDigest = try container.decodeBoundedStringIfPresent(
       forKey: .scopeDigest,
       maximumUTF8Bytes: TacuaQueueBounds.maximumDigestBytes
+    )
+    buildIdentityJSON = try container.decodeBoundedStringIfPresent(
+      forKey: .buildIdentityJSON,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumSessionArtifactBytes
+    )
+    captureScopeJSON = try container.decodeBoundedStringIfPresent(
+      forKey: .captureScopeJSON,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumSessionArtifactBytes
     )
     currentCredentialID = try container.decodeBoundedStringIfPresent(
       forKey: .currentCredentialID,
@@ -578,6 +732,10 @@ struct TacuaTransportQueueV3: Codable, Equatable {
       forKey: .credentialCapability
     )
     timeAnchor = try container.decodeIfPresent(TacuaServerTimeAnchor.self, forKey: .timeAnchor)
+    sessionRetentionAuthority = try container.decodeIfPresent(
+      TacuaSessionRetentionAuthority.self,
+      forKey: .sessionRetentionAuthority
+    )
     operations = try container.decodeBoundedArray(
       TacuaQueuedOperation.self,
       forKey: .operations,
@@ -591,6 +749,10 @@ struct TacuaTransportQueueV3: Codable, Equatable {
     completionCleanupAuthority = try container.decodeIfPresent(
       TacuaCompletionCleanupAuthority.self,
       forKey: .completionCleanupAuthority
+    )
+    pendingCompletionReplayID = try container.decodeBoundedStringIfPresent(
+      forKey: .pendingCompletionReplayID,
+      maximumUTF8Bytes: TacuaQueueBounds.maximumIdentifierBytes
     )
     deletionCleanupAuthority = try container.decodeIfPresent(
       TacuaDeletionCleanupAuthority.self,
@@ -618,15 +780,19 @@ struct TacuaTransportQueueV3: Codable, Equatable {
     transportConfigurationDigest = nil
     remoteSessionID = nil
     scopeDigest = nil
+    buildIdentityJSON = nil
+    captureScopeJSON = nil
     currentCredentialID = nil
     currentCredentialExpiresAt = nil
     credentialExpiryLedger = [:]
     pendingRevokedCredentialRemovals = []
     credentialCapability = .requiresExchange
     timeAnchor = nil
+    sessionRetentionAuthority = nil
     operations = []
     self.localPayloadPaths = localPayloadPaths
     completionCleanupAuthority = nil
+    pendingCompletionReplayID = nil
     deletionCleanupAuthority = nil
     payloadCleanupState = .none
     credentialCleanupState = .none
@@ -647,9 +813,28 @@ struct TacuaTransportQueueV3: Codable, Equatable {
       try normalizeDecodedQueue(&queue)
       try queue.validate()
       return queue
+    case 3:
+      var queue = try decoder.decode(TacuaTransportQueueV3.self, from: data)
+      queue.schemaVersion = schemaVersion
+      // Queue V3 had only `queued`, whose delivery outcome was not journaled before network I/O.
+      // The current enum intentionally decodes that raw value as outcomeUnknown. Also distrust a
+      // `prepared` value in a relabelled/partially-forward-written V3 document: V3 could not make
+      // that stronger claim.
+      for index in queue.operations.indices where queue.operations[index].state == .prepared {
+        queue.operations[index].state = .outcomeUnknown
+      }
+      try normalizeDecodedQueue(&queue)
+      try queue.validate()
+      return queue
     case 2:
       var queue = try decoder.decode(TacuaTransportQueueV3.self, from: data)
       queue.schemaVersion = schemaVersion
+      // Schema v2 had no pre-network dispatch state. If bytes produced by a newer encoder are
+      // deliberately relabelled (or a partial forward migration is encountered), never accept a
+      // claim that an operation is known unsent: v2 could only prove an unknown outcome.
+      for index in queue.operations.indices where queue.operations[index].state == .prepared {
+        queue.operations[index].state = .outcomeUnknown
+      }
       switch queue.credentialCapability {
       case .requiresExchange, .deletionReplayOnly:
         // A deletion receipt has already terminated transport authority. Keep its local cleanup
@@ -746,6 +931,50 @@ struct TacuaTransportQueueV3: Codable, Equatable {
     return data
   }
 
+  var hasDurableSessionArtifacts: Bool {
+    buildIdentityJSON != nil && captureScopeJSON != nil
+  }
+
+  func durableSessionArtifacts() throws -> TacuaDurableSessionArtifacts? {
+    switch (buildIdentityJSON, captureScopeJSON) {
+    case (nil, nil):
+      return nil
+    case (.some(let build), .some(let scope)):
+      return try TacuaDurableSessionArtifacts.exactCanonical(
+        buildIdentityJSON: build,
+        scopeJSON: scope
+      )
+    default:
+      throw TacuaTransportQueueError.invalidQueue
+    }
+  }
+
+  /// Exact-match current authority or atomically backfill a migrated nil/nil queue. A host can
+  /// never rewrite an already-persisted build/scope pair during RESUME or admission.
+  mutating func bindDurableSessionArtifacts(
+    _ artifacts: TacuaDurableSessionArtifacts
+  ) throws {
+    if let existing = try durableSessionArtifacts() {
+      guard existing.buildIdentityJSON == artifacts.buildIdentityJSON,
+        existing.scopeJSON == artifacts.scopeJSON
+      else { throw TacuaTransportQueueError.operationConflict }
+      return
+    }
+    if let scopeDigest, scopeDigest != artifacts.scopeDigest {
+      throw TacuaTransportQueueError.operationConflict
+    }
+    if let transportConfigurationDigest,
+      transportConfigurationDigest != artifacts.transportConfigurationDigest
+    {
+      throw TacuaTransportQueueError.transportConfigurationMismatch
+    }
+    var candidate = self
+    candidate.buildIdentityJSON = String(decoding: artifacts.buildIdentityJSON, as: UTF8.self)
+    candidate.captureScopeJSON = String(decoding: artifacts.scopeJSON, as: UTF8.self)
+    try candidate.validate()
+    self = candidate
+  }
+
   mutating func applyExchange(
     remoteSessionID: String,
     scopeDigest: String,
@@ -804,15 +1033,22 @@ struct TacuaTransportQueueV3: Codable, Equatable {
     credentialID: String,
     transportConfigurationDigest: String,
     expiresAt: String,
-    timeAnchor: TacuaServerTimeAnchor
+    timeAnchor: TacuaServerTimeAnchor,
+    sessionRetentionAuthority: TacuaSessionRetentionAuthority? = nil,
+    sessionArtifacts: TacuaDurableSessionArtifacts? = nil
   ) throws {
     guard self.remoteSessionID == nil, self.scopeDigest == nil,
       self.transportConfigurationDigest == nil, currentCredentialID == nil,
       currentCredentialExpiresAt == nil, credentialCapability == .requiresExchange,
       operations.isEmpty, pendingRevokedCredentialRemovals.isEmpty,
-      completionCleanupAuthority == nil, deletionCleanupAuthority == nil
+      completionCleanupAuthority == nil, pendingCompletionReplayID == nil,
+      deletionCleanupAuthority == nil
     else { throw TacuaTransportQueueError.operationConflict }
-    try applyExchange(
+    var candidate = self
+    if let sessionArtifacts {
+      try candidate.bindDurableSessionArtifacts(sessionArtifacts)
+    }
+    try candidate.applyExchange(
       remoteSessionID: remoteSessionID,
       scopeDigest: scopeDigest,
       credentialID: credentialID,
@@ -822,6 +1058,12 @@ struct TacuaTransportQueueV3: Codable, Equatable {
       capability: .active,
       timeAnchor: timeAnchor
     )
+    if let sessionRetentionAuthority {
+      try sessionRetentionAuthority.validate()
+    }
+    candidate.sessionRetentionAuthority = sessionRetentionAuthority
+    try candidate.validate()
+    self = candidate
   }
 
   /// Applies a validated RESUME receipt using the exact server-time anchor captured when that
@@ -871,18 +1113,37 @@ struct TacuaTransportQueueV3: Codable, Equatable {
 
     switch capability {
     case .active:
-      guard replayCompletionID == nil, completionCleanupAuthority == nil else {
+      guard replayCompletionID == nil, completionCleanupAuthority == nil,
+        pendingCompletionReplayID == nil
+      else {
         throw TacuaTransportQueueError.operationNotAllowed
       }
     case .completionReplayOrDeleteOnly:
-      guard let replayCompletionID,
-        let authority = completionCleanupAuthority,
-        authority.completionID == replayCompletionID,
-        let operation = operations.first(where: { $0.operationID == replayCompletionID }),
-        operation.kind == .completion,
-        operation.state == .responseStored,
-        operation.responseArtifactDigest == authority.completionReceiptDigest
-      else { throw TacuaTransportQueueError.cleanupNotAuthorized }
+      guard let replayCompletionID else {
+        throw TacuaTransportQueueError.cleanupNotAuthorized
+      }
+      if let authority = completionCleanupAuthority {
+        guard pendingCompletionReplayID == nil,
+          authority.completionID == replayCompletionID,
+          let operation = operations.first(where: { $0.operationID == replayCompletionID }),
+          operation.kind == .completion,
+          operation.state == .responseStored,
+          operation.responseArtifactDigest == authority.completionReceiptDigest
+        else { throw TacuaTransportQueueError.cleanupNotAuthorized }
+      } else {
+        let matching = operations.filter {
+          $0.kind == .completion && $0.operationID == replayCompletionID
+        }
+        guard pendingCompletionReplayID == nil || pendingCompletionReplayID == replayCompletionID,
+          matching.count == 1,
+          matching[0].state == .outcomeUnknown,
+          (try? TacuaSDKBackendProtocol.validateRequest(matching[0].canonicalRequest))
+            == .completion,
+          operations.filter({ $0.kind == .completion }).count == 1,
+          operations.filter({ $0.kind == .segment || $0.kind == .diagnostic })
+            .allSatisfy({ $0.state == .responseStored })
+        else { throw TacuaTransportQueueError.cleanupNotAuthorized }
+      }
     case .requiresExchange, .requiresTransportRebind, .deletionReplayOnly:
       throw TacuaTransportQueueError.operationNotAllowed
     }
@@ -902,6 +1163,8 @@ struct TacuaTransportQueueV3: Codable, Equatable {
       capability: capability,
       timeAnchor: timeAnchor
     )
+    candidate.pendingCompletionReplayID = capability == .completionReplayOrDeleteOnly
+      && immutableCompletionAuthority == nil ? replayCompletionID : nil
     guard candidate.operations == immutableOperations,
       candidate.localPayloadPaths == immutableLocalPayloadPaths,
       candidate.completionCleanupAuthority == immutableCompletionAuthority,
@@ -979,6 +1242,39 @@ struct TacuaTransportQueueV3: Codable, Equatable {
     )
   }
 
+  /// Observes a timestamp from an already authenticated, fully validated backend receipt.
+  ///
+  /// Exact idempotent replay is intentionally allowed after a reboot: the immutable operation may
+  /// already be durable remotely, so forcing RESUME before looking it up could strand a completion
+  /// receipt. Such a receipt is also the only safe evidence with which to establish a fresh local
+  /// monotonic anchor. It may move the durable lower bound forward, never backward.
+  mutating func observeAuthoritativeReceiptTimestamp(
+    _ authoritativeServerTimestamp: String,
+    clock: TacuaMonotonicClock
+  ) throws {
+    guard let anchor = timeAnchor,
+      let authoritative = TacuaProtocolTimestamp.parseMilliseconds(
+        authoritativeServerTimestamp
+      )
+    else { throw TacuaTransportQueueError.invalidTimeAnchor }
+    // A RESUME may have advanced the local lower bound after the backend accepted this exact
+    // operation. The authenticated receipt remains valid evidence for committing the response, but
+    // it must not rewind or re-anchor time. Keeping a cross-boot anchor stale intentionally makes
+    // any subsequent *new* operation require RESUME while still allowing completion cleanup.
+    if authoritative < anchor.minimumEpochMilliseconds { return }
+    if anchor.bootSessionID == clock.bootSessionID {
+      timeAnchor = try anchor.advancing(
+        toAuthoritativeServerTimestamp: authoritativeServerTimestamp,
+        clock: clock
+      )
+      return
+    }
+    timeAnchor = try TacuaServerTimeAnchor.establish(
+      issuedAt: authoritativeServerTimestamp,
+      clock: clock
+    )
+  }
+
   func timestampForNewOperation(clock: TacuaMonotonicClock) throws -> String {
     guard credentialCapability != .requiresExchange,
       credentialCapability != .requiresTransportRebind,
@@ -1040,7 +1336,12 @@ struct TacuaTransportQueueV3: Codable, Equatable {
       throw TacuaTransportQueueError.invalidDigest
     }
     if !localPayloadBindings.isEmpty {
-      try Self.validateLocalPayloadBindings(localPayloadBindings, for: kind, request: request)
+      try Self.validateLocalPayloadBindings(
+        localPayloadBindings,
+        for: kind,
+        request: request,
+        localSessionID: localSessionID
+      )
     }
     guard !operations.contains(where: { $0.operationID == operationID }) else {
       throw TacuaTransportQueueError.operationConflict
@@ -1054,7 +1355,7 @@ struct TacuaTransportQueueV3: Codable, Equatable {
         canonicalRequest: canonicalRequest,
         localPayloadPath: localPayloadPath,
         localPayloadBindings: localPayloadBindings.isEmpty ? nil : localPayloadBindings,
-        state: .queued,
+        state: .prepared,
         canonicalResponse: nil,
         responseDigest: nil,
         responseArtifactDigest: nil
@@ -1062,9 +1363,190 @@ struct TacuaTransportQueueV3: Codable, Equatable {
     )
   }
 
-  /// Returns immutable request bytes and the current transport credential. Those IDs may differ
-  /// after rotation; only the Authorization credential rotates during an exact durable replay.
-  func attempt(
+  /// Rebuilds a request which is durably known never to have reached the network after RESUME
+  /// rotated its body credential. Payload identity and every semantic protocol field remain exact;
+  /// only `credential_id`, `requested_at`, and the derived root digest may change.
+  mutating func rebindPreparedOperation(
+    operationID: String,
+    replacement: TacuaPreparedBackendRequest,
+    clock: TacuaMonotonicClock
+  ) throws {
+    guard let index = operations.firstIndex(where: { $0.operationID == operationID }) else {
+      throw TacuaTransportQueueError.operationNotFound
+    }
+    guard operations[index].state == .prepared else {
+      throw TacuaTransportQueueError.operationNotAllowed
+    }
+    try replaceHistoricalOperation(
+      at: index,
+      replacement: replacement,
+      proof: nil,
+      clock: clock
+    )
+  }
+
+  /// Rebuilds an outcome-unknown historical request only after the authenticated backend has
+  /// returned a content-free, request-bound proof that no durable operation exists. A malformed,
+  /// stale, cross-session, or differently authenticated proof cannot rewrite protocol truth.
+  mutating func rebindProvenMissingHistoricalOperation(
+    operationID: String,
+    replacement: TacuaPreparedBackendRequest,
+    proof: TacuaValidatedBackendError,
+    clock: TacuaMonotonicClock
+  ) throws {
+    guard let index = operations.firstIndex(where: { $0.operationID == operationID }) else {
+      throw TacuaTransportQueueError.operationNotFound
+    }
+    guard operations[index].state == .outcomeUnknown else {
+      throw TacuaTransportQueueError.operationNotAllowed
+    }
+    try replaceHistoricalOperation(
+      at: index,
+      replacement: replacement,
+      proof: proof,
+      clock: clock
+    )
+  }
+
+  private mutating func replaceHistoricalOperation(
+    at index: Int,
+    replacement: TacuaPreparedBackendRequest,
+    proof: TacuaValidatedBackendError?,
+    clock: TacuaMonotonicClock
+  ) throws {
+    let original = operations[index]
+    let replacementValue = try TacuaCanonicalJSON.parse(replacement.canonicalData)
+    let replacementDigest = try TacuaCanonicalJSON.digest(
+      replacementValue,
+      omittingRootField: Self.digestField(for: replacement.kind)
+    )
+    let permitsReplacement = credentialCapability == .active
+      || (credentialCapability == .completionReplayOrDeleteOnly
+        && original.kind == .deletion)
+    guard permitsReplacement,
+      let currentCredentialID,
+      let remoteSessionID,
+      original.requestCredentialID != currentCredentialID,
+      replacement.kind == original.kind,
+      replacement.operationID == original.operationID,
+      replacement.credentialID == currentCredentialID,
+      replacement.requestDigest != original.requestDigest,
+      replacement.canonicalData.count <= Self.maximumEncodedBytes,
+      replacementDigest == replacement.requestDigest
+    else { throw TacuaTransportQueueError.operationConflict }
+    _ = try timestampForNewOperation(clock: clock)
+    let validatedKind = try TacuaSDKBackendProtocol.validateRequest(replacement.canonicalData)
+    guard validatedKind.rawValue == replacement.kind.rawValue else {
+      throw TacuaTransportQueueError.operationConflict
+    }
+    let originalValue = try TacuaCanonicalJSON.parse(original.canonicalRequest)
+    guard try Self.semanticRequestIdentity(
+      originalValue,
+      kind: original.kind
+    ) == Self.semanticRequestIdentity(
+      replacementValue,
+      kind: replacement.kind
+    ) else { throw TacuaTransportQueueError.operationConflict }
+    if let proof {
+      let expectedKind: TacuaBackendOperationKind
+      switch original.kind {
+      case .segment: expectedKind = .segment
+      case .diagnostic: expectedKind = .diagnostic
+      case .completion: expectedKind = .completion
+      case .deletion: expectedKind = .deletion
+      }
+      guard proof.statusCode == 403,
+        proof.code == .operationNotAuthorized,
+        proof.reconciliationOutcome == .historicalOperationNotFound,
+        proof.operationKind == expectedKind,
+        proof.remoteSessionID == remoteSessionID,
+        proof.operationID == original.operationID,
+        proof.requestDigest == original.requestDigest,
+        proof.requestCredentialID == original.requestCredentialID,
+        proof.authenticatedCredentialID == currentCredentialID
+      else { throw TacuaTransportQueueError.operationConflict }
+    }
+    let replacementObject = try JSONSerialization.jsonObject(with: replacement.canonicalData)
+    guard !Self.containsProhibitedKey(replacementObject) else {
+      throw TacuaTransportQueueError.prohibitedPersistedMaterial
+    }
+    operations[index] = TacuaQueuedOperation(
+      kind: replacement.kind,
+      operationID: replacement.operationID,
+      requestCredentialID: replacement.credentialID,
+      requestDigest: replacement.requestDigest,
+      canonicalRequest: replacement.canonicalData,
+      localPayloadPath: original.localPayloadPath,
+      localPayloadBindings: original.localPayloadBindings,
+      state: .prepared,
+      canonicalResponse: nil,
+      responseDigest: nil,
+      responseArtifactDigest: nil
+    )
+    try validate()
+  }
+
+  private static func semanticRequestIdentity(
+    _ value: TacuaJSONValue,
+    kind: TacuaQueuedOperationKind
+  ) throws -> TacuaJSONValue {
+    guard case .object(var object) = value else {
+      throw TacuaTransportQueueError.operationConflict
+    }
+    object.removeValue(forKey: "credential_id")
+    object.removeValue(forKey: "requested_at")
+    object.removeValue(forKey: digestField(for: kind))
+    return .object(object)
+  }
+
+  /// Admission artifacts survive legitimate credential rotation. Match their stable operation
+  /// identity without mistaking the three explicitly rebindable fields for a different capture.
+  func operationSemanticallyMatches(
+    _ operation: TacuaQueuedOperation,
+    expected: TacuaPreparedBackendRequest,
+    bindings: [TacuaLocalPayloadBinding]
+  ) -> Bool {
+    guard operation.kind == expected.kind,
+      operation.operationID == expected.operationID,
+      operation.localPayloadPath == nil,
+      operation.localPayloadBindings == bindings,
+      let existing = try? TacuaCanonicalJSON.parse(operation.canonicalRequest),
+      let proposed = try? TacuaCanonicalJSON.parse(expected.canonicalData),
+      let existingIdentity = try? Self.semanticRequestIdentity(existing, kind: operation.kind),
+      let proposedIdentity = try? Self.semanticRequestIdentity(proposed, kind: expected.kind)
+    else { return false }
+    return existingIdentity == proposedIdentity
+  }
+
+  /// Moves a known-unsent request to the conservative outcome-unknown state before any caller is
+  /// allowed to start network I/O. The caller must compare-and-swap this mutated queue durably,
+  /// then obtain the exact replay with `outcomeUnknownAttempt`. A crash anywhere after that first
+  /// durable transition can only cause an exact idempotent replay; it can never cause an unsafe
+  /// request rewrite.
+  mutating func beginAttempt(
+    operationID: String,
+    expectedTransportConfigurationDigest: String,
+    clock: TacuaMonotonicClock
+  ) throws -> TacuaOperationAttempt {
+    guard let index = operations.firstIndex(where: { $0.operationID == operationID }) else {
+      throw TacuaTransportQueueError.operationNotFound
+    }
+    guard operations[index].state == .prepared else {
+      throw TacuaTransportQueueError.operationNotAllowed
+    }
+    let attempt = try authorizedAttempt(
+      operation: operations[index],
+      expectedTransportConfigurationDigest: expectedTransportConfigurationDigest,
+      clock: clock,
+      requireCurrentClock: true
+    )
+    operations[index].state = .outcomeUnknown
+    return attempt
+  }
+
+  /// Returns the exact immutable request for an operation whose delivery outcome is already
+  /// unknown. This is the only state which may be replayed after a crash or credential rotation.
+  func outcomeUnknownAttempt(
     operationID: String,
     expectedTransportConfigurationDigest: String,
     clock: TacuaMonotonicClock
@@ -1072,13 +1554,56 @@ struct TacuaTransportQueueV3: Codable, Equatable {
     guard let operation = operations.first(where: { $0.operationID == operationID }) else {
       throw TacuaTransportQueueError.operationNotFound
     }
+    guard operation.state == .outcomeUnknown else {
+      throw TacuaTransportQueueError.operationNotAllowed
+    }
+    return try authorizedAttempt(
+      operation: operation,
+      expectedTransportConfigurationDigest: expectedTransportConfigurationDigest,
+      clock: clock,
+      requireCurrentClock: false
+    )
+  }
+
+  /// Replays the exact completion/deletion request only when its validated response and cleanup
+  /// authority are already durable. Ordinary uploaded objects never need another network send
+  /// after their receipt is stored.
+  func storedResponseReplayAttempt(
+    operationID: String,
+    expectedTransportConfigurationDigest: String,
+    clock: TacuaMonotonicClock
+  ) throws -> TacuaOperationAttempt {
+    guard let operation = operations.first(where: { $0.operationID == operationID }) else {
+      throw TacuaTransportQueueError.operationNotFound
+    }
+    guard operation.state == .responseStored,
+      (operation.kind == .completion || operation.kind == .deletion)
+    else { throw TacuaTransportQueueError.operationNotAllowed }
+    return try authorizedAttempt(
+      operation: operation,
+      expectedTransportConfigurationDigest: expectedTransportConfigurationDigest,
+      clock: clock,
+      requireCurrentClock: false
+    )
+  }
+
+  private func authorizedAttempt(
+    operation: TacuaQueuedOperation,
+    expectedTransportConfigurationDigest: String,
+    clock: TacuaMonotonicClock,
+    requireCurrentClock: Bool
+  ) throws -> TacuaOperationAttempt {
     guard let transportCredentialID = currentCredentialID else {
       throw TacuaTransportQueueError.missingCredential
     }
     guard Self.validDigest(expectedTransportConfigurationDigest),
       transportConfigurationDigest == expectedTransportConfigurationDigest
     else { throw TacuaTransportQueueError.transportConfigurationMismatch }
-    _ = try timestampForNewOperation(clock: clock)
+    // A first send of known-unsent bytes remains gated on locally proven current authority. An
+    // exact replay must not be: after a reboot its immutable timestamp may already name a durable
+    // backend operation, and forcing RESUME here could make a lost completion receipt impossible
+    // to recover. The backend remains the authority for current bearer expiry on exact replay.
+    if requireCurrentClock { _ = try timestampForNewOperation(clock: clock) }
     switch credentialCapability {
     case .requiresExchange, .requiresTransportRebind:
       throw TacuaTransportQueueError.resumeRequired
@@ -1087,7 +1612,8 @@ struct TacuaTransportQueueV3: Codable, Equatable {
     case .completionReplayOrDeleteOnly:
       guard operation.kind == .deletion
         || (operation.kind == .completion
-          && completionCleanupAuthority?.completionID == operation.operationID)
+          && (completionCleanupAuthority?.completionID == operation.operationID
+            || pendingCompletionReplayID == operation.operationID))
       else {
         throw TacuaTransportQueueError.operationNotAllowed
       }
@@ -1129,6 +1655,9 @@ struct TacuaTransportQueueV3: Codable, Equatable {
         throw TacuaTransportQueueError.responseConflict
       }
       return
+    }
+    guard operations[index].state == .outcomeUnknown else {
+      throw TacuaTransportQueueError.responseConflict
     }
     operations[index].canonicalResponse = canonicalResponse
     operations[index].responseDigest = responseDigest
@@ -1204,6 +1733,7 @@ struct TacuaTransportQueueV3: Codable, Equatable {
       throw TacuaTransportQueueError.responseConflict
     }
     completionCleanupAuthority = authority
+    pendingCompletionReplayID = nil
     credentialCapability = .completionReplayOrDeleteOnly
   }
 
@@ -1220,6 +1750,7 @@ struct TacuaTransportQueueV3: Codable, Equatable {
       throw TacuaTransportQueueError.responseConflict
     }
     deletionCleanupAuthority = authority
+    pendingCompletionReplayID = nil
     credentialCapability = .deletionReplayOnly
   }
 
@@ -1269,7 +1800,10 @@ struct TacuaTransportQueueV3: Codable, Equatable {
         let request = try? TacuaCanonicalJSON.parse(operation.canonicalRequest)
       else { throw TacuaTransportQueueError.cleanupNotAuthorized }
       try Self.validateLocalPayloadBindings(
-        operationBindings, for: operation.kind, request: request
+        operationBindings,
+        for: operation.kind,
+        request: request,
+        localSessionID: localSessionID
       )
       bindings.append(contentsOf: operationBindings)
     }
@@ -1295,6 +1829,15 @@ struct TacuaTransportQueueV3: Codable, Equatable {
     else {
       throw TacuaTransportQueueError.invalidQueue
     }
+    let artifacts: TacuaDurableSessionArtifacts?
+    do { artifacts = try durableSessionArtifacts() }
+    catch { throw TacuaTransportQueueError.invalidQueue }
+    if let artifacts {
+      guard scopeDigest == nil || scopeDigest == artifacts.scopeDigest,
+        transportConfigurationDigest == nil
+          || transportConfigurationDigest == artifacts.transportConfigurationDigest
+      else { throw TacuaTransportQueueError.invalidQueue }
+    }
     guard pendingRevokedCredentialRemovals.count <= TacuaQueueBounds.maximumCredentialEntries,
       pendingRevokedCredentialRemovals.allSatisfy(Self.validIdentifier),
       Set(pendingRevokedCredentialRemovals).count == pendingRevokedCredentialRemovals.count,
@@ -1318,6 +1861,7 @@ struct TacuaTransportQueueV3: Codable, Equatable {
         timeAnchor.minimumEpochMilliseconds >= issuedEpoch
       else { throw TacuaTransportQueueError.invalidQueue }
     }
+    try sessionRetentionAuthority?.validate()
     if credentialCapability == .requiresExchange {
       guard transportConfigurationDigest == nil, currentCredentialID == nil,
         currentCredentialExpiresAt == nil, timeAnchor == nil,
@@ -1360,6 +1904,31 @@ struct TacuaTransportQueueV3: Codable, Equatable {
         credentialExpiryLedger[currentCredentialID] == currentCredentialExpiresAt
       else { throw TacuaTransportQueueError.invalidQueue }
     }
+    guard pendingCompletionReplayID.map(Self.validIdentifier) ?? true else {
+      throw TacuaTransportQueueError.invalidQueue
+    }
+    if let pendingCompletionReplayID {
+      let matching = operations.filter {
+        $0.kind == .completion && $0.operationID == pendingCompletionReplayID
+      }
+      guard credentialCapability == .completionReplayOrDeleteOnly,
+        completionCleanupAuthority == nil,
+        matching.count == 1,
+        matching[0].state == .outcomeUnknown,
+        (try? TacuaSDKBackendProtocol.validateRequest(matching[0].canonicalRequest))
+          == .completion,
+        operations.filter({ $0.kind == .completion }).count == 1,
+        operations.filter({ $0.kind == .segment || $0.kind == .diagnostic })
+          .allSatisfy({ $0.state == .responseStored })
+      else { throw TacuaTransportQueueError.invalidQueue }
+    } else if credentialCapability == .completionReplayOrDeleteOnly {
+      guard completionCleanupAuthority != nil else {
+        throw TacuaTransportQueueError.invalidQueue
+      }
+    }
+    guard completionCleanupAuthority == nil || pendingCompletionReplayID == nil else {
+      throw TacuaTransportQueueError.invalidQueue
+    }
     var operationIDs = Set<String>()
     var boundPayloadPaths = Set<String>()
     for operation in operations {
@@ -1390,7 +1959,7 @@ struct TacuaTransportQueueV3: Codable, Equatable {
         !Self.containsProhibitedKey(requestObject)
       else { throw TacuaTransportQueueError.invalidQueue }
       switch operation.state {
-      case .queued:
+      case .prepared, .outcomeUnknown:
         guard operation.canonicalResponse == nil, operation.responseDigest == nil,
           operation.responseArtifactDigest == nil
         else {
@@ -1413,12 +1982,19 @@ struct TacuaTransportQueueV3: Codable, Equatable {
         else { throw TacuaTransportQueueError.invalidQueue }
       }
       if !bindings.isEmpty {
-        try Self.validateLocalPayloadBindings(bindings, for: operation.kind, request: request)
+        try Self.validateLocalPayloadBindings(
+          bindings,
+          for: operation.kind,
+          request: request,
+          localSessionID: localSessionID
+        )
       }
     }
-    if payloadCleanupState != .none { guard completionCleanupAuthority != nil else {
+    if payloadCleanupState != .none {
+      guard completionCleanupAuthority != nil || deletionCleanupAuthority != nil else {
       throw TacuaTransportQueueError.invalidQueue
-    }}
+      }
+    }
     if let completionCleanupAuthority {
       _ = try authorizedPayloadBindings(for: completionCleanupAuthority)
     }
@@ -1440,6 +2016,24 @@ struct TacuaTransportQueueV3: Codable, Equatable {
     }
   }
 
+  var authorizedCompletionReplayID: String? {
+    completionCleanupAuthority?.completionID ?? pendingCompletionReplayID
+  }
+
+  /// Before a completed-session RESUME is committed, this exact local operation is the only
+  /// evidence that the backend may already be completed while its receipt is missing.
+  var outcomeUnknownCompletionReplayCandidateID: String? {
+    guard completionCleanupAuthority == nil, pendingCompletionReplayID == nil else { return nil }
+    let completions = operations.filter { $0.kind == .completion }
+    guard completions.count == 1, completions[0].state == .outcomeUnknown,
+      (try? TacuaSDKBackendProtocol.validateRequest(completions[0].canonicalRequest))
+        == .completion,
+      operations.filter({ $0.kind == .segment || $0.kind == .diagnostic })
+        .allSatisfy({ $0.state == .responseStored })
+    else { return nil }
+    return completions[0].operationID
+  }
+
   private static func digestField(for kind: TacuaQueuedOperationKind) -> String {
     switch kind {
     case .segment: return "intent_digest"
@@ -1450,7 +2044,8 @@ struct TacuaTransportQueueV3: Codable, Equatable {
   private static func validateLocalPayloadBindings(
     _ bindings: [TacuaLocalPayloadBinding],
     for kind: TacuaQueuedOperationKind,
-    request: TacuaJSONValue
+    request: TacuaJSONValue,
+    localSessionID: String
   ) throws {
     guard let root = request.objectValue else {
       throw TacuaTransportQueueError.invalidQueue
@@ -1470,7 +2065,18 @@ struct TacuaTransportQueueV3: Codable, Equatable {
       guard let transport = root["transport"]?.objectValue,
         let contentDigest = transport["content_digest"]?.stringValue
       else { throw TacuaTransportQueueError.invalidQueue }
-      expected = [.diagnosticEnvelope: contentDigest]
+      guard bindings.count == 1 || bindings.count == 2,
+        bindings[0].role == .diagnosticEnvelope,
+        bindings[0].contentDigest == contentDigest
+      else { throw TacuaTransportQueueError.invalidQueue }
+      if bindings.count == 2 {
+        let source = bindings[1]
+        guard source.role == .diagnosticSourceJournal,
+          source.relativePath == "diagnostics/\(localSessionID).diagnostics-v1.jsonl",
+          Self.validDigest(source.contentDigest)
+        else { throw TacuaTransportQueueError.invalidQueue }
+      }
+      return
     case .completion, .deletion:
       expected = [:]
     }
@@ -1526,12 +2132,52 @@ struct TacuaOperationAttempt: Equatable {
   let transportCredentialID: String
 }
 
+/// Canonical protocol request prepared for durable queue admission or safe credential rebinding.
+/// It lives with the queue model so crash-state tests do not depend on the request factory.
+struct TacuaPreparedBackendRequest: Equatable {
+  let kind: TacuaQueuedOperationKind
+  let operationID: String
+  let credentialID: String
+  let canonicalData: Data
+  let requestDigest: String
+}
+
 protocol TacuaTransportQueuePersisting {
   func persist(_ queue: TacuaTransportQueueV3) throws
 }
 
+protocol TacuaSDKResumeRecoveryInspecting {
+  func hasRecovery(localSessionID: String) throws -> Bool
+}
+
+enum TacuaSDKLocalRetentionError: Error, Equatable {
+  case invalidSessionID
+  case invalidClock
+  case authoritativeTimeUnavailable
+  case clockRollbackDetected
+  case expired
+  case cleanupIncomplete
+}
+
+/// Retention guard for lifecycle coordinators that already hold the per-session START lease.
+/// Keeping this as a separate entry point prevents a non-recursive flock from being acquired
+/// twice while still placing the expiry check inside the exact critical section that consumes or
+/// publishes local raw-media state.
+protocol TacuaSDKLocalRetentionChecking {
+  func requireActiveHoldingLifecycleLease(localSessionID: String) throws
+  func activeStopUptimeMillisecondsHoldingLifecycleLease(
+    localSessionID: String
+  ) throws -> Int64
+}
+
 protocol TacuaLocalPayloadRemoving {
   func removePayload(_ binding: TacuaLocalPayloadBinding) throws
+}
+
+/// Destructively retires one exact capture-session directory after remote receipt authority is
+/// durable. Implementations must be idempotent and must not follow names outside that directory.
+protocol TacuaLocalSessionRetiring {
+  func retireSession() throws
 }
 
 enum TacuaTransportCleanup {
@@ -1569,13 +2215,38 @@ enum TacuaTransportCleanup {
     try persistence.persist(queue)
   }
 
+  static func retireAuthorizedSession(
+    queue: inout TacuaTransportQueueV3,
+    persistence: TacuaTransportQueuePersisting,
+    retirer: TacuaLocalSessionRetiring
+  ) throws {
+    guard queue.completionCleanupAuthority != nil || queue.deletionCleanupAuthority != nil else {
+      throw TacuaTransportQueueError.cleanupNotAuthorized
+    }
+    // A completion receipt must still independently bind every admitted upload before it can
+    // authorize the wider directory retirement. Deletion tombstones are already scoped to
+    // `session_all_data` and deliberately do not depend on a readable local manifest.
+    if queue.completionCleanupAuthority != nil {
+      _ = try queue.authorizedLocalPayloadBindings()
+    }
+    if queue.payloadCleanupState == .none {
+      queue.payloadCleanupState = .tombstoneWritten
+      try persistence.persist(queue)
+    }
+    guard queue.payloadCleanupState == .tombstoneWritten else { return }
+    try retirer.retireSession()
+    queue.payloadCleanupState = .payloadsRemoved
+    try persistence.persist(queue)
+  }
+
   static func removeAuthorizedCredential(
     queue: inout TacuaTransportQueueV3,
     persistence: TacuaTransportQueuePersisting,
     credentialStore: TacuaCredentialStoring
   ) throws {
     guard let authority = queue.deletionCleanupAuthority,
-      authority.credentialID == queue.currentCredentialID
+      authority.credentialID == queue.currentCredentialID,
+      queue.payloadCleanupState == .payloadsRemoved
     else {
       throw TacuaTransportQueueError.deletionNotAuthorized
     }

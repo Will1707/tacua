@@ -31,12 +31,91 @@ private func expectConfigurationError(
 @main
 enum BackendConfigurationTests {
   static func main() throws {
+    try qaBuildGateRejectsProductionAndMalformedConfiguration()
+    try buildIdentityMustMatchNativeQABuildAuthority()
     try normalizesBuildConfiguredHTTPSOrigin()
     try rejectsRuntimeOverrideShapes()
     try loopbackHTTPRequiresExplicitDebugConfiguration()
     try endpointCannotEscapeOrigin()
     try redirectsAreRejected()
     print("Tacua backend configuration tests passed")
+  }
+
+  private static func buildIdentityMustMatchNativeQABuildAuthority() throws {
+    let qaBuild = try TacuaQABuildConfiguration(
+      captureEnabled: true,
+      buildVariant: "preview",
+      distribution: "testflight",
+      debugBuild: false
+    )
+    let config = try TacuaBackendConfiguration(
+      buildConfiguredOrigin: "https://qa.example.com",
+      allowInsecureLoopback: false,
+      debugBuild: false,
+      qaBuildConfiguration: qaBuild
+    )
+    let matching = try TacuaCanonicalJSON.parse(
+      Data(#"{"build_variant":"preview","distribution":"testflight"}"#.utf8)
+    )
+    try config.validateBuildIdentityBinding(matching)
+
+    let mismatched = try TacuaCanonicalJSON.parse(
+      Data(#"{"build_variant":"development","distribution":"internal"}"#.utf8)
+    )
+    do {
+      try config.validateBuildIdentityBinding(mismatched)
+      throw BackendConfigurationTestFailure.assertion(
+        "Caller-supplied build identity escaped the native QA build authority"
+      )
+    } catch let error as TacuaBackendConfigurationError {
+      try require(error == .buildIdentityMismatch, "Unexpected build binding error: \(error)")
+    }
+  }
+
+  private static func qaBuildGateRejectsProductionAndMalformedConfiguration() throws {
+    let development = try TacuaQABuildConfiguration(
+      captureEnabled: true,
+      buildVariant: "development",
+      distribution: "local",
+      debugBuild: true
+    )
+    try require(
+      development.buildVariant == "development" && development.distribution == "local",
+      "Development QA build was not accepted"
+    )
+    let preview = try TacuaQABuildConfiguration(
+      captureEnabled: true,
+      buildVariant: "preview",
+      distribution: "testflight",
+      debugBuild: false
+    )
+    try require(preview.buildVariant == "preview", "TestFlight preview build was not accepted")
+
+    let invalid: [(
+      Bool, String, String, Bool, TacuaQABuildConfigurationError
+    )] = [
+      (false, "preview", "testflight", false, .captureNotEnabled),
+      (true, "production", "testflight", false, .invalidBuildVariant),
+      (true, "preview", "appstore", false, .invalidDistribution),
+      (true, "preview", "local", true, .unsupportedBuildPair),
+      (true, "development", "testflight", true, .unsupportedBuildPair),
+      (true, "development", "internal", false, .developmentBuildRequiresDebug),
+    ]
+    for (enabled, variant, distribution, debugBuild, expected) in invalid {
+      do {
+        _ = try TacuaQABuildConfiguration(
+          captureEnabled: enabled,
+          buildVariant: variant,
+          distribution: distribution,
+          debugBuild: debugBuild
+        )
+        throw BackendConfigurationTestFailure.assertion(
+          "Invalid QA build configuration was accepted"
+        )
+      } catch let error as TacuaQABuildConfigurationError {
+        try require(error == expected, "Unexpected QA build error: \(error)")
+      }
+    }
   }
 
   private static func normalizesBuildConfiguredHTTPSOrigin() throws {

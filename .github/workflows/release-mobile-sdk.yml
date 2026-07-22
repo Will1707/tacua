@@ -1,0 +1,170 @@
+name: Release mobile SDK
+
+on:
+  push:
+    tags:
+      - 'mobile-sdk-v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-mobile-sdk-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '22.22.2'
+          package-manager-cache: false
+
+      - name: Require an annotated tag on the default branch
+        id: tag
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = tag
+          tag_commit="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          git show-ref --verify --quiet "refs/remotes/origin/$DEFAULT_BRANCH"
+          git merge-base --is-ancestor "$tag_commit" "refs/remotes/origin/$DEFAULT_BRANCH"
+          printf 'commit=%s\n' "$tag_commit" >> "$GITHUB_OUTPUT"
+
+      - name: Require a green Verify run for the tagged commit
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          TAG_COMMIT: ${{ steps.tag.outputs.commit }}
+        run: |
+          set -euo pipefail
+          runs="$RUNNER_TEMP/tacua-green-verify-runs.json"
+          gh api --method GET \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/verify.yml/runs" \
+            -f branch="$DEFAULT_BRANCH" \
+            -f event=push \
+            -f head_sha="$TAG_COMMIT" \
+            -f per_page=100 \
+            -f status=success > "$runs"
+          node .github/scripts/validate-mobile-sdk-release-run.mjs \
+            "$runs" "$TAG_COMMIT" "$DEFAULT_BRANCH"
+
+      - name: Install harness dependencies without lifecycle scripts
+        working-directory: experiments/ios-capture-spike/harness
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Verify the SDK and harness
+        working-directory: experiments/ios-capture-spike/package
+        run: sh tests/run-core-tests.sh
+
+      - name: Build the release tarball and checksum
+        id: package
+        env:
+          RELEASE_DIRECTORY: ${{ runner.temp }}/tacua-mobile-sdk-release
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          node .github/scripts/package-mobile-sdk.mjs \
+            --tag "$RELEASE_TAG" \
+            --out-dir "$RELEASE_DIRECTORY" \
+            > "$RUNNER_TEMP/tacua-mobile-sdk-release.json"
+          node --input-type=module - "$RUNNER_TEMP/tacua-mobile-sdk-release.json" "$GITHUB_OUTPUT" <<'NODE'
+          import { appendFileSync, readFileSync } from "node:fs";
+          const [manifestPath, outputPath] = process.argv.slice(2);
+          const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+          for (const key of ["checksumFilename", "tarballFilename", "version"]) {
+            if (typeof manifest[key] !== "string" || !manifest[key]) {
+              throw new Error(`release manifest is missing ${key}`);
+            }
+            appendFileSync(outputPath, `${key}=${manifest[key]}\n`, "utf8");
+          }
+          NODE
+
+      - name: Compile the packed SDK through a clean Expo harness
+        env:
+          RELEASE_DIRECTORY: ${{ runner.temp }}/tacua-mobile-sdk-release
+          TARBALL_FILENAME: ${{ steps.package.outputs.tarballFilename }}
+        run: |
+          set -euo pipefail
+          packed_harness="$RUNNER_TEMP/tacua-packed-sdk-harness"
+          mkdir -p "$packed_harness/src"
+          cp experiments/ios-capture-spike/harness/app.json "$packed_harness/app.json"
+          cp experiments/ios-capture-spike/harness/index.ts "$packed_harness/index.ts"
+          cp experiments/ios-capture-spike/harness/package-lock.json "$packed_harness/package-lock.json"
+          cp experiments/ios-capture-spike/harness/tacua-sdk-profile.json "$packed_harness/tacua-sdk-profile.json"
+          cp experiments/ios-capture-spike/harness/tsconfig.json "$packed_harness/tsconfig.json"
+          cp experiments/ios-capture-spike/harness/src/App.tsx "$packed_harness/src/App.tsx"
+          cp experiments/ios-capture-spike/harness/src/backend-contract.typecheck.ts \
+            "$packed_harness/src/backend-contract.typecheck.ts"
+          node --input-type=module - \
+            experiments/ios-capture-spike/harness/package.json \
+            "$packed_harness/package.json" \
+            "$RELEASE_DIRECTORY/$TARBALL_FILENAME" <<'NODE'
+          import { readFileSync, writeFileSync } from "node:fs";
+          import { pathToFileURL } from "node:url";
+          const [sourcePath, destinationPath, tarballPath] = process.argv.slice(2);
+          const manifest = JSON.parse(readFileSync(sourcePath, "utf8"));
+          manifest.name = "@tacua/packed-sdk-release-harness";
+          manifest.dependencies["@tacua/mobile-sdk"] = pathToFileURL(tarballPath).href;
+          writeFileSync(destinationPath, `${JSON.stringify(manifest, null, 2)}\n`, {
+            encoding: "utf8",
+            mode: 0o600,
+          });
+          NODE
+          cd "$packed_harness"
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund --offline
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run typecheck
+          ./node_modules/.bin/expo prebuild --platform ios --no-install
+          cd ios
+          pod install
+          xcodebuild -quiet \
+            -workspace TacuaCaptureLab.xcworkspace \
+            -scheme TacuaCaptureLab \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Create and publish the GitHub prerelease
+        env:
+          CHECKSUM_FILENAME: ${{ steps.package.outputs.checksumFilename }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_DIRECTORY: ${{ runner.temp }}/tacua-mobile-sdk-release
+          RELEASE_TAG: ${{ github.ref_name }}
+          SDK_VERSION: ${{ steps.package.outputs.version }}
+          TARBALL_FILENAME: ${{ steps.package.outputs.tarballFilename }}
+        run: |
+          set -euo pipefail
+          (
+            cd "$RELEASE_DIRECTORY"
+            shasum -a 256 -c "$CHECKSUM_FILENAME"
+          )
+          gh release create "$RELEASE_TAG" \
+            "$RELEASE_DIRECTORY/$TARBALL_FILENAME" \
+            "$RELEASE_DIRECTORY/$CHECKSUM_FILENAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --prerelease \
+            --title "Tacua mobile SDK $SDK_VERSION" \
+            --notes "Pre-release QA-build SDK artifact. This workflow does not publish to npm. Verify the accompanying SHA-256 checksum before installation."
+          gh release edit "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --prerelease

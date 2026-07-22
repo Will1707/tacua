@@ -34,7 +34,9 @@ class ProcessingJobStateTests(BackendHarness):
         restarted = PilotBackend(self.config, self.admin_secret, clock=self.clock)
 
         self.assertEqual(job, restarted.get_job(job["job_id"]))
-        self.assertEqual([job], restarted.list_jobs())
+        listed = restarted.list_jobs()
+        self.assertEqual([job["job_id"]], [item["job_id"] for item in listed["jobs"]])
+        self.assertIsNone(listed["next_cursor"])
         self.assertEqual("queued", job["status"])
         self.assertIsNone(job["started_at"])
         self.assertEqual(
@@ -107,6 +109,20 @@ class ProcessingJobStateTests(BackendHarness):
                 store.list,
                 lambda: store.claim("worker_without_transaction"),
                 lambda: store.put_initial(job),
+                lambda: store.validate_publication_lease(
+                    job["job_id"], "x" * 43
+                ),
+                lambda: store.succeed(
+                    job["job_id"],
+                    "generate_tickets",
+                    "x" * 43,
+                    outputs={
+                        "disposition": "no_issue_detected",
+                        "candidate_refs": [],
+                        "derived_evidence_refs": [],
+                        "summary": "Synthetic transaction-bound result.",
+                    },
+                ),
                 store._validate_all_leases,
             )
             for operation in operations:
@@ -174,7 +190,10 @@ class ProcessingJobStateTests(BackendHarness):
         )
         self.assertEqual(lifecycle["completion_bytes"], replay.body)
         self.assertEqual(checkpoint, self.backend.get_job(job["job_id"]))
-        self.assertEqual([checkpoint], self.backend.list_jobs())
+        listed = self.backend.list_jobs()
+        self.assertEqual([checkpoint["job_id"]], [item["job_id"] for item in listed["jobs"]])
+        self.assertEqual("queued", listed["jobs"][0]["status"])
+        self.assertIsNone(listed["next_cursor"])
         with self.backend._connect() as connection:
             versions = connection.execute(
                 """SELECT job_version,previous_job_digest,job_digest,canonical_json

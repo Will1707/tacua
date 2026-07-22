@@ -7,6 +7,7 @@ import { ActivityIndicator, Pressable, RefreshControl, ScrollView, Text, View } 
 import type { CaptureSession, TicketCandidateSummary } from "@/api/types";
 import { ActionButton } from "@/components/action-button";
 import { MessageState } from "@/components/message-state";
+import { ResumeSessionCard } from "@/components/resume-session-card";
 import { SectionCard } from "@/components/section-card";
 import { StatusPill } from "@/components/status-pill";
 import { useBackend } from "@/hooks/use-backend";
@@ -15,7 +16,7 @@ import { formatBytes, formatDate } from "@/utils/format";
 
 export default function SessionRoute() {
   const { "session-id": sessionId } = useLocalSearchParams<{ "session-id": string }>();
-  const { client } = useBackend();
+  const { client, config } = useBackend();
   const [session, setSession] = useState<CaptureSession | null>(null);
   const [candidates, setCandidates] = useState<readonly TicketCandidateSummary[]>([]);
   const [nextCandidateCursor, setNextCandidateCursor] = useState<string | null>(null);
@@ -93,8 +94,13 @@ export default function SessionRoute() {
   }, [client, loading, nextCandidateCursor, sessionId]);
 
   useEffect(() => { void refresh(); }, [refresh]);
-  if (!session && loading) return <View style={{ flex: 1, justifyContent: "center" }}><ActivityIndicator /></View>;
-  if (!session) return <ScrollView contentInsetAdjustmentBehavior="automatic"><MessageState title="Session unavailable" detail={error ?? "The session was not found."} /></ScrollView>;
+  if (!session && loading) return <View accessible accessibilityLabel="Loading review session" accessibilityRole="progressbar" style={{ flex: 1, justifyContent: "center" }}><ActivityIndicator /></View>;
+  if (!session) return (
+    <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 16, gap: 12 }}>
+      <MessageState title="Session unavailable" detail={error ?? "The session was not found."} />
+      {client && sessionId ? <ActionButton label="Retry session" loading={loading} onPress={() => void refresh()} /> : null}
+    </ScrollView>
+  );
 
   return (
     <ScrollView contentInsetAdjustmentBehavior="automatic" refreshControl={<RefreshControl refreshing={loading} onRefresh={() => void refresh()} />} contentContainerStyle={{ padding: 16, gap: 14 }}>
@@ -103,6 +109,19 @@ export default function SessionRoute() {
         <Text selectable style={{ color: colors.tertiaryLabel, fontVariant: ["tabular-nums"] }}>Started {formatDate(session.created_at)}</Text>
         <Text selectable style={{ color: colors.tertiaryLabel, fontVariant: ["tabular-nums"] }}>Raw media expires {formatDate(session.retention.raw_media_expires_at)}</Text>
       </SectionCard>
+
+      {error ? (
+        <SectionCard title="Current session not verified">
+          <Text selectable accessibilityRole="alert" style={{ color: colors.red, lineHeight: 20 }}>
+            {error} Previously loaded details remain visible, but recovery is locked until refresh succeeds.
+          </Text>
+          <ActionButton label="Retry session refresh" loading={loading} onPress={() => void refresh()} />
+        </SectionCard>
+      ) : null}
+
+      {client && config ? (
+        <ResumeSessionCard client={client} disabled={loading || error !== null} session={session} targetScheme={config.targetScheme} />
+      ) : null}
 
       <SectionCard title="Captured evidence">
         <Text selectable style={{ color: colors.label }}>{session.segments?.length ?? 0} verified media segments</Text>
@@ -129,7 +148,7 @@ export default function SessionRoute() {
       </SectionCard>
 
       <SectionCard title="Ticket candidates" trailing={<Text selectable style={{ color: colors.secondaryLabel, fontVariant: ["tabular-nums"] }}>{candidates.length}{nextCandidateCursor ? "+" : ""}</Text>}>
-        {candidateError ? <Text selectable style={{ color: colors.red }}>Candidate state is unavailable: {candidateError}</Text> : null}
+        {candidateError ? <Text selectable accessibilityRole="alert" style={{ color: colors.red }}>Candidate state is unavailable: {candidateError}</Text> : null}
         {!candidateError && candidates.length === 0 ? <Text selectable style={{ color: colors.secondaryLabel }}>Candidates will appear after processing. Approval always requires a human action.</Text> : null}
         {candidates.map((candidate) => (
           <Link key={candidate.candidate_id} href={{ pathname: "/candidates/[candidate-id]", params: { "candidate-id": candidate.candidate_id } }} asChild>
@@ -139,13 +158,13 @@ export default function SessionRoute() {
                   <Text selectable style={{ color: colors.label, fontWeight: "700", flex: 1 }}>{candidate.title}</Text>
                   <StatusPill value={candidate.state} />
                 </View>
-                <Text selectable numberOfLines={2} style={{ color: colors.secondaryLabel }}>{candidate.summary}</Text>
+                <Text selectable style={{ color: colors.secondaryLabel }}>{candidate.summary}</Text>
               </Pressable>
             </Link.Trigger>
             <Link.Preview />
           </Link>
         ))}
-        {nextCandidateCursor ? <ActionButton label="Load 50 more candidates" onPress={() => void loadMoreCandidates()} loading={loadingMoreCandidates} disabled={loading} /> : null}
+        {nextCandidateCursor ? <ActionButton label="Load 50 more candidates" onPress={() => void loadMoreCandidates()} loading={loadingMoreCandidates} disabled={loading || error !== null} /> : null}
       </SectionCard>
     </ScrollView>
   );

@@ -24,6 +24,14 @@ import runtime_contract as runtime  # noqa: E402
 
 ContractError = runtime.ContractError
 PROTOCOL_VERSION = "tacua.sdk-backend@1.0.0"
+MAX_SESSION_CREDENTIALS = 64
+PROCESSING_JOB_STAGES = (
+    "transcribe",
+    "align",
+    "correlate",
+    "research",
+    "generate_tickets",
+)
 
 
 def canonical_json(value: Any) -> str:
@@ -476,6 +484,40 @@ def validate_completion_receipt(value: dict[str, Any]) -> None:
     job = value["processing_job"]
     runtime.validate(job)
     require(job["status"] == "queued", "JOB_NOT_QUEUED", "$.processing_job.status", "completion must durably create a queued job")
+    expected_stages = [
+        {
+            "name": name,
+            "state": "pending",
+            "attempt_count": 0,
+            "started_at": None,
+            "completed_at": None,
+            "detail": None,
+        }
+        for name in PROCESSING_JOB_STAGES
+    ]
+    expected_execution = {
+        "mode": "async",
+        "max_attempts": 3,
+        "egress": {
+            "policy": "default_deny",
+            "authorized": False,
+            "authorization_decision_id": None,
+            "destinations": [],
+        },
+    }
+    require(
+        job["job_version"] == 1
+        and job["previous_job_digest"] is None
+        and job["started_at"] is None
+        and job["completed_at"] is None
+        and job["outputs"] is None
+        and job["failure"] is None
+        and job["pipeline"]["stages"] == expected_stages
+        and job["execution"] == expected_execution,
+        "COMPLETION_JOB_NOT_INITIAL",
+        "$.processing_job",
+        "completion must return the exact version-one queued processing baseline",
+    )
     require(job["session_id"] == value["session_id"], "COMPLETION_SCOPE_MISMATCH", "$.processing_job.session_id", "job names another session")
     require(
         value["credential"]["replay_completion_id"] == value["completion_id"],
@@ -674,6 +716,12 @@ def validate_launch_chain(
 ) -> tuple[str, dict[str, dict[str, Any]]]:
     """Validate ordered start/resume exchanges and return durable credential history."""
     require(bool(launch_pairs), "EMPTY_LAUNCH_CHAIN", "$.launch_pairs", "lifecycle requires a start exchange")
+    require(
+        len(launch_pairs) <= MAX_SESSION_CREDENTIALS,
+        "CREDENTIAL_ROTATION_LIMIT_REACHED",
+        "$.launch_pairs",
+        "V1 session credential history may contain at most 64 credentials",
+    )
     history: dict[str, dict[str, Any]] = {}
     session_id: str | None = None
     previous_credential_id: str | None = None

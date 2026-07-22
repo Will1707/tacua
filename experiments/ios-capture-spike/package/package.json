@@ -1,31 +1,39 @@
 {
-  "name": "@tacua/ios-capture-spike",
-  "version": "0.0.1",
-  "description": "Removable ReplayKit capture and recovery probe for Tacua EXP-001/EXP-005",
+  "name": "@tacua/mobile-sdk",
+  "version": "0.1.0",
+  "description": "Pre-release iOS capture, diagnostics, recovery, and self-hosted transport SDK for Tacua QA builds",
   "license": "Apache-2.0",
   "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Will1707/tacua.git",
+    "directory": "experiments/ios-capture-spike/package"
+  },
+  "homepage": "https://github.com/Will1707/tacua/tree/main/experiments/ios-capture-spike/package#readme",
+  "bugs": {
+    "url": "https://github.com/Will1707/tacua/issues"
+  },
   "main": "src/index.ts",
   "types": "src/index.ts",
   "files": [
     "LICENSE",
     "NOTICE",
+    "CONFIG_PLUGIN.md",
+    "app.plugin.js",
     "expo-module.config.json",
     "ios",
+    "plugin",
     "src",
-    "tests",
     "README.md"
   ],
   "exports": {
     ".": "./src/index.ts"
   },
-  "scripts": {
-    "test:core": "sh tests/run-core-tests.sh"
-  },
   "dependencies": {
     "expo-modules-core": "~56.0.17"
   },
   "peerDependencies": {
-    "expo": "*",
-    "react-native": "*"
+    "expo": ">=56.0.16 <57",
+    "react-native": ">=0.85.3 <0.86"
   }
 }

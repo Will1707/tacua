@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Strict HTTP/1.1 mapping for the frozen Tacua SDK/backend protocol."""
 
 from __future__ import annotations
@@ -16,13 +18,16 @@ from .service import (
     InvalidJSONValue,
     LimitedReader,
     PilotBackend,
+    SDK_BACKEND_ERROR_CONTRACT,
+    SDK_BACKEND_ERROR_MAX_BYTES,
+    SDK_BACKEND_ERROR_MEDIA_TYPE,
     StoredResponse,
     strict_json_loads,
 )
 
 
 ID = r"[a-z][a-z0-9_-]{2,63}"
-SEQUENCE = r"(?:0|[1-9][0-9]*)"
+SEQUENCE = r"(?:0|[1-9][0-9]{0,3})"
 VERSION = r"[1-9][0-9]{0,15}"
 
 
@@ -70,8 +75,14 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
         return
 
     def handle_expect_100(self) -> bool:
-        self.send_error(417, "Expectation Failed")
         self.close_connection = True
+        self._send_api_error(
+            ApiError(
+                417,
+                "EXPECTATION_NOT_SUPPORTED",
+                "100-continue is not supported",
+            )
+        )
         return False
 
     @property
@@ -155,7 +166,7 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
         if self.headers.get("Transfer-Encoding") is not None:
             raise ApiError(400, "TRANSFER_ENCODING_NOT_ALLOWED", "chunked request bodies are not accepted")
         values = self.headers.get_all("Content-Length") or []
-        if len(values) != 1 or not values[0].isdigit():
+        if len(values) != 1 or re.fullmatch(r"[0-9]{1,10}", values[0]) is None:
             raise ApiError(411, "CONTENT_LENGTH_REQUIRED", "one valid Content-Length is required")
         length = int(values[0])
         if length < 1 or length > maximum:
@@ -215,6 +226,35 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
 
     def _send_protocol(self, response: StoredResponse) -> None:
         self._send_bytes(response.status, response.body)
+
+    def _send_api_error(self, error: ApiError) -> None:
+        reconciliation = error.sdk_reconciliation
+        if reconciliation is None:
+            self._send_json(
+                error.status,
+                {"error": {"code": error.code, "message": error.message}},
+            )
+            return
+        document = {
+            "contract_version": SDK_BACKEND_ERROR_CONTRACT,
+            "media_type": SDK_BACKEND_ERROR_MEDIA_TYPE,
+            "protocol_version": PROTOCOL_VERSION,
+            "error": {
+                "code": error.code,
+                "message": error.message,
+                "reconciliation": reconciliation.as_dict(),
+            },
+        }
+        payload = canonical_json(document).encode("utf-8")
+        if len(payload) > SDK_BACKEND_ERROR_MAX_BYTES:
+            # All fields are internally constructed and independently bounded.
+            # Preserve a content-free failure if that invariant ever regresses.
+            self._send_json(
+                500,
+                {"error": {"code": "INTERNAL_ERROR", "message": "request failed"}},
+            )
+            return
+        self._send_bytes(error.status, payload, SDK_BACKEND_ERROR_MEDIA_TYPE)
 
     def _dispatch(self) -> None:
         path = self._path()
@@ -462,7 +502,7 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
                 idempotency_key=self._single_header(
                     "Idempotency-Key", "IDEMPOTENCY_KEY_REQUIRED"
                 ),
-                body=self._read_json(16_384),
+                body=self._read_json(1_048_576),
             )
             self._send_bytes(
                 response.status,
@@ -501,7 +541,7 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
 
         if self.command == "GET" and path == "/v1/admin/jobs":
             self._admin()
-            self._send_json(200, {"jobs": self.backend.list_jobs()})
+            self._send_json(200, self.backend.list_jobs(self._page_cursor()))
             return
         admin_job = re.fullmatch(rf"/v1/admin/jobs/(?P<job_id>{ID})", path)
         if admin_job and self.command == "GET":
@@ -510,7 +550,7 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
             return
         if self.command == "GET" and path == "/v1/admin/audit-events":
             self._admin()
-            self._send_json(200, {"events": self.backend.list_audit_events()})
+            self._send_json(200, self.backend.list_audit_events(self._page_cursor()))
             return
 
         raise ApiError(404, "NOT_FOUND", "route was not found")
@@ -520,7 +560,7 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
             self._dispatch()
         except ApiError as exc:
             self.close_connection = True
-            self._send_json(exc.status, {"error": {"code": exc.code, "message": exc.message}})
+            self._send_api_error(exc)
         except (BrokenPipeError, ConnectionResetError):
             self.close_connection = True
         except Exception:

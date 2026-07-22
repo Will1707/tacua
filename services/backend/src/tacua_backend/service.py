@@ -1,9 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Durable SDK/backend protocol service for one self-hosted Tacua deployment."""
 
 from __future__ import annotations
 
 import base64
 import binascii
+import copy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -19,7 +22,7 @@ import stat
 import tempfile
 import threading
 import unicodedata
-from typing import Any, BinaryIO, Callable
+from typing import Any, BinaryIO, Callable, Protocol
 
 from . import PROCESSING_JOB_CONTRACT, __version__
 from .candidate_domain import ContractError as CandidateContractError, TICKET_CONTRACT
@@ -66,6 +69,9 @@ from .handoff_store import (
     initialize_schema as initialize_handoff_schema,
 )
 from .processing_jobs import (
+    JOB_STAGES,
+    ProcessingResult,
+    PublicationCandidate,
     ProcessingJobClaim,
     ProcessingJobStore,
     ProcessingJobStoreError,
@@ -74,7 +80,12 @@ from .processing_jobs import (
 
 
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
+MAX_JSON_NESTING_DEPTH = 64
 MAX_SEGMENTS = 2048
+MAX_SESSION_CREDENTIALS = 64
+CREDENTIAL_ORDINAL_CHECK_SQL = (
+    "ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 63)"
+)
 MAX_CANDIDATE_EVIDENCE_VIEW_BYTES = 1_572_864
 MAX_HANDOFF_ARTIFACT_BYTES = 2_097_152
 LIST_PAGE_SIZE = 50
@@ -85,6 +96,21 @@ INTERNAL_DELETION_RESOURCE = "tacua.internal-deletion-job@1.0.0"
 SCOPE_POLICY_CONTRACT = "tacua.capture-scope-policy@1.0.0"
 RETENTION_POLICY_VERSION = "tacua.retention-v1"
 MANIFEST_RETENTION_POLICY_VERSION = "tacua.retention@1.0.0"
+SDK_BACKEND_ERROR_CONTRACT = "tacua.sdk-backend-error@1.0.0"
+SDK_BACKEND_ERROR_MEDIA_TYPE = (
+    "application/vnd.tacua.sdk-backend-error+json;version=1.0.0"
+)
+SDK_BACKEND_ERROR_MAX_BYTES = 4_096
+HISTORICAL_OPERATION_NOT_FOUND = "historical_operation_not_found"
+OPERATION_NOT_AUTHORIZED_MESSAGE = (
+    "new upload requires the current active credential"
+)
+COMPLETION_NOT_AUTHORIZED_MESSAGE = (
+    "first completion requires the current active credential"
+)
+CREDENTIAL_ROTATION_LIMIT_MESSAGE = (
+    "session credential recovery limit was reached; delete this session and start a new capture"
+)
 
 
 class ClosingConnection(sqlite3.Connection):
@@ -97,14 +123,74 @@ class ClosingConnection(sqlite3.Connection):
             self.close()
 
 
+@dataclass(frozen=True)
+class SDKReconciliationBinding:
+    """Content-free binding for one authoritative historical-operation lookup miss."""
+
+    session_id: str
+    operation_kind: str
+    operation_id: str
+    request_digest: str
+    request_credential_id: str
+    authenticated_credential_id: str
+
+    def __post_init__(self) -> None:
+        identifiers = (
+            self.session_id,
+            self.operation_id,
+            self.request_credential_id,
+            self.authenticated_credential_id,
+        )
+        if (
+            self.operation_kind not in {"segment", "diagnostic", "completion"}
+            or any(ID_PATTERN.fullmatch(value) is None for value in identifiers)
+            or DIGEST_PATTERN.fullmatch(self.request_digest) is None
+            or self.request_credential_id == self.authenticated_credential_id
+        ):
+            raise ValueError("invalid SDK reconciliation binding")
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "outcome": HISTORICAL_OPERATION_NOT_FOUND,
+            "session_id": self.session_id,
+            "operation_kind": self.operation_kind,
+            "operation_id": self.operation_id,
+            "request_digest": self.request_digest,
+            "request_credential_id": self.request_credential_id,
+            "authenticated_credential_id": self.authenticated_credential_id,
+        }
+
+
 class ApiError(Exception):
     """A content-free error safe to serialize to an API client."""
 
-    def __init__(self, status: int, code: str, message: str):
+    def __init__(
+        self,
+        status: int,
+        code: str,
+        message: str,
+        *,
+        sdk_reconciliation: SDKReconciliationBinding | None = None,
+    ):
+        if sdk_reconciliation is not None:
+            expected_message = (
+                COMPLETION_NOT_AUTHORIZED_MESSAGE
+                if sdk_reconciliation.operation_kind == "completion"
+                else OPERATION_NOT_AUTHORIZED_MESSAGE
+            )
+            if (
+                status != 403
+                or code != "OPERATION_NOT_AUTHORIZED"
+                or message != expected_message
+            ):
+                raise ValueError(
+                    "SDK reconciliation is only valid for historical operation denial"
+                )
         super().__init__(message)
         self.status = status
         self.code = code
         self.message = message
+        self.sdk_reconciliation = sdk_reconciliation
 
 
 @dataclass(frozen=True)
@@ -127,12 +213,25 @@ class InvalidJSONValue(ValueError):
     pass
 
 
+class ProcessingEngine(Protocol):
+    """Opt-in internal processor; no engine is configured by default."""
+
+    def process_stage(
+        self, claim: ProcessingJobClaim
+    ) -> ProcessingResult | None:
+        """Process one lease-owned stage without receiving backend authority."""
+
+
 def strict_json_loads(value: bytes | str) -> Any:
     """Decode duplicate-free, integer-only, NFC, interoperable JSON."""
 
     def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, item in pairs:
+            try:
+                key.encode("utf-8", errors="strict")
+            except UnicodeEncodeError as exc:
+                raise InvalidJSONValue("JSON object key contains invalid Unicode") from exc
             if unicodedata.normalize("NFC", key) != key:
                 raise InvalidJSONValue("JSON object keys must be NFC-normalized")
             if key in result:
@@ -144,6 +243,9 @@ def strict_json_loads(value: bytes | str) -> Any:
         raise InvalidJSONValue("floating-point JSON values are forbidden")
 
     def checked_int(raw: str) -> int:
+        digits = raw[1:] if raw.startswith("-") else raw
+        if len(digits) > 16:
+            raise InvalidJSONValue("JSON integer exceeds the interoperable range")
         parsed = int(raw)
         if abs(parsed) > MAX_SAFE_INTEGER:
             raise InvalidJSONValue("JSON integer exceeds the interoperable range")
@@ -154,16 +256,39 @@ def strict_json_loads(value: bytes | str) -> Any:
 
     if isinstance(value, bytes):
         value = value.decode("utf-8")
-    result = json.loads(
-        value,
-        object_pairs_hook=reject_duplicates,
-        parse_float=reject_float,
-        parse_int=checked_int,
-        parse_constant=reject_constant,
-    )
-    for path, child in PROTOCOL.runtime.walk(result):
-        if isinstance(child, str) and unicodedata.normalize("NFC", child) != child:
-            raise InvalidJSONValue(f"non-NFC string at {path}")
+    try:
+        result = json.loads(
+            value,
+            object_pairs_hook=reject_duplicates,
+            parse_float=reject_float,
+            parse_int=checked_int,
+            parse_constant=reject_constant,
+        )
+    except RecursionError as exc:
+        raise InvalidJSONValue("JSON nesting exceeds the safe depth") from exc
+
+    stack: list[tuple[str, Any, int]] = [("$", result, 0)]
+    while stack:
+        path, child, depth = stack.pop()
+        if depth > MAX_JSON_NESTING_DEPTH:
+            raise InvalidJSONValue("JSON nesting exceeds the safe depth")
+        if isinstance(child, str):
+            try:
+                child.encode("utf-8", errors="strict")
+            except UnicodeEncodeError as exc:
+                raise InvalidJSONValue(f"invalid Unicode string at {path}") from exc
+            if unicodedata.normalize("NFC", child) != child:
+                raise InvalidJSONValue(f"non-NFC string at {path}")
+        elif isinstance(child, list):
+            stack.extend(
+                (f"{path}[{index}]", item, depth + 1)
+                for index, item in enumerate(child)
+            )
+        elif isinstance(child, dict):
+            stack.extend(
+                (f"{path}.{key}", item, depth + 1)
+                for key, item in child.items()
+            )
     return result
 
 
@@ -217,11 +342,15 @@ def _decode_page_cursor(
         document = strict_json_loads(raw)
         if not isinstance(document, dict) or _encode_page_cursor(document) != value:
             raise ValueError("cursor is not canonical")
-        expected_keys = (
-            {"version", "kind", "created_at", "session_id"}
-            if kind == "sessions"
-            else {"version", "kind", "session_id", "candidate_id"}
-        )
+        expected_keys_by_kind = {
+            "sessions": {"version", "kind", "created_at", "session_id"},
+            "candidates": {"version", "kind", "session_id", "candidate_id"},
+            "jobs": {"version", "kind", "requested_at", "job_id"},
+            "audit_events": {"version", "kind", "occurred_at", "event_id"},
+        }
+        expected_keys = expected_keys_by_kind.get(kind)
+        if expected_keys is None:  # pragma: no cover - callers pin a known kind
+            raise RuntimeError("unsupported internal page cursor kind")
         if (
             set(document) != expected_keys
             or document["version"] != PAGE_CURSOR_VERSION
@@ -250,8 +379,26 @@ def _decode_page_cursor(
                 or ID_PATTERN.fullmatch(candidate_id) is None
             ):
                 raise ValueError("candidate cursor position is invalid")
-        else:  # pragma: no cover - every caller uses one fixed internal kind
-            raise RuntimeError("unsupported internal page cursor kind")
+        elif kind == "jobs":
+            requested_at = document["requested_at"]
+            job_id = document["job_id"]
+            if (
+                not isinstance(requested_at, str)
+                or timestamp(_parse_timestamp(requested_at)) != requested_at
+                or not isinstance(job_id, str)
+                or ID_PATTERN.fullmatch(job_id) is None
+            ):
+                raise ValueError("job cursor position is invalid")
+        elif kind == "audit_events":
+            occurred_at = document["occurred_at"]
+            event_id = document["event_id"]
+            if (
+                not isinstance(occurred_at, str)
+                or timestamp(_parse_timestamp(occurred_at)) != occurred_at
+                or not isinstance(event_id, str)
+                or ID_PATTERN.fullmatch(event_id) is None
+            ):
+                raise ValueError("audit-event cursor position is invalid")
         return document
     except (
         binascii.Error,
@@ -300,6 +447,7 @@ class PilotBackend:
         *,
         clock: Callable[[], datetime] = utc_now,
         retention_wait: Callable[[threading.Event, float], bool] | None = None,
+        processing_engine: ProcessingEngine | None = None,
     ):
         if not 32 <= len(admin_secret) <= 4096:
             raise ValueError("admin secret must contain from 32 through 4096 bytes")
@@ -349,6 +497,10 @@ class PilotBackend:
             raise ValueError("retention_sweep_interval_seconds is outside the V1 bound")
         if not callable(clock):
             raise ValueError("clock must be callable")
+        if processing_engine is not None and not callable(
+            getattr(processing_engine, "process_stage", None)
+        ):
+            raise ValueError("processing_engine must implement process_stage")
         self.config = config
         self._registered_build_identity = strict_json_loads(canonical_json(config.build_identity))
         self._registered_build_identity_json = canonical_json(self._registered_build_identity)
@@ -365,6 +517,7 @@ class PilotBackend:
         ).digest()
         self._clock = clock
         self._retention_wait = retention_wait or self._wait_for_retention_interval
+        self._processing_engine = processing_engine
         self.state_dir = config.state_directory
         if not self.state_dir.is_absolute() or self.state_dir == Path(self.state_dir.anchor):
             raise ValueError("state_directory must be an absolute non-root path")
@@ -392,6 +545,10 @@ class PilotBackend:
             metadata = directory.lstat()
             if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
                 raise ValueError(f"backend state path is not a real directory: {directory}")
+            if metadata.st_uid != os.geteuid():
+                raise ValueError(
+                    f"backend state path is not owned by the service user: {directory}"
+                )
             directory.chmod(0o700)
         try:
             database_metadata = self.db_path.lstat()
@@ -404,11 +561,16 @@ class PilotBackend:
                 raise ValueError(
                     f"backend database path is not a regular file: {self.db_path}"
                 )
+            if database_metadata.st_uid != os.geteuid():
+                raise ValueError("backend database is not owned by the service user")
         self._initialize_database()
+        self.db_path.chmod(0o600)
         self._restore_authoritative_time_floor()
         self._initialize_review_storage()
         self._recover_pending_deletions()
+        self._validate_persisted_credential_histories()
         self._reconcile_storage()
+        self._validate_processing_publications_on_startup()
 
     @staticmethod
     def _wait_for_retention_interval(stop_event: threading.Event, seconds: float) -> bool:
@@ -474,6 +636,9 @@ class PilotBackend:
                 tables = conn.execute(
                     "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
                 ).fetchall()
+                credential_schema = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'credentials'"
+                ).fetchone()
             if version not in {0, SCHEMA_VERSION}:
                 raise ValueError(
                     "persisted backend schema is incompatible with the frozen SDK protocol; "
@@ -481,6 +646,15 @@ class PilotBackend:
                 )
             if version == 0 and tables:
                 raise ValueError("unversioned backend state is not safe to adopt")
+            if version == SCHEMA_VERSION and (
+                credential_schema is None
+                or not isinstance(credential_schema["sql"], str)
+                or CREDENTIAL_ORDINAL_CHECK_SQL not in credential_schema["sql"]
+            ):
+                raise ValueError(
+                    "persisted backend schema-v2 credential constraint is incompatible; "
+                    "back up and start with an empty state directory"
+                )
 
         schema = """
         CREATE TABLE IF NOT EXISTS deployment_pin (
@@ -503,7 +677,7 @@ class PilotBackend:
         CREATE TABLE IF NOT EXISTS credentials (
             credential_id TEXT PRIMARY KEY,
             session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
-            ordinal INTEGER NOT NULL,
+            ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 63),
             verifier TEXT NOT NULL,
             issued_at TEXT NOT NULL,
             expires_at TEXT NOT NULL,
@@ -625,7 +799,11 @@ class PilotBackend:
         CREATE INDEX IF NOT EXISTS sessions_retention_idx ON sessions(raw_media_expires_at, state);
         CREATE INDEX IF NOT EXISTS sessions_admin_list_idx ON sessions(created_at DESC, session_id DESC);
         CREATE INDEX IF NOT EXISTS audit_session_idx ON audit_events(session_id, occurred_at);
+        CREATE INDEX IF NOT EXISTS audit_admin_list_idx
+            ON audit_events(occurred_at DESC, event_id DESC);
         CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs(status, requested_at);
+        CREATE INDEX IF NOT EXISTS jobs_admin_list_idx
+            ON jobs(requested_at DESC, job_id DESC);
         """
         pin_json = canonical_json(self.config.deployment_pin)
         with self._connect() as conn:
@@ -644,6 +822,107 @@ class PilotBackend:
                 raise ValueError(
                     "persisted processing-job state failed safe schema-v2 adoption"
                 ) from error
+
+    def _validate_persisted_credential_histories(self) -> None:
+        """Fail closed when durable credential state cannot satisfy the V1 bound.
+
+        Pending deletions are recovered before this check because their durable
+        crash boundary legitimately revokes every credential. Any session still
+        present here must have one bounded, contiguous credential chain.
+        """
+
+        invalid_message = (
+            "persisted backend credential history failed safe schema-v2 adoption; "
+            "back up and start with an empty state directory"
+        )
+        with self._connect() as conn:
+            orphan = conn.execute(
+                """SELECT 1 FROM credentials
+                   LEFT JOIN sessions ON sessions.session_id = credentials.session_id
+                   WHERE sessions.session_id IS NULL LIMIT 1"""
+            ).fetchone()
+            if orphan is not None:
+                raise ValueError(invalid_message)
+
+            sessions = conn.execute(
+                "SELECT session_id,state,completion_id FROM sessions ORDER BY session_id"
+            )
+            for session in sessions:
+                credentials = conn.execute(
+                    """SELECT ordinal,revoked_at,issued_session_state,issued_state,
+                              current_state,replay_completion_id
+                         FROM credentials WHERE session_id = ?
+                         ORDER BY ordinal LIMIT ?""",
+                    (session["session_id"], MAX_SESSION_CREDENTIALS + 1),
+                ).fetchall()
+                if (
+                    not 1 <= len(credentials) <= MAX_SESSION_CREDENTIALS
+                    or [row["ordinal"] for row in credentials]
+                    != list(range(len(credentials)))
+                ):
+                    raise ValueError(invalid_message)
+
+                current = [row for row in credentials if row["revoked_at"] is None]
+                if len(current) != 1 or current[0]["ordinal"] != len(credentials) - 1:
+                    raise ValueError(invalid_message)
+
+                session_state = session["state"]
+                completion_id = session["completion_id"]
+                if (
+                    (session_state == "receiving" and completion_id is not None)
+                    or (session_state == "completed" and completion_id is None)
+                    or session_state not in {"receiving", "completed"}
+                ):
+                    raise ValueError(invalid_message)
+
+                for credential in credentials:
+                    issued_session_state = credential["issued_session_state"]
+                    expected_issued_state = {
+                        "receiving": "active",
+                        "completed": "completion_replay_or_delete_only",
+                    }.get(issued_session_state)
+                    replay_completion_id = credential["replay_completion_id"]
+                    if (
+                        expected_issued_state is None
+                        or credential["issued_state"] != expected_issued_state
+                        or (
+                            issued_session_state == "completed"
+                            and (
+                                session_state != "completed"
+                                or replay_completion_id != completion_id
+                            )
+                        )
+                        or (
+                            replay_completion_id is not None
+                            and (
+                                session_state != "completed"
+                                or replay_completion_id != completion_id
+                            )
+                        )
+                    ):
+                        raise ValueError(invalid_message)
+
+                    if credential["revoked_at"] is not None:
+                        if credential["current_state"] != "revoked":
+                            raise ValueError(invalid_message)
+                        continue
+                    expected_current_state = (
+                        "active"
+                        if session_state == "receiving"
+                        else "completion_replay_or_delete_only"
+                    )
+                    if (
+                        credential["current_state"] != expected_current_state
+                        or (
+                            session_state == "receiving"
+                            and replay_completion_id is not None
+                        )
+                        or (
+                            session_state == "completed"
+                            and replay_completion_id != completion_id
+                        )
+                    ):
+                        raise ValueError(invalid_message)
 
     def _initialize_review_storage(self) -> None:
         """Initialize append-only review state before serving concurrent requests."""
@@ -686,11 +965,119 @@ class PilotBackend:
                 "processing_lease", f"{job_id}:{version}", token
             ),
             token_factory=lambda: secrets.token_urlsafe(32),
+            successful_output_validator=self._validate_processing_result_publication,
         )
 
     @staticmethod
     def _raise_processing_job_error(error: ProcessingJobStoreError) -> None:
         raise ApiError(error.status, error.code, error.message) from error
+
+    def _validate_processing_result_publication(
+        self,
+        connection: sqlite3.Connection,
+        job: dict[str, Any],
+    ) -> None:
+        """Resolve every successful output back to exact durable artifacts."""
+
+        outputs = job.get("outputs")
+        if job.get("status") != "succeeded" or not isinstance(outputs, dict):
+            raise ValueError("processing publication validator requires a successful job")
+        candidate_refs = outputs["candidate_refs"]
+        evidence_refs = outputs["derived_evidence_refs"]
+        published_candidate_ids = [
+            row["candidate_id"]
+            for row in connection.execute(
+                """SELECT candidate_id FROM candidate_versions
+                    WHERE organization_id = ? AND project_id = ?
+                      AND session_id = ? AND candidate_version = 1
+                    ORDER BY candidate_id""",
+                (job["organization_id"], job["project_id"], job["session_id"]),
+            )
+        ]
+        if outputs["disposition"] == "no_issue_detected":
+            if candidate_refs or evidence_refs or published_candidate_ids:
+                raise ValueError("no-issue result references published artifacts")
+            return
+
+        expected_refs: list[dict[str, Any]] = []
+        expected_evidence: set[str] = set()
+        publication_actors: set[str] = set()
+        evidence = self._evidence_store(connection)
+        for reference in candidate_refs:
+            if reference["candidate_version"] != 1:
+                raise ValueError("processing output must reference generated version one")
+            candidate = self._candidate_from_connection(
+                connection, reference["candidate_id"], reference["candidate_version"]
+            )
+            if (
+                candidate["candidate_version"] != 1
+                or candidate["previous_candidate_digest"] is not None
+                or candidate["lineage"] != {"operation": "generated", "parents": []}
+                or candidate["state"] != "draft"
+                or candidate["transition"]["actor"]["actor_type"] != "system"
+                or candidate["organization_id"] != job["organization_id"]
+                or candidate["project_id"] != job["project_id"]
+                or candidate["session_id"] != job["session_id"]
+                or candidate["build_id"] != job["build_id"]
+                or candidate["build_identity_digest"]
+                != job["build_identity_digest"]
+            ):
+                raise ValueError("processing output candidate binding changed")
+            binding = self._candidate_binding(candidate)
+            manifest = evidence.get_manifest(**binding)
+            if (
+                manifest["manifest_id"]
+                != candidate["evidence_manifest"]["manifest_id"]
+                or manifest["manifest_digest"]
+                != candidate["evidence_manifest"]["manifest_digest"]
+                or sorted(item["evidence_id"] for item in manifest["items"])
+                != sorted(candidate["evidence_manifest"]["evidence_ids"])
+            ):
+                raise ValueError("processing output evidence binding changed")
+            keyframes = [
+                item["evidence_id"]
+                for item in manifest["items"]
+                if item["evidence_type"] == "media.keyframe"
+                and item["availability"] == "available"
+            ]
+            if not keyframes:
+                raise ValueError("processing output has no available screenshot")
+            verified = evidence.get_verified_keyframes_for_approval(
+                evidence_ids=keyframes,
+                **binding,
+            )
+            if len(verified["verified_keyframes"]) != len(keyframes):
+                raise ValueError("processing output screenshot population changed")
+            expected_refs.append(
+                {
+                    "candidate_id": candidate["candidate_id"],
+                    "candidate_version": candidate["candidate_version"],
+                }
+            )
+            expected_evidence.update(candidate["evidence_manifest"]["evidence_ids"])
+            publication_actors.add(candidate["transition"]["actor"]["actor_id"])
+
+        if (
+            candidate_refs
+            != sorted(expected_refs, key=lambda item: item["candidate_id"])
+            or [item["candidate_id"] for item in candidate_refs]
+            != published_candidate_ids
+            or evidence_refs != sorted(expected_evidence)
+            or len(publication_actors) != 1
+        ):
+            raise ValueError("processing output references differ from published artifacts")
+
+    def _validate_processing_publications_on_startup(self) -> None:
+        """Fail closed before serving if a successful output cannot be resolved."""
+
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN")
+                self._processing_job_store(connection).list()
+        except (ApiError, EvidenceDomainError, ProcessingJobStoreError, sqlite3.Error) as error:
+            raise ValueError(
+                "persisted successful processing publication failed validation"
+            ) from error
 
     def _verified_candidate_publication_manifest(
         self,
@@ -803,6 +1190,15 @@ class PilotBackend:
         evidence, manifest = self._verified_candidate_publication_manifest(
             connection, candidate
         )
+        processing = connection.execute(
+            "SELECT status FROM jobs WHERE session_id = ?", (candidate["session_id"],)
+        ).fetchone()
+        if processing is None or processing["status"] == "succeeded":
+            raise ApiError(
+                409,
+                "PROCESSING_PUBLICATION_CLOSED",
+                "processing output candidate publication is closed",
+            )
         keyframe_ids = [
             item["evidence_id"]
             for item in manifest["items"]
@@ -981,32 +1377,102 @@ class PilotBackend:
             os.close(descriptor)
 
     @staticmethod
-    def _regular_file_size(path: Path) -> int | None:
+    def _file_digest(path: Path) -> tuple[int, str] | None:
+        """Hash one exact non-linked file without following its final component."""
+
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
+            os, "O_NOFOLLOW", 0
+        )
         try:
-            metadata = path.lstat()
+            descriptor = os.open(path, flags)
         except FileNotFoundError:
             return None
-        if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-            raise ValueError(f"state path is not a regular file: {path}")
-        return metadata.st_size
-
-    @staticmethod
-    def _file_digest(path: Path) -> tuple[int, str]:
-        hasher = hashlib.sha256()
-        size = 0
-        with path.open("rb") as handle:
-            while chunk := handle.read(1024 * 1024):
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_uid != os.geteuid()
+            ):
+                raise ValueError("state object is not one service-owned regular file")
+            hasher = hashlib.sha256()
+            size = 0
+            while chunk := os.read(descriptor, 1024 * 1024):
                 hasher.update(chunk)
                 size += len(chunk)
-        return size, "sha256:" + hasher.hexdigest()
+            after = os.fstat(descriptor)
+            if (
+                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                or size != before.st_size
+            ):
+                raise ValueError("state object changed while it was verified")
+            return size, "sha256:" + hasher.hexdigest()
+        finally:
+            os.close(descriptor)
 
-    def _object_path(self, relative_path: str) -> Path:
-        candidate = (self.state_dir / relative_path).resolve()
-        root = self.objects_dir.resolve()
+    def _object_path(
+        self,
+        relative_path: str,
+        *,
+        expected_session_id: str | None = None,
+        expected_category: str | None = None,
+    ) -> Path:
+        """Resolve only Tacua's closed object layout without following links."""
+
+        if not isinstance(relative_path, str):
+            raise ValueError("persisted object path is not text")
+        relative = Path(relative_path)
+        parts = relative.parts
+        suffixes = {
+            "segments": "media",
+            "diagnostics": "json",
+            "completion": "json",
+        }
+        if (
+            relative.is_absolute()
+            or len(parts) != 4
+            or parts[0] != "objects"
+            or any(part in {"", ".", ".."} for part in parts)
+            or ID_PATTERN.fullmatch(parts[1]) is None
+            or parts[2] not in suffixes
+            or (
+                expected_session_id is not None
+                and parts[1] != expected_session_id
+            )
+            or (
+                expected_category is not None
+                and parts[2] != expected_category
+            )
+        ):
+            raise ValueError("persisted object path escaped its closed storage scope")
+        stem, separator, suffix = parts[3].rpartition(".")
+        if (
+            separator != "."
+            or ID_PATTERN.fullmatch(stem) is None
+            or suffix != suffixes[parts[2]]
+        ):
+            raise ValueError("persisted object file name is invalid")
+
+        candidate = self.state_dir.joinpath(*parts)
+        current = self.state_dir
+        for part in parts[:-1]:
+            current = current / part
+            try:
+                metadata = current.lstat()
+            except FileNotFoundError:
+                break
+            if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                raise ValueError("persisted object parent is not a real directory")
         try:
-            candidate.relative_to(root)
-        except ValueError as exc:
-            raise ValueError("persisted object path escaped backend storage") from exc
+            final_metadata = candidate.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISREG(final_metadata.st_mode) or stat.S_ISLNK(
+                final_metadata.st_mode
+            ):
+                raise ValueError("persisted object is not a regular file")
         return candidate
 
     def _reconcile_storage(self) -> None:
@@ -1014,6 +1480,30 @@ class PilotBackend:
 
         changed = False
         for entry in self.temp_dir.iterdir():
+            if entry.name.startswith("processing-"):
+                if entry.is_symlink():
+                    entry.unlink()
+                    changed = True
+                    continue
+                if not entry.is_dir():
+                    raise ValueError(
+                        f"unrecognized processing temporary path: {entry.name}"
+                    )
+                for root, directories, files in os.walk(
+                    entry, topdown=False, followlinks=False
+                ):
+                    root_path = Path(root)
+                    for name in files:
+                        (root_path / name).unlink()
+                    for name in directories:
+                        child = root_path / name
+                        if child.is_symlink():
+                            child.unlink()
+                        else:
+                            child.rmdir()
+                entry.rmdir()
+                changed = True
+                continue
             if entry.is_symlink() or not entry.is_file():
                 raise ValueError(f"unrecognized backend temporary path: {entry.name}")
             if not entry.name.startswith(("segment-", "diagnostic-", "completion-")):
@@ -1025,15 +1515,31 @@ class PilotBackend:
 
         with self._connect() as conn:
             expected_rows = []
-            for table in ("segments", "diagnostics", "completions"):
+            for table, category in (
+                ("segments", "segments"),
+                ("diagnostics", "diagnostics"),
+                ("completions", "completion"),
+            ):
                 expected_rows.extend(
-                    (row["relative_path"], row["size_bytes"], row["content_digest"])
-                    for row in conn.execute(f"SELECT relative_path, size_bytes, content_digest FROM {table}")
+                    (
+                        row["relative_path"],
+                        row["size_bytes"],
+                        row["content_digest"],
+                        row["session_id"],
+                        category,
+                    )
+                    for row in conn.execute(
+                        f"SELECT relative_path,size_bytes,content_digest,session_id FROM {table}"
+                    )
                 )
-        expected = {relative for relative, _, _ in expected_rows}
-        for relative, size, content_digest in expected_rows:
-            path = self._object_path(relative)
-            if self._regular_file_size(path) != size or self._file_digest(path) != (size, content_digest):
+        expected = {relative for relative, _, _, _, _ in expected_rows}
+        for relative, size, content_digest, session_id, category in expected_rows:
+            path = self._object_path(
+                relative,
+                expected_session_id=session_id,
+                expected_category=category,
+            )
+            if self._file_digest(path) != (size, content_digest):
                 raise ValueError(f"committed backend object is unavailable or changed: {relative}")
 
         for entry in sorted(self.objects_dir.rglob("*"), reverse=True):
@@ -1132,6 +1638,44 @@ class PilotBackend:
         ):
             raise ApiError(401, "ADMIN_AUTHENTICATION_FAILED", "administrator authentication failed")
 
+    @staticmethod
+    def _require_credential_rotation_capacity(
+        connection: sqlite3.Connection,
+        session_id: str,
+        current: sqlite3.Row,
+    ) -> None:
+        """Keep the V1 credential history bounded before issuing a rotation."""
+
+        population = connection.execute(
+            """SELECT COUNT(*) AS credential_count,
+                      MIN(ordinal) AS minimum_ordinal,
+                      MAX(ordinal) AS maximum_ordinal
+                 FROM credentials WHERE session_id = ?""",
+            (session_id,),
+        ).fetchone()
+        ordinal = current["ordinal"]
+        if (
+            population is None
+            or not isinstance(ordinal, int)
+            or ordinal < 0
+            or population["credential_count"] < 1
+            or population["minimum_ordinal"] != 0
+            or population["maximum_ordinal"] != ordinal
+            or population["credential_count"] != ordinal + 1
+            or population["credential_count"] > MAX_SESSION_CREDENTIALS
+        ):
+            raise ApiError(
+                500,
+                "STORAGE_INCONSISTENT",
+                "session credential history is inconsistent",
+            )
+        if population["credential_count"] == MAX_SESSION_CREDENTIALS:
+            raise ApiError(
+                409,
+                "CREDENTIAL_ROTATION_LIMIT_REACHED",
+                CREDENTIAL_ROTATION_LIMIT_MESSAGE,
+            )
+
     def _audit(
         self,
         conn: sqlite3.Connection,
@@ -1198,6 +1742,7 @@ class PilotBackend:
                 ).fetchone()
                 if current is None:
                     raise ApiError(500, "STORAGE_INCONSISTENT", "session has no current credential")
+                self._require_credential_rotation_capacity(conn, session_id, current)
                 build = self._decode_protocol_object(session["build_identity_json"])
                 scope_authorization = self._decode_protocol_object(session["scope_json"])
                 previous_id = current["credential_id"]
@@ -1365,6 +1910,10 @@ class PilotBackend:
                 ).fetchone()
                 if current is None:
                     raise ApiError(500, "STORAGE_INCONSISTENT", "session has no current credential")
+                # Recheck inside this BEGIN IMMEDIATE transaction. Multiple
+                # resume grants may have been issued against the same current
+                # credential before one of them consumed the final V1 slot.
+                self._require_credential_rotation_capacity(conn, session_id, current)
                 session_state = session["state"]
                 completion_id = session["completion_id"]
                 if (
@@ -1589,16 +2138,72 @@ class PilotBackend:
         request: dict[str, Any],
         accepted_at: datetime,
     ) -> None:
+        history = self._credential_history(conn, session["session_id"])
         try:
             validate_new_upload_authentication(
                 request,
                 current["credential_id"],
                 timestamp(accepted_at),
-                self._credential_history(conn, session["session_id"]),
+                history,
                 session["state"],
             )
         except ContractError as exc:
-            raise ApiError(403, "OPERATION_NOT_AUTHORIZED", "new upload requires the current active credential") from exc
+            reconciliation = self._historical_operation_miss_binding(
+                session,
+                current,
+                request,
+                history,
+            )
+            if reconciliation is not None:
+                raise ApiError(
+                    403,
+                    "OPERATION_NOT_AUTHORIZED",
+                    OPERATION_NOT_AUTHORIZED_MESSAGE,
+                    sdk_reconciliation=reconciliation,
+                ) from exc
+            raise ApiError(
+                403,
+                "OPERATION_NOT_AUTHORIZED",
+                OPERATION_NOT_AUTHORIZED_MESSAGE,
+            ) from exc
+
+    def _historical_operation_miss_binding(
+        self,
+        session: sqlite3.Row,
+        current: sqlite3.Row,
+        request: dict[str, Any],
+        history: dict[str, dict[str, Any]],
+    ) -> SDKReconciliationBinding | None:
+        operation_fields = {
+            "segment_upload_intent": ("segment", "upload_id", "intent_digest"),
+            "diagnostic_upload_request": ("diagnostic", "upload_id", "request_digest"),
+            "completion_request": ("completion", "completion_id", "request_digest"),
+        }
+        operation = operation_fields.get(request.get("message_type"))
+        request_credential_id = request.get("credential_id")
+        historical = (
+            history.get(request_credential_id)
+            if isinstance(request_credential_id, str)
+            else None
+        )
+        if (
+            operation is None
+            or historical is None
+            or historical["revoked_at"] is None
+            or session["state"] != "receiving"
+            or current["current_state"] != "active"
+            or request_credential_id == current["credential_id"]
+        ):
+            return None
+        operation_kind, operation_id_field, request_digest_field = operation
+        return SDKReconciliationBinding(
+            session_id=session["session_id"],
+            operation_kind=operation_kind,
+            operation_id=request[operation_id_field],
+            request_digest=request[request_digest_field],
+            request_credential_id=request_credential_id,
+            authenticated_credential_id=current["credential_id"],
+        )
 
     def _relative_object_path(self, session_id: str, category: str, object_id: str, suffix: str) -> str:
         for value, field in ((session_id, "session_id"), (object_id, "object_id")):
@@ -1652,7 +2257,10 @@ class PilotBackend:
             raise
 
     def _ensure_object_parent(self, final: Path) -> None:
-        root = self.objects_dir.resolve()
+        # Keep the same lexical root used by ``_object_path``. On macOS,
+        # resolving an ancestor rewrites /var to /private/var and would make an
+        # otherwise in-scope child fail ``relative_to``.
+        root = self.objects_dir
         try:
             relative_parent = final.parent.relative_to(root)
         except ValueError as exc:
@@ -1693,10 +2301,16 @@ class PilotBackend:
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
 
     def _verify_row_object(self, row: sqlite3.Row) -> None:
-        path = self._object_path(row["relative_path"])
-        if self._regular_file_size(path) != row["size_bytes"]:
-            raise ApiError(500, "STORAGE_INCONSISTENT", "durable object size changed")
-        if self._file_digest(path) != (row["size_bytes"], row["content_digest"]):
+        try:
+            path = self._object_path(
+                row["relative_path"], expected_session_id=row["session_id"]
+            )
+            verified = self._file_digest(path)
+        except (OSError, ValueError) as error:
+            raise ApiError(
+                500, "STORAGE_INCONSISTENT", "durable object failed safe verification"
+            ) from error
+        if verified != (row["size_bytes"], row["content_digest"]):
             raise ApiError(500, "STORAGE_INCONSISTENT", "durable object digest changed")
 
     @staticmethod
@@ -2140,7 +2754,17 @@ class PilotBackend:
                     or current["current_state"] != "active"
                     or request["credential_id"] != current["credential_id"]
                 ):
-                    raise ApiError(403, "OPERATION_NOT_AUTHORIZED", "first completion requires the current active credential")
+                    raise ApiError(
+                        403,
+                        "OPERATION_NOT_AUTHORIZED",
+                        COMPLETION_NOT_AUTHORIZED_MESSAGE,
+                        sdk_reconciliation=self._historical_operation_miss_binding(
+                            session,
+                            current,
+                            request,
+                            self._credential_history(conn, session_id),
+                        ),
+                    )
                 self._require_client_not_before_credential(request["requested_at"], current)
                 if _parse_timestamp(request["capture_manifest"]["started_at"]) < _parse_timestamp(
                     session["created_at"]
@@ -2511,8 +3135,16 @@ class PilotBackend:
 
     def _erase_session_objects(self, conn: sqlite3.Connection, session_id: str) -> None:
         paths = [
-            self._object_path(row["relative_path"])
-            for table in ("segments", "diagnostics", "completions")
+            self._object_path(
+                row["relative_path"],
+                expected_session_id=session_id,
+                expected_category=category,
+            )
+            for table, category in (
+                ("segments", "segments"),
+                ("diagnostics", "diagnostics"),
+                ("completions", "completion"),
+            )
             for row in conn.execute(
                 f"SELECT relative_path FROM {table} WHERE session_id = ?", (session_id,)
             )
@@ -2569,8 +3201,12 @@ class PilotBackend:
             with self._connect() as conn:
                 try:
                     self._erase_session_objects(conn, session_id)
-                except OSError as exc:
-                    raise ApiError(500, "STORAGE_DELETE_FAILED", "session objects could not be erased") from exc
+                except (OSError, ValueError) as exc:
+                    raise ApiError(
+                        500,
+                        "STORAGE_DELETE_FAILED",
+                        "session objects could not be erased",
+                    ) from exc
 
             deleted_at = max(self._now(), _parse_timestamp(pending["accepted_at"]))
             deleted_text = timestamp(deleted_at)
@@ -2847,8 +3483,22 @@ class PilotBackend:
             sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
             tombstones = conn.execute("SELECT COUNT(*) FROM tombstones").fetchone()[0]
             pending = conn.execute("SELECT COUNT(*) FROM pending_deletions").fetchone()[0]
+        last_sweep = self.last_retention_sweep
+        sweep_age_seconds = (
+            None
+            if last_sweep is None
+            else (self._now() - _parse_timestamp(last_sweep["swept_at"])).total_seconds()
+        )
+        retention_healthy = (
+            self.retention_worker_running
+            and last_sweep is not None
+            and not last_sweep["failed_session_ids"]
+            and sweep_age_seconds is not None
+            and -300 <= sweep_age_seconds
+            <= 2 * self.config.retention_sweep_interval_seconds + 60
+        )
         return {
-            "status": "ok" if pending == 0 else "degraded",
+            "status": "ok" if pending == 0 and retention_healthy else "degraded",
             "service": "tacua-backend",
             "version": __version__,
             "protocol_version": PROTOCOL_VERSION,
@@ -2857,6 +3507,15 @@ class PilotBackend:
             "tombstones": tombstones,
             "pending_deletions": pending,
             "retention_worker_running": self.retention_worker_running,
+            "retention_last_swept_at": (
+                None if last_sweep is None else last_sweep["swept_at"]
+            ),
+            "retention_last_deleted_sessions": (
+                0 if last_sweep is None else len(last_sweep["deleted_session_ids"])
+            ),
+            "retention_last_failed_sessions": (
+                0 if last_sweep is None else len(last_sweep["failed_session_ids"])
+            ),
         }
 
     def list_builds(self) -> list[dict[str, Any]]:
@@ -3069,21 +3728,21 @@ class PilotBackend:
         evidence_manifest: dict[str, Any],
         previews: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        """Publish one processed draft only after all reviewer evidence is durable.
+        """Reject the retired single-candidate processing publication path.
 
-        This is an internal worker boundary, not an HTTP upload route. A crash
-        before the final candidate insert can leave retention-scoped evidence,
-        but can never expose a candidate whose required screenshot is missing.
-        V1 runs one backend process, so the same process lock that accepts
-        deletion covers every publication phase through the candidate insert.
+        Generated candidates become visible only through
+        :meth:`publish_processing_result`, whose final SQLite transaction also
+        seals the successful processing job and drops its lease. Keeping this
+        named boundary closed prevents older integrations from accidentally
+        exposing a partial terminal result.
         """
 
-        with self._lock:
-            return self._persist_candidate_bundle_locked(
-                candidate=candidate,
-                evidence_manifest=evidence_manifest,
-                previews=previews,
-            )
+        _ = (candidate, evidence_manifest, previews)
+        raise ApiError(
+            409,
+            "PROCESSING_PUBLICATION_REQUIRED",
+            "generated candidates require atomic terminal publication",
+        )
 
     def _persist_candidate_bundle_locked(
         self,
@@ -3091,6 +3750,7 @@ class PilotBackend:
         candidate: dict[str, Any],
         evidence_manifest: dict[str, Any],
         previews: list[dict[str, Any]],
+        publish_candidate: bool = True,
     ) -> dict[str, Any]:
         """Implementation covered end-to-end by ``self._lock``."""
 
@@ -3148,6 +3808,16 @@ class PilotBackend:
             session = self._require_review_session(
                 connection, candidate["session_id"], require_completed=True
             )
+            processing = connection.execute(
+                "SELECT status FROM jobs WHERE session_id = ?",
+                (candidate["session_id"],),
+            ).fetchone()
+            if processing is None or processing["status"] == "succeeded":
+                raise ApiError(
+                    409,
+                    "PROCESSING_PUBLICATION_CLOSED",
+                    "processing output candidate publication is closed",
+                )
             if (
                 candidate["build_id"] != self.config.build_id
                 or candidate["build_identity_digest"] != session["build_identity_digest"]
@@ -3192,6 +3862,8 @@ class PilotBackend:
                     )
             except EvidenceDomainError as error:
                 self._raise_evidence_error(error)
+        if not publish_candidate:
+            return copy.deepcopy(candidate)
         try:
             return self._candidate_store().insert_generated(candidate)
         except CandidateStoreError as error:
@@ -4005,7 +4677,324 @@ class PilotBackend:
             ]
             return result
 
-    def list_jobs(self) -> list[dict[str, Any]]:
+    @staticmethod
+    def _normalize_processing_result(
+        result: ProcessingResult,
+    ) -> tuple[str, str, list[PublicationCandidate]]:
+        if not isinstance(result, ProcessingResult):
+            raise ApiError(
+                422,
+                "PROCESSING_RESULT_INVALID",
+                "processor returned an invalid terminal result",
+            )
+        if (
+            result.disposition not in {"candidates_created", "no_issue_detected"}
+            or not isinstance(result.summary, str)
+            or not 1 <= len(result.summary) <= 4096
+            or unicodedata.normalize("NFC", result.summary) != result.summary
+            or "\x00" in result.summary
+            or not isinstance(result.candidates, tuple)
+            or len(result.candidates) > 256
+        ):
+            raise ApiError(
+                422,
+                "PROCESSING_RESULT_INVALID",
+                "processor returned an invalid terminal result",
+            )
+        if (result.disposition == "candidates_created") != bool(result.candidates):
+            raise ApiError(
+                422,
+                "PROCESSING_RESULT_INVALID",
+                "processing disposition differs from its candidate set",
+            )
+        bundles: list[PublicationCandidate] = []
+        candidate_ids: set[str] = set()
+        candidate_digests: set[str] = set()
+        for bundle in result.candidates:
+            if (
+                not isinstance(bundle, PublicationCandidate)
+                or not isinstance(bundle.candidate, dict)
+                or not isinstance(bundle.evidence_manifest, dict)
+                or not isinstance(bundle.previews, tuple)
+                or len(bundle.previews) > 100
+                or any(not isinstance(preview, dict) for preview in bundle.previews)
+            ):
+                raise ApiError(
+                    422,
+                    "PROCESSING_RESULT_INVALID",
+                    "processor returned an invalid candidate bundle",
+                )
+            candidate = copy.deepcopy(bundle.candidate)
+            try:
+                TICKET_CONTRACT.validate_chain([candidate])
+            except CandidateContractError as error:
+                raise ApiError(
+                    422, "INVALID_CANDIDATE", "processed candidate is invalid"
+                ) from error
+            if (
+                candidate["candidate_id"] in candidate_ids
+                or candidate["candidate_digest"] in candidate_digests
+            ):
+                raise ApiError(
+                    409,
+                    "DUPLICATE_GENERATED_CANDIDATE",
+                    "processing result contains duplicate candidates",
+                )
+            candidate_ids.add(candidate["candidate_id"])
+            candidate_digests.add(candidate["candidate_digest"])
+            bundles.append(
+                PublicationCandidate(
+                    candidate=candidate,
+                    evidence_manifest=copy.deepcopy(bundle.evidence_manifest),
+                    previews=tuple(copy.deepcopy(bundle.previews)),
+                )
+            )
+        evidence_ids = {
+            evidence_id
+            for bundle in bundles
+            for evidence_id in bundle.candidate["evidence_manifest"]["evidence_ids"]
+        }
+        if len(evidence_ids) > 10_000:
+            raise ApiError(
+                422,
+                "PROCESSING_RESULT_INVALID",
+                "processing result contains too many evidence references",
+            )
+        return result.disposition, result.summary, bundles
+
+    def publish_processing_result(
+        self,
+        job_id: str,
+        lease_token: str,
+        result: ProcessingResult,
+    ) -> dict[str, Any]:
+        """Stage processor artifacts, then reveal all outputs in one commit.
+
+        Evidence manifests and preview files use their existing crash journal
+        before this transaction. Reviewer routes cannot resolve those staged
+        rows without a candidate head. The final transaction inserts every
+        candidate version/head, appends the successful job snapshot, validates
+        all cross-links, and removes the lease together.
+        """
+
+        _require_id(job_id, "job_id")
+        disposition, summary, bundles = self._normalize_processing_result(result)
+        with self._lock:
+            publication_time = self._now()
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    job, publication_worker_id = self._processing_job_store(
+                        connection
+                    ).validate_publication_lease(job_id, lease_token)
+                except ProcessingJobStoreError as error:
+                    self._raise_processing_job_error(error)
+                existing_candidate = connection.execute(
+                    """SELECT candidate_id FROM candidate_versions
+                        WHERE organization_id = ? AND project_id = ?
+                          AND session_id = ? AND candidate_version = 1
+                        LIMIT 1""",
+                    (
+                        job["organization_id"],
+                        job["project_id"],
+                        job["session_id"],
+                    ),
+                ).fetchone()
+                if existing_candidate is not None:
+                    raise ApiError(
+                        409,
+                        "PROCESSING_PUBLICATION_CONFLICT",
+                        "processing session already has generated candidates",
+                    )
+
+            for bundle in bundles:
+                candidate = bundle.candidate
+                if (
+                    candidate["organization_id"] != job["organization_id"]
+                    or candidate["project_id"] != job["project_id"]
+                    or candidate["session_id"] != job["session_id"]
+                    or candidate["build_id"] != job["build_id"]
+                    or candidate["build_identity_digest"]
+                    != job["build_identity_digest"]
+                    or candidate["candidate_version"] != 1
+                    or candidate["previous_candidate_digest"] is not None
+                    or candidate["lineage"]
+                    != {"operation": "generated", "parents": []}
+                    or candidate["state"] != "draft"
+                    or candidate["transition"]["actor"]["actor_type"] != "system"
+                    or candidate["transition"]["actor"]["actor_id"]
+                    != publication_worker_id
+                    or any(
+                        not (
+                            _parse_timestamp(job["requested_at"])
+                            <= _parse_timestamp(candidate_timestamp)
+                            <= publication_time
+                        )
+                        for candidate_timestamp in (
+                            candidate["candidate_created_at"],
+                            candidate["transition"]["occurred_at"],
+                            candidate["version_created_at"],
+                        )
+                    )
+                ):
+                    raise ApiError(
+                        422,
+                        "PROCESSING_RESULT_BINDING_MISMATCH",
+                        "processed candidate differs from its leased job",
+                    )
+                self._persist_candidate_bundle_locked(
+                    candidate=candidate,
+                    evidence_manifest=bundle.evidence_manifest,
+                    previews=list(bundle.previews),
+                    publish_candidate=False,
+                )
+
+            candidate_documents = [bundle.candidate for bundle in bundles]
+            candidate_refs = sorted(
+                (
+                    {
+                        "candidate_id": candidate["candidate_id"],
+                        "candidate_version": candidate["candidate_version"],
+                    }
+                    for candidate in candidate_documents
+                ),
+                key=lambda item: item["candidate_id"],
+            )
+            evidence_refs = sorted(
+                {
+                    evidence_id
+                    for candidate in candidate_documents
+                    for evidence_id in candidate["evidence_manifest"]["evidence_ids"]
+                }
+            )
+            outputs = {
+                "disposition": disposition,
+                "candidate_refs": candidate_refs,
+                "derived_evidence_refs": evidence_refs,
+                "summary": summary,
+            }
+
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    if candidate_documents:
+                        self._candidate_store().insert_generated_many_in_transaction(
+                            connection, candidate_documents
+                        )
+                    succeeded = self._processing_job_store(connection).succeed(
+                        job_id,
+                        JOB_STAGES[-1],
+                        lease_token,
+                        outputs=outputs,
+                    )
+                    try:
+                        self._validate_processing_result_publication(
+                            connection, succeeded
+                        )
+                    except ValueError as error:
+                        raise ApiError(
+                            500,
+                            "PROCESSING_PUBLICATION_INVALID",
+                            "processing result failed publication validation",
+                        ) from error
+                    return succeeded
+                except CandidateStoreError as error:
+                    self._raise_candidate_error(error)
+                except ProcessingJobStoreError as error:
+                    self._raise_processing_job_error(error)
+                except EvidenceDomainError as error:
+                    self._raise_evidence_error(error)
+
+    def run_processing_once(self, worker_id: str) -> dict[str, Any] | None:
+        """Run one lease-owned stage through the explicitly injected engine."""
+
+        engine = self._processing_engine
+        if engine is None:
+            raise ApiError(
+                503,
+                "PROCESSING_ENGINE_DISABLED",
+                "no internal processing engine is configured",
+            )
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                claimed = self._processing_job_store(connection).claim(worker_id)
+            except ProcessingJobStoreError as error:
+                self._raise_processing_job_error(error)
+            if claimed.retry_required:
+                raise ApiError(
+                    409,
+                    "PROCESSING_CLAIM_RETRY",
+                    "bounded processing cleanup made progress; retry the claim",
+                )
+            claim = claimed.claim
+        if claim is None:
+            return None
+
+        try:
+            stage_result = engine.process_stage(claim)
+        except Exception as error:
+            try:
+                self.fail_processing_job(
+                    claim.job["job_id"],
+                    claim.stage_name,
+                    claim.lease_token,
+                    code="PROCESSING_ENGINE_FAILED",
+                    detail="The configured processing engine failed.",
+                    retryable=True,
+                )
+            except ApiError:
+                pass
+            raise ApiError(
+                500,
+                "PROCESSING_ENGINE_FAILED",
+                "configured processing engine failed",
+            ) from error
+
+        final_stage = claim.stage_name == JOB_STAGES[-1]
+        if final_stage and isinstance(stage_result, ProcessingResult):
+            return self.publish_processing_result(
+                claim.job["job_id"], claim.lease_token, stage_result
+            )
+        if not final_stage and stage_result is None:
+            return self.checkpoint_processing_stage(
+                claim.job["job_id"],
+                claim.stage_name,
+                claim.lease_token,
+                detail="The configured processor completed this stage.",
+            )
+
+        try:
+            self.fail_processing_job(
+                claim.job["job_id"],
+                claim.stage_name,
+                claim.lease_token,
+                code="PROCESSING_ENGINE_RESULT_INVALID",
+                detail="The configured processing engine returned an invalid stage result.",
+                retryable=False,
+            )
+        finally:
+            raise ApiError(
+                500,
+                "PROCESSING_ENGINE_RESULT_INVALID",
+                "configured processing engine returned an invalid stage result",
+            )
+
+    @staticmethod
+    def _processing_job_summary(job: dict[str, Any]) -> dict[str, Any]:
+        failure = job["failure"]
+        return {
+            "job_id": job["job_id"],
+            "job_type": "process_session",
+            "status": job["status"],
+            "requested_at": job["requested_at"],
+            "started_at": job["started_at"],
+            "completed_at": job["completed_at"],
+            "failure_code": failure["code"] if failure else None,
+        }
+
+    def list_jobs(self, page_cursor: str | None = None) -> dict[str, Any]:
+        cursor = _decode_page_cursor(page_cursor, kind="jobs")
         boundary = self._sweep_before_review_access()
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN")
@@ -4014,23 +5003,51 @@ class PilotBackend:
                 store.validate_population()
             except ProcessingJobStoreError as error:
                 self._raise_processing_job_error(error)
+            cursor_requested_at = None if cursor is None else cursor["requested_at"]
+            cursor_job_id = None if cursor is None else cursor["job_id"]
             rows = conn.execute(
-                """SELECT jobs.job_id FROM jobs
+                """SELECT jobs.job_id,jobs.requested_at FROM jobs
                    JOIN sessions ON sessions.session_id = jobs.session_id
                    WHERE jobs.organization_id = ? AND jobs.project_id = ?
                      AND sessions.state != 'deleting'
                      AND sessions.raw_media_expires_at > ?
-                   ORDER BY jobs.requested_at DESC, jobs.job_id DESC""",
+                     AND (
+                          ? IS NULL
+                          OR jobs.requested_at < ?
+                          OR (jobs.requested_at = ? AND jobs.job_id < ?)
+                     )
+                   ORDER BY jobs.requested_at DESC, jobs.job_id DESC
+                   LIMIT 51""",
                 (
                     self.config.organization_id,
                     self.config.project_id,
                     timestamp(boundary),
+                    cursor_requested_at,
+                    cursor_requested_at,
+                    cursor_requested_at,
+                    cursor_job_id,
                 ),
             ).fetchall()
             try:
-                return [store.get(row["job_id"]) for row in rows]
+                page_rows = rows[:LIST_PAGE_SIZE]
+                jobs = [
+                    self._processing_job_summary(store.get(row["job_id"]))
+                    for row in page_rows
+                ]
             except ProcessingJobStoreError as error:
                 self._raise_processing_job_error(error)
+            next_cursor = None
+            if len(rows) > LIST_PAGE_SIZE:
+                last = page_rows[-1]
+                next_cursor = _encode_page_cursor(
+                    {
+                        "version": PAGE_CURSOR_VERSION,
+                        "kind": "jobs",
+                        "requested_at": last["requested_at"],
+                        "job_id": last["job_id"],
+                    }
+                )
+            return {"jobs": jobs, "next_cursor": next_cursor}
 
     def get_job(self, job_id: str) -> dict[str, Any]:
         _require_id(job_id, "job_id")
@@ -4151,9 +5168,12 @@ class PilotBackend:
             except ProcessingJobStoreError as error:
                 self._raise_processing_job_error(error)
 
-    def list_audit_events(self) -> list[dict[str, Any]]:
+    def list_audit_events(self, page_cursor: str | None = None) -> dict[str, Any]:
+        cursor = _decode_page_cursor(page_cursor, kind="audit_events")
         boundary = self._sweep_before_review_access()
-        with self._connect() as conn:
+        with self._lock, self._connect() as conn:
+            cursor_occurred_at = None if cursor is None else cursor["occurred_at"]
+            cursor_event_id = None if cursor is None else cursor["event_id"]
             rows = conn.execute(
                 """SELECT audit_events.event_id,audit_events.event_type,
                           audit_events.actor_kind,audit_events.organization_id,
@@ -4171,14 +5191,40 @@ class PilotBackend:
                              AND sessions.raw_media_expires_at > ?
                          )
                      )
-                   ORDER BY audit_events.occurred_at,audit_events.event_id""",
+                     AND (
+                          ? IS NULL
+                          OR audit_events.occurred_at < ?
+                          OR (
+                              audit_events.occurred_at = ?
+                              AND audit_events.event_id < ?
+                          )
+                     )
+                   ORDER BY audit_events.occurred_at DESC,audit_events.event_id DESC
+                   LIMIT 51""",
                 (
                     self.config.organization_id,
                     self.config.project_id,
                     timestamp(boundary),
+                    cursor_occurred_at,
+                    cursor_occurred_at,
+                    cursor_occurred_at,
+                    cursor_event_id,
                 ),
             ).fetchall()
-        return [dict(row) for row in rows]
+        page_rows = rows[:LIST_PAGE_SIZE]
+        events = [dict(row) for row in page_rows]
+        next_cursor = None
+        if len(rows) > LIST_PAGE_SIZE:
+            last = page_rows[-1]
+            next_cursor = _encode_page_cursor(
+                {
+                    "version": PAGE_CURSOR_VERSION,
+                    "kind": "audit_events",
+                    "occurred_at": last["occurred_at"],
+                    "event_id": last["event_id"],
+                }
+            )
+        return {"events": events, "next_cursor": next_cursor}
 
 
 class LimitedReader(io.RawIOBase):

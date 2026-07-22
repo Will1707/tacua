@@ -186,7 +186,7 @@ class BackendReleaseRegressionTests(BackendHarness):
         lifecycle = self.full_completed_session()
         session_id = lifecycle["launch_receipt"]["session_id"]
         candidate, manifest, previews = self.candidate_bundle(session_id)
-        self.backend.persist_candidate_bundle(
+        self.persist_candidate_fixture(
             candidate=candidate,
             evidence_manifest=manifest,
             previews=previews,
@@ -199,7 +199,7 @@ class BackendReleaseRegressionTests(BackendHarness):
             [session_id],
             [item["session_id"] for item in self.backend.list_sessions()["sessions"]],
         )
-        self.assertEqual(1, len(self.backend.list_jobs()))
+        self.assertEqual(1, len(self.backend.list_jobs()["jobs"]))
         self.assertEqual(
             1,
             len(self.backend.list_candidates(session_id)["candidates"]),
@@ -211,7 +211,10 @@ class BackendReleaseRegressionTests(BackendHarness):
         self.assertEqual(410, captured.exception.status)
         self.assertEqual("SESSION_DELETED", captured.exception.code)
         self.assertEqual([], self.backend.list_sessions()["sessions"])
-        self.assertEqual([], self.backend.list_jobs())
+        self.assertEqual(
+            {"jobs": [], "next_cursor": None},
+            self.backend.list_jobs(),
+        )
         self.assertFalse((self.backend.objects_dir / session_id).exists())
         self.assert_api_error(
             410,
@@ -291,8 +294,44 @@ class BackendReleaseRegressionTests(BackendHarness):
         )
         self.assertIn(self.backend.temp_dir.resolve(), synced)
 
+    def test_deletion_never_follows_a_committed_object_symlink(self) -> None:
+        lifecycle = self.full_completed_session()
+        session_id = lifecycle["launch_receipt"]["session_id"]
+        with closing(sqlite3.connect(self.backend.db_path)) as connection:
+            relative_path = connection.execute(
+                "SELECT relative_path FROM segments WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0]
+
+        protected = self.backend.objects_dir / "protected.media"
+        protected_bytes = b"must not be erased through another object's path"
+        protected.write_bytes(protected_bytes)
+        object_path = self.backend.state_dir / relative_path
+        object_path.unlink()
+        object_path.symlink_to(protected)
+
+        with self.assertRaises(ApiError) as captured:
+            self.backend.delete_session(session_id)
+
+        self.assertEqual(500, captured.exception.status)
+        self.assertEqual("STORAGE_DELETE_FAILED", captured.exception.code)
+        self.assertEqual(protected_bytes, protected.read_bytes())
+
 
 class BackendContainerRegressionTests(unittest.TestCase):
+    def test_image_contains_apache_license_and_notice(self) -> None:
+        repository = Path(__file__).resolve().parents[3]
+        dockerfile = (repository / "services/backend/Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        dockerignore = (
+            repository / "services/backend/Dockerfile.dockerignore"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("COPY --chown=root:root LICENSE NOTICE /app/", dockerfile)
+        self.assertIn("!LICENSE", dockerignore.splitlines())
+        self.assertIn("!NOTICE", dockerignore.splitlines())
+
     def test_image_contains_runtime_review_and_handoff_contracts(self) -> None:
         repository = Path(__file__).resolve().parents[3]
         dockerfile = (repository / "services/backend/Dockerfile").read_text(

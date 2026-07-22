@@ -11,7 +11,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@tacua/ios-capture-spike": "file:../package",
+    "@tacua/mobile-sdk": "file:../package",
     "expo": "~56.0.12",
     "expo-dev-client": "~56.0.12",
     "react": "19.2.3",
