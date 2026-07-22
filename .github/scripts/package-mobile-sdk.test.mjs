@@ -30,6 +30,7 @@ test("release paths are closed to an audited runtime file set", () => {
     "ios/TacuaSDKLocalRetention.swift",
     "ios/TacuaCaptureSpike.podspec",
     "plugin/config.js",
+    "src/BackendManagedHostController.ts",
     "src/index.ts",
     "README.md",
   ]) {

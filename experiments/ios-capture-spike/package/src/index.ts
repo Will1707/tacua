@@ -51,6 +51,22 @@ import {
   type StartedCaptureSessionPlan,
 } from "./TacuaCaptureSpikeModule";
 import { type EventSubscription } from "expo-modules-core";
+import {
+  createBackendManagedHostControllerForPrimitives,
+  type BackendManagedHostAction,
+  type BackendManagedHostController,
+  type BackendManagedHostControllerOptions,
+  type BackendManagedHostError,
+  type BackendManagedHostErrorCategory,
+  type BackendManagedHostMutation,
+  type BackendManagedHostPhase,
+  type BackendManagedHostSnapshot,
+  type BackendManagedLaunchKind,
+  type BackendManagedPlanNextAction,
+  type BackendManagedQueueRequirement,
+  type BackendManagedRecorderSnapshot,
+  type BackendManagedSessionSummary,
+} from "./BackendManagedHostController";
 
 export type {
   AppAudioAppendDrop,
@@ -100,7 +116,57 @@ export type {
   ResumedCaptureSessionPlan,
   ResumeCaptureSessionPlanOptions,
   StartedCaptureSessionPlan,
+  BackendManagedHostAction,
+  BackendManagedHostController,
+  BackendManagedHostControllerOptions,
+  BackendManagedHostError,
+  BackendManagedHostErrorCategory,
+  BackendManagedHostMutation,
+  BackendManagedHostPhase,
+  BackendManagedHostSnapshot,
+  BackendManagedLaunchKind,
+  BackendManagedPlanNextAction,
+  BackendManagedQueueRequirement,
+  BackendManagedRecorderSnapshot,
+  BackendManagedSessionSummary,
 };
+
+/**
+ * Creates the dependency-light orchestration boundary for a backend-managed Expo QA host.
+ * Network requests, launch codes, bearer credentials, and backend origins stay native.
+ * Capture-plan fields are held privately and never projected into controller snapshots.
+ */
+export function createBackendManagedHostController(
+  options: BackendManagedHostControllerOptions = {},
+): BackendManagedHostController {
+  return createBackendManagedHostControllerForPrimitives(
+    {
+      prepareBackendLaunch,
+      confirmBackendLaunchConsent,
+      cancelBackendLaunch,
+      createCaptureSessionPlan,
+      resumeCaptureSessionPlan,
+      recoverStartedCaptureSessionPlan,
+      recoverResumedCaptureSessionPlan,
+      listBackendSessions,
+      getBackendQueueStatus,
+      getBackendStartRecoveryStatus,
+      getBackendResumeRecoveryStatus,
+      abandonBackendStart,
+      resetPreparedBackendResume,
+      getStatus,
+      listRecoverableSessions,
+      start,
+      resume,
+      stop,
+      markPartialReadyForUpload,
+      admitFinalizedCapture,
+      processAdmittedCapture,
+      deleteBackendSession,
+    },
+    options,
+  );
+}
 
 export function getCapabilities(): CaptureCapabilities {
   return TacuaCaptureSpikeModule.getCapabilities();
