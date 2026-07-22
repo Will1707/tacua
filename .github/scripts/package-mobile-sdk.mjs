@@ -50,6 +50,7 @@ const allowedRuntimePaths = new Set([
   "ios/TacuaCaptureUploadCoordinator.swift",
   "ios/TacuaCredentialStore.swift",
   "ios/TacuaDiagnosticJournal.swift",
+  "ios/TacuaLocalHarnessPolicy.swift",
   "ios/TacuaLaunchLink.swift",
   "ios/TacuaSDKBackendClient.swift",
   "ios/TacuaSDKBackendProtocol.swift",
