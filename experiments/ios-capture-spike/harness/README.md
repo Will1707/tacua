@@ -1,7 +1,7 @@
 # Tacua physical-iPhone capture harness
 
 This is a removable Expo development client for `EXP-001`. It links the local
-`@tacua/ios-capture-spike` package and provides a deliberately small UI for
+`@tacua/mobile-sdk` package and provides a deliberately small UI for
 consent, ReplayKit start/mark/stop, recovery discovery, and local deletion.
 
 The harness is not a production reviewer app and does not upload anything.

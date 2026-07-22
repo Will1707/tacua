@@ -1,0 +1,23 @@
+{
+  "content_type": "video/quicktime",
+  "credential_id": "credential_synthetic",
+  "intent_digest": "sha256:1279a5bb8440de4c4e169c93e359eb8abef623d9137a922d2fc95aec5d6cd686",
+  "message_type": "segment_upload_receipt",
+  "protocol_version": "tacua.sdk-backend@1.0.0",
+  "runtime_receipt": {
+    "content_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+    "object_id": "object_synthetic",
+    "receipt_digest": "sha256:148faa7469515a4846b6b21ba2bba07030d0a640bf6d9440c37fa44b8f0b5989",
+    "received_at": "2026-07-21T10:02:00Z",
+    "segment_id": "segment_synthetic",
+    "size_bytes": 2048
+  },
+  "scope_digest": "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50",
+  "segment_id": "segment_synthetic",
+  "segment_receipt_digest": "sha256:c7cbceba15de493d1b042b9352c211b7cd560b302a40e9b4843ed50b2bf1d0f6",
+  "sequence": 0,
+  "session_id": "session_synthetic",
+  "sidecar_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+  "transport_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+  "upload_id": "upload_segment_synthetic"
+}

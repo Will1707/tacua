@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tacua.invalid/schemas/sdk-backend/1.0.0/deletion-request.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "Tacua idempotent session-deletion request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "message_type",
+    "deletion_id",
+    "session_id",
+    "scope_digest",
+    "credential_id",
+    "target",
+    "reason",
+    "requested_at",
+    "request_digest"
+  ],
+  "properties": {
+    "protocol_version": { "$ref": "common.schema.json#/$defs/protocolVersion" },
+    "message_type": { "const": "deletion_request" },
+    "deletion_id": { "$ref": "common.schema.json#/$defs/id" },
+    "session_id": { "$ref": "common.schema.json#/$defs/id" },
+    "scope_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "credential_id": { "$ref": "common.schema.json#/$defs/id" },
+    "target": { "const": "session_all_data" },
+    "reason": { "enum": ["user_requested", "retention_expired", "operator_requested"] },
+    "requested_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "request_digest": { "$ref": "common.schema.json#/$defs/digest" }
+  }
+}

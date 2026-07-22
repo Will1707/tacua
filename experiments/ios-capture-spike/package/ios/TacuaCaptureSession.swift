@@ -8,6 +8,25 @@ import ReplayKit
 import UIKit
 
 final class TacuaCaptureSession {
+  final class ExclusiveRecoveryLease {
+    private let lock = NSLock()
+    private var releaseClosure: (() -> Void)?
+
+    fileprivate init(release: @escaping () -> Void) {
+      releaseClosure = release
+    }
+
+    func release() {
+      lock.lock()
+      let closure = releaseClosure
+      releaseClosure = nil
+      lock.unlock()
+      closure?()
+    }
+
+    deinit { release() }
+  }
+
   typealias EventSink = (_ name: String, _ payload: [String: Any]) -> Void
   typealias TerminalSink = (_ session: TacuaCaptureSession, _ payload: [String: Any]) -> Void
   typealias StopCompletion = (Result<[String: Any], Error>) -> Void
@@ -24,6 +43,7 @@ final class TacuaCaptureSession {
   ]
   private static let recorderOwnershipLock = NSLock()
   private static var activeRecorderOwnershipToken: UUID?
+  private static let captureGapOverflowID = "tacua-capture-gap-overflow"
 
   let sessionId: String
 
@@ -36,9 +56,15 @@ final class TacuaCaptureSession {
   private let directory: URL
   private let manifestURL: URL
   private let recorderOwnershipToken: UUID
+  private var diagnosticJournal: TacuaDiagnosticJournal?
+  private var diagnosticEventCount = 0
+  private var diagnosticContainsCollectionGap = false
+  private var diagnosticAppState = TacuaDiagnosticAppState.unknown
 
   private var manifest: CaptureManifest
   private var durationBudgetSeconds = TacuaCapturePolicy.maximumDurationSeconds
+  private var durationStopReason = "maximum_duration"
+  private let rawMediaStopHostUptimeSeconds: Double
   private var writer: SegmentWriter?
   private var nextSegmentIndex = 0
   private var latestVideoPTS: CMTime?
@@ -86,6 +112,7 @@ final class TacuaCaptureSession {
   init(
     options: TacuaCaptureStartOptions,
     resuming: Bool = false,
+    rawMediaStopHostUptimeSeconds: Double,
     eventSink: @escaping EventSink,
     terminalSink: @escaping TerminalSink
   ) throws {
@@ -97,6 +124,15 @@ final class TacuaCaptureSession {
     }
     let handoff = Self.handoff(from: options)
     try Self.validateCandidateHandoff(handoff)
+    guard Self.protocolDate(options.rawMediaExpiresAt) != nil else {
+      throw TacuaCaptureSpikeError.retentionAuthorityInvalid
+    }
+    let retentionNowUptime = ProcessInfo.processInfo.systemUptime
+    guard rawMediaStopHostUptimeSeconds.isFinite,
+      rawMediaStopHostUptimeSeconds > retentionNowUptime
+    else { throw TacuaCaptureSpikeError.retentionExpired }
+    self.rawMediaStopHostUptimeSeconds = rawMediaStopHostUptimeSeconds
+    let retentionBudget = rawMediaStopHostUptimeSeconds - retentionNowUptime
 
     let ownershipToken = UUID()
     guard Self.claimRecorderOwnership(ownershipToken) else {
@@ -147,6 +183,23 @@ final class TacuaCaptureSession {
       }
       try Self.validateStoredSessionId(manifest: manifest, expected: options.sessionId)
       try Self.validateStoredIdentity(manifest: manifest, handoff: handoff)
+      guard manifest.rawMediaExpiresAt == options.rawMediaExpiresAt else {
+        throw TacuaCaptureSpikeError.retentionAuthorityInvalid
+      }
+      guard manifest.gaps.count <= TacuaCapturePolicy.maximumManifestGaps,
+        manifest.markers.count <= TacuaCapturePolicy.maximumManifestMarkers,
+        Set(manifest.gaps.map(\.id)).count == manifest.gaps.count,
+        Set(manifest.markers.map(\.id)).count == manifest.markers.count
+      else {
+        throw TacuaCaptureSpikeError.recoveryIO(
+          "The stored capture manifest exceeds its bounded marker or gap limit."
+        )
+      }
+      guard TacuaCapturePolicy.canResumeStoredSession(
+        schemaVersion: manifest.schemaVersion,
+        storedBootSessionID: manifest.bootSessionId,
+        currentBootSessionID: TacuaSystemMonotonicClock().bootSessionID
+      ) else { throw TacuaCaptureSpikeError.sessionNotRecoverable }
       guard Self.resumableStates.contains(manifest.state) else {
         throw TacuaCaptureSpikeError.sessionNotRecoverable
       }
@@ -156,6 +209,10 @@ final class TacuaCaptureSession {
         throw TacuaCaptureSpikeError.sessionNotRecoverable
       }
       durationBudgetSeconds = TacuaCapturePolicy.maximumDurationSeconds - recordedDuration
+      if retentionBudget < durationBudgetSeconds {
+        durationBudgetSeconds = retentionBudget
+        durationStopReason = "raw_media_retention_expired"
+      }
       nextSegmentIndex = (manifest.segments.map(\.index).max() ?? -1) + 1
       if let lastPTS = manifest.segments.last?.lastMediaPTSSeconds {
         latestVideoPTS = CMTime(seconds: lastPTS, preferredTimescale: 1_000_000_000)
@@ -175,10 +232,16 @@ final class TacuaCaptureSession {
         priorMediaPTSSeconds: latestVideoPTS.map(CMTimeGetSeconds),
         nextMediaPTSSeconds: nil
       )
-      manifest.gaps.append(resumeGap)
-      pendingResumeGapId = resumeGap.id
+      let boundedResumeGap = Self.appendBoundedGap(resumeGap, to: &manifest)
+      pendingResumeGapId = boundedResumeGap.id
       try persistManifest()
     } else {
+      let bootSessionID = TacuaSystemMonotonicClock().bootSessionID
+      guard !bootSessionID.isEmpty else {
+        throw TacuaCaptureSpikeError.storageIO(
+          "Tacua could not establish a durable boot identity for capture timing."
+        )
+      }
       if fileManager.fileExists(atPath: directory.path) {
         throw TacuaCaptureSpikeError.writerCreation("The requested capture session already exists.")
       }
@@ -186,7 +249,8 @@ final class TacuaCaptureSession {
       try Self.protectAndExcludeFromBackup(directory)
 
       manifest = CaptureManifest(
-        schemaVersion: 2,
+        schemaVersion: 3,
+        bootSessionId: bootSessionID,
         sessionId: options.sessionId,
         organizationId: options.organizationId,
         projectId: options.projectId,
@@ -194,6 +258,7 @@ final class TacuaCaptureSession {
         handoffId: options.handoffId,
         handoffTokenIdentifier: options.handoffTokenIdentifier,
         expiresAt: options.expiresAt,
+        rawMediaExpiresAt: options.rawMediaExpiresAt,
         consentVersion: options.consentVersion,
         expectedApplicationId: options.expectedApplicationId,
         expectedBuildNumber: options.expectedBuildNumber,
@@ -220,6 +285,37 @@ final class TacuaCaptureSession {
         appAudioSamplesObserved: 0
       )
       try persistManifest()
+    }
+    guard let bootSessionID = manifest.bootSessionId else {
+      throw TacuaCaptureSpikeError.storageIO(
+        "Tacua could not bind the diagnostic journal to the capture boot identity."
+      )
+    }
+    do {
+      let journal = try TacuaDiagnosticJournal(
+        rootDirectory: TacuaDiagnosticJournal.rootDirectory(sessionDirectory: directory),
+        localSessionID: options.sessionId,
+        bootSessionID: bootSessionID,
+        // Two runtime-envelope slots are reserved for the terminal summary and an explicit
+        // projection-overflow signal.
+        maximumEvents: TacuaCapturePolicy.maximumDiagnosticJournalEvents
+      )
+      let diagnosticSnapshot = try journal.snapshot()
+      diagnosticJournal = journal
+      diagnosticEventCount = diagnosticSnapshot.entries.count
+      diagnosticContainsCollectionGap = diagnosticSnapshot.containsCollectionGap
+      diagnosticAppState = diagnosticSnapshot.entries.reversed().compactMap { entry in
+        if case .event(.appStateChanged(_, let toState)) = entry.event { return toState }
+        return nil
+      }.first ?? .unknown
+    } catch {
+      throw resuming
+        ? TacuaCaptureSpikeError.recoveryIO(
+          "The stored diagnostic journal failed its recovery integrity checks."
+        )
+        : TacuaCaptureSpikeError.storageIO(
+          "Tacua could not create the private diagnostic journal."
+        )
     }
     initializationCompleted = true
   }
@@ -314,6 +410,10 @@ final class TacuaCaptureSession {
         completion(.failure(TacuaCaptureSpikeError.noCaptureRunning))
         return
       }
+      guard manifest.markers.count < TacuaCapturePolicy.maximumManifestMarkers else {
+        completion(.failure(TacuaCaptureSpikeError.markerLimitReached))
+        return
+      }
       let marker = CaptureMarker(
         id: UUID().uuidString,
         label: label,
@@ -321,6 +421,10 @@ final class TacuaCaptureSession {
         latestMediaPTSSeconds: latestVideoPTS.map(CMTimeGetSeconds)
       )
       manifest.markers.append(marker)
+      appendSystemDiagnosticBestEffort(.issueMark(
+        markerID: Self.stableDiagnosticIdentifier(prefix: "m", source: marker.id),
+        kind: .manual
+      ))
       persistManifestAndReport()
       let payload: [String: Any] = [
         "id": marker.id,
@@ -330,6 +434,32 @@ final class TacuaCaptureSession {
       ]
       eventSink("onMarker", payload)
       completion(.success(payload))
+    }
+  }
+
+  func recordDiagnostic(
+    _ event: TacuaDiagnosticJournalEvent,
+    completion: @escaping (Result<[String: Any], Error>) -> Void
+  ) {
+    queue.async { [self] in
+      guard manifest.state == "recording", !isStopping else {
+        completion(.failure(TacuaCaptureSpikeError.noCaptureRunning))
+        return
+      }
+      guard let diagnosticJournal else {
+        completion(.failure(TacuaCaptureSpikeError.diagnosticUnavailable))
+        return
+      }
+      do {
+        let entry = try diagnosticJournal.append(event)
+        if entry.sequence > Int64(diagnosticEventCount + 1) {
+          diagnosticContainsCollectionGap = true
+        }
+        diagnosticEventCount = max(diagnosticEventCount, Int(entry.sequence))
+        completion(.success(Self.diagnosticReceipt(entry)))
+      } catch {
+        completion(.failure(Self.captureDiagnosticError(error)))
+      }
     }
   }
 
@@ -494,16 +624,26 @@ final class TacuaCaptureSession {
           self.pendingStartCompletion = nil
           let now = Date()
           let uptime = ProcessInfo.processInfo.systemUptime
+          let remainingRetention = max(0, self.rawMediaStopHostUptimeSeconds - uptime)
+          if remainingRetention < self.durationBudgetSeconds {
+            self.durationBudgetSeconds = remainingRetention
+            self.durationStopReason = "raw_media_retention_expired"
+          }
           self.manifest.state = "recording"
           if self.manifest.startedAt == nil {
             self.manifest.startedAt = Self.iso8601(now)
           }
-          self.manifest.startedHostUptimeSeconds = uptime
+          self.manifest.startedHostUptimeSeconds =
+            TacuaCapturePolicy.preservedSessionStartHostUptime(
+              existing: self.manifest.startedHostUptimeSeconds,
+              resumeCandidate: uptime
+            )
           self.manifest.automaticStopAt = Self.iso8601(
             now.addingTimeInterval(self.durationBudgetSeconds)
           )
           self.manifest.automaticStopHostUptimeSeconds = uptime + self.durationBudgetSeconds
           self.installLifecycleObservers()
+          self.transitionDiagnosticAppState(to: .active)
           self.scheduleDurationStopOnQueue()
           self.scheduleMicrophoneWatchdogOnQueue()
           self.persistManifestAndReport()
@@ -883,7 +1023,7 @@ final class TacuaCaptureSession {
     durationWorkItem?.cancel()
     let workItem = DispatchWorkItem { [self] in
       guard manifest.state == "recording", !isStopping else { return }
-      requestStopOnQueue(reason: "maximum_duration")
+      requestStopOnQueue(reason: durationStopReason)
     }
     durationWorkItem = workItem
     queue.asyncAfter(deadline: .now() + durationBudgetSeconds, execute: workItem)
@@ -930,7 +1070,7 @@ final class TacuaCaptureSession {
       hostUptimeSeconds: hostUptimeSeconds,
       deadlineHostUptimeSeconds: manifest.automaticStopHostUptimeSeconds
     ) {
-      requestStopOnQueue(reason: "maximum_duration")
+      requestStopOnQueue(reason: durationStopReason)
       return
     }
 
@@ -1329,26 +1469,114 @@ final class TacuaCaptureSession {
       priorMediaPTSSeconds: priorMediaPTS.map(CMTimeGetSeconds),
       nextMediaPTSSeconds: nextMediaPTS.map(CMTimeGetSeconds)
     )
-    manifest.gaps.append(gap)
+    let bounded = Self.appendBoundedGap(gap, to: &manifest)
+    if bounded.inserted {
+      appendSystemDiagnosticBestEffort(.captureGap(
+        gapID: Self.stableDiagnosticIdentifier(prefix: "g", source: bounded.id),
+        affectedStreams: Self.diagnosticAffectedStreams(reason: bounded.reason)
+      ))
+    }
     eventSink(
       "onGap",
       [
-        "id": gap.id,
-        "reason": gap.reason,
-        "openedHostUptimeSeconds": gap.openedHostUptimeSeconds,
-        "closedHostUptimeSeconds": jsonValue(gap.closedHostUptimeSeconds),
+        "id": bounded.id,
+        "reason": bounded.reason,
+        "openedHostUptimeSeconds": bounded.openedHostUptimeSeconds,
+        "closedHostUptimeSeconds": jsonValue(bounded.closedHostUptimeSeconds),
       ]
     )
+  }
+
+  @discardableResult
+  private func appendSystemDiagnosticBestEffort(_ event: TacuaDiagnosticStoredEvent) -> Bool {
+    guard let diagnosticJournal else { return false }
+    do {
+      let entry = try diagnosticJournal.appendSystemEvent(event)
+      if entry.sequence > Int64(diagnosticEventCount + 1) {
+        diagnosticContainsCollectionGap = true
+      }
+      diagnosticEventCount = max(diagnosticEventCount, Int(entry.sequence))
+      if case .collectionGap = entry.event { diagnosticContainsCollectionGap = true }
+      return true
+    } catch {
+      let code = Self.captureDiagnosticError(error).code
+      appendErrorCode(code)
+      eventSink("onError", ["code": code, "reason": "diagnostic_journal_unavailable"])
+      return false
+    }
+  }
+
+  private func transitionDiagnosticAppState(to nextState: TacuaDiagnosticAppState) {
+    let previous = diagnosticAppState
+    guard previous != nextState else { return }
+    guard appendSystemDiagnosticBestEffort(.event(.appStateChanged(
+      fromState: previous,
+      toState: nextState
+    ))) else { return }
+    diagnosticAppState = nextState
+  }
+
+  private static func diagnosticReceipt(_ entry: TacuaDiagnosticSnapshotEntry) -> [String: Any] {
+    [
+      "eventId": entry.eventID,
+      "sequence": entry.sequence,
+      "monotonicMilliseconds": entry.monotonicMilliseconds,
+    ]
+  }
+
+  private static func captureDiagnosticError(_ error: Error) -> TacuaCaptureSpikeError {
+    guard let error = error as? TacuaDiagnosticJournalError else {
+      return .diagnosticUnavailable
+    }
+    switch error {
+    case .invalidEvent, .invalidIdentity:
+      return .diagnosticInvalid
+    case .privacyViolation:
+      return .diagnosticPrivacyViolation
+    case .eventLimitReached:
+      return .diagnosticEventLimitReached
+    case .identityMismatch, .invalidJournal, .persistenceFailure:
+      return .diagnosticUnavailable
+    }
+  }
+
+  private static func stableDiagnosticIdentifier(prefix: String, source: String) -> String {
+    let digest = SHA256.hash(data: Data(source.utf8)).map {
+      String(format: "%02x", $0)
+    }.joined()
+    let available = max(1, 64 - prefix.utf8.count - 1)
+    return "\(prefix)_\(digest.prefix(available))"
+  }
+
+  private static func diagnosticAffectedStreams(
+    reason: String
+  ) -> [TacuaDiagnosticAffectedStream] {
+    if reason.contains("diagnostic") { return [.diagnostics] }
+    if reason.contains("audio") || reason.contains("microphone") {
+      return [.appAudio, .microphone]
+    }
+    if reason.contains("permission") { return [.microphone] }
+    return [.appAudio, .appVideo, .microphone]
   }
 
   private func installLifecycleObservers() {
     guard observers.isEmpty else { return }
     let center = NotificationCenter.default
     observers.append(
+      center.addObserver(
+        forName: UIApplication.willResignActiveNotification,
+        object: nil,
+        queue: nil
+      ) { [weak self] _ in
+        self?.queue.async { self?.transitionDiagnosticAppState(to: .inactive) }
+      }
+    )
+    observers.append(
       center.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: nil) {
         [weak self] _ in
         self?.queue.async {
           guard let self else { return }
+          self.transitionDiagnosticAppState(to: .background)
           // A foreground notification is only an admission signal until the
           // next background transition. Clear it even when a gap is already open.
           self.foregroundReturnHostUptimeSeconds = nil
@@ -1364,11 +1592,17 @@ final class TacuaCaptureSession {
             priorMediaPTSSeconds: self.latestVideoPTS.map(CMTimeGetSeconds),
             nextMediaPTSSeconds: nil
           )
-          self.backgroundGapId = gap.id
-          self.manifest.gaps.append(gap)
+          let bounded = Self.appendBoundedGap(gap, to: &self.manifest)
+          self.backgroundGapId = bounded.id
+          if bounded.inserted {
+            self.appendSystemDiagnosticBestEffort(.captureGap(
+              gapID: Self.stableDiagnosticIdentifier(prefix: "g", source: bounded.id),
+              affectedStreams: [.appAudio, .appVideo, .microphone]
+            ))
+          }
           self.finishCurrentSegment()
           self.persistManifestAndReport()
-          self.eventSink("onGap", ["id": gap.id, "reason": gap.reason])
+          self.eventSink("onGap", ["id": bounded.id, "reason": bounded.reason])
         }
       }
     )
@@ -1379,9 +1613,19 @@ final class TacuaCaptureSession {
           guard let self, self.backgroundGapId != nil, self.acceptsCaptureSamples else {
             return
           }
+          self.transitionDiagnosticAppState(to: .inactive)
           self.foregroundReturnHostUptimeSeconds = ProcessInfo.processInfo.systemUptime
           self.scheduleMicrophoneWatchdogOnQueue()
         }
+      }
+    )
+    observers.append(
+      center.addObserver(
+        forName: UIApplication.didBecomeActiveNotification,
+        object: nil,
+        queue: nil
+      ) { [weak self] _ in
+        self?.queue.async { self?.transitionDiagnosticAppState(to: .active) }
       }
     )
   }
@@ -1397,6 +1641,73 @@ final class TacuaCaptureSession {
     manifest.gaps[index].closedHostUptimeSeconds = closedHostUptimeSeconds
     manifest.gaps[index].nextMediaPTSSeconds = nextMediaPTS.map(CMTimeGetSeconds)
     persistManifestAndReport()
+  }
+
+  /// Keeps the persisted capture artifact admissible under the runtime's 2,048-gap cap. The
+  /// final slot is a durable overflow sentinel; later interruptions extend it without creating
+  /// unbounded manifest or diagnostic records.
+  private static func appendBoundedGap(
+    _ proposed: CaptureGap,
+    to manifest: inout CaptureManifest
+  ) -> (id: String, reason: String, openedHostUptimeSeconds: Double,
+    closedHostUptimeSeconds: Double?, inserted: Bool)
+  {
+    let limit = TacuaCapturePolicy.maximumManifestGaps
+    precondition(limit >= 2)
+    let overflowIndex = manifest.gaps.firstIndex(where: { $0.id == captureGapOverflowID })
+    guard let disposition = TacuaCapturePolicy.captureGapInsertionDisposition(
+      existingCount: manifest.gaps.count,
+      overflowSentinelPresent: overflowIndex != nil
+    ) else { preconditionFailure("Capture manifest gap count exceeded its hard limit") }
+    if disposition == .append {
+      manifest.gaps.append(proposed)
+      return (
+        proposed.id, proposed.reason, proposed.openedHostUptimeSeconds,
+        proposed.closedHostUptimeSeconds, true
+      )
+    }
+
+    if disposition == .coalesceIntoOverflowSentinel, let overflowIndex {
+      let priorClosed = manifest.gaps[overflowIndex].closedHostUptimeSeconds
+        ?? manifest.gaps[overflowIndex].openedHostUptimeSeconds
+      let proposedClosed = proposed.closedHostUptimeSeconds ?? proposed.openedHostUptimeSeconds
+      manifest.gaps[overflowIndex].closedHostUptimeSeconds = max(priorClosed, proposedClosed)
+      if let next = proposed.nextMediaPTSSeconds {
+        manifest.gaps[overflowIndex].nextMediaPTSSeconds = next
+      }
+      let overflow = manifest.gaps[overflowIndex]
+      return (
+        overflow.id, overflow.reason, overflow.openedHostUptimeSeconds,
+        overflow.closedHostUptimeSeconds, false
+      )
+    }
+
+    let replaced: CaptureGap?
+    if disposition == .replaceLastWithOverflowSentinel {
+      replaced = manifest.gaps.removeLast()
+    } else {
+      replaced = nil
+    }
+    let opened = min(replaced?.openedHostUptimeSeconds ?? proposed.openedHostUptimeSeconds,
+      proposed.openedHostUptimeSeconds)
+    let closedCandidates = [
+      replaced?.closedHostUptimeSeconds,
+      proposed.closedHostUptimeSeconds,
+      proposed.openedHostUptimeSeconds,
+    ].compactMap { $0 }
+    let overflow = CaptureGap(
+      id: captureGapOverflowID,
+      reason: "capture_gap_overflow",
+      openedHostUptimeSeconds: opened,
+      closedHostUptimeSeconds: closedCandidates.max(),
+      priorMediaPTSSeconds: replaced?.priorMediaPTSSeconds ?? proposed.priorMediaPTSSeconds,
+      nextMediaPTSSeconds: proposed.nextMediaPTSSeconds ?? replaced?.nextMediaPTSSeconds
+    )
+    manifest.gaps.append(overflow)
+    return (
+      overflow.id, overflow.reason, overflow.openedHostUptimeSeconds,
+      overflow.closedHostUptimeSeconds, true
+    )
   }
 
   private func removeLifecycleObservers() {
@@ -1430,12 +1741,19 @@ final class TacuaCaptureSession {
   }
 
   static func withExclusiveRecoveryAccess<T>(_ operation: () throws -> T) throws -> T {
+    let lease = try acquireExclusiveRecoveryLease()
+    defer { lease.release() }
+    return try operation()
+  }
+
+  static func acquireExclusiveRecoveryLease() throws -> ExclusiveRecoveryLease {
     let token = UUID()
     guard claimRecorderOwnership(token) else {
       throw TacuaCaptureSpikeError.captureAlreadyRunning
     }
-    defer { releaseRecorderOwnership(token) }
-    return try operation()
+    return ExclusiveRecoveryLease {
+      releaseRecorderOwnership(token)
+    }
   }
 
   private func releaseRecorderOwnershipIfSafeOnQueue() {
@@ -1464,6 +1782,8 @@ final class TacuaCaptureSession {
       "microphoneSamplesObserved": manifest.microphoneSamplesObserved ?? 0,
       "appAudioSamplesObserved": manifest.appAudioSamplesObserved ?? 0,
       "appAudioAvailable": (manifest.appAudioSamplesObserved ?? 0) > 0,
+      "diagnosticEventCount": diagnosticEventCount,
+      "diagnosticContainsCollectionGap": diagnosticContainsCollectionGap,
     ]
 #if TACUA_CAPTURE_FAULT_INJECTION
     result["testFaultPlan"] = faultInjection?.plan.rawValue ?? NSNull()
@@ -1513,6 +1833,18 @@ final class TacuaCaptureSession {
       expectedApplicationId: options.expectedApplicationId,
       expectedBuildNumber: options.expectedBuildNumber
     )
+  }
+
+  private static func protocolDate(_ value: String) -> Date? {
+    guard value.utf8.count == 20,
+      value.range(
+        of: "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+        options: .regularExpression
+      ) != nil
+    else { return nil }
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime]
+    return formatter.date(from: value)
   }
 
   private static func handoff(from options: TacuaCaptureRecoveryOptions) -> CandidateHandoffEnvelope {

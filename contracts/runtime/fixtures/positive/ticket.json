@@ -1,0 +1,182 @@
+{
+  "approval": {
+    "actor_id": "reviewer_synthetic",
+    "actor_type": "human",
+    "approval_id": "approval_synthetic",
+    "approved_at": "2026-07-21T10:06:00Z",
+    "candidate_content_digest": "sha256:8ca65930a9bf5d1a044b74e12c2461a92ce74aa27cf65d6d271a44d302e7b1ab",
+    "candidate_version": 2,
+    "immutable": true
+  },
+  "build_id": "build_synthetic",
+  "build_identity_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+  "candidate_content_digest": "sha256:8ca65930a9bf5d1a044b74e12c2461a92ce74aa27cf65d6d271a44d302e7b1ab",
+  "candidate_digest": "sha256:6d69972a46b8ce0e31a8fc99b73ad85b6bb7d8afa725fa476bc1db5bead59bc4",
+  "candidate_id": "candidate_synthetic",
+  "candidate_version": 2,
+  "content": {
+    "acceptance_criteria": [
+      {
+        "criterion": "The Settings primary action reads Continue.",
+        "criterion_id": "criterion_copy",
+        "verification": "Open Settings in the QA build and compare the visible label."
+      }
+    ],
+    "actual_behavior": {
+      "claim_refs": [
+        "claim_actual"
+      ],
+      "evidence_refs": [
+        "evidence_frame",
+        "evidence_transcript"
+      ],
+      "text": "The button reads Save."
+    },
+    "claims": [
+      {
+        "claim_id": "claim_actual",
+        "confidence": "high",
+        "evidence_refs": [
+          "evidence_frame"
+        ],
+        "kind": "observed",
+        "statement": "The captured frame shows Save.",
+        "support": "direct"
+      },
+      {
+        "claim_id": "claim_expected",
+        "confidence": "high",
+        "evidence_refs": [
+          "evidence_transcript"
+        ],
+        "kind": "expected",
+        "statement": "The reviewer requested Continue.",
+        "support": "direct"
+      }
+    ],
+    "clarifications": [
+      {
+        "choices": [
+          {
+            "choice_id": "choice_continue",
+            "consequence": "Use the reviewer-requested product copy.",
+            "evidence_refs": [
+              "evidence_transcript"
+            ],
+            "label": "Continue"
+          },
+          {
+            "choice_id": "choice_next",
+            "consequence": "Use alternative navigation copy not supported by the recording.",
+            "evidence_refs": [],
+            "label": "Next"
+          }
+        ],
+        "clarification_id": "clarification_copy",
+        "impact": "blocking",
+        "question": "Which approved label should replace Save?",
+        "resolution_note": "The reviewer selected Continue.",
+        "selected_choice_id": "choice_continue",
+        "status": "resolved"
+      }
+    ],
+    "expected_behavior": {
+      "claim_refs": [
+        "claim_expected"
+      ],
+      "evidence_refs": [
+        "evidence_transcript"
+      ],
+      "text": "The button should read Continue."
+    },
+    "preconditions": [
+      {
+        "claim_refs": [
+          "claim_actual"
+        ],
+        "evidence_refs": [
+          "evidence_frame"
+        ],
+        "precondition_id": "precondition_settings",
+        "text": "Open the Settings screen in the tested build."
+      }
+    ],
+    "priority": "P2",
+    "reproduction_steps": [
+      {
+        "action": "Open Settings and inspect the primary action.",
+        "actual_result": "The action reads Save.",
+        "claim_refs": [
+          "claim_actual",
+          "claim_expected"
+        ],
+        "confidence": "high",
+        "evidence_refs": [
+          "evidence_frame",
+          "evidence_transcript"
+        ],
+        "expected_result": "The action reads Continue.",
+        "step_id": "step_open"
+      }
+    ],
+    "scope": {
+      "in_scope": [
+        "Settings primary action copy"
+      ],
+      "out_of_scope": [
+        "Settings navigation behavior"
+      ]
+    },
+    "summary": "The Settings action is labelled Save instead of Continue.",
+    "summary_claim_refs": [
+      "claim_actual",
+      "claim_expected"
+    ],
+    "title": "Settings button uses incorrect copy",
+    "uncertainty": {
+      "items": [
+        {
+          "evidence_refs": [
+            "evidence_frame"
+          ],
+          "impact": "non_blocking",
+          "statement": "No backend behavior is implicated by the available evidence.",
+          "uncertainty_id": "uncertainty_backend"
+        }
+      ],
+      "overall_confidence": "high"
+    }
+  },
+  "contract_version": "tacua.runtime-ticket-candidate@1.0.0",
+  "created_at": "2026-07-21T10:04:00Z",
+  "media_type": "application/vnd.tacua.runtime-ticket-candidate+json;version=1.0.0",
+  "organization_id": "org_synthetic",
+  "previous_candidate_digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+  "project_id": "project_synthetic",
+  "rejection": null,
+  "review": {
+    "last_edited_by": "reviewer_synthetic",
+    "last_reviewed_at": "2026-07-21T10:06:00Z",
+    "notes": [
+      "Confirmed the intended copy."
+    ],
+    "reviewer_action_required": false,
+    "status": "reviewed"
+  },
+  "session_id": "session_synthetic",
+  "source": {
+    "evidence_manifest_digest": "sha256:08915b84578c23976d30bd5ac70429c570e28a43988161512949de07e78752c6",
+    "job_digest": "sha256:97f16381272e341b718210b3378bb8ee65bf8737e7e6817464ac59a786dc38bd",
+    "job_id": "job_synthetic"
+  },
+  "state": "approved",
+  "transition": {
+    "actor_id": "reviewer_synthetic",
+    "actor_type": "human",
+    "from_state": "ready_for_review",
+    "occurred_at": "2026-07-21T10:06:00Z",
+    "reason": "Reviewer accepted the exact candidate version.",
+    "to_state": "approved"
+  },
+  "updated_at": "2026-07-21T10:06:00Z"
+}

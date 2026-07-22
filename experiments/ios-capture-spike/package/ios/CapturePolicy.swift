@@ -2,8 +2,20 @@
 
 import Foundation
 
+enum TacuaCaptureGapInsertionDisposition: Equatable {
+  case append
+  case appendOverflowSentinel
+  case coalesceIntoOverflowSentinel
+  case replaceLastWithOverflowSentinel
+}
+
 enum TacuaCapturePolicy {
   static let maximumDurationSeconds: Double = 1_800
+  /// The runtime envelope has 10,000 slots. Capture reserves one terminal-summary slot and one
+  /// projection-overflow slot so a late manifest marker or gap can never make admission fail.
+  static let maximumDiagnosticJournalEvents = 9_998
+  static let maximumManifestGaps = 2_048
+  static let maximumManifestMarkers = 2_048
   static let minimumFreeStorageBytes: Int64 = 256 * 1_024 * 1_024
   static let maximumCatchUpSegmentRotations = 60
   static let minimumSegmentBoundaryToleranceSeconds: Double = 1e-9
@@ -14,6 +26,17 @@ enum TacuaCapturePolicy {
   static let microphoneGapToleranceSeconds: Double = 3
   static let videoClockDiscontinuityToleranceSeconds: Double = 0.5
   static let requiredConsentVersion = "tacua-local-capture-consent-v1"
+
+  static func captureGapInsertionDisposition(
+    existingCount: Int,
+    overflowSentinelPresent: Bool
+  ) -> TacuaCaptureGapInsertionDisposition? {
+    guard existingCount >= 0, existingCount <= maximumManifestGaps else { return nil }
+    if overflowSentinelPresent { return .coalesceIntoOverflowSentinel }
+    if existingCount < maximumManifestGaps - 1 { return .append }
+    if existingCount == maximumManifestGaps - 1 { return .appendOverflowSentinel }
+    return .replaceLastWithOverflowSentinel
+  }
 
   static func terminalState(
     segmentCount: Int,
@@ -29,6 +52,29 @@ enum TacuaCapturePolicy {
   static func hasReachedDeadline(hostUptimeSeconds: Double, deadlineHostUptimeSeconds: Double?) -> Bool {
     guard let deadlineHostUptimeSeconds else { return false }
     return hostUptimeSeconds >= deadlineHostUptimeSeconds
+  }
+
+  /// A process resume starts a new ReplayKit lease, not a new logical QA session. Every segment
+  /// and gap remains relative to the first capture origin, so the resume callback may fill a
+  /// missing origin but must never replace an existing one.
+  static func preservedSessionStartHostUptime(
+    existing: Double?,
+    resumeCandidate: Double
+  ) -> Double {
+    existing ?? resumeCandidate
+  }
+
+  /// Persisted host-uptime values are meaningful only on the boot that produced them. Legacy
+  /// schema-2 sessions remain available to the explicit recovery/finalization APIs, but must not
+  /// restart ReplayKit because they have no durable boot identity to prove that chronology.
+  static func canResumeStoredSession(
+    schemaVersion: Int,
+    storedBootSessionID: String?,
+    currentBootSessionID: String
+  ) -> Bool {
+    schemaVersion == 3
+      && !currentBootSessionID.isEmpty
+      && storedBootSessionID == currentBootSessionID
   }
 
   static func hasSufficientStorage(

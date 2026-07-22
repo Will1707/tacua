@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tacua.invalid/schemas/sdk-backend/1.0.0/diagnostic-upload-receipt.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "Tacua durable diagnostic-envelope receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "message_type",
+    "receipt_id",
+    "upload_id",
+    "request_digest",
+    "session_id",
+    "scope_digest",
+    "credential_id",
+    "object_id",
+    "size_bytes",
+    "transport_digest",
+    "envelope_id",
+    "envelope_digest",
+    "received_at",
+    "diagnostic_receipt_digest"
+  ],
+  "properties": {
+    "protocol_version": { "$ref": "common.schema.json#/$defs/protocolVersion" },
+    "message_type": { "const": "diagnostic_upload_receipt" },
+    "receipt_id": { "$ref": "common.schema.json#/$defs/id" },
+    "upload_id": { "$ref": "common.schema.json#/$defs/id" },
+    "request_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "session_id": { "$ref": "common.schema.json#/$defs/id" },
+    "scope_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "credential_id": { "$ref": "common.schema.json#/$defs/id" },
+    "object_id": { "$ref": "common.schema.json#/$defs/id" },
+    "size_bytes": { "type": "integer", "minimum": 1, "maximum": 1073741824 },
+    "transport_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "envelope_id": { "$ref": "common.schema.json#/$defs/id" },
+    "envelope_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "received_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "diagnostic_receipt_digest": { "$ref": "common.schema.json#/$defs/digest" }
+  }
+}

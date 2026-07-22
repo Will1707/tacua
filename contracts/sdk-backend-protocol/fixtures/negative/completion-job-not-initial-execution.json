@@ -1,0 +1,127 @@
+{
+  "accepted_at": "2026-07-21T10:02:06Z",
+  "completion_id": "completion_synthetic",
+  "completion_receipt_digest": "sha256:28451273de032f69c7f795f34a53923b5812082b64a12e3db364367bac3c0b5f",
+  "credential": {
+    "credential_id": "credential_receiving_resume",
+    "expires_at": "2026-08-20T10:00:00Z",
+    "replay_completion_id": "completion_synthetic",
+    "state": "completion_replay_or_delete_only"
+  },
+  "local_cleanup": {
+    "diagnostic_receipt_digests": [
+      "sha256:62d566bef8be86883818cfe2edeb4a07e797ce6c3d56b0f1260adf58f9fef8f5"
+    ],
+    "manifest_digest": "sha256:6a0816b264fd508f2e870c4989e82348450b42779199e9f63458d0980c55a599",
+    "segment_receipt_digests": [
+      "sha256:00500257fe3fb5315c871a2f5619daca5a1689c00084d98440f1727de16b8d76"
+    ],
+    "state": "authorized_after_durable_receipt"
+  },
+  "message_type": "completion_receipt",
+  "processing_job": {
+    "build_id": "build_synthetic",
+    "build_identity_digest": "sha256:234578e520242629d531f7a9649e0417dd9e67d8761572530f054f65e7dc4b63",
+    "completed_at": null,
+    "contract_version": "tacua.processing-job@1.0.0",
+    "execution": {
+      "egress": {
+        "authorization_decision_id": null,
+        "authorized": false,
+        "destinations": [],
+        "policy": "default_deny"
+      },
+      "max_attempts": 4,
+      "mode": "async"
+    },
+    "failure": null,
+    "inputs": {
+      "capture_manifest_digest": "sha256:6a0816b264fd508f2e870c4989e82348450b42779199e9f63458d0980c55a599",
+      "context_sources": [
+        {
+          "access": "read_only",
+          "availability": "available",
+          "kind": "mobile_repository",
+          "snapshot_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+          "source_id": "repo_synthetic",
+          "unavailable": null
+        },
+        {
+          "access": "read_only",
+          "availability": "unavailable",
+          "kind": "sentry",
+          "snapshot_digest": null,
+          "source_id": "sentry_synthetic",
+          "unavailable": {
+            "detail": "The optional connector was not configured.",
+            "reason": "not_configured"
+          }
+        }
+      ],
+      "diagnostic_envelope_digests": [
+        "sha256:9842a35e46a1cb1b914c3a3500eeb35bb3020dedf5f6a9f5b10170b7cbd7479d"
+      ]
+    },
+    "job_digest": "sha256:49a84163c1cd3ff9de4e0fd3e6c8c7a8041b2a3aff7f1e58a5806e3dc01271af",
+    "job_id": "job_synthetic",
+    "job_version": 1,
+    "media_type": "application/vnd.tacua.processing-job+json;version=1.0.0",
+    "organization_id": "org_synthetic",
+    "outputs": null,
+    "pipeline": {
+      "pipeline_version": "tacua.pipeline@1.0.0",
+      "stages": [
+        {
+          "attempt_count": 0,
+          "completed_at": null,
+          "detail": null,
+          "name": "transcribe",
+          "started_at": null,
+          "state": "pending"
+        },
+        {
+          "attempt_count": 0,
+          "completed_at": null,
+          "detail": null,
+          "name": "align",
+          "started_at": null,
+          "state": "pending"
+        },
+        {
+          "attempt_count": 0,
+          "completed_at": null,
+          "detail": null,
+          "name": "correlate",
+          "started_at": null,
+          "state": "pending"
+        },
+        {
+          "attempt_count": 0,
+          "completed_at": null,
+          "detail": null,
+          "name": "research",
+          "started_at": null,
+          "state": "pending"
+        },
+        {
+          "attempt_count": 0,
+          "completed_at": null,
+          "detail": null,
+          "name": "generate_tickets",
+          "started_at": null,
+          "state": "pending"
+        }
+      ]
+    },
+    "previous_job_digest": null,
+    "project_id": "project_synthetic",
+    "requested_at": "2026-07-21T10:02:06Z",
+    "session_id": "session_synthetic",
+    "started_at": null,
+    "status": "queued"
+  },
+  "protocol_version": "tacua.sdk-backend@1.0.0",
+  "request_digest": "sha256:d5b45fc406ddc15489034b25ac8fcb0cc00f46bb1affed59774c281a844f1a8d",
+  "scope_digest": "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50",
+  "session_id": "session_synthetic"
+}

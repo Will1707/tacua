@@ -1,0 +1,25 @@
+{
+  "build_id": "build_synthetic",
+  "build_identity_digest": "sha256:10bfd80126ab1b90562624922583c82e1b436df8f1fecd14095ded91652f2255",
+  "build_variant": "production",
+  "bundle_identifier": "dev.tacua.synthetic",
+  "created_at": "2026-07-21T09:55:00Z",
+  "distribution": "testflight",
+  "expo": {
+    "runtime_version": "1.0.0",
+    "sdk_version": "56.0.0",
+    "update_channel": "preview",
+    "update_id": "update_synthetic"
+  },
+  "message_type": "build_identity",
+  "native_build": "42",
+  "native_version": "1.0.0",
+  "platform": "ios",
+  "protocol_version": "tacua.sdk-backend@1.0.0",
+  "react_native_version": "0.81.5",
+  "source": {
+    "git_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "working_tree_dirty": false
+  },
+  "transport_configuration_digest": "sha256:201c7da992e3af7025b47ebc672208012b3b03ab25f41d7985e05c845879f6e4"
+}

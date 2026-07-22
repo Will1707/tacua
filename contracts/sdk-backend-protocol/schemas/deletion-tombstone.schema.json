@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tacua.invalid/schemas/sdk-backend/1.0.0/deletion-tombstone.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "Tacua minimal session-deletion tombstone",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "message_type",
+    "deletion_id",
+    "deletion_request_digest",
+    "session_id",
+    "scope_digest",
+    "credential",
+    "session_access",
+    "erasure",
+    "local_credential_cleanup",
+    "accepted_at",
+    "deleted_at",
+    "tombstone_expires_at",
+    "tombstone_digest"
+  ],
+  "properties": {
+    "protocol_version": { "$ref": "common.schema.json#/$defs/protocolVersion" },
+    "message_type": { "const": "deletion_tombstone" },
+    "deletion_id": { "$ref": "common.schema.json#/$defs/id" },
+    "deletion_request_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "session_id": { "$ref": "common.schema.json#/$defs/id" },
+    "scope_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "credential": { "$ref": "#/$defs/credential" },
+    "session_access": { "$ref": "#/$defs/sessionAccess" },
+    "erasure": { "$ref": "#/$defs/erasure" },
+    "local_credential_cleanup": { "const": "authorized_after_durable_tombstone" },
+    "accepted_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "deleted_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "tombstone_expires_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "tombstone_digest": { "$ref": "common.schema.json#/$defs/digest" }
+  },
+  "$defs": {
+    "credential": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["credential_id", "state", "replay_deletion_id", "verifier_retained_until"],
+      "properties": {
+        "credential_id": { "$ref": "common.schema.json#/$defs/id" },
+        "state": { "const": "deletion_replay_only" },
+        "replay_deletion_id": { "$ref": "common.schema.json#/$defs/id" },
+        "verifier_retained_until": { "$ref": "common.schema.json#/$defs/timestamp" }
+      }
+    },
+    "sessionAccess": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evidence", "uploads", "completion", "processing"],
+      "properties": {
+        "evidence": { "const": "revoked" },
+        "uploads": { "const": "revoked" },
+        "completion": { "const": "revoked" },
+        "processing": { "const": "revoked" }
+      }
+    },
+    "erasure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "raw_media",
+        "diagnostics",
+        "derived_data",
+        "session_metadata",
+        "erased_object_count"
+      ],
+      "properties": {
+        "raw_media": { "const": "deleted" },
+        "diagnostics": { "const": "deleted" },
+        "derived_data": { "const": "deleted" },
+        "session_metadata": { "const": "deleted_except_tombstone_and_replay_verifier" },
+        "erased_object_count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    }
+  }
+}

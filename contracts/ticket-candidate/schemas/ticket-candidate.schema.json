@@ -1,0 +1,506 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tacua.invalid/schemas/ticket-candidate/1.0.0/ticket-candidate.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "Tacua production draft ticket-candidate snapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "media_type",
+    "organization_id",
+    "project_id",
+    "build_id",
+    "build_identity_digest",
+    "session_id",
+    "evidence_manifest",
+    "candidate_id",
+    "candidate_version",
+    "previous_candidate_digest",
+    "state",
+    "candidate_created_at",
+    "version_created_at",
+    "lineage",
+    "transition",
+    "content",
+    "review",
+    "approval",
+    "rejection",
+    "candidate_content_digest",
+    "candidate_digest"
+  ],
+  "properties": {
+    "contract_version": { "const": "tacua.ticket-candidate@1.0.0" },
+    "media_type": { "const": "application/vnd.tacua.ticket-candidate+json;version=1.0.0" },
+    "organization_id": { "$ref": "common.schema.json#/$defs/id" },
+    "project_id": { "$ref": "common.schema.json#/$defs/id" },
+    "build_id": { "$ref": "common.schema.json#/$defs/id" },
+    "build_identity_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "session_id": { "$ref": "common.schema.json#/$defs/id" },
+    "evidence_manifest": { "$ref": "#/$defs/evidenceManifestBinding" },
+    "candidate_id": { "$ref": "common.schema.json#/$defs/id" },
+    "candidate_version": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "previous_candidate_digest": { "$ref": "common.schema.json#/$defs/nullableDigest" },
+    "state": { "$ref": "#/$defs/state" },
+    "candidate_created_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "version_created_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "lineage": { "$ref": "#/$defs/lineage" },
+    "transition": { "$ref": "#/$defs/transition" },
+    "content": { "$ref": "#/$defs/content" },
+    "review": { "$ref": "#/$defs/review" },
+    "approval": {
+      "oneOf": [
+        { "$ref": "#/$defs/approval" },
+        { "type": "null" }
+      ]
+    },
+    "rejection": {
+      "oneOf": [
+        { "$ref": "#/$defs/rejection" },
+        { "type": "null" }
+      ]
+    },
+    "candidate_content_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "candidate_digest": { "$ref": "common.schema.json#/$defs/digest" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "state": { "const": "approved" } } },
+      "then": {
+        "properties": {
+          "approval": { "$ref": "#/$defs/approval" },
+          "rejection": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "state": { "const": "rejected" } } },
+      "then": {
+        "properties": {
+          "approval": { "type": "null" },
+          "rejection": { "$ref": "#/$defs/rejection" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": { "enum": ["draft", "needs_clarification", "ready_for_review"] }
+        }
+      },
+      "then": {
+        "properties": {
+          "approval": { "type": "null" },
+          "rejection": { "type": "null" }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "state": {
+      "enum": ["draft", "needs_clarification", "ready_for_review", "approved", "rejected"]
+    },
+    "idList": {
+      "type": "array",
+      "maxItems": 128,
+      "uniqueItems": true,
+      "items": { "$ref": "common.schema.json#/$defs/id" }
+    },
+    "nonEmptyIdList": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "uniqueItems": true,
+      "items": { "$ref": "common.schema.json#/$defs/id" }
+    },
+    "evidenceManifestBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifest_id", "manifest_digest", "evidence_ids"],
+      "properties": {
+        "manifest_id": { "$ref": "common.schema.json#/$defs/id" },
+        "manifest_digest": { "$ref": "common.schema.json#/$defs/digest" },
+        "evidence_ids": { "$ref": "#/$defs/nonEmptyIdList" }
+      }
+    },
+    "parent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_id", "candidate_version", "candidate_digest"],
+      "properties": {
+        "candidate_id": { "$ref": "common.schema.json#/$defs/id" },
+        "candidate_version": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "candidate_digest": { "$ref": "common.schema.json#/$defs/digest" }
+      }
+    },
+    "lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation", "parents"],
+      "properties": {
+        "operation": {
+          "enum": [
+            "generated",
+            "split",
+            "merged",
+            "edited",
+            "clarification_answered",
+            "reviewed",
+            "approved",
+            "rejected",
+            "reopened"
+          ]
+        },
+        "parents": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/parent" }
+        }
+      }
+    },
+    "transition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from_state", "to_state", "actor", "occurred_at", "reason"],
+      "properties": {
+        "from_state": {
+          "oneOf": [
+            { "$ref": "#/$defs/state" },
+            { "type": "null" }
+          ]
+        },
+        "to_state": { "$ref": "#/$defs/state" },
+        "actor": { "$ref": "common.schema.json#/$defs/actor" },
+        "occurred_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "reason": { "$ref": "common.schema.json#/$defs/shortText" }
+      }
+    },
+    "claim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["claim_id", "kind", "support", "confidence", "statement", "evidence_refs"],
+      "properties": {
+        "claim_id": { "$ref": "common.schema.json#/$defs/id" },
+        "kind": { "enum": ["observed", "expected", "diagnosis", "hypothesis", "constraint"] },
+        "support": { "enum": ["direct", "inferred", "unknown"] },
+        "confidence": { "enum": ["high", "medium", "low", "unknown"] },
+        "statement": { "$ref": "common.schema.json#/$defs/boundedText" },
+        "evidence_refs": { "$ref": "#/$defs/idList" }
+      }
+    },
+    "groundedText": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["text", "claim_refs", "evidence_refs"],
+      "properties": {
+        "text": { "$ref": "common.schema.json#/$defs/boundedText" },
+        "claim_refs": { "$ref": "#/$defs/nonEmptyIdList" },
+        "evidence_refs": { "$ref": "#/$defs/nonEmptyIdList" }
+      }
+    },
+    "precondition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["precondition_id", "text", "claim_refs", "evidence_refs"],
+      "properties": {
+        "precondition_id": { "$ref": "common.schema.json#/$defs/id" },
+        "text": { "$ref": "common.schema.json#/$defs/boundedText" },
+        "claim_refs": { "$ref": "#/$defs/idList" },
+        "evidence_refs": { "$ref": "#/$defs/idList" }
+      }
+    },
+    "reproductionStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "step_id",
+        "action",
+        "expected_result",
+        "actual_result",
+        "claim_refs",
+        "evidence_refs",
+        "confidence"
+      ],
+      "properties": {
+        "step_id": { "$ref": "common.schema.json#/$defs/id" },
+        "action": { "$ref": "common.schema.json#/$defs/boundedText" },
+        "expected_result": { "$ref": "common.schema.json#/$defs/nullableText" },
+        "actual_result": { "$ref": "common.schema.json#/$defs/nullableText" },
+        "claim_refs": { "$ref": "#/$defs/nonEmptyIdList" },
+        "evidence_refs": { "$ref": "#/$defs/nonEmptyIdList" },
+        "confidence": { "enum": ["high", "medium", "low", "unknown"] }
+      }
+    },
+    "reproduction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["preconditions", "steps", "attempts", "reproductions"],
+      "properties": {
+        "preconditions": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/precondition" }
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/reproductionStep" }
+        },
+        "attempts": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "reproductions": { "type": "integer", "minimum": 0, "maximum": 1000 }
+      }
+    },
+    "acceptanceCriterion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["criterion_id", "criterion", "verification", "claim_refs", "evidence_refs"],
+      "properties": {
+        "criterion_id": { "$ref": "common.schema.json#/$defs/id" },
+        "criterion": { "$ref": "common.schema.json#/$defs/boundedText" },
+        "verification": { "$ref": "common.schema.json#/$defs/boundedText" },
+        "claim_refs": { "$ref": "#/$defs/nonEmptyIdList" },
+        "evidence_refs": { "$ref": "#/$defs/nonEmptyIdList" }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["in_scope", "out_of_scope"],
+      "properties": {
+        "in_scope": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "$ref": "common.schema.json#/$defs/boundedText" }
+        },
+        "out_of_scope": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "common.schema.json#/$defs/boundedText" }
+        }
+      }
+    },
+    "uncertaintyItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uncertainty_id", "statement", "impact", "evidence_refs"],
+      "properties": {
+        "uncertainty_id": { "$ref": "common.schema.json#/$defs/id" },
+        "statement": { "$ref": "common.schema.json#/$defs/boundedText" },
+        "impact": { "enum": ["blocking", "non_blocking"] },
+        "evidence_refs": { "$ref": "#/$defs/idList" }
+      }
+    },
+    "uncertainty": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["overall_confidence", "items"],
+      "properties": {
+        "overall_confidence": { "enum": ["high", "medium", "low", "unknown"] },
+        "items": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/uncertaintyItem" }
+        }
+      }
+    },
+    "choicePresentation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "value", "evidence_ref"],
+      "properties": {
+        "kind": { "enum": ["text", "evidence_thumbnail", "color_swatch", "sf_symbol"] },
+        "value": { "$ref": "common.schema.json#/$defs/nullableText" },
+        "evidence_ref": { "$ref": "common.schema.json#/$defs/nullableId" }
+      }
+    },
+    "clarificationChoice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "choice_id",
+        "label",
+        "description",
+        "consequence",
+        "requires_note",
+        "presentation",
+        "evidence_refs"
+      ],
+      "properties": {
+        "choice_id": { "$ref": "common.schema.json#/$defs/id" },
+        "label": { "$ref": "common.schema.json#/$defs/shortText" },
+        "description": { "$ref": "common.schema.json#/$defs/boundedText" },
+        "consequence": { "$ref": "common.schema.json#/$defs/boundedText" },
+        "requires_note": { "type": "boolean" },
+        "presentation": { "$ref": "#/$defs/choicePresentation" },
+        "evidence_refs": { "$ref": "#/$defs/idList" }
+      }
+    },
+    "clarification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "clarification_id",
+        "question",
+        "target",
+        "impact",
+        "status",
+        "choices",
+        "selected_choice_id",
+        "resolution_note"
+      ],
+      "properties": {
+        "clarification_id": { "$ref": "common.schema.json#/$defs/id" },
+        "question": { "$ref": "common.schema.json#/$defs/boundedText" },
+        "target": { "$ref": "common.schema.json#/$defs/shortText" },
+        "impact": { "enum": ["blocking", "non_blocking"] },
+        "status": { "enum": ["unresolved", "resolved"] },
+        "choices": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 5,
+          "items": { "$ref": "#/$defs/clarificationChoice" }
+        },
+        "selected_choice_id": { "$ref": "common.schema.json#/$defs/nullableId" },
+        "resolution_note": { "$ref": "common.schema.json#/$defs/nullableText" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "unresolved" } } },
+          "then": {
+            "properties": {
+              "selected_choice_id": { "type": "null" },
+              "resolution_note": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "status": { "const": "resolved" } } },
+          "then": {
+            "properties": {
+              "selected_choice_id": { "$ref": "common.schema.json#/$defs/id" }
+            }
+          }
+        }
+      ]
+    },
+    "content": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "priority",
+        "summary",
+        "actual_behavior",
+        "expected_behavior",
+        "claims",
+        "reproduction",
+        "scope",
+        "acceptance_criteria",
+        "uncertainty",
+        "clarifications"
+      ],
+      "properties": {
+        "title": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "priority": { "enum": ["P0", "P1", "P2", "P3"] },
+        "summary": { "$ref": "#/$defs/groundedText" },
+        "actual_behavior": { "$ref": "#/$defs/groundedText" },
+        "expected_behavior": { "$ref": "#/$defs/groundedText" },
+        "claims": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/claim" }
+        },
+        "reproduction": { "$ref": "#/$defs/reproduction" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "acceptance_criteria": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/acceptanceCriterion" }
+        },
+        "uncertainty": { "$ref": "#/$defs/uncertainty" },
+        "clarifications": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/clarification" }
+        }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "reviewer_action_required", "last_human_actor_id", "last_reviewed_at", "notes"],
+      "properties": {
+        "status": { "enum": ["unreviewed", "in_review", "reviewed"] },
+        "reviewer_action_required": { "type": "boolean" },
+        "last_human_actor_id": { "$ref": "common.schema.json#/$defs/nullableId" },
+        "last_reviewed_at": { "$ref": "common.schema.json#/$defs/nullableTimestamp" },
+        "notes": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "common.schema.json#/$defs/boundedText" }
+        }
+      }
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approval_id",
+        "actor_type",
+        "actor_id",
+        "approved_at",
+        "reviewed_candidate_version",
+        "reviewed_candidate_digest",
+        "approved_candidate_version",
+        "candidate_content_digest",
+        "evidence_manifest_digest",
+        "authorized_evidence_ids",
+        "immutable"
+      ],
+      "properties": {
+        "approval_id": { "$ref": "common.schema.json#/$defs/id" },
+        "actor_type": { "const": "human" },
+        "actor_id": { "$ref": "common.schema.json#/$defs/id" },
+        "approved_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "reviewed_candidate_version": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "reviewed_candidate_digest": { "$ref": "common.schema.json#/$defs/digest" },
+        "approved_candidate_version": { "type": "integer", "minimum": 2, "maximum": 9007199254740991 },
+        "candidate_content_digest": { "$ref": "common.schema.json#/$defs/digest" },
+        "evidence_manifest_digest": { "$ref": "common.schema.json#/$defs/digest" },
+        "authorized_evidence_ids": { "$ref": "#/$defs/nonEmptyIdList" },
+        "immutable": { "const": true }
+      }
+    },
+    "rejection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "actor_type",
+        "actor_id",
+        "rejected_at",
+        "reviewed_candidate_version",
+        "reviewed_candidate_digest",
+        "rejected_candidate_version",
+        "candidate_content_digest",
+        "reason",
+        "immutable"
+      ],
+      "properties": {
+        "actor_type": { "const": "human" },
+        "actor_id": { "$ref": "common.schema.json#/$defs/id" },
+        "rejected_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "reviewed_candidate_version": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "reviewed_candidate_digest": { "$ref": "common.schema.json#/$defs/digest" },
+        "rejected_candidate_version": { "type": "integer", "minimum": 2, "maximum": 9007199254740991 },
+        "candidate_content_digest": { "$ref": "common.schema.json#/$defs/digest" },
+        "reason": { "$ref": "common.schema.json#/$defs/boundedText" },
+        "immutable": { "const": true }
+      }
+    }
+  }
+}

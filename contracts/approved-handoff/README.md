@@ -2,7 +2,7 @@
 
 # Candidate approved-ticket handoff contract
 
-This directory is a self-contained, implementation-candidate package for the decision tracked as [ADR-011](../../docs/decisions/ADR-011-approved-handoff.md). It does **not** accept or change that decision. It exists so the proposed boundary can be exercised by a real coding-agent trial before owner approval.
+This directory is a repository-contained, implementation-candidate package for the decision tracked as [ADR-011](../../docs/decisions/ADR-011-approved-handoff.md). It uses the sibling `ticket-candidate` package as the authoritative validator for its embedded source candidate. It does **not** accept or change that decision. It exists so the proposed boundary can be exercised by a real coding-agent trial before owner approval.
 
 The `tacua.*` contract names are candidate identifiers only. Schema `$id` values use the reserved `.invalid` top-level domain and do not imply control of a public DNS or package-registry namespace.
 
@@ -13,16 +13,18 @@ The package defines five versioned artifacts and one reusable evidence-item sche
 | Build identity | `tacua.build-identity@1.0.0` | `application/vnd.tacua.build-identity+json;version=1.0.0` | Included in handoff limit |
 | Evidence item | `tacua.evidence-item@1.0.0` | Embedded in manifest only | 100 MiB referenced-object metadata ceiling; no payload |
 | Evidence manifest | `tacua.evidence-manifest@1.0.0` | `application/vnd.tacua.evidence-manifest+json;version=1.0.0` | 100 items |
-| Approved handoff | `tacua.approved-handoff@1.0.0` | `application/vnd.tacua.approved-handoff+json;version=1.0.0` | 1 MiB canonical JSON |
+| Approved handoff | `tacua.approved-handoff@1.1.0` | `application/vnd.tacua.approved-handoff+json;version=1.1.0` | 1 MiB canonical JSON |
 | Agent trial | `tacua.agent-trial@1.0.0` | `application/vnd.tacua.agent-trial+json;version=1.0.0` | Included validation fields only |
 | Registry assertion | `tacua.registry-assertion@1.0.0` | `application/vnd.tacua.registry-assertion+json;version=1.0.0` | Short-lived candidate trust input |
 
-The deterministic Markdown view is UTF-8 `text/markdown` and is limited to 2 MiB. It contains an HTML-escaped, complete canonical JSON representation. Exact re-render comparison is the cross-format equivalence rule.
+The deterministic Markdown view is UTF-8 `text/markdown` and is limited to 2 MiB. It contains an HTML-escaped, complete canonical JSON representation and an explicit warning that the file is not execution authorization. Exact re-render comparison is the cross-format equivalence rule.
 
 ## Security and integrity rules
 
 - Structural validation and execution authorization are separate operations. An offline digest proves internal consistency only; it never proves who approved a ticket or whether it is still current.
-- An agent-ready handoff is one immutable, explicitly approved ticket version. The approval binds the ticket, build snapshot, evidence-manifest digest, and authority through `ticket_content_digest`; executable validation additionally requires an authenticated registry assertion obtained outside the handoff.
+- An agent-ready handoff is one immutable, explicitly approved ticket version. Its required `source_candidate.canonical_json` is the exact Tacua Canonical JSON for that approved `tacua.ticket-candidate@1.0.0` snapshot, with no trailing newline. The mirrored source ID, version, snapshot digest, and content digest must match the parsed candidate exactly.
+- The embedded source is validated by the authoritative sibling ticket-candidate validator and must be approved, duplicate-key-free, NFC-normalized, safe-integer-only, secret-clean, and internally sealed. The handoff cross-binds its organization, project, build, session, manifest, authorized evidence set, approval, and deterministic convenience-ticket projection to that exact source.
+- The approval binds the full source wrapper, projected ticket, build snapshot, evidence-manifest digest, and authority through `ticket_content_digest`; therefore even a change to a valid source field omitted by the convenience projection changes both the approved-content and handoff digests. Executable validation additionally requires an authenticated registry assertion obtained outside the handoff.
 - `handoff_digest`, nested object digests, referenced-content digests, JSON artifact digest, Markdown artifact digest, and trial digest use SHA-256.
 - Tacua Canonical JSON v1 is UTF-8 JSON with NFC strings, sorted keys, no insignificant whitespace, no floats, `ensure_ascii=false`, and a single trailing newline only for a JSON artifact. Object digests exclude only their own digest field and do not include that artifact newline.
 - Available evidence contains only an internal `tacua-evidence` locator, content metadata/digest, provenance, and an immutable handoff-authorization decision. Raw media, logs, source, SaaS results, headers, bodies, credentials, and signed URLs are not embedded.
@@ -31,7 +33,8 @@ The deterministic Markdown view is UTF-8 `text/markdown` and is limited to 2 MiB
 - An executable handoff must be the registry-current approved version. A superseded export, forged assertion, expired assertion, untrusted evidence source, or digest that differs from the authenticated registry assertion is rejected.
 - Summary, actual behavior, expected behavior, and every reproduction step link to typed claims/evidence. Claims distinguish direct, inferred, and unknown support and carry confidence explicitly.
 - Blocking clarifications must be resolved before export. External writes, merge, and deployment are not authorized by this V1 handoff.
-- Strict schemas reject unknown properties. The semantic validator additionally rejects tampering, duplicate JSON keys, non-canonical executable artifact bytes, secret-like values/fields, cross-project references, unsupported source/evidence combinations, ungrounded claims, impossible chronology, unsafe integers, false fixed-trial outcomes, and stale handoffs.
+- `ticket_version` preserves the immutable backend candidate version. The first approved export may therefore be greater than one after draft and review transitions; supersession is expressed only by `supersedes_handoff_digest`, never inferred from the version number.
+- Strict schemas reject unknown properties. The semantic validator additionally rejects tampering, duplicate JSON keys (including inside the embedded source), non-canonical executable artifact bytes, a non-canonical or newline-terminated source string, secret-like values/fields, cross-project references, unsupported source/evidence combinations, ungrounded claims, impossible chronology, unsafe integers, false fixed-trial outcomes, and stale handoffs. Version 1.0 handoffs are rejected rather than interpreted lossily.
 
 The handoff's supersession block is an untrusted export-time observation. `validate-executable` requires a separately supplied, current registry assertion plus an external verification key. The bundled HMAC assertion is a dependency-free candidate trust adapter, not an accepted signature policy; production key distribution, asymmetric signatures, rotation and revocation remain `ADR-011` decisions. The checked-in key and assertion are synthetic fixtures only.
 

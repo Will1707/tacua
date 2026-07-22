@@ -1,0 +1,68 @@
+{
+  "build_identity": {
+    "build_id": "build_synthetic",
+    "build_identity_digest": "sha256:234578e520242629d531f7a9649e0417dd9e67d8761572530f054f65e7dc4b63",
+    "build_variant": "preview",
+    "bundle_identifier": "dev.tacua.synthetic",
+    "created_at": "2026-07-21T09:55:00Z",
+    "distribution": "testflight",
+    "expo": {
+      "runtime_version": "1.0.0",
+      "sdk_version": "56.0.0",
+      "update_channel": "preview",
+      "update_id": "update_synthetic"
+    },
+    "message_type": "build_identity",
+    "native_build": "42",
+    "native_version": "1.0.0",
+    "platform": "ios",
+    "protocol_version": "tacua.sdk-backend@1.0.0",
+    "react_native_version": "0.81.5",
+    "source": {
+      "git_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "working_tree_dirty": false
+    },
+    "transport_configuration_digest": "sha256:201c7da992e3af7025b47ebc672208012b3b03ab25f41d7985e05c845879f6e4"
+  },
+  "credential": {
+    "authentication_scheme": "Bearer",
+    "credential_id": "credential_receiving_resume",
+    "local_storage": "ios_keychain_when_unlocked_this_device_only",
+    "secret": "UUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUU"
+  },
+  "exchange_id": "exchange_receiving_resume",
+  "exchange_kind": "resume_session",
+  "expected_completion_id": null,
+  "expected_session_id": "session_synthetic",
+  "expected_session_state": "receiving",
+  "launch_code": "QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ",
+  "message_type": "launch_exchange_request",
+  "previous_credential_id": "credential_synthetic",
+  "protocol_version": "tacua.sdk-backend@1.0.0",
+  "request_digest": "sha256:fb229fcb70a04ba483a6451a8650d74282c63c4e7ecf82ad9c8c250e90334f93",
+  "requested_at": "2026-07-21T10:02:01Z",
+  "scope": {
+    "application_id": "app_synthetic",
+    "build_id": "build_synthetic",
+    "build_identity_digest": "sha256:234578e520242629d531f7a9649e0417dd9e67d8761572530f054f65e7dc4b63",
+    "capture_scope": "app_only",
+    "consent": {
+      "diagnostics": "granted",
+      "granted_at": "2026-07-21T09:56:00Z",
+      "microphone": "granted",
+      "policy_version": "tacua.consent-v1",
+      "raw_media_upload": "granted",
+      "screen_recording": "granted"
+    },
+    "message_type": "capture_scope",
+    "organization_id": "org_synthetic",
+    "project_id": "project_synthetic",
+    "protocol_version": "tacua.sdk-backend@1.0.0",
+    "retention": {
+      "derived_data_days": 30,
+      "policy_version": "tacua.retention-v1",
+      "raw_media_days": 30
+    },
+    "scope_digest": "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50"
+  }
+}

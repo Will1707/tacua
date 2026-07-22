@@ -1,0 +1,177 @@
+{
+  "build_id": "build_synthetic",
+  "build_identity_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+  "collection_gaps": [
+    {
+      "detail": "Collection paused while the app was backgrounded.",
+      "gap_id": "diagnostic_gap",
+      "reason": "diagnostic_collection_paused",
+      "time_range": {
+        "clock": "session_monotonic",
+        "end_ms": 31000,
+        "start_ms": 30000
+      }
+    }
+  ],
+  "contract_version": "tacua.diagnostic-envelope@1.0.0",
+  "envelope_digest": "sha256:08915b84578c23976d30bd5ac70429c570e28a43988161512949de07e78752c6",
+  "envelope_id": "envelope_synthetic",
+  "envelope_version": 1,
+  "events": [
+    {
+      "data": {
+        "from_route": null,
+        "to_route": "Settings",
+        "trigger": "user"
+      },
+      "elapsed_ms": 1000,
+      "event_id": "event_route",
+      "event_type": "route_transition",
+      "evidence_refs": [],
+      "occurred_at": "2026-07-21T10:00:01Z",
+      "sequence": 10,
+      "source": "mobile_sdk"
+    },
+    {
+      "data": {
+        "kind": "spoken",
+        "marker_id": "marker_synthetic",
+        "narration_elapsed_ms": 20000
+      },
+      "elapsed_ms": 20000,
+      "event_id": "event_issue",
+      "event_type": "issue_mark",
+      "evidence_refs": [
+        "evidence_transcript",
+        "evidence_frame"
+      ],
+      "occurred_at": "2026-07-21T10:00:20Z",
+      "sequence": 11,
+      "source": "mobile_sdk"
+    },
+    {
+      "data": {
+        "affected_streams": [
+          "app_video",
+          "app_audio"
+        ],
+        "gap_id": "gap_synthetic"
+      },
+      "elapsed_ms": 30000,
+      "event_id": "event_gap",
+      "event_type": "capture_gap",
+      "evidence_refs": [],
+      "occurred_at": "2026-07-21T10:00:30Z",
+      "sequence": 12,
+      "source": "capture_extension"
+    }
+  ],
+  "evidence": [
+    {
+      "availability": "available",
+      "description": "Reviewer says the button uses the wrong copy.",
+      "evidence_id": "evidence_transcript",
+      "evidence_type": "transcript_excerpt",
+      "redaction": {
+        "applied": true,
+        "policy_version": "tacua.redaction@1.0.0",
+        "removed_field_count": 1
+      },
+      "reference": {
+        "content_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+        "content_type": "text/plain",
+        "locator": {
+          "evidence_id": "evidence_transcript",
+          "organization_id": "org_synthetic",
+          "project_id": "project_synthetic",
+          "revision_id": "revision_transcript",
+          "scheme": "tacua-evidence"
+        },
+        "size_bytes": 64
+      },
+      "source": {
+        "captured_at": "2026-07-21T10:00:22Z",
+        "component": "mobile_sdk",
+        "snapshot_revision": "1.0.0",
+        "source_id": "sdk_synthetic"
+      },
+      "time_range": {
+        "clock": "session_monotonic",
+        "end_ms": 22000,
+        "start_ms": 19000
+      },
+      "unavailable": null
+    },
+    {
+      "availability": "available",
+      "description": "Frame showing the incorrect button label.",
+      "evidence_id": "evidence_frame",
+      "evidence_type": "media_keyframe",
+      "redaction": {
+        "applied": true,
+        "policy_version": "tacua.redaction@1.0.0",
+        "removed_field_count": 1
+      },
+      "reference": {
+        "content_digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+        "content_type": "image/png",
+        "locator": {
+          "evidence_id": "evidence_frame",
+          "organization_id": "org_synthetic",
+          "project_id": "project_synthetic",
+          "revision_id": "revision_frame",
+          "scheme": "tacua-evidence"
+        },
+        "size_bytes": 1024
+      },
+      "source": {
+        "captured_at": "2026-07-21T10:00:20Z",
+        "component": "mobile_sdk",
+        "snapshot_revision": "1.0.0",
+        "source_id": "sdk_synthetic"
+      },
+      "time_range": {
+        "clock": "session_monotonic",
+        "end_ms": 20000,
+        "start_ms": 20000
+      },
+      "unavailable": null
+    },
+    {
+      "availability": "unavailable",
+      "description": "Sentry correlation was not configured for this pilot.",
+      "evidence_id": "evidence_sentry",
+      "evidence_type": "sentry_event",
+      "redaction": {
+        "applied": false,
+        "policy_version": "tacua.redaction@1.0.0",
+        "removed_field_count": 0
+      },
+      "reference": null,
+      "source": {
+        "captured_at": "2026-07-21T10:03:00Z",
+        "component": "sentry",
+        "snapshot_revision": "none",
+        "source_id": "sentry_synthetic"
+      },
+      "time_range": null,
+      "unavailable": {
+        "detail": "The optional Sentry connector was not configured.",
+        "reason": "not_configured"
+      }
+    }
+  ],
+  "media_type": "application/vnd.tacua.diagnostic-envelope+json;version=1.0.0",
+  "organization_id": "org_synthetic",
+  "project_id": "project_synthetic",
+  "redaction": {
+    "applied": true,
+    "policy_version": "tacua.redaction@1.0.0",
+    "removed_field_count": 1
+  },
+  "sequence_range": {
+    "first": 10,
+    "last": 12
+  },
+  "session_id": "session_synthetic"
+}

@@ -1,0 +1,18 @@
+{
+  "credential_id": "credential_synthetic",
+  "intent_digest": "sha256:1279a5bb8440de4c4e169c93e359eb8abef623d9137a922d2fc95aec5d6cd686",
+  "message_type": "segment_upload_intent",
+  "protocol_version": "tacua.sdk-backend@1.0.0",
+  "requested_at": "2026-07-21T10:01:59Z",
+  "scope_digest": "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50",
+  "segment_id": "segment_synthetic",
+  "sequence": 0,
+  "session_id": "session_synthetic",
+  "sidecar_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+  "transport": {
+    "content_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "content_type": "video/quicktime",
+    "size_bytes": 2048
+  },
+  "upload_id": "upload_segment_synthetic"
+}

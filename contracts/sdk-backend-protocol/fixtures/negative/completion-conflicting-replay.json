@@ -1,0 +1,135 @@
+{
+  "capture_manifest": {
+    "build_id": "build_synthetic",
+    "build_identity_digest": "sha256:234578e520242629d531f7a9649e0417dd9e67d8761572530f054f65e7dc4b63",
+    "capture_scope": "app_only",
+    "capture_state": "complete",
+    "contract_version": "tacua.capture-upload-manifest@1.0.0",
+    "ended_at": "2026-07-21T10:01:00Z",
+    "gaps": [
+      {
+        "affected_streams": [
+          "app_video",
+          "app_audio"
+        ],
+        "detail": "ReplayKit reported an explicit one-second interruption.",
+        "gap_id": "gap_synthetic",
+        "reason": "app_backgrounded",
+        "time_range": {
+          "clock": "session_monotonic",
+          "end_ms": 31000,
+          "start_ms": 30000
+        }
+      }
+    ],
+    "manifest_digest": "sha256:6a0816b264fd508f2e870c4989e82348450b42779199e9f63458d0980c55a599",
+    "manifest_version": 2,
+    "media_type": "application/vnd.tacua.capture-upload-manifest+json;version=1.0.0",
+    "monotonic_duration_ms": 60000,
+    "organization_id": "org_synthetic",
+    "project_id": "project_synthetic",
+    "retention": {
+      "deletion_status": "active",
+      "derived_data_expires_at": "2026-08-20T10:00:00Z",
+      "policy_version": "tacua.retention@1.0.0",
+      "raw_media_expires_at": "2026-08-20T10:00:00Z"
+    },
+    "segments": [
+      {
+        "availability": "available",
+        "content": {
+          "content_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+          "content_type": "video/quicktime",
+          "sidecar_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+          "size_bytes": 2048
+        },
+        "finalized": true,
+        "segment_id": "segment_synthetic",
+        "sequence": 0,
+        "time_range": {
+          "clock": "session_monotonic",
+          "end_ms": 60000,
+          "start_ms": 0
+        },
+        "unavailable": null
+      }
+    ],
+    "session_id": "session_synthetic",
+    "started_at": "2026-07-21T10:00:00Z",
+    "streams": {
+      "app_audio": "enabled",
+      "app_video": "enabled",
+      "diagnostics": "enabled",
+      "microphone": "enabled"
+    },
+    "upload": {
+      "completed_at": "2026-07-21T10:02:00Z",
+      "last_error": null,
+      "protocol": "segmented-resumable-v1",
+      "receipts": [
+        {
+          "content_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+          "object_id": "object_synthetic",
+          "receipt_digest": "sha256:4608d212ef2153a29687a9bed66e85854d8871083ba32bcf730d385f2c9db949",
+          "received_at": "2026-07-21T10:02:00Z",
+          "segment_id": "segment_synthetic",
+          "size_bytes": 2048
+        }
+      ],
+      "remote_session_id": "session_synthetic",
+      "state": "complete"
+    }
+  },
+  "completion_id": "completion_synthetic",
+  "credential_id": "credential_receiving_resume",
+  "diagnostic_receipts": [
+    {
+      "credential_id": "credential_receiving_resume",
+      "diagnostic_receipt_digest": "sha256:62d566bef8be86883818cfe2edeb4a07e797ce6c3d56b0f1260adf58f9fef8f5",
+      "envelope_digest": "sha256:9842a35e46a1cb1b914c3a3500eeb35bb3020dedf5f6a9f5b10170b7cbd7479d",
+      "envelope_id": "envelope_synthetic",
+      "message_type": "diagnostic_upload_receipt",
+      "object_id": "object_diagnostic_synthetic",
+      "protocol_version": "tacua.sdk-backend@1.0.0",
+      "receipt_id": "receipt_diagnostic_synthetic",
+      "received_at": "2026-07-21T10:02:04Z",
+      "request_digest": "sha256:8262c9a2865a735afe517349c57a40bc1b8135e785d0e1db1b3bd9056cc93d68",
+      "scope_digest": "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50",
+      "session_id": "session_synthetic",
+      "size_bytes": 3774,
+      "transport_digest": "sha256:6f395bf765e73eac49e90ff444ce8965ce31b452a683f26e03e8554497e4efbf",
+      "upload_id": "upload_diagnostic_synthetic"
+    }
+  ],
+  "message_type": "completion_request",
+  "protocol_version": "tacua.sdk-backend@1.0.0",
+  "request_digest": "sha256:60786a99a398090e127b88859e280f1233c903dfcd5728792ac517b339c07430",
+  "requested_at": "2026-07-21T10:02:07Z",
+  "scope_digest": "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50",
+  "segment_receipts": [
+    {
+      "content_type": "video/quicktime",
+      "credential_id": "credential_synthetic",
+      "intent_digest": "sha256:1279a5bb8440de4c4e169c93e359eb8abef623d9137a922d2fc95aec5d6cd686",
+      "message_type": "segment_upload_receipt",
+      "protocol_version": "tacua.sdk-backend@1.0.0",
+      "runtime_receipt": {
+        "content_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "object_id": "object_synthetic",
+        "receipt_digest": "sha256:4608d212ef2153a29687a9bed66e85854d8871083ba32bcf730d385f2c9db949",
+        "received_at": "2026-07-21T10:02:00Z",
+        "segment_id": "segment_synthetic",
+        "size_bytes": 2048
+      },
+      "scope_digest": "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50",
+      "segment_id": "segment_synthetic",
+      "segment_receipt_digest": "sha256:00500257fe3fb5315c871a2f5619daca5a1689c00084d98440f1727de16b8d76",
+      "sequence": 0,
+      "session_id": "session_synthetic",
+      "sidecar_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "transport_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "upload_id": "upload_segment_synthetic"
+    }
+  ],
+  "session_id": "session_synthetic"
+}

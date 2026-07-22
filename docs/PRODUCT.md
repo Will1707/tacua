@@ -6,6 +6,10 @@ publishing private interviews, pilot repositories, recordings, or environment
 evidence. Everything described here is planned unless the repository explicitly
 labels an implementation or experiment as complete.
 
+The separate [release-readiness assessment](RELEASE-READINESS.md) records which
+foundations are implemented, what each verification level proves, and which
+owner, device, integration, and production gates remain open.
+
 ## Purpose
 
 Tacua reduces the reviewer's active time between noticing a mobile-app problem
@@ -37,6 +41,11 @@ writing several tickets, and answering avoidable follow-up questions.
 8. V1 exports an approved ticket as canonical Markdown and JSON. Tracker sync,
    including Linear, is deferred.
 
+The exact source-disposition and evidence-union behavior for split and merge is
+still a product decision. [ADR-015](decisions/ADR-015-candidate-split-merge-semantics.md)
+records the bounded atomic-replacement recommendation; backend endpoints and UI
+controls remain intentionally absent until it is accepted or replaced.
+
 ## Product shape
 
 Tacua has three planned first-party parts:
@@ -47,11 +56,21 @@ Tacua has three planned first-party parts:
 - a provider-neutral Docker deployment containing the API, durable processing,
   structured state, and media storage interfaces.
 
+The ownership and launch boundary between those components is fixed in
+[ADR-012](decisions/ADR-012-v1-component-boundary.md). The embedded SDK owns
+capture, local recovery, and upload because app-only ReplayKit media remains in
+the tested application's sandbox; the reviewer app orchestrates sessions and
+reviews backend-owned candidates.
+
 The SDK is essential: screen recording alone does not give a coding agent enough
 context to distinguish a visual symptom from navigation, application state,
 network, console, or backend behavior. The exact event set and storage topology
-remain subject to measured experiments. The public SDK candidate intentionally
-implements only the local capture and recovery boundary today.
+remain subject to measured experiments. The public SDK candidate implements the
+local capture/recovery boundary, a sealed native START/RESUME bridge, explicit
+stopped-capture admission, retry-safe upload and completion, receipt-authorized
+local retirement, and authenticated deletion. These operations are connected
+as explicit host calls rather than hidden inside `stop()`, so consent and
+failure recovery remain visible.
 
 ## Fixed V1 boundaries
 
@@ -107,9 +126,34 @@ authorization, repository scope, and current build/evidence scope.
 
 ## Current proof level
 
-The repository contains candidate contracts and risk-reduction experiments, not
-a deployable V1. Local synthetic contract suites pass, and the capture SDK has
-compiled and linked inside an isolated arm64 iOS Simulator host. Physical-device
-ReplayKit behavior, 30-minute resource limits, upload/processing, runtime
-security, real-agent outcomes, and an operator-ready Docker topology are still
-release blockers.
+The repository contains candidate contracts, risk-reduction experiments, and a
+non-production reviewer/backend/SDK foundation, not a deployable V1. Local
+synthetic contract and integration suites pass. `EXP-001` also completed
+its physical candidate gates on one iPhone using synthetic QA data: foreground
+narration and app audio, static-screen segmentation, the 30-minute limit, lock
+recovery, process interruption, the fixed recovery choices, scoped deletion,
+and deterministic storage/writer/stop fault handling. Every segment accepted as
+evidence matched its manifest byte length and SHA-256 value; the detailed scope
+and measurements are recorded in the
+[physical-device results](../experiments/ios-capture-spike/PHYSICAL-DEVICE-RESULTS.md).
+
+That result proves a local capture candidate, not a production SDK. Since the
+physical campaign, the repository has added a backend-issued launch exchange,
+authenticated retry-safe upload protocol, tested runtime retention/deletion,
+immutable evidence-linked candidate review, atomic structural handoff export,
+and an opt-in offline processing-command boundary. The SDK and backend pieces
+are now connected in code and simulator builds, but not yet in a physical
+capture-to-reviewed-ticket run. They do not authorize external model egress or
+agent execution. The 30-minute run dropped 121 of 77,523 app-audio append attempts
+(about 0.156%); production promotion must eliminate those boundary-ordering
+drops or define and enforce a measured acceptance threshold. The SDK implements
+authenticated, manifest-independent deletion, but the tested QA app still needs
+to expose that reset as an explicit destructive action. Protected-file behavior
+and that host UI both require production-integration verification.
+
+An operator-selected transcription/research implementation and any authorized
+read-only repository or telemetry connectors, automatic foreground upload
+draining in a host app, authenticated execution-trust registry, a real
+pilot-to-agent outcome, the physical end-to-end rerun, and an operator-validated
+Internet-facing deployment remain release blockers. Split/merge controls also
+remain gated on the product decision in ADR-015.

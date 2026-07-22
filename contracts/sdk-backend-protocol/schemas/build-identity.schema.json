@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tacua.invalid/schemas/sdk-backend/1.0.0/build-identity.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "Tacua immutable tested-build identity",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "message_type",
+    "build_id",
+    "platform",
+    "bundle_identifier",
+    "native_version",
+    "native_build",
+    "build_variant",
+    "distribution",
+    "react_native_version",
+    "transport_configuration_digest",
+    "expo",
+    "source",
+    "created_at",
+    "build_identity_digest"
+  ],
+  "properties": {
+    "protocol_version": { "$ref": "common.schema.json#/$defs/protocolVersion" },
+    "message_type": { "const": "build_identity" },
+    "build_id": { "$ref": "common.schema.json#/$defs/id" },
+    "platform": { "const": "ios" },
+    "bundle_identifier": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 255,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9-]*(\\.[A-Za-z0-9][A-Za-z0-9-]*)+$"
+    },
+    "native_version": { "$ref": "common.schema.json#/$defs/versionText" },
+    "native_build": { "$ref": "common.schema.json#/$defs/versionText" },
+    "build_variant": { "enum": ["development", "preview"] },
+    "distribution": { "enum": ["local", "internal", "testflight"] },
+    "react_native_version": { "$ref": "common.schema.json#/$defs/versionText" },
+    "transport_configuration_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "expo": {
+      "oneOf": [
+        { "$ref": "#/$defs/expo" },
+        { "type": "null" }
+      ]
+    },
+    "source": { "$ref": "#/$defs/source" },
+    "created_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "build_identity_digest": { "$ref": "common.schema.json#/$defs/digest" }
+  },
+  "$defs": {
+    "expo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sdk_version", "runtime_version", "update_id", "update_channel"],
+      "properties": {
+        "sdk_version": { "$ref": "common.schema.json#/$defs/versionText" },
+        "runtime_version": { "$ref": "common.schema.json#/$defs/versionText" },
+        "update_id": { "$ref": "common.schema.json#/$defs/nullableShortText" },
+        "update_channel": { "$ref": "common.schema.json#/$defs/nullableShortText" }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["git_revision", "working_tree_dirty"],
+      "properties": {
+        "git_revision": { "type": "string", "pattern": "^[a-f0-9]{7,64}$" },
+        "working_tree_dirty": { "type": "boolean" }
+      }
+    }
+  }
+}

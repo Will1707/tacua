@@ -1,0 +1,114 @@
+{
+  "build_id": "build_synthetic",
+  "build_identity_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+  "completed_at": "2026-07-21T10:04:00Z",
+  "contract_version": "tacua.processing-job@1.0.0",
+  "execution": {
+    "egress": {
+      "authorization_decision_id": null,
+      "authorized": false,
+      "destinations": [],
+      "policy": "default_deny"
+    },
+    "max_attempts": 3,
+    "mode": "async"
+  },
+  "failure": null,
+  "inputs": {
+    "capture_manifest_digest": "sha256:ed29d84bd1ce896057b6b5bd8e5b7d0207ef65482ad9a2b00673a644020716bc",
+    "context_sources": [
+      {
+        "access": "read_only",
+        "availability": "available",
+        "kind": "mobile_repository",
+        "snapshot_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+        "source_id": "repo_synthetic",
+        "unavailable": null
+      },
+      {
+        "access": "read_only",
+        "availability": "unavailable",
+        "kind": "sentry",
+        "snapshot_digest": null,
+        "source_id": "sentry_synthetic",
+        "unavailable": {
+          "detail": "The optional connector was not configured.",
+          "reason": "not_configured"
+        }
+      }
+    ],
+    "diagnostic_envelope_digests": [
+      "sha256:08915b84578c23976d30bd5ac70429c570e28a43988161512949de07e78752c6"
+    ]
+  },
+  "job_digest": "sha256:97f16381272e341b718210b3378bb8ee65bf8737e7e6817464ac59a786dc38bd",
+  "job_id": "job_synthetic",
+  "job_version": 1,
+  "media_type": "application/vnd.tacua.processing-job+json;version=1.0.0",
+  "organization_id": "org_synthetic",
+  "outputs": {
+    "candidate_refs": [
+      {
+        "candidate_id": "candidate_synthetic",
+        "candidate_version": 2
+      }
+    ],
+    "derived_evidence_refs": [
+      "evidence_transcript",
+      "evidence_frame"
+    ],
+    "disposition": "candidates_created",
+    "summary": "One candidate was grounded in the narration and keyframe."
+  },
+  "pipeline": {
+    "pipeline_version": "tacua.pipeline@1.0.0",
+    "stages": [
+      {
+        "attempt_count": 1,
+        "completed_at": "2026-07-21T10:04:00Z",
+        "detail": null,
+        "name": "transcribe",
+        "started_at": "2026-07-21T10:03:00Z",
+        "state": "succeeded"
+      },
+      {
+        "attempt_count": 1,
+        "completed_at": "2026-07-21T10:04:00Z",
+        "detail": null,
+        "name": "align",
+        "started_at": "2026-07-21T10:03:00Z",
+        "state": "succeeded"
+      },
+      {
+        "attempt_count": 1,
+        "completed_at": "2026-07-21T10:04:00Z",
+        "detail": null,
+        "name": "correlate",
+        "started_at": "2026-07-21T10:03:00Z",
+        "state": "succeeded"
+      },
+      {
+        "attempt_count": 1,
+        "completed_at": "2026-07-21T10:04:00Z",
+        "detail": null,
+        "name": "research",
+        "started_at": "2026-07-21T10:03:00Z",
+        "state": "succeeded"
+      },
+      {
+        "attempt_count": 1,
+        "completed_at": "2026-07-21T10:04:00Z",
+        "detail": null,
+        "name": "generate_tickets",
+        "started_at": "2026-07-21T10:03:00Z",
+        "state": "succeeded"
+      }
+    ]
+  },
+  "previous_job_digest": null,
+  "project_id": "project_synthetic",
+  "requested_at": "2026-07-21T10:02:30Z",
+  "session_id": "session_synthetic",
+  "started_at": "2026-07-21T10:03:00Z",
+  "status": "succeeded"
+}

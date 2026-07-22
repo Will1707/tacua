@@ -12,8 +12,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from handoff_contract import (  # noqa: E402
+    TICKET_CANDIDATE,
     canonical_json_artifact,
     load_json,
+    project_source_candidate_ticket,
     render_markdown,
     seal_handoff,
     seal_registry_assertion,
@@ -28,6 +30,215 @@ SAMPLE_PROJECT_ID = "project-sample-mobile-app-synthetic"
 SAMPLE_MOBILE_REPOSITORY_ID = "repo-sample-mobile-app"
 SAMPLE_BACKEND_REPOSITORY_ID = "repo-sample-backend"
 SAMPLE_APPLICATION_ID = "com.example.samplemobileapp.tacua.synthetic"
+
+
+def _claim_evidence(ticket: dict, claim_refs: list[str]) -> list[str]:
+    claims = {claim["claim_id"]: claim for claim in ticket["claims"]}
+    return sorted(
+        {
+            evidence_id
+            for claim_id in claim_refs
+            for evidence_id in claims[claim_id]["evidence_refs"]
+        }
+    )
+
+
+def build_source_candidate(handoff: dict) -> dict:
+    """Build the exact synthetic approved candidate represented by the handoff."""
+
+    ticket = handoff["ticket"]
+    approval = handoff["approval"]
+    manifest = handoff["evidence_manifest"]
+    previous_digest = "sha256:" + "9" * 64
+    expected_claim_refs = ticket["reproduction"]["expected_claim_refs"]
+    observed_claim_refs = ticket["reproduction"]["observed_claim_refs"]
+    summary_claim_refs = ticket["summary_claim_refs"]
+    acceptance_claim_refs = [
+        expected_claim_refs,
+        ["claim-observed-submit"],
+    ]
+    content = {
+        "title": ticket["title"],
+        "priority": ticket["priority"],
+        "summary": {
+            "text": ticket["summary"],
+            "claim_refs": summary_claim_refs,
+            "evidence_refs": _claim_evidence(ticket, summary_claim_refs),
+        },
+        "actual_behavior": {
+            "text": ticket["reproduction"]["observed_result"],
+            "claim_refs": observed_claim_refs,
+            "evidence_refs": _claim_evidence(ticket, observed_claim_refs),
+        },
+        "expected_behavior": {
+            "text": ticket["reproduction"]["expected_result"],
+            "claim_refs": expected_claim_refs,
+            "evidence_refs": _claim_evidence(ticket, expected_claim_refs),
+        },
+        "claims": ticket["claims"],
+        "reproduction": {
+            "preconditions": [
+                {
+                    "precondition_id": f"precondition-{index}",
+                    "text": text,
+                    "claim_refs": [],
+                    "evidence_refs": [],
+                }
+                for index, text in enumerate(
+                    ticket["reproduction"]["preconditions"], start=1
+                )
+            ],
+            "steps": [
+                {
+                    "step_id": step["step_id"],
+                    "action": step["action"],
+                    "expected_result": None,
+                    "actual_result": None,
+                    "claim_refs": step["claim_refs"],
+                    "evidence_refs": step["evidence_refs"],
+                    "confidence": "high",
+                }
+                for step in ticket["reproduction"]["steps"]
+            ],
+            "attempts": ticket["reproduction"]["attempts"],
+            "reproductions": ticket["reproduction"]["reproductions"],
+        },
+        "scope": ticket["scope"],
+        "acceptance_criteria": [
+            {
+                **criterion,
+                "claim_refs": claim_refs,
+                "evidence_refs": _claim_evidence(ticket, claim_refs),
+            }
+            for criterion, claim_refs in zip(
+                ticket["acceptance_criteria"], acceptance_claim_refs, strict=True
+            )
+        ],
+        "uncertainty": {
+            "overall_confidence": "medium",
+            "items": [
+                {
+                    "uncertainty_id": "uncertainty-sentry-correlation",
+                    "statement": "The unavailable Sentry correlation remains an explicit non-blocking limitation.",
+                    "impact": "non_blocking",
+                    "evidence_refs": ["evidence-sentry-001"],
+                }
+            ],
+        },
+        "clarifications": [
+            {
+                "clarification_id": item["clarification_id"],
+                "question": item["question"],
+                "target": "expected_behavior",
+                "impact": item["impact"],
+                "status": item["status"],
+                "choices": [
+                    {
+                        "choice_id": "choice-keep-current",
+                        "label": "Keep current copy",
+                        "description": "Keep the copy observed in the tested build.",
+                        "consequence": "No copy correction would be requested.",
+                        "requires_note": False,
+                        "presentation": {
+                            "kind": "text",
+                            "value": "Save draft",
+                            "evidence_ref": None,
+                        },
+                        "evidence_refs": ["evidence-keyframe-001"],
+                    },
+                    {
+                        "choice_id": "choice-use-approved",
+                        "label": "Use approved copy",
+                        "description": "Use the reviewer-approved V1 copy.",
+                        "consequence": "The ticket requests the approved label.",
+                        "requires_note": False,
+                        "presentation": {
+                            "kind": "text",
+                            "value": "Save profile",
+                            "evidence_ref": None,
+                        },
+                        "evidence_refs": ["evidence-repository-001"],
+                    },
+                ],
+                "selected_choice_id": "choice-use-approved",
+                "resolution_note": item["resolution"],
+            }
+            for item in ticket["clarifications"]
+        ],
+    }
+    candidate = {
+        "contract_version": "tacua.ticket-candidate@1.0.0",
+        "media_type": "application/vnd.tacua.ticket-candidate+json;version=1.0.0",
+        "organization_id": handoff["organization_id"],
+        "project_id": handoff["project_id"],
+        "build_id": handoff["build_identity"]["build_id"],
+        "build_identity_digest": handoff["build_identity"]["sdk"][
+            "configuration_digest"
+        ],
+        "session_id": manifest["session_id"],
+        "evidence_manifest": {
+            "manifest_id": manifest["manifest_id"],
+            "manifest_digest": "sha256:" + "a" * 64,
+            "evidence_ids": sorted(
+                item["evidence_id"] for item in manifest["items"]
+            ),
+        },
+        "candidate_id": ticket["ticket_id"],
+        "candidate_version": 4,
+        "previous_candidate_digest": previous_digest,
+        "state": "approved",
+        "candidate_created_at": "2026-07-20T10:10:00Z",
+        "version_created_at": approval["approved_at"],
+        "lineage": {
+            "operation": "approved",
+            "parents": [
+                {
+                    "candidate_id": ticket["ticket_id"],
+                    "candidate_version": 3,
+                    "candidate_digest": previous_digest,
+                }
+            ],
+        },
+        "transition": {
+            "from_state": "ready_for_review",
+            "to_state": "approved",
+            "actor": {
+                "actor_type": "human",
+                "actor_id": approval["actor_id"],
+            },
+            "occurred_at": approval["approved_at"],
+            "reason": "Synthetic owner approved the exact reviewed candidate.",
+        },
+        "content": content,
+        "review": {
+            "status": "reviewed",
+            "reviewer_action_required": False,
+            "last_human_actor_id": approval["actor_id"],
+            "last_reviewed_at": "2026-07-20T10:15:30Z",
+            "notes": ["Synthetic fixture review only."],
+        },
+        "approval": {
+            "approval_id": approval["approval_id"],
+            "actor_type": "human",
+            "actor_id": approval["actor_id"],
+            "approved_at": approval["approved_at"],
+            "reviewed_candidate_version": 3,
+            "reviewed_candidate_digest": previous_digest,
+            "approved_candidate_version": 4,
+            "candidate_content_digest": "sha256:" + "0" * 64,
+            "evidence_manifest_digest": "sha256:" + "0" * 64,
+            "authorized_evidence_ids": sorted(
+                item["evidence_id"] for item in manifest["items"]
+            ),
+            "immutable": True,
+        },
+        "rejection": None,
+        "candidate_content_digest": "sha256:" + "0" * 64,
+        "candidate_digest": "sha256:" + "0" * 64,
+    }
+    candidate = TICKET_CANDIDATE.seal(candidate)
+    TICKET_CANDIDATE.validate(candidate)
+    return candidate
 
 
 def apply_sample_mobile_app_identity(handoff: dict) -> None:
@@ -99,7 +310,24 @@ def main() -> None:
     for step in reproduction["steps"]:
         step["claim_refs"] = step_claims[step["step_id"]]
 
+    source_candidate = build_source_candidate(handoff)
+    handoff["contract_version"] = "tacua.approved-handoff@1.1.0"
+    handoff["media_type"] = (
+        "application/vnd.tacua.approved-handoff+json;version=1.1.0"
+    )
+    handoff["source_candidate"] = {
+        "contract_version": source_candidate["contract_version"],
+        "candidate_id": source_candidate["candidate_id"],
+        "candidate_version": source_candidate["candidate_version"],
+        "candidate_digest": source_candidate["candidate_digest"],
+        "candidate_content_digest": source_candidate["candidate_content_digest"],
+        "canonical_json": TICKET_CANDIDATE.canonical_json(source_candidate),
+    }
+    handoff["ticket"] = project_source_candidate_ticket(source_candidate)
+    handoff["approval"]["ticket_id"] = source_candidate["candidate_id"]
+    handoff["approval"]["ticket_version"] = source_candidate["candidate_version"]
     handoff = seal_handoff(handoff)
+    ticket = handoff["ticket"]
     handoff_bytes = canonical_json_artifact(handoff)
     markdown = render_markdown(handoff)
 
@@ -138,6 +366,8 @@ def main() -> None:
 
     trial = load_json(POSITIVE / "agent-trial.json")
     trial["project_id"] = SAMPLE_PROJECT_ID
+    trial["ticket_id"] = ticket["ticket_id"]
+    trial["ticket_version"] = ticket["ticket_version"]
     for change in trial["changes"]:
         change["repository_id"] = SAMPLE_MOBILE_REPOSITORY_ID
         change["path"] = f"apps/sample-mobile-app/src/profile/{Path(change['path']).name}"
@@ -161,6 +391,9 @@ def main() -> None:
 
     (POSITIVE / "approved-handoff.json").write_bytes(handoff_bytes)
     (POSITIVE / "approved-handoff.md").write_text(markdown, encoding="utf-8")
+    (POSITIVE / "source-candidate.json").write_bytes(
+        TICKET_CANDIDATE.canonical_json_artifact(source_candidate)
+    )
     (POSITIVE / "build-identity.json").write_bytes(canonical_json_artifact(handoff["build_identity"]))
     (POSITIVE / "evidence-manifest.json").write_bytes(canonical_json_artifact(handoff["evidence_manifest"]))
     (POSITIVE / "registry-assertion.json").write_bytes(assertion_bytes)

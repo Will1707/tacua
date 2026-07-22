@@ -12,11 +12,24 @@
       "deploymentTarget": "17.0",
       "supportsTablet": false,
       "infoPlist": {
-        "NSMicrophoneUsageDescription": "Tacua records your spoken QA narration alongside an in-app screen recording only after you start a test session.",
         "TacuaCaptureFaultInjectionEnabled": true
       }
     },
-    "plugins": ["expo-dev-client"],
+    "plugins": [
+      "expo-dev-client",
+      [
+        "@tacua/mobile-sdk",
+        {
+          "allowInsecureLoopback": true,
+          "backendOrigin": "http://127.0.0.1:8080",
+          "buildVariant": "development",
+          "captureEnabled": true,
+          "distribution": "local",
+          "launchScheme": "tacua-capture-lab",
+          "sdkProfilePath": "./tacua-sdk-profile.json"
+        }
+      ]
+    ],
     "extra": {
       "tacuaExperiment": "EXP-001"
     }

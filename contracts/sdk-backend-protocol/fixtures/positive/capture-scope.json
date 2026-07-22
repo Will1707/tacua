@@ -1,0 +1,24 @@
+{
+  "application_id": "app_synthetic",
+  "build_id": "build_synthetic",
+  "build_identity_digest": "sha256:234578e520242629d531f7a9649e0417dd9e67d8761572530f054f65e7dc4b63",
+  "capture_scope": "app_only",
+  "consent": {
+    "diagnostics": "granted",
+    "granted_at": "2026-07-21T09:56:00Z",
+    "microphone": "granted",
+    "policy_version": "tacua.consent-v1",
+    "raw_media_upload": "granted",
+    "screen_recording": "granted"
+  },
+  "message_type": "capture_scope",
+  "organization_id": "org_synthetic",
+  "project_id": "project_synthetic",
+  "protocol_version": "tacua.sdk-backend@1.0.0",
+  "retention": {
+    "derived_data_days": 30,
+    "policy_version": "tacua.retention-v1",
+    "raw_media_days": 30
+  },
+  "scope_digest": "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50"
+}

@@ -1,0 +1,81 @@
+{
+  "build_id": "build_synthetic",
+  "build_identity_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+  "capture_scope": "app_only",
+  "capture_state": "complete",
+  "contract_version": "tacua.capture-upload-manifest@1.0.0",
+  "ended_at": "2026-07-21T10:01:00Z",
+  "gaps": [
+    {
+      "affected_streams": [
+        "app_video",
+        "app_audio"
+      ],
+      "detail": "ReplayKit reported an explicit one-second interruption.",
+      "gap_id": "gap_synthetic",
+      "reason": "app_backgrounded",
+      "time_range": {
+        "clock": "session_monotonic",
+        "end_ms": 31000,
+        "start_ms": 30000
+      }
+    }
+  ],
+  "manifest_digest": "sha256:ed29d84bd1ce896057b6b5bd8e5b7d0207ef65482ad9a2b00673a644020716bc",
+  "manifest_version": 2,
+  "media_type": "application/vnd.tacua.capture-upload-manifest+json;version=1.0.0",
+  "monotonic_duration_ms": 60000,
+  "organization_id": "org_synthetic",
+  "project_id": "project_synthetic",
+  "retention": {
+    "deletion_status": "active",
+    "derived_data_expires_at": "2026-08-20T10:00:00Z",
+    "policy_version": "tacua.retention@1.0.0",
+    "raw_media_expires_at": "2026-08-20T10:00:00Z"
+  },
+  "segments": [
+    {
+      "availability": "available",
+      "content": {
+        "content_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "content_type": "video/quicktime",
+        "sidecar_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "size_bytes": 2048
+      },
+      "finalized": true,
+      "segment_id": "segment_synthetic",
+      "sequence": 0,
+      "time_range": {
+        "clock": "session_monotonic",
+        "end_ms": 60000,
+        "start_ms": 0
+      },
+      "unavailable": null
+    }
+  ],
+  "session_id": "session_synthetic",
+  "started_at": "2026-07-21T10:00:00Z",
+  "streams": {
+    "app_audio": "enabled",
+    "app_video": "enabled",
+    "diagnostics": "enabled",
+    "microphone": "enabled"
+  },
+  "upload": {
+    "completed_at": "2026-07-21T10:02:00Z",
+    "last_error": null,
+    "protocol": "segmented-resumable-v1",
+    "receipts": [
+      {
+        "content_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "object_id": "object_synthetic",
+        "receipt_digest": "sha256:4608d212ef2153a29687a9bed66e85854d8871083ba32bcf730d385f2c9db949",
+        "received_at": "2026-07-21T10:02:00Z",
+        "segment_id": "segment_synthetic",
+        "size_bytes": 2048
+      }
+    ],
+    "remote_session_id": "remote_synthetic",
+    "state": "complete"
+  }
+}

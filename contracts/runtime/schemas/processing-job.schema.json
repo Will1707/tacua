@@ -1,0 +1,312 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tacua.invalid/schemas/runtime/1.0.0/processing-job.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "Tacua asynchronous processing job snapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "media_type",
+    "organization_id",
+    "project_id",
+    "build_id",
+    "build_identity_digest",
+    "session_id",
+    "job_id",
+    "job_version",
+    "previous_job_digest",
+    "status",
+    "requested_at",
+    "started_at",
+    "completed_at",
+    "inputs",
+    "pipeline",
+    "execution",
+    "outputs",
+    "failure",
+    "job_digest"
+  ],
+  "properties": {
+    "contract_version": { "const": "tacua.processing-job@1.0.0" },
+    "media_type": { "const": "application/vnd.tacua.processing-job+json;version=1.0.0" },
+    "organization_id": { "$ref": "common.schema.json#/$defs/id" },
+    "project_id": { "$ref": "common.schema.json#/$defs/id" },
+    "build_id": { "$ref": "common.schema.json#/$defs/id" },
+    "build_identity_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "session_id": { "$ref": "common.schema.json#/$defs/id" },
+    "job_id": { "$ref": "common.schema.json#/$defs/id" },
+    "job_version": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "previous_job_digest": { "$ref": "common.schema.json#/$defs/nullableDigest" },
+    "status": { "enum": ["queued", "running", "waiting_for_clarification", "succeeded", "failed", "cancelled"] },
+    "requested_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "started_at": { "$ref": "common.schema.json#/$defs/nullableTimestamp" },
+    "completed_at": { "$ref": "common.schema.json#/$defs/nullableTimestamp" },
+    "inputs": { "$ref": "#/$defs/inputs" },
+    "pipeline": { "$ref": "#/$defs/pipeline" },
+    "execution": { "$ref": "#/$defs/execution" },
+    "outputs": {
+      "oneOf": [
+        { "$ref": "#/$defs/outputs" },
+        { "type": "null" }
+      ]
+    },
+    "failure": {
+      "oneOf": [
+        { "$ref": "#/$defs/failure" },
+        { "type": "null" }
+      ]
+    },
+    "job_digest": { "$ref": "common.schema.json#/$defs/digest" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "queued" } } },
+      "then": {
+        "properties": {
+          "started_at": { "type": "null" },
+          "completed_at": { "type": "null" },
+          "outputs": { "type": "null" },
+          "failure": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "enum": ["running", "waiting_for_clarification"] } } },
+      "then": {
+        "properties": {
+          "started_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+          "completed_at": { "type": "null" },
+          "outputs": { "type": "null" },
+          "failure": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "succeeded" } } },
+      "then": {
+        "properties": {
+          "started_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+          "completed_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+          "outputs": { "$ref": "#/$defs/outputs" },
+          "failure": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "failed" } } },
+      "then": {
+        "properties": {
+          "started_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+          "completed_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+          "outputs": { "type": "null" },
+          "failure": { "$ref": "#/$defs/failure" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "cancelled" } } },
+      "then": {
+        "properties": {
+          "completed_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+          "outputs": { "type": "null" },
+          "failure": { "type": "null" }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "contextSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_id", "kind", "access", "availability", "snapshot_digest", "unavailable"],
+      "properties": {
+        "source_id": { "$ref": "common.schema.json#/$defs/id" },
+        "kind": { "enum": ["mobile_repository", "backend_repository", "sentry", "posthog", "other_observability"] },
+        "access": { "const": "read_only" },
+        "availability": { "enum": ["available", "unavailable"] },
+        "snapshot_digest": { "$ref": "common.schema.json#/$defs/nullableDigest" },
+        "unavailable": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/unavailable" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "availability": { "const": "available" } } },
+          "then": {
+            "properties": {
+              "snapshot_digest": { "$ref": "common.schema.json#/$defs/digest" },
+              "unavailable": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "availability": { "const": "unavailable" } } },
+          "then": {
+            "properties": {
+              "snapshot_digest": { "type": "null" },
+              "unavailable": { "$ref": "common.schema.json#/$defs/unavailable" }
+            }
+          }
+        }
+      ]
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capture_manifest_digest", "diagnostic_envelope_digests", "context_sources"],
+      "properties": {
+        "capture_manifest_digest": { "$ref": "common.schema.json#/$defs/digest" },
+        "diagnostic_envelope_digests": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2048,
+          "uniqueItems": true,
+          "items": { "$ref": "common.schema.json#/$defs/digest" }
+        },
+        "context_sources": {
+          "type": "array",
+          "maxItems": 32,
+          "items": { "$ref": "#/$defs/contextSource" }
+        }
+      }
+    },
+    "stage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "state", "attempt_count", "started_at", "completed_at", "detail"],
+      "properties": {
+        "name": { "enum": ["transcribe", "align", "correlate", "research", "generate_tickets"] },
+        "state": { "enum": ["pending", "running", "waiting_for_clarification", "succeeded", "skipped", "failed"] },
+        "attempt_count": { "type": "integer", "minimum": 0, "maximum": 1000 },
+        "started_at": { "$ref": "common.schema.json#/$defs/nullableTimestamp" },
+        "completed_at": { "$ref": "common.schema.json#/$defs/nullableTimestamp" },
+        "detail": { "$ref": "common.schema.json#/$defs/nullableText" }
+      }
+    },
+    "pipeline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pipeline_version", "stages"],
+      "properties": {
+        "pipeline_version": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "stages": {
+          "type": "array",
+          "minItems": 5,
+          "maxItems": 5,
+          "items": { "$ref": "#/$defs/stage" }
+        }
+      }
+    },
+    "destination": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["destination_id", "provider_kind", "model_id", "content_categories"],
+      "properties": {
+        "destination_id": { "$ref": "common.schema.json#/$defs/id" },
+        "provider_kind": { "enum": ["local", "openai", "anthropic", "other_api"] },
+        "model_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "content_categories": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": { "enum": ["transcript", "screenshots", "sdk_diagnostics", "repository_context", "observability_context"] }
+        }
+      }
+    },
+    "egress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy", "authorized", "authorization_decision_id", "destinations"],
+      "properties": {
+        "policy": { "const": "default_deny" },
+        "authorized": { "type": "boolean" },
+        "authorization_decision_id": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/id" },
+            { "type": "null" }
+          ]
+        },
+        "destinations": {
+          "type": "array",
+          "maxItems": 8,
+          "items": { "$ref": "#/$defs/destination" }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "authorized": { "const": false } } },
+          "then": {
+            "properties": {
+              "authorization_decision_id": { "type": "null" },
+              "destinations": { "type": "array", "maxItems": 0 }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "authorized": { "const": true } } },
+          "then": {
+            "properties": {
+              "authorization_decision_id": { "$ref": "common.schema.json#/$defs/id" },
+              "destinations": { "type": "array", "minItems": 1, "maxItems": 8, "items": { "$ref": "#/$defs/destination" } }
+            }
+          }
+        }
+      ]
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "max_attempts", "egress"],
+      "properties": {
+        "mode": { "const": "async" },
+        "max_attempts": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "egress": { "$ref": "#/$defs/egress" }
+      }
+    },
+    "candidateRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_id", "candidate_version"],
+      "properties": {
+        "candidate_id": { "$ref": "common.schema.json#/$defs/id" },
+        "candidate_version": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+      }
+    },
+    "outputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["disposition", "candidate_refs", "derived_evidence_refs", "summary"],
+      "properties": {
+        "disposition": { "enum": ["candidates_created", "no_issue_detected"] },
+        "candidate_refs": {
+          "type": "array",
+          "maxItems": 256,
+          "items": { "$ref": "#/$defs/candidateRef" }
+        },
+        "derived_evidence_refs": {
+          "type": "array",
+          "maxItems": 10000,
+          "uniqueItems": true,
+          "items": { "$ref": "common.schema.json#/$defs/id" }
+        },
+        "summary": { "$ref": "common.schema.json#/$defs/boundedText" }
+      }
+    },
+    "failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "failed_stage", "retryable", "detail"],
+      "properties": {
+        "code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{2,63}$" },
+        "failed_stage": { "enum": ["transcribe", "align", "correlate", "research", "generate_tickets"] },
+        "retryable": { "type": "boolean" },
+        "detail": { "$ref": "common.schema.json#/$defs/shortText" }
+      }
+    }
+  }
+}

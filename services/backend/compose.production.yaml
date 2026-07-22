@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# Optional production override. TACUA_BACKEND_IMAGE must be an immutable image
+# reference such as registry.example/tacua@sha256:<64 lowercase hex characters>.
+
+services:
+  backend:
+    image: ${TACUA_BACKEND_IMAGE:?set TACUA_BACKEND_IMAGE to an immutable digest-pinned image}
+    build: !reset null

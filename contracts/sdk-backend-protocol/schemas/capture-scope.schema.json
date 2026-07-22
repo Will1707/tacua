@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tacua.invalid/schemas/sdk-backend/1.0.0/capture-scope.schema.json",
+  "$comment": "SPDX-License-Identifier: Apache-2.0",
+  "title": "Tacua immutable capture scope and consent",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "message_type",
+    "organization_id",
+    "project_id",
+    "application_id",
+    "build_id",
+    "build_identity_digest",
+    "capture_scope",
+    "consent",
+    "retention",
+    "scope_digest"
+  ],
+  "properties": {
+    "protocol_version": { "$ref": "common.schema.json#/$defs/protocolVersion" },
+    "message_type": { "const": "capture_scope" },
+    "organization_id": { "$ref": "common.schema.json#/$defs/id" },
+    "project_id": { "$ref": "common.schema.json#/$defs/id" },
+    "application_id": { "$ref": "common.schema.json#/$defs/id" },
+    "build_id": { "$ref": "common.schema.json#/$defs/id" },
+    "build_identity_digest": { "$ref": "common.schema.json#/$defs/digest" },
+    "capture_scope": { "const": "app_only" },
+    "consent": { "$ref": "#/$defs/consent" },
+    "retention": { "$ref": "#/$defs/retention" },
+    "scope_digest": { "$ref": "common.schema.json#/$defs/digest" }
+  },
+  "$defs": {
+    "consent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "policy_version",
+        "screen_recording",
+        "microphone",
+        "diagnostics",
+        "raw_media_upload",
+        "granted_at"
+      ],
+      "properties": {
+        "policy_version": { "$ref": "common.schema.json#/$defs/versionText" },
+        "screen_recording": { "const": "granted" },
+        "microphone": { "const": "granted" },
+        "diagnostics": { "const": "granted" },
+        "raw_media_upload": { "const": "granted" },
+        "granted_at": { "$ref": "common.schema.json#/$defs/timestamp" }
+      }
+    },
+    "retention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_version", "raw_media_days", "derived_data_days"],
+      "properties": {
+        "policy_version": { "$ref": "common.schema.json#/$defs/versionText" },
+        "raw_media_days": { "type": "integer", "minimum": 1, "maximum": 30 },
+        "derived_data_days": { "type": "integer", "minimum": 1, "maximum": 365 }
+      }
+    }
+  }
+}

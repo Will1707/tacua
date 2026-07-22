@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: Apache-2.0
+
+services:
+  backend:
+    build:
+      context: ../..
+      dockerfile: services/backend/Dockerfile
+    image: tacua-backend:local
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    pids_limit: 128
+    deploy:
+      replicas: 1
+    read_only: true
+    user: "10001:10001"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - tacua-default-deny
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import json,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)); assert d['status']=='ok' and d['retention_worker_running'] and d['pending_deletions']==0 and d['retention_last_failed_sessions']==0
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - tacua-state:/var/lib/tacua
+      - ./local/config.json:/run/tacua/config.json:ro
+    secrets:
+      - tacua_admin
+
+secrets:
+  tacua_admin:
+    file: ./local/admin-secret
+
+volumes:
+  tacua-state:
+
+networks:
+  tacua-default-deny:
+    internal: true

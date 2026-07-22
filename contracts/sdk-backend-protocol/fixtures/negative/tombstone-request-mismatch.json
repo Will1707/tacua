@@ -1,0 +1,32 @@
+{
+  "accepted_at": "2026-07-21T10:03:01Z",
+  "credential": {
+    "credential_id": "credential_receiving_resume",
+    "replay_deletion_id": "deletion_synthetic",
+    "state": "deletion_replay_only",
+    "verifier_retained_until": "2026-08-19T10:03:05Z"
+  },
+  "deleted_at": "2026-07-21T10:03:05Z",
+  "deletion_id": "deletion_synthetic",
+  "deletion_request_digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+  "erasure": {
+    "derived_data": "deleted",
+    "diagnostics": "deleted",
+    "erased_object_count": 4,
+    "raw_media": "deleted",
+    "session_metadata": "deleted_except_tombstone_and_replay_verifier"
+  },
+  "local_credential_cleanup": "authorized_after_durable_tombstone",
+  "message_type": "deletion_tombstone",
+  "protocol_version": "tacua.sdk-backend@1.0.0",
+  "scope_digest": "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50",
+  "session_access": {
+    "completion": "revoked",
+    "evidence": "revoked",
+    "processing": "revoked",
+    "uploads": "revoked"
+  },
+  "session_id": "session_synthetic",
+  "tombstone_digest": "sha256:401c94f7ee9989708f6b9956bcc671d2858dd5516ab1edf257e2e69909a27964",
+  "tombstone_expires_at": "2026-08-19T10:03:05Z"
+}

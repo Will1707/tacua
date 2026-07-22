@@ -1,0 +1,98 @@
+{
+  "organization_id": "org_example",
+  "project_id": "project_example",
+  "application_id": "app_example",
+  "reviewer_id": "reviewer_owner",
+  "build_identity": {
+    "build_id": "build_example",
+    "build_identity_digest": "sha256:82464072551a9837cd953bcca83d3b3235f81b1058ebc99f8c4374e7ec6513c5",
+    "build_variant": "preview",
+    "bundle_identifier": "com.example.app",
+    "created_at": "2026-07-21T09:55:00Z",
+    "distribution": "testflight",
+    "expo": {
+      "runtime_version": "1.0.0",
+      "sdk_version": "56.0.0",
+      "update_channel": "preview",
+      "update_id": "update_synthetic"
+    },
+    "message_type": "build_identity",
+    "native_build": "1",
+    "native_version": "1.0.0",
+    "platform": "ios",
+    "protocol_version": "tacua.sdk-backend@1.0.0",
+    "react_native_version": "0.81.5",
+    "source": {
+      "git_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "working_tree_dirty": false
+    },
+    "transport_configuration_digest": "sha256:c247c8dfdd0a21d4410748aa9f847d026008c7a0c3944f1a54a1183f1e67b452"
+  },
+  "approved_handoff": {
+    "build_identity": {
+      "contract_version": "tacua.build-identity@1.0.0",
+      "media_type": "application/vnd.tacua.build-identity+json;version=1.0.0",
+      "organization_id": "org_example",
+      "project_id": "project_example",
+      "build_id": "build_example",
+      "mobile": {
+        "platform": "ios",
+        "application_id": "com.example.app",
+        "app_version": "1.0.0",
+        "build_number": "1",
+        "distribution": "testflight",
+        "source": {
+          "repository_id": "repo_example_mobile",
+          "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "dirty": false
+        },
+        "native_binary_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "backend": {
+        "availability": "unavailable",
+        "environment": "self-hosted-example",
+        "deployment_id": null,
+        "image_digest": null,
+        "deployed_at": null,
+        "sources": [],
+        "unavailable_reason": "not_deployed"
+      },
+      "sdk": {
+        "package_name": "@tacua/mobile-sdk",
+        "package_version": "0.1.0",
+        "source_revision": "cccccccccccccccccccccccccccccccccccccccc",
+        "capture_schema_version": "tacua.sdk-evidence@1.0.0",
+        "configuration_digest": "sha256:c247c8dfdd0a21d4410748aa9f847d026008c7a0c3944f1a54a1183f1e67b452"
+      },
+      "build_identity_digest": "sha256:354850f0230238edeaa9a125ddc7abadb59cce291036722124be9bcd094e9bc9"
+    },
+    "authority": {
+      "purpose": "implement_approved_ticket",
+      "allowed_repositories": [
+        "repo_example_mobile"
+      ],
+      "read_authorized_evidence": true,
+      "modify_code": true,
+      "run_tests": true,
+      "external_writes": false,
+      "merge": false,
+      "deploy": false
+    },
+    "registry_revision": "registry_initial"
+  },
+  "consent_contract": "tacua.consent-v1",
+  "backend_origin": "https://qa.example.com",
+  "transport_policy_version": "tacua.sdk-transport@1.0.0",
+  "state_directory": "/var/lib/tacua",
+  "listen_host": "0.0.0.0",
+  "listen_port": 8080,
+  "launch_code_ttl_seconds": 300,
+  "credential_ttl_seconds": 2592000,
+  "max_segment_bytes": 268435456,
+  "max_diagnostic_bytes": 16777216,
+  "max_completion_bytes": 16777216,
+  "raw_retention_days": 30,
+  "derived_retention_days": 30,
+  "tombstone_retention_days": 30,
+  "retention_sweep_interval_seconds": 300
+}
