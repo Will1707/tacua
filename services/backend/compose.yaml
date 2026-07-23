@@ -67,6 +67,9 @@ services:
       backend:
         condition: service_healthy
         restart: true
+      reviewer:
+        condition: service_healthy
+        restart: true
     networks:
       - tacua-default-deny
       - tacua-loopback-publish
@@ -82,6 +85,7 @@ services:
         - -ec
         - >-
           wget -qO- -T 2 http://127.0.0.1:8080/healthz | grep -q '"status":"ok"'
+          && wget -qO- -T 2 http://127.0.0.1:8080/ | grep -Fq '<div id="root"></div>'
       interval: 30s
       timeout: 3s
       start_period: 5s
@@ -91,6 +95,42 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  reviewer:
+    build:
+      context: ../..
+      dockerfile: services/reviewer-web/Dockerfile
+    image: tacua-reviewer-web:local
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    pids_limit: 64
+    deploy:
+      replicas: 1
+    read_only: true
+    user: "10002:10002"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - tacua-default-deny
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8081/', timeout=2); assert r.status==200 and r.headers['Cache-Control']=='no-store' and r.headers['X-Content-Type-Options']=='nosniff'
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
 
 secrets:
   tacua_admin:

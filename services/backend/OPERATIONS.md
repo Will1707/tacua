@@ -68,43 +68,79 @@ start an explicitly empty deployment.
 
 ## 2. Resolve and preflight production Compose
 
-Build only from a clean, verification-green checkout. Before every local image
-build, run the same closed Dockerfile/context checks as CI (the repository
-workflow pins Node 22.22.2):
+Build only from a clean, verification-green checkout with the pinned Node
+22.22.2 runtime. The reviewer export and license inventory are generated
+release inputs, so refuse stale local build state and create both from the
+exact package lock:
 
-```sh
+```bash
+set -euo pipefail
+test -z "$(git status --porcelain --untracked-files=all)"
+test ! -e apps/reviewer/node_modules
+test ! -e apps/reviewer/dist
+test ! -e apps/reviewer/generated
+
 node --test .github/scripts/validate-backend-image-inputs.test.mjs
 node .github/scripts/validate-backend-image-inputs.mjs
-docker build -f services/backend/Dockerfile -t tacua-backend:<revision> .
+npm --prefix apps/reviewer ci --ignore-scripts --no-audit --no-fund
+node .github/scripts/generate-reviewer-third-party-notices.mjs
+npm --prefix apps/reviewer test
+npm --prefix apps/reviewer run typecheck
+npm --prefix apps/reviewer run export:web -- --output-dir dist --clear
+node --test .github/scripts/validate-reviewer-web-image-inputs.test.mjs
+node .github/scripts/validate-reviewer-web-image-inputs.mjs
+PYTHONWARNINGS=error python3 -B -m unittest discover \
+  -s services/reviewer-web/tests -v
 ```
 
-The validator requires the exact audited Docker instruction sequence, pinned
-base-image digest, ignore rules, source/schema file allowlist, regular-file
-types, and per-file/aggregate size bounds. A new legitimate runtime file must
-be added deliberately to that policy; do not bypass a failed check with a broad
-build context.
+The validators require the exact audited Docker instruction sequences, pinned
+base-image digests, ignore rules, source/schema/export/license allowlists,
+regular-file types, content-addressed entry bundle, and per-file/aggregate size
+bounds. A new legitimate runtime file must be added deliberately to that
+policy; do not bypass a failed check with a broad build context.
 
 On an isolated validation host, exercise the complete image boundary with the
-same checked-in command used by CI:
+same checked-in command used by CI. For a release, opt in to retaining the two
+exact successful image tags:
 
-```sh
-TACUA_CONTAINER_TEST_ID=local-verify \
+```bash
+release_id="release-$(git rev-parse --short=12 HEAD)"
+TACUA_CONTAINER_TEST_ID="$release_id" \
+TACUA_KEEP_VERIFIED_IMAGES=true \
   bash .github/scripts/verify-backend-container.sh
 ```
 
 The identifier is at most 32 characters, starts with a lowercase letter or
 digit, and otherwise accepts only lowercase letters, digits, and hyphens. The
 script refuses pre-existing container, volume, image, or local-input names,
-then cleans only the names it created. It verifies hardened startup, the state-volume
-single-writer lock, authenticated smoke, backup manifest and retention binding,
-non-destructive and applied restore, and candidate-image startup from the
-restored state. It is a release-candidate test, not a production deployment.
+then cleans only the names it created. It verifies both hardened images,
+same-origin routing, license payloads, the state-volume single-writer lock,
+authenticated smoke, backup manifest and retention binding, non-destructive and
+applied restore, and candidate-image startup from restored state. On any
+failure it deletes its image tags. `TACUA_KEEP_VERIFIED_IMAGES=true` retains
+them only after every check succeeds.
 
-Publish the validated image through your chosen registry, record its immutable
-digest, and set (do not put this in the config or secret file):
+Tag and push those retained image IDs; never run another build between
+verification and publication. Record the local image IDs printed by the
+verifier, then record the registry digests returned by the pushes:
+
+```bash
+backend_release="registry.example/tacua:$release_id"
+reviewer_release="registry.example/tacua-reviewer:$release_id"
+docker tag "tacua-backend:$release_id" "$backend_release"
+docker tag "tacua-reviewer-web:$release_id" "$reviewer_release"
+docker push "$backend_release"
+docker push "$reviewer_release"
+docker image inspect --format '{{json .RepoDigests}}' \
+  "$backend_release" "$reviewer_release"
+```
+
+Set the resulting immutable digest references (do not put them in the config
+or secret file):
 
 ```sh
 export TACUA_BACKEND_IMAGE='registry.example/tacua@sha256:<64 lowercase hex>'
+export TACUA_REVIEWER_IMAGE='registry.example/tacua-reviewer@sha256:<64 lowercase hex>'
 ```
 
 The optional production override removes the local build stanza. Inspect the
@@ -115,7 +151,7 @@ The base model separately pins the Docker Official
 GPL-licensed, runs as UID/GID `99`, and is not incorporated into Tacua's
 Apache-2.0 backend image. Mirror that exact manifest into an operator-controlled
 registry for production if Docker Hub is outside the approved supply chain;
-changing its reference or relay configuration requires updating and rerunning
+changing its reference or ingress configuration requires updating and rerunning
 the closed validator.
 
 Run this deployment workflow in Bash. Create a private runtime path in the same
@@ -168,22 +204,23 @@ if the backend is still running and never opens the source database.
 
 ## 3. TLS reverse-proxy contract
 
-Compose keeps the backend on one egress-denied internal network and publishes
-only a digest-pinned, non-root HAProxy TCP relay on host loopback
-`127.0.0.1:8080`. The relay has no Tacua config, secret, state, or Docker
-socket. It joins one ordinary bridge to support the loopback publication path
-operated on the private pilot's rootless mini-PC, and forwards bytes to the
-backend's internal service name. Hosted CI exercises this topology on its
-standard daemon, so the live pilot is not a general rootless portability
-matrix. Keep TCP 8080 closed at both host and provider firewalls.
+Compose keeps the backend and authority-free static reviewer on one
+egress-denied internal network and publishes only a digest-pinned, non-root
+HAProxy ingress on host loopback `127.0.0.1:8080`. The ingress has no Tacua
+config, secret, state, source, or Docker socket. It joins one ordinary bridge
+to support the loopback publication path operated on the private pilot's
+rootless mini-PC, routes the fixed API paths to the backend, and routes every
+other path to the reviewer. Hosted CI exercises this topology on its standard
+daemon, so the live pilot is not a general rootless portability matrix. Keep
+TCP 8080 closed at both host and provider firewalls.
 
-The relay is deliberately content-blind plumbing, not the required production
-HTTP control plane. The application listener is Python's
+The ingress is deliberately a small same-origin router, not the required
+production HTTP control plane. The application listener is Python's
 `ThreadingHTTPServer`: it starts one thread per accepted connection and does
 not provide a bounded worker pool, connection quota, or socket/header/body
 read deadlines. Neither component is safe to expose directly. The production
 reverse proxy is therefore both the TLS endpoint and the mandatory
-slow-client/overload boundary. It may connect to the loopback relay only while
+slow-client/overload boundary. It may connect to the loopback ingress only while
 preserving this application contract:
 
 - the configured HTTPS origin terminates with a valid hostname-matching
@@ -263,7 +300,12 @@ Do not use `--scale`. A second process sharing the state volume exits before
 database initialization, but repeatedly starting replicas is still an
 operational fault.
 
-Monitor `/healthz` without authentication. Alert when any of these is true:
+Monitor `/healthz` without authentication. Also probe `/` through the exact
+public HTTPS origin and require status `200`, the bounded reviewer shell marker
+`<div id="root"></div>`, `Cache-Control: no-store`, and
+`X-Content-Type-Options: nosniff`. Alert if the backend, reviewer, or ingress
+container is not running and healthy, or when any of these backend conditions
+is true:
 
 - `status` is not `ok`;
 - `schema_version` is not `2`;
@@ -329,6 +371,7 @@ set -euo pipefail
 project='tacua'
 backup_carrier='/secure-backups/tacua-YYYYMMDDTHHMMSSZ'
 : "${TACUA_BACKEND_IMAGE:?export the running immutable image}"
+: "${TACUA_REVIEWER_IMAGE:?export the running immutable reviewer image}"
 
 repo_root="$(pwd -P)"
 config_file="$repo_root/services/backend/local/config.json"
@@ -370,6 +413,17 @@ print(image)
 ' "$compose_json"
 )"
 test "$expected_backend_image" = "$TACUA_BACKEND_IMAGE"
+expected_reviewer_image="$(
+  python3 -B -c '
+import json, re, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    image = json.load(stream)["services"]["reviewer"]["image"]
+if not isinstance(image, str) or re.fullmatch(r"\S+@sha256:[a-f0-9]{64}", image) is None:
+    raise SystemExit("resolved reviewer image is not immutable")
+print(image)
+' "$compose_json"
+)"
+test "$expected_reviewer_image" = "$TACUA_REVIEWER_IMAGE"
 compose=(docker compose -p "$project" -f "$compose_json")
 
 "${compose[@]}" stop backend
@@ -512,6 +566,7 @@ set -euo pipefail
 project='tacua-restored'
 recovery='/secure-recovery/tacua-restore'
 : "${TACUA_BACKEND_IMAGE:?export the immutable digest-pinned backend image}"
+: "${TACUA_REVIEWER_IMAGE:?export the immutable digest-pinned reviewer image}"
 
 repo_root="$(pwd -P)"
 local_dir="$repo_root/services/backend/local"
@@ -620,6 +675,23 @@ print(image)
 PY
 )"
 test "$expected_backend_image" = "$TACUA_BACKEND_IMAGE"
+expected_reviewer_image="$(
+  python3 -B - "$compose_json" <<'PY'
+import json
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    image = json.load(stream)["services"]["reviewer"]["image"]
+if (
+    not isinstance(image, str)
+    or re.fullmatch(r"\S+@sha256:[a-f0-9]{64}", image) is None
+):
+    raise SystemExit("resolved reviewer image is not immutable")
+print(image)
+PY
+)"
+test "$expected_reviewer_image" = "$TACUA_REVIEWER_IMAGE"
 compose=(docker compose -p "$project" -f "$compose_json")
 
 if ! project_containers="$(
@@ -873,7 +945,8 @@ For every upgrade:
 5. Restore that bundle on an isolated host/volume and start the candidate
    image there. This startup compatibility test is required: preflight's
    read-only SQLite quick check does not perform an application migration.
-6. Start exactly one production container from the verified digest without
+6. Start exactly one backend replica together with the validated reviewer and
+   ingress services from their verified digest-pinned images without
    rebuilding.
 7. Run the exact-origin smoke test and monitor at least one retention interval.
 

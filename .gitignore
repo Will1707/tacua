@@ -7,6 +7,7 @@
 node_modules/
 .pnpm-store/
 dist/
+apps/reviewer/generated/
 build/
 coverage/
 __pycache__/

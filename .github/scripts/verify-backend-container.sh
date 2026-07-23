@@ -3,6 +3,15 @@
 
 set -euo pipefail
 
+keep_verified_images="${TACUA_KEEP_VERIFIED_IMAGES:-false}"
+case "$keep_verified_images" in
+  true|false) ;;
+  *)
+    echo "TACUA_KEEP_VERIFIED_IMAGES must be true or false" >&2
+    exit 2
+    ;;
+esac
+
 test_id="${TACUA_CONTAINER_TEST_ID:-ci}"
 case "$test_id" in
   *[!a-z0-9-]*|''|-*)
@@ -21,6 +30,7 @@ if [ ! -f services/backend/Dockerfile ] || [ ! -f services/backend/config.exampl
 fi
 
 image="tacua-backend:${test_id}"
+reviewer_image="tacua-reviewer-web:${test_id}"
 container="tacua-backend-${test_id}"
 second_container="tacua-backend-${test_id}-second"
 restored_container="tacua-backend-${test_id}-restored"
@@ -28,6 +38,7 @@ compose_project="tacua-backend-${test_id}-compose"
 restore_compose_project="${compose_project}-restore"
 compose_container=""
 compose_ingress_container=""
+compose_reviewer_container=""
 restore_compose_container=""
 volume="tacua-backend-${test_id}-state"
 backup_volume="tacua-backend-${test_id}-backup"
@@ -50,6 +61,7 @@ created_local_directory=false
 docker_cleanup=false
 compose_started=false
 restore_compose_created=false
+verification_succeeded=false
 
 cleanup() {
   if [ "$docker_cleanup" = true ]; then
@@ -74,7 +86,10 @@ cleanup() {
     docker volume rm "$volume" >/dev/null 2>&1 || true
     docker volume rm "$backup_volume" >/dev/null 2>&1 || true
     docker volume rm "$restored_volume" >/dev/null 2>&1 || true
-    docker image rm "$image" >/dev/null 2>&1 || true
+    if [ "$verification_succeeded" != true ] || [ "$keep_verified_images" != true ]; then
+      docker image rm "$image" >/dev/null 2>&1 || true
+      docker image rm "$reviewer_image" >/dev/null 2>&1 || true
+    fi
   fi
   if [ "$cleanup_local_files" = true ]; then
     if [ -d "$local_directory" ] && [ ! -L "$local_directory" ]; then
@@ -133,6 +148,7 @@ for target in \
   "$restored_container" \
   "${compose_project}-backend-1" \
   "${compose_project}-ingress-1" \
+  "${compose_project}-reviewer-1" \
   "${restore_compose_project}-backend-1"; do
   if printf '%s\n' "$container_names" | grep -Fqx -- "$target"; then
     echo "refusing to replace existing Docker container: $target" >&2
@@ -241,10 +257,15 @@ if printf '%s\n' "$image_names" | grep -Fqx -- "$image"; then
   echo "refusing to replace existing Docker image: $image" >&2
   exit 1
 fi
+if printf '%s\n' "$image_names" | grep -Fqx -- "$reviewer_image"; then
+  echo "refusing to replace existing Docker image: $reviewer_image" >&2
+  exit 1
+fi
 
 printf '%s' 'tacua-ci-admin-secret-0123456789abcdef' > "$secret"
 chmod 0444 "$secret"
-printf '{"services":{"backend":{"image":"%s"}}}\n' "$image" \
+printf '{"services":{"backend":{"image":"%s"},"reviewer":{"image":"%s"}}}\n' \
+  "$image" "$reviewer_image" \
   > "$test_compose_override"
 printf '{"volumes":{"tacua-state":{"name":"%s"}}}\n' "$restored_volume" \
   > "$restore_volume_override"
@@ -279,6 +300,7 @@ PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool \
   --compose-json "$resolved_test_compose" \
   --allow-mutable-image
 TACUA_BACKEND_IMAGE="registry.invalid/tacua@sha256:$(printf 'a%.0s' {1..64})" \
+TACUA_REVIEWER_IMAGE="registry.invalid/tacua-reviewer@sha256:$(printf 'b%.0s' {1..64})" \
   docker compose \
     -f services/backend/compose.yaml \
     -f services/backend/compose.production.yaml \
@@ -309,6 +331,11 @@ wait_for_healthy() {
 
 docker_cleanup=true
 docker build -f services/backend/Dockerfile -t "$image" .
+node .github/scripts/validate-reviewer-web-image-inputs.mjs >/dev/null
+docker build --pull=false \
+  -f services/reviewer-web/Dockerfile \
+  -t "$reviewer_image" \
+  .
 
 compose_started=true
 docker compose \
@@ -339,7 +366,19 @@ if [ -z "$compose_ingress_container" ] || [ "$(printf '%s\n' "$compose_ingress_c
   echo "Compose did not resolve exactly one ingress container" >&2
   exit 1
 fi
+compose_reviewer_container="$(
+  docker compose \
+    -p "$compose_project" \
+    -f services/backend/compose.yaml \
+    -f "$test_compose_override" \
+    ps -q reviewer
+)"
+if [ -z "$compose_reviewer_container" ] || [ "$(printf '%s\n' "$compose_reviewer_container" | wc -l)" -ne 1 ]; then
+  echo "Compose did not resolve exactly one reviewer container" >&2
+  exit 1
+fi
 wait_for_healthy "$compose_container"
+wait_for_healthy "$compose_reviewer_container"
 wait_for_healthy "$compose_ingress_container"
 docker exec "$compose_container" sh -c \
   'test "$(stat -c %a /run/secrets/tacua_admin)" = 444 && ! test -w /run/secrets/tacua_admin'
@@ -355,6 +394,20 @@ if [ "$(docker inspect --format '{{len .NetworkSettings.Networks}}' "$compose_in
   echo "the ingress did not join exactly two networks" >&2
   exit 1
 fi
+if [ "$(docker inspect --format '{{len .NetworkSettings.Networks}}' "$compose_reviewer_container")" -ne 1 ]; then
+  echo "the reviewer did not remain on exactly one internal network" >&2
+  exit 1
+fi
+if docker port "$compose_reviewer_container" 8081/tcp >/dev/null 2>&1; then
+  echo "the reviewer unexpectedly published its internal listener" >&2
+  exit 1
+fi
+docker exec "$compose_reviewer_container" python -B - \
+  < .github/scripts/smoke-reviewer-web-container.py
+docker exec "$compose_reviewer_container" python -B -c \
+  'from pathlib import Path; import stat; files=(Path("/licenses/tacua/LICENSE"),Path("/licenses/tacua/NOTICE"),Path("/licenses/reviewer/NOTICE"),Path("/licenses/reviewer/THIRD_PARTY_NOTICES.txt")); assert all(path.is_file() and stat.S_IMODE(path.stat().st_mode)==0o444 for path in files); assert files[0].read_text(encoding="utf-8").startswith("Apache License"); assert files[3].read_text(encoding="utf-8").startswith("Tacua reviewer web — third-party notices")'
+docker exec "$compose_reviewer_container" python -B -c \
+  'from pathlib import Path; assert not any(Path(path).exists() for path in ("/run/secrets/tacua_admin","/run/tacua/config.json","/var/lib/tacua/tacua.sqlite3","/var/run/docker.sock","/run/docker.sock"))'
 docker exec "$compose_ingress_container" sh -c \
   'test "$(id -u)" = 99 && test ! -e /run/secrets/tacua_admin && test ! -e /run/tacua/config.json && haproxy -c -q -f /usr/local/etc/haproxy/haproxy.cfg'
 docker exec "$compose_container" python -m tacua_backend.operator_tool smoke \
@@ -367,6 +420,10 @@ PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool smoke 
   --admin-secret-file "$local_secret" \
   --origin http://127.0.0.1:8080 \
   --allow-loopback-http
+python3 -B -c \
+  "import urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8080/', timeout=2); body=r.read(65537); assert r.status==200 and b'<div id=\"root\"></div>' in body and r.headers['Cache-Control']=='no-store' and r.headers['X-Content-Type-Options']=='nosniff'"
+python3 -B -c \
+  "import urllib.request; q=urllib.request.Request('http://127.0.0.1:8080/', headers={'Authorization':'Bearer synthetic-never-log','Cookie':'synthetic=1','Idempotency-Key':'synthetic','If-Match':'\"synthetic\"','Proxy-Authorization':'Basic synthetic','Tacua-Content-Digest':'sha256:synthetic','Tacua-Credential-ID':'synthetic','Tacua-Evidence-Manifest-Digest':'sha256:synthetic','Tacua-Intent-Digest':'sha256:synthetic','Tacua-Page-Cursor':'synthetic','Tacua-Protocol-Version':'synthetic','Tacua-Requested-At':'2026-01-01T00:00:00Z','Tacua-Scope-Digest':'sha256:synthetic','Tacua-Sidecar-Digest':'sha256:synthetic','Tailscale-User-Login':'synthetic@example.invalid','Tailscale-User-Name':'Synthetic','Tailscale-User-Profile-Pic':'https://example.invalid/synthetic'}); r=urllib.request.urlopen(q, timeout=2); body=r.read(65537); assert r.status==200 and b'<div id=\"root\"></div>' in body"
 
 docker stop "$compose_ingress_container" >/dev/null
 if python3 -B -c \
@@ -620,4 +677,14 @@ docker exec "$restored_container" python -m tacua_backend.operator_tool smoke \
   --origin http://127.0.0.1:8080 \
   --allow-loopback-http
 
+backend_image_id="$(docker image inspect --format '{{.Id}}' "$image")"
+reviewer_image_id="$(docker image inspect --format '{{.Id}}' "$reviewer_image")"
+if ! printf '%s\n' "$backend_image_id" | grep -Eq '^sha256:[a-f0-9]{64}$' \
+  || ! printf '%s\n' "$reviewer_image_id" | grep -Eq '^sha256:[a-f0-9]{64}$'; then
+  echo "verified image identifiers are invalid" >&2
+  exit 1
+fi
+verification_succeeded=true
 printf 'Backend container verification passed for %s.\n' "$test_id"
+printf 'Verified backend image: %s (%s)\n' "$image" "$backend_image_id"
+printf 'Verified reviewer image: %s (%s)\n' "$reviewer_image" "$reviewer_image_id"

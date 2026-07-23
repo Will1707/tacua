@@ -221,6 +221,41 @@ class OperatorToolTests(unittest.TestCase):
                 "context": str(REPOSITORY),
                 "dockerfile": "services/backend/Dockerfile",
             }
+        reviewer = {
+            "cap_drop": ["ALL"],
+            "command": None,
+            "deploy": {"replicas": 1},
+            "entrypoint": None,
+            "healthcheck": {
+                "interval": "30s",
+                "retries": 3,
+                "start_period": "5s",
+                "test": list(operator_tool._REVIEWER_HEALTHCHECK),
+                "timeout": "3s",
+            },
+            "image": (
+                "registry.example/tacua-reviewer@sha256:" + "b" * 64
+                if immutable
+                else "tacua-reviewer-web:local"
+            ),
+            "init": True,
+            "logging": {
+                "driver": "json-file",
+                "options": {"max-file": "3", "max-size": "10m"},
+            },
+            "networks": {"tacua-default-deny": None},
+            "pids_limit": 64,
+            "read_only": True,
+            "restart": "unless-stopped",
+            "security_opt": ["no-new-privileges:true"],
+            "stop_grace_period": "30s",
+            "user": "10002:10002",
+        }
+        if not immutable:
+            reviewer["build"] = {
+                "context": str(REPOSITORY),
+                "dockerfile": "services/reviewer-web/Dockerfile",
+            }
         ingress = {
             "cap_drop": ["ALL"],
             "command": None,
@@ -235,7 +270,12 @@ class OperatorToolTests(unittest.TestCase):
                     "condition": "service_healthy",
                     "required": True,
                     "restart": True,
-                }
+                },
+                "reviewer": {
+                    "condition": "service_healthy",
+                    "required": True,
+                    "restart": True,
+                },
             },
             "deploy": {"replicas": 1},
             "entrypoint": None,
@@ -280,7 +320,11 @@ class OperatorToolTests(unittest.TestCase):
                 }
             },
             "name": "test",
-            "services": {"backend": backend, "ingress": ingress},
+            "services": {
+                "backend": backend,
+                "ingress": ingress,
+                "reviewer": reviewer,
+            },
             "networks": {
                 "tacua-default-deny": {
                     "internal": True,
@@ -463,6 +507,36 @@ class OperatorToolTests(unittest.TestCase):
                         require_immutable_image=True,
                     )
 
+            reviewer_mutations = [
+                lambda service: service.update(user="0:0"),
+                lambda service: service["cap_drop"].clear(),
+                lambda service: service.update(networks={
+                    "tacua-loopback-publish": None,
+                }),
+                lambda service: service.update(
+                    image="registry.example/reviewer:latest"
+                ),
+                lambda service: service.update(
+                    volumes=["/run/secrets/tacua_admin"]
+                ),
+                lambda service: service.update(ports=["0.0.0.0:8081:8081"]),
+                lambda service: service["healthcheck"].update(disable=True),
+            ]
+            for mutate in reviewer_mutations:
+                document = self.compose_document(
+                    immutable=True,
+                    state_target=str(state),
+                    config_source=str(config_file),
+                    secret_source=str(secret_file),
+                )
+                mutate(document["services"]["reviewer"])
+                with self.assertRaises(OperatorError):
+                    validate_compose_document(
+                        document,
+                        config,
+                        require_immutable_image=True,
+                    )
+
             document = self.compose_document(
                 immutable=True,
                 state_target=str(state),
@@ -505,7 +579,7 @@ class OperatorToolTests(unittest.TestCase):
             }
             with self.assertRaisesRegex(
                 OperatorError,
-                "only the backend and ingress services",
+                "only backend, reviewer, and ingress",
             ):
                 validate_compose_document(
                     document,

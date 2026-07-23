@@ -177,11 +177,11 @@ For a single-owner test deployment that should be reachable only from an
 existing Tailscale network, follow the
 [tailnet-only private-pilot runbook](TAILNET_PRIVATE_PILOT.md). Its validator
 cross-checks the sealed HTTPS origin, tailnet certificate name, exact Serve
-handler, pinned ingress relay with no mounted static Tacua authority, and the
-backend's egress-denied Compose boundary. The relay still handles plaintext
-authenticated traffic and has a publish-network route. Direct Serve and the
-content-blind relay are intentionally not claimed as the bounded production
-proxy required by the
+handler, pinned ingress with no mounted static Tacua authority, the
+authority-free reviewer container, and the backend's egress-denied Compose
+boundary. The ingress still handles plaintext authenticated traffic and has a
+publish-network route. Direct Serve and this limited router are intentionally
+not claimed as the bounded production proxy required by the
 [single-node operations runbook](OPERATIONS.md).
 
 ## Fail-closed schema adoption
@@ -260,19 +260,32 @@ PYTHONPATH=services/backend/src python3 -B -m tacua_backend.config_tool \
 PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool \
   create-admin-secret \
   --destination services/backend/local/admin-secret
+npm --prefix apps/reviewer ci --ignore-scripts --no-audit --no-fund
+node .github/scripts/generate-reviewer-third-party-notices.mjs
+npm --prefix apps/reviewer run export:web -- --output-dir dist --clear
+node --test .github/scripts/validate-reviewer-web-image-inputs.test.mjs
+node .github/scripts/validate-reviewer-web-image-inputs.mjs
 docker compose -f services/backend/compose.yaml up --build
 ```
 
+The reviewer preparation commands are required on a clean clone: its hardened
+image consumes the generated web export and audited third-party notice rather
+than installing or compiling dependencies in the image build.
+
 The backend runs as UID/GID `10001`, drops Linux capabilities, uses a read-only
 root filesystem, writes only to `/var/lib/tacua`, publishes no host port, and
-joins exactly one `internal: true` network. A separately digest-pinned,
-non-root HAProxy TCP relay joins that network plus one ordinary publish bridge
-and binds `127.0.0.1:8080`; it receives no Tacua config, secret, state, or
-Docker socket. This preserves default-deny outbound connectivity for the
-backend and any explicitly invoked local processor. The topology has been
-operated on the private pilot's rootless mini-PC; hosted CI exercises it on a
-standard daemon, so that result is not a general rootless portability claim.
-The relay is transport plumbing, not the bounded production HTTP proxy.
+joins exactly one `internal: true` network. The browser reviewer runs as
+UID/GID `10002` on that same internal network with a read-only root filesystem
+and no secret, config, state, source, or Docker-socket mount. A separately
+digest-pinned, non-root HAProxy ingress joins the internal network plus one
+ordinary publish bridge and binds `127.0.0.1:8080`. It routes only the fixed
+backend paths to port 8080 and every other path to the static reviewer, which
+lets both share the sealed HTTPS origin without CORS. This preserves
+default-deny outbound connectivity for both application containers and any
+explicitly invoked local processor. The topology has been operated on the
+private pilot's rootless mini-PC; hosted CI exercises it on a standard daemon,
+so that result is not a general rootless portability claim. The ingress is a
+limited private-pilot router, not the bounded production HTTP proxy.
 `backend_origin` is the normalized public origin used by the QA build
 (normally the HTTPS reverse-proxy origin), not the container listener address.
 Compose bind-mounts its file-backed secret without owner remapping. The source

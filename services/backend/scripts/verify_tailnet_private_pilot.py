@@ -327,11 +327,15 @@ def _validate_private_pilot_base(
 
     services = compose_document.get("services")
     backend = services.get("backend") if isinstance(services, dict) else None
+    reviewer = services.get("reviewer") if isinstance(services, dict) else None
     _require(
         isinstance(backend, dict)
         and backend.get("image") == "tacua-backend:local"
-        and isinstance(backend.get("build"), dict),
-        "private-pilot backend must use the locally verified image and build",
+        and isinstance(backend.get("build"), dict)
+        and isinstance(reviewer, dict)
+        and reviewer.get("image") == "tacua-reviewer-web:local"
+        and isinstance(reviewer.get("build"), dict),
+        "private-pilot services must use the locally verified images and builds",
     )
     dns_name = _validate_tailnet_status(tailscale_status)
     expected_origin = f"https://{dns_name}"
@@ -354,6 +358,10 @@ def _validate_private_pilot_base(
         and compose.get("published_host") == "127.0.0.1"
         and compose.get("published_port") == "8080",
         "Compose ingress must publish Tacua only at 127.0.0.1:8080",
+    )
+    _require(
+        compose.get("reviewer_image") == "tacua-reviewer-web:local",
+        "Compose reviewer image must remain the locally verified candidate",
     )
     return expected_origin, compose
 

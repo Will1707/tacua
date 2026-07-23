@@ -1,0 +1,13 @@
+**
+!apps/
+!apps/reviewer/
+!apps/reviewer/dist/
+!apps/reviewer/dist/**
+!apps/reviewer/NOTICE
+!apps/reviewer/generated/
+!apps/reviewer/generated/THIRD_PARTY_NOTICES.txt
+!LICENSE
+!NOTICE
+!services/
+!services/reviewer-web/
+!services/reviewer-web/server.py

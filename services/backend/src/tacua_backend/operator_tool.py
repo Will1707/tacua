@@ -73,7 +73,7 @@ _INGRESS_IMAGE = (
     "sha256:66e25cc9a8332635f4e897f7f4b1e5622c25f09f0ee23cddc6ce9bdb3a24772a"
 )
 _INGRESS_CONFIG_DIGEST = (
-    "sha256:e2d2c264d05e4a1167d5593122793e5fce51c6e599312a4d98cfa512617a721b"
+    "sha256:11c31e6d3e163a22c0d688b8a0c7570d1a715e9c7e0b7785fed02968e08a0643"
 )
 _INGRESS_CONFIG_TARGET = "/usr/local/etc/haproxy/haproxy.cfg"
 _COMPOSE_HEALTHCHECK = [
@@ -93,7 +93,20 @@ _INGRESS_HEALTHCHECK = [
     "-ec",
     (
         "wget -qO- -T 2 http://127.0.0.1:8080/healthz "
-        "| grep -q '\"status\":\"ok\"'"
+        "| grep -q '\"status\":\"ok\"' "
+        "&& wget -qO- -T 2 http://127.0.0.1:8080/ "
+        "| grep -Fq '<div id=\"root\"></div>'"
+    ),
+]
+_REVIEWER_HEALTHCHECK = [
+    "CMD",
+    "python",
+    "-c",
+    (
+        "import urllib.request; "
+        "r=urllib.request.urlopen('http://127.0.0.1:8081/', timeout=2); "
+        "assert r.status==200 and r.headers['Cache-Control']=='no-store' and "
+        "r.headers['X-Content-Type-Options']=='nosniff'"
     ),
 ]
 
@@ -1293,14 +1306,19 @@ def validate_compose_document(
         or set(document)
         != {"configs", "name", "networks", "secrets", "services", "volumes"}
         or not isinstance(document.get("services"), dict)
-        or set(document["services"]) != {"backend", "ingress"}
+        or set(document["services"]) != {"backend", "ingress", "reviewer"}
     ):
         raise OperatorError(
-            "resolved Compose must contain only the backend and ingress services"
+            "resolved Compose must contain only backend, reviewer, and ingress"
         )
     backend = document["services"].get("backend")
     ingress = document["services"].get("ingress")
-    if not isinstance(backend, dict) or not isinstance(ingress, dict):
+    reviewer = document["services"].get("reviewer")
+    if (
+        not isinstance(backend, dict)
+        or not isinstance(ingress, dict)
+        or not isinstance(reviewer, dict)
+    ):
         raise OperatorError("resolved Compose services are invalid")
     project_name = document.get("name")
     if (
@@ -1330,6 +1348,25 @@ def validate_compose_document(
     }
     if backend.get("build") is not None:
         backend_keys.add("build")
+    reviewer_keys = {
+        "cap_drop",
+        "command",
+        "deploy",
+        "entrypoint",
+        "healthcheck",
+        "image",
+        "init",
+        "logging",
+        "networks",
+        "pids_limit",
+        "read_only",
+        "restart",
+        "security_opt",
+        "stop_grace_period",
+        "user",
+    }
+    if reviewer.get("build") is not None:
+        reviewer_keys.add("build")
     ingress_keys = {
         "cap_drop",
         "command",
@@ -1350,7 +1387,11 @@ def validate_compose_document(
         "stop_grace_period",
         "user",
     }
-    if set(backend) != backend_keys or set(ingress) != ingress_keys:
+    if (
+        set(backend) != backend_keys
+        or set(ingress) != ingress_keys
+        or set(reviewer) != reviewer_keys
+    ):
         raise OperatorError("resolved Compose services contain unexpected authority")
     backend_build = backend.get("build")
     if backend_build is not None and backend_build != {
@@ -1358,6 +1399,12 @@ def validate_compose_document(
         "dockerfile": "services/backend/Dockerfile",
     }:
         raise OperatorError("backend build authority differs from the repository root")
+    reviewer_build = reviewer.get("build")
+    if reviewer_build is not None and reviewer_build != {
+        "context": str(_REPOSITORY_ROOT),
+        "dockerfile": "services/reviewer-web/Dockerfile",
+    }:
+        raise OperatorError("reviewer build authority differs from the repository root")
 
     _validate_compose_service_common(
         backend,
@@ -1373,10 +1420,22 @@ def validate_compose_document(
         pids_limit=64,
         healthcheck_test=_INGRESS_HEALTHCHECK,
     )
+    _validate_compose_service_common(
+        reviewer,
+        label="reviewer",
+        user="10002:10002",
+        pids_limit=64,
+        healthcheck_test=_REVIEWER_HEALTHCHECK,
+    )
     if backend.get("ports") or backend.get("depends_on") or backend.get("configs"):
         raise OperatorError("backend must not publish or join the ingress authority")
     if ingress.get("volumes") or ingress.get("secrets") or ingress.get("build"):
         raise OperatorError("ingress must not receive state, config, or secret authority")
+    if any(
+        reviewer.get(field)
+        for field in ("configs", "depends_on", "ports", "secrets", "volumes")
+    ):
+        raise OperatorError("reviewer must not receive deployment authority")
 
     networks = document.get("networks")
     if not isinstance(networks, dict) or set(networks) != {
@@ -1408,6 +1467,8 @@ def validate_compose_document(
         raise OperatorError("Compose networks violate the closed bridge topology")
     if backend.get("networks") != {"tacua-default-deny": None}:
         raise OperatorError("backend must join only the egress-denied network")
+    if reviewer.get("networks") != {"tacua-default-deny": None}:
+        raise OperatorError("reviewer must join only the egress-denied network")
     if ingress.get("networks") != {
         "tacua-default-deny": None,
         "tacua-loopback-publish": None,
@@ -1419,9 +1480,14 @@ def validate_compose_document(
             "condition": "service_healthy",
             "required": True,
             "restart": True,
-        }
+        },
+        "reviewer": {
+            "condition": "service_healthy",
+            "required": True,
+            "restart": True,
+        },
     }:
-        raise OperatorError("ingress must wait for the one healthy backend")
+        raise OperatorError("ingress must wait for the healthy backend and reviewer")
     ports = ingress.get("ports")
     if not isinstance(ports, list) or len(ports) != 1:
         raise OperatorError("ingress must publish one loopback port")
@@ -1551,14 +1617,18 @@ def validate_compose_document(
         raise OperatorError("backend Compose secret definition is not one file")
 
     backend_image = backend.get("image")
+    reviewer_image = reviewer.get("image")
     if (
         not isinstance(backend_image, str)
+        or not isinstance(reviewer_image, str)
         or ingress.get("image") != _INGRESS_IMAGE
         or (
             require_immutable_image
             and (
                 _IMMUTABLE_IMAGE.fullmatch(backend_image) is None
                 or backend.get("build") is not None
+                or _IMMUTABLE_IMAGE.fullmatch(reviewer_image) is None
+                or reviewer.get("build") is not None
             )
         )
     ):
@@ -1571,8 +1641,12 @@ def validate_compose_document(
         "published_host": port["host_ip"],
         "published_port": published,
         "image": backend_image,
+        "reviewer_image": reviewer_image,
         "ingress_image": _INGRESS_IMAGE,
-        "immutable_image": _IMMUTABLE_IMAGE.fullmatch(backend_image) is not None,
+        "immutable_image": (
+            _IMMUTABLE_IMAGE.fullmatch(backend_image) is not None
+            and _IMMUTABLE_IMAGE.fullmatch(reviewer_image) is not None
+        ),
     }
 
 

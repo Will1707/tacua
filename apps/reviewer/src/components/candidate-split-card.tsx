@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import * as Crypto from "expo-crypto";
-import { Alert, Pressable, Text, View } from "react-native";
+import { Pressable, Text, View } from "react-native";
 import { useEffect, useRef, useState } from "react";
 
 import { createCandidateReplacementRequest, seedSplitDraft, seedSplitDrafts } from "@/api/candidate-replacement";
@@ -9,6 +9,7 @@ import type { CandidateReplacementDraft, TicketCandidate } from "@/api/types";
 import { ActionButton } from "@/components/action-button";
 import { CandidateReplacementDraftFields } from "@/components/candidate-replacement-draft-fields";
 import { SectionCard } from "@/components/section-card";
+import { useAppDialog } from "@/providers/app-dialog";
 import { colors } from "@/theme/colors";
 
 type Props = {
@@ -24,6 +25,7 @@ function newCandidateId(): string {
 }
 
 export function CandidateSplitCard({ actorId, candidate, disabled, saving, onSubmit }: Props) {
+  const showDialog = useAppDialog();
   const [drafts, setDrafts] = useState<readonly CandidateReplacementDraft[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [expandedDraftId, setExpandedDraftId] = useState<string | null>(null);
@@ -107,7 +109,7 @@ export function CandidateSplitCard({ actorId, candidate, disabled, saving, onSub
         : "Review the result fields before continuing.");
       return;
     }
-    Alert.alert(
+    showDialog(
       `Replace 1 active ticket with ${drafts.length} drafts?`,
       `“${candidate.content.title}” will leave the active queue. It remains visible in history and links to every replacement. None of the new drafts will be approved automatically.`,
       [

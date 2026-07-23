@@ -6,7 +6,7 @@ Canonical repository: [`Will1707/tacua`](https://github.com/Will1707/tacua).
 
 The planned V1 consists of:
 
-- an iOS reviewer app;
+- an iOS-first reviewer app with a same-origin self-hosted browser build;
 - a development-build SDK embedded in the app under test; and
 - a Docker-packaged backend for upload, asynchronous research, candidate review, and approved Markdown/JSON handoff.
 
@@ -48,8 +48,8 @@ The first pilot targets an authorized private Expo/React Native iOS app. The V1 
 - [`contracts/local-processing`](contracts/local-processing/README.md): canonical synthetic adapter-1.0/1.1 and isolated-wrapper-1.0 conformance fixtures with a dependency-free, content-free validator. They freeze dormant wire compatibility without selecting or activating a processor.
 - [`contracts/ticket-candidate`](contracts/ticket-candidate/README.md): the standalone production draft/review contract for immutable candidate versions, evidence-manifest binding, visual clarification choices, atomic split/merge replacement, and exact human approval before approved-handoff export.
 - [`contracts/sdk-backend-protocol`](contracts/sdk-backend-protocol/README.md): the exact retry-safe SDK wire contract for scoped Keychain credentials, media and diagnostic receipts, idempotent completion, local cleanup authority, and deletion.
-- [`apps/reviewer`](apps/reviewer/README.md): an iOS-first Expo reviewer app with secure self-hosted configuration, QA-build launch orchestration, session/evidence/job views, clarification choices, atomic split/merge replacement, exact-version human approval, and verified Markdown/JSON file sharing.
-- [`services/backend`](services/backend/README.md): a dependency-free, Docker-packaged upload boundary with fixed deployment scope, integrity-checked segment and diagnostic persistence, contract-valid processing jobs, immutable evidence-linked candidate review and replacement, atomic approved-handoff persistence, durable deletion, operator backup/restore tooling, an opt-in provider-neutral local processing command adapter, and a separate host-side isolated private-pilot processor gate. The checked-in deployment keeps external egress disabled; selecting and authorizing a real transcription/research implementation remains operator work.
+- [`apps/reviewer`](apps/reviewer/README.md): an iOS-first Expo reviewer app with a same-origin, authority-free browser image; secure self-hosted configuration; QA-build launch orchestration; session/evidence/job views; clarification choices; atomic split/merge replacement; exact-version human approval; and verified Markdown/JSON sharing.
+- [`services/backend`](services/backend/README.md): a dependency-free, Docker-packaged upload boundary with fixed deployment scope, integrity-checked segment and diagnostic persistence, contract-valid processing jobs, immutable evidence-linked candidate review and replacement, atomic approved-handoff persistence, durable deletion, operator backup/restore tooling, an opt-in provider-neutral local processing command adapter, and a separate host-side isolated private-pilot processor gate. The checked-in Compose deployment keeps the backend and reviewer on an egress-denied network and routes both through one loopback ingress; selecting and authorizing a real transcription/research implementation remains operator work.
 - [`services/backend/TAILNET_PRIVATE_PILOT.md`](services/backend/TAILNET_PRIVATE_PILOT.md): a checked, single-owner Tailscale HTTPS-to-loopback test profile that avoids public hosting while explicitly remaining outside the production reverse-proxy gate.
 - [`docs/design/visual-direction.md`](docs/design/visual-direction.md): the adaptive, cicada-derived light and dark colour system used by the reviewer app.
 
@@ -71,19 +71,27 @@ python3 -B -m unittest discover -s experiments/eval-harness/tests -v
 node --test experiments/security-harness/test/harness.test.mjs
 sh experiments/ios-capture-spike/package/tests/run-core-tests.sh
 npm --prefix apps/reviewer ci --ignore-scripts --no-audit --no-fund
+node .github/scripts/generate-reviewer-third-party-notices.mjs
 npm --prefix apps/reviewer test
 npm --prefix apps/reviewer run typecheck
 npm --prefix apps/reviewer run export:ios
+npm --prefix apps/reviewer run export:web -- --output-dir dist --clear
+node --test .github/scripts/validate-reviewer-web-image-inputs.test.mjs
+node .github/scripts/validate-reviewer-web-image-inputs.mjs
+node .github/scripts/smoke-reviewer-web-browser.mjs
+PYTHONWARNINGS=error python3 -B -m unittest discover \
+  -s services/reviewer-web/tests -v
 node --test .github/scripts/check-markdown-links.test.mjs
 node .github/scripts/check-markdown-links.mjs
 ```
 
 The security harness and repository checks require Node 22 or newer. On an
 isolated Docker host, `bash .github/scripts/verify-backend-container.sh` runs the
-same hardened image, single-writer, smoke, backup, restore, and restored-start
-gate as CI. It refuses to replace colliding Docker resources and removes only
-the uniquely named resources it creates. The older Docker topology probe is a
-separate experiment; read its runbook before running it.
+same hardened backend and reviewer images, same-origin routing, single-writer,
+smoke, backup, restore, and restored-start gate as CI. It refuses to replace
+colliding Docker resources and removes only the uniquely named resources it
+creates. The older Docker topology probe is a separate experiment; read its
+runbook before running it.
 
 ## Safety boundary
 

@@ -181,8 +181,17 @@ start Compose:
 PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool \
   create-admin-secret \
   --destination services/backend/local/admin-secret
+npm --prefix apps/reviewer ci --ignore-scripts --no-audit --no-fund
+node .github/scripts/generate-reviewer-third-party-notices.mjs
+npm --prefix apps/reviewer run export:web -- --output-dir dist --clear
+node --test .github/scripts/validate-reviewer-web-image-inputs.test.mjs
+node .github/scripts/validate-reviewer-web-image-inputs.mjs
 docker compose -f services/backend/compose.yaml up --build
 ```
+
+These reviewer preparation commands are part of clean-clone startup. The
+reviewer image intentionally consumes a prevalidated static export and notice
+inventory and does not install or compile dependencies during `docker build`.
 
 Compose implements file-backed secrets as read-only bind mounts and cannot
 remap their owner. The exact mode `0444` lets the fixed non-root container read
