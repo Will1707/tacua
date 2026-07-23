@@ -189,6 +189,93 @@ const processed = await TacuaCapture.processAdmittedCapture({
 });
 ```
 
+### Backend-managed host controller
+
+`createBackendManagedHostController()` is the dependency-light orchestration
+foundation for an Expo QA host. It is intentionally not a React hook and does
+not create a second app. A future host screen can subscribe to its immutable
+snapshot and render the finite `phase`, `mutation`, and `actions` unions without
+reimplementing lifecycle ordering:
+
+```ts
+import * as TacuaCapture from '@tacua/mobile-sdk';
+
+const controller = TacuaCapture.createBackendManagedHostController({
+  segmentDurationSeconds: 10,
+});
+
+const unsubscribe = controller.subscribe((snapshot) => {
+  // Render snapshot.phase and snapshot.actions. While mutation is non-null,
+  // actions is empty so a UI cannot start an overlapping native mutation.
+  renderCaptureState(snapshot);
+});
+
+// Forward an incoming link immediately. The controller does not retain the URL,
+// launch code, consent-request ID, or approved-launch ID in its public snapshot.
+await controller.prepareLaunch(incomingURL);
+
+// Present the exact consent contract named by the awaiting_launch_consent phase.
+await controller.respondToLaunchConsent(true);
+await controller.exchangeApprovedLaunch();
+
+const next = controller.getSnapshot().phase;
+if (next.kind === 'plan_ready' && next.nextAction === 'start_capture') {
+  await controller.startPlannedCapture();
+} else if (
+  next.kind === 'plan_ready' &&
+  next.nextAction === 'resume_capture'
+) {
+  await controller.resumePlannedCapture();
+}
+
+// The host still decides when the person stops. Admission remains an explicit
+// stopped-capture boundary; transport then runs entirely through native code.
+await controller.stopCapture();
+await controller.admitAndDrain();
+
+// Call only on a real inactive/background -> active transition. It retries an
+// already admitted exact native request, or discovers admitted work after relaunch.
+await controller.notifyForeground();
+
+unsubscribe();
+controller.dispose();
+```
+
+Every mutating method is serialized. Discovery is capped (64 sessions by
+default, configurable only from 1 through 128), segment duration stays inside
+the SDK's integer 2...60-second bound, and a RESUME link must match exactly one
+fresh native queue before consent can be approved. Unknown START/RESUME outcomes
+remain operator-reconciliation actions; the controller never guesses whether a
+remote exchange succeeded. Subscriber exceptions cannot interrupt lifecycle
+work, and public errors expose only a closed controller category plus an
+allowlisted, bounded native error code—not native error text.
+
+The fixed interrupted-capture choices are projected as typed actions. With a
+current recovered or freshly resumed plan, the host can call
+`resumePlannedCapture()` or `keepVerifiedPartial()`. The destructive choice is
+the backend-managed `requestAuthenticatedReset()` followed by a separate
+`confirmAuthenticatedReset()`; the controller deliberately uses
+`deleteBackendSession`, not identity fields or a JS HTTP client. Admission and
+upload also call only native SDK primitives, so JavaScript never receives a
+bearer secret, constructs backend request bytes, or selects a backend origin,
+remote session, deletion reason, build identity, scope, or retention deadline.
+The existing native plan bridge does return its validated `CaptureStartOptions`
+projection to private controller state because the low-level `start()` and
+`resume()` APIs require it. Those plan fields are never included in a public
+snapshot, but they do exist in JavaScript memory until the lifecycle no longer
+needs them; replacing that pair with an opaque native plan handle is a future
+hardening step.
+
+There is one deliberate current API constraint: after process relaunch, an
+ordinary committed queue does not expose enough authority to reconstruct
+`CaptureStartOptions` in JavaScript. Resume or “keep verified partial” therefore
+requires a fresh matching reviewer RESUME launch unless a validated START or
+RESUME receipt journal is recoverable. Discovery exposes
+`request_resume_launch` for that state. Authenticated reset and replay of already
+admitted work remain available without reconstructing those options. Adding a
+native queue-to-capture-plan recovery API would remove this extra reviewer-link
+step without weakening the secret boundary.
+
 Native code loads the build-time `TacuaSDKProfileJSON`, validates its exact
 canonical bytes and digest against the installed app bundle, generates the
 local session ID and consent/request timestamp, materializes the dynamic scope,
