@@ -1446,7 +1446,7 @@ def validate_compose_document(
         raise OperatorError("backend build authority differs from the repository root")
     reviewer_build = reviewer.get("build")
     if reviewer_build is not None and reviewer_build != {
-        "context": str(_REPOSITORY_ROOT),
+        "context": str(repository_root),
         "dockerfile": "services/reviewer-web/Dockerfile",
     }:
         raise OperatorError("reviewer build authority differs from the repository root")

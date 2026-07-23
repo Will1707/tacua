@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from datetime import datetime, timedelta, timezone
 import json
 import os
@@ -683,6 +684,9 @@ class OperatorToolTests(unittest.TestCase):
             document["services"]["backend"]["build"]["context"] = str(
                 verified_source
             )
+            document["services"]["reviewer"]["build"]["context"] = str(
+                verified_source
+            )
 
             with self.assertRaisesRegex(
                 OperatorError,
@@ -701,6 +705,21 @@ class OperatorToolTests(unittest.TestCase):
                 expected_repository_root=verified_source,
             )
             self.assertFalse(validated["immutable_image"])
+
+            split_context = copy.deepcopy(document)
+            split_context["services"]["reviewer"]["build"]["context"] = str(
+                REPOSITORY
+            )
+            with self.assertRaisesRegex(
+                OperatorError,
+                "reviewer build authority differs",
+            ):
+                validate_compose_document(
+                    split_context,
+                    config,
+                    require_immutable_image=False,
+                    expected_repository_root=verified_source,
+                )
 
             preflight = deployment_preflight(
                 config_file,
