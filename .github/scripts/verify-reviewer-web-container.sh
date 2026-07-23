@@ -129,6 +129,7 @@ assert config["ExposedPorts"] == {"8081/tcp": {}}
 assert config.get("Volumes") in (None, {})
 '
 
+docker container stop --time 10 "$container" >/dev/null
 docker container rm "$container" >/dev/null
 cleanup_container=false
 reviewer_image_id="$(docker image inspect --format '{{.Id}}' "$image")"

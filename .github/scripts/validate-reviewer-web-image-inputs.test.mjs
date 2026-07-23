@@ -33,12 +33,30 @@ const dockerignore = readFileSync(
   "utf8",
 );
 const exportRoot = path.join(root, "apps/reviewer/dist");
+const verifier = readFileSync(
+  path.join(root, ".github/scripts/verify-reviewer-web-container.sh"),
+  "utf8",
+);
 
 test("accepts the exact reviewer Docker boundary and generated export", () => {
   validateDockerDefinition(dockerfile, dockerignore);
   const result = validateReviewerExport(exportRoot);
   assert.equal(result.status, "ok");
   assert.match(result.bundle, /^_expo\/static\/js\/web\/entry-[a-f0-9]{32}\.js$/u);
+});
+
+test("stops the healthy reviewer before normal verification cleanup", () => {
+  const stop = 'docker container stop --time 10 "$container" >/dev/null';
+  const remove = 'docker container rm "$container" >/dev/null';
+  const stopIndex = verifier.lastIndexOf(stop);
+  const removeIndex = verifier.lastIndexOf(remove);
+
+  assert.notEqual(stopIndex, -1, "successful cleanup must stop the container");
+  assert.notEqual(removeIndex, -1, "successful cleanup must remove the container");
+  assert.ok(
+    stopIndex < removeIndex,
+    "successful cleanup must stop the reviewer before removing it",
+  );
 });
 
 test("rejects mutable image, expanded build context, and added authority", () => {
