@@ -45,6 +45,7 @@ The first pilot targets an authorized private Expo/React Native iOS app. The V1 
 - [`experiments/docker-topology-probe`](experiments/docker-topology-probe/README.md): a non-production container lifecycle probe. It does not select or implement the backend topology.
 - [`contracts/approved-handoff`](contracts/approved-handoff/README.md): a strict candidate Markdown/JSON agent-handoff contract that separates offline structure from externally authenticated execution trust. [ADR-017](docs/decisions/ADR-017-codex-execution-trust.md) accepts the single-host private-pilot Codex assertion/revocation subset; the broader remote-production trust decision in [ADR-011](docs/decisions/ADR-011-approved-handoff.md) remains proposed, and no trusted real-consumer trial has passed.
 - [`contracts/runtime`](contracts/runtime/README.md): strict candidate contracts for the capture/upload manifest, sanitized SDK diagnostics, asynchronous processing jobs, and editable ticket lifecycle. Structural validation does not authorize capture, egress, or agent execution.
+- [`contracts/local-processing`](contracts/local-processing/README.md): canonical synthetic adapter-1.0/1.1 and isolated-wrapper-1.0 conformance fixtures with a dependency-free, content-free validator. They freeze dormant wire compatibility without selecting or activating a processor.
 - [`contracts/ticket-candidate`](contracts/ticket-candidate/README.md): the standalone production draft/review contract for immutable candidate versions, evidence-manifest binding, visual clarification choices, atomic split/merge replacement, and exact human approval before approved-handoff export.
 - [`contracts/sdk-backend-protocol`](contracts/sdk-backend-protocol/README.md): the exact retry-safe SDK wire contract for scoped Keychain credentials, media and diagnostic receipts, idempotent completion, local cleanup authority, and deletion.
 - [`apps/reviewer`](apps/reviewer/README.md): an iOS-first Expo reviewer app with secure self-hosted configuration, QA-build launch orchestration, session/evidence/job views, clarification choices, atomic split/merge replacement, exact-version human approval, and verified Markdown/JSON file sharing.
@@ -59,6 +60,9 @@ The contract and synthetic harnesses have no network dependency:
 python3 -B -m unittest discover -s contracts/approved-handoff/tests -v
 python3 -B contracts/runtime/scripts/validate.py bundle contracts/runtime/fixtures/positive
 python3 -B -m unittest discover -s contracts/runtime/tests -v
+python3 -B contracts/local-processing/scripts/regenerate_fixtures.py --check
+python3 -B contracts/local-processing/scripts/validate.py fixtures contracts/local-processing/fixtures
+PYTHONWARNINGS=error python3 -B -m unittest discover -s contracts/local-processing/tests -v
 PYTHONWARNINGS=error python3 -B -m unittest discover -s contracts/ticket-candidate/tests -v
 PYTHONWARNINGS=error python3 -B -m unittest discover -s contracts/sdk-backend-protocol/tests -v
 PYTHONWARNINGS=error python3 -B -m unittest discover -s services/backend/tests -v
