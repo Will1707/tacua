@@ -45,11 +45,12 @@ The first pilot targets an authorized private Expo/React Native iOS app. The V1 
 - [`experiments/docker-topology-probe`](experiments/docker-topology-probe/README.md): a non-production container lifecycle probe. It does not select or implement the backend topology.
 - [`contracts/approved-handoff`](contracts/approved-handoff/README.md): a strict candidate Markdown/JSON agent-handoff contract that separates offline structure from externally authenticated execution trust. [ADR-017](docs/decisions/ADR-017-codex-execution-trust.md) accepts the single-host private-pilot Codex assertion/revocation subset; the broader remote-production trust decision in [ADR-011](docs/decisions/ADR-011-approved-handoff.md) remains proposed, and no trusted real-consumer trial has passed.
 - [`contracts/runtime`](contracts/runtime/README.md): strict candidate contracts for the capture/upload manifest, sanitized SDK diagnostics, asynchronous processing jobs, and editable ticket lifecycle. Structural validation does not authorize capture, egress, or agent execution.
-- [`contracts/local-processing`](contracts/local-processing/README.md): canonical synthetic adapter-1.0/1.1 and isolated-wrapper-1.0 conformance fixtures with a dependency-free, content-free validator. They freeze dormant wire compatibility without selecting or activating a processor.
+- [`contracts/local-processing`](contracts/local-processing/README.md): canonical synthetic adapter-1.0/1.1 and isolated-wrapper-1.0 conformance fixtures with a dependency-free, content-free validator. They freeze dormant wire compatibility independently of any optional processor implementation.
 - [`contracts/ticket-candidate`](contracts/ticket-candidate/README.md): the standalone production draft/review contract for immutable candidate versions, evidence-manifest binding, visual clarification choices, atomic split/merge replacement, and exact human approval before approved-handoff export.
 - [`contracts/sdk-backend-protocol`](contracts/sdk-backend-protocol/README.md): the exact retry-safe SDK wire contract for scoped Keychain credentials, media and diagnostic receipts, idempotent completion, local cleanup authority, and deletion.
 - [`apps/reviewer`](apps/reviewer/README.md): an iOS-first Expo reviewer app with a same-origin, authority-free browser image; secure self-hosted configuration; QA-build launch orchestration; session/evidence/job views; clarification choices; atomic split/merge replacement; exact-version human approval; and verified Markdown/JSON sharing.
-- [`services/backend`](services/backend/README.md): a dependency-free, Docker-packaged upload boundary with fixed deployment scope, integrity-checked segment and diagnostic persistence, contract-valid processing jobs, immutable evidence-linked candidate review and replacement, atomic approved-handoff persistence, durable deletion, operator backup/restore tooling, an opt-in provider-neutral local processing command adapter, and a separate host-side isolated private-pilot processor gate. The checked-in Compose deployment keeps the backend and reviewer on an egress-denied network and routes both through one loopback ingress; selecting and authorizing a real transcription/research implementation remains operator work.
+- [`services/backend`](services/backend/README.md): a dependency-free, Docker-packaged upload boundary with fixed deployment scope, integrity-checked segment and diagnostic persistence, contract-valid processing jobs, immutable evidence-linked candidate review and replacement, atomic approved-handoff persistence, durable deletion, operator backup/restore tooling, an opt-in provider-neutral local processing command adapter, and a separate host-side isolated private-pilot processor gate. The checked-in Compose deployment keeps the backend and reviewer on an egress-denied network and routes both through one loopback ingress; processing remains operator-triggered.
+- [`services/processor`](services/processor/README.md): an optional offline marked-session processor candidate that pins its base image and `whisper.cpp` source, accepts an operator-supplied digest-verified model, extracts issue screenshots and bounded narration windows, and creates conservative draft candidates inside the isolated runner. Repository and observability research, real-model terminal-stage validation, and release promotion remain open gates.
 - [`services/backend/TAILNET_PRIVATE_PILOT.md`](services/backend/TAILNET_PRIVATE_PILOT.md): a checked, single-owner Tailscale HTTPS-to-loopback test profile that avoids public hosting while explicitly remaining outside the production reverse-proxy gate.
 - [`docs/design/visual-direction.md`](docs/design/visual-direction.md): the adaptive, cicada-derived light and dark colour system used by the reviewer app.
 
@@ -67,8 +68,12 @@ PYTHONWARNINGS=error python3 -B -m unittest discover -s contracts/local-processi
 PYTHONWARNINGS=error python3 -B -m unittest discover -s contracts/ticket-candidate/tests -v
 PYTHONWARNINGS=error python3 -B -m unittest discover -s contracts/sdk-backend-protocol/tests -v
 PYTHONWARNINGS=error python3 -B -m unittest discover -s services/backend/tests -v
+PYTHONWARNINGS=error python3 -B -m unittest discover -s services/processor/tests -v
 python3 -B -m unittest discover -s experiments/eval-harness/tests -v
 node --test experiments/security-harness/test/harness.test.mjs
+node --test .github/scripts/validate-processor-image-inputs.test.mjs
+node --test .github/scripts/verify-processor-container.test.mjs
+node .github/scripts/validate-processor-image-inputs.mjs
 sh experiments/ios-capture-spike/package/tests/run-core-tests.sh
 npm --prefix apps/reviewer ci --ignore-scripts --no-audit --no-fund
 node .github/scripts/generate-reviewer-third-party-notices.mjs
@@ -92,6 +97,18 @@ smoke, backup, restore, and restored-start gate as CI. It refuses to replace
 colliding Docker resources and removes only the uniquely named resources it
 creates. The older Docker topology probe is a separate experiment; read its
 runbook before running it.
+
+On an isolated Docker host,
+`bash .github/scripts/verify-processor-container.sh` builds and smoke-tests the
+offline processor with no network, a read-only root, an unprivileged UID, and
+synthetic checkpoint data. For pilot or release promotion, begin from a clean
+checkout of the exact immutable commit and set
+`TACUA_KEEP_VERIFIED_IMAGES=true` plus a unique
+`TACUA_PROCESSOR_TEST_ID`. Publish the successful retained image by the image
+ID printed by the verifier; do not rebuild it. After pushing, record the
+registry repository digest and configure the runner with that
+`registry/repository@sha256:...` reference. The printed local image ID and the
+registry digest are separate evidence and must not be conflated.
 
 ## Safety boundary
 
