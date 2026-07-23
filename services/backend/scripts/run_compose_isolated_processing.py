@@ -5068,7 +5068,7 @@ def run_compose_processing(args: argparse.Namespace) -> dict[str, Any]:
         _write_private_snapshot(
             isolated_command_snapshot,
             isolated_command_payload,
-            0o400,
+            0o600,
         )
         pre_journal_stage = "BACKEND_RESOLUTION"
         compose_prefix = _compose_prefix(args.project, compose_snapshot)

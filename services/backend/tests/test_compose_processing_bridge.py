@@ -252,6 +252,18 @@ class ComposeProcessingBridgeTests(unittest.TestCase):
                     "role": attempt["role"],
                 }
 
+            def broker_process(
+                _socket_path,
+                command_snapshot,
+                _command_digest,
+                _max_requests,
+            ):
+                self.assertEqual(
+                    stat.S_IMODE(command_snapshot.stat().st_mode),
+                    0o600,
+                )
+                return object()
+
             consumers = [
                 {backend_id},
                 {backend_id},
@@ -318,7 +330,7 @@ class ComposeProcessingBridgeTests(unittest.TestCase):
                 mock.patch.object(
                     BRIDGE,
                     "_broker_process",
-                    return_value=object(),
+                    side_effect=broker_process,
                 ),
                 mock.patch.object(
                     BRIDGE,
