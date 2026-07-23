@@ -269,10 +269,14 @@ worker from the trusted host so the runner can use the host container runtime.
 Do not mount the Docker socket into the backend or processor container. The
 runner is trusted Tacua boundary code; the selected processor image is not.
 
-The worker's ordinary `tacua.local-processing-command@1.0.0` document must give
-the runner the parent's exact 240-second deadline. The adapter exports that
-actual value as `TACUA_ADAPTER_TIMEOUT_SECONDS`; the runner rejects any other
-value. An illustrative outer document is:
+The worker's outer local-processing command must give the runner the parent's
+exact 240-second deadline. The adapter exports that actual value as
+`TACUA_ADAPTER_TIMEOUT_SECONDS`; the runner rejects any other value. Legacy
+pipeline work uses the frozen `tacua.local-processing-command@1.0.0` shape
+below. Dormant pipeline-1.1 work requires an explicit
+`tacua.local-processing-command@1.1.0` document with the same five fields; no
+checked-in command or deployment default selects it. An illustrative legacy
+outer document is:
 
 ```json
 {"argv":["/usr/bin/python3","/absolute/checkout/services/backend/scripts/run_isolated_processor.py","--command-file","/absolute/operator/path/isolated-command.json","--input","{input}","--output-directory","{output_directory}"],"contract_version":"tacua.local-processing-command@1.0.0","max_stderr_bytes":65536,"max_stdout_bytes":16777216,"timeout_seconds":240}
@@ -298,6 +302,14 @@ The separately mode-`0600`, operator-owned
   ]
 }
 ```
+
+The isolated command contract stays at 1.0 for both outer adapter versions; it
+selects isolation resources, not the nested local-processing wire. Likewise,
+the container continues to receive
+`tacua.isolated-processing-input@1.0.0` and return
+`tacua.isolated-processing-output@1.0.0`. Those wrapper bytes, Docker labels,
+mounts, paths and limits do not version-bump merely because their sealed
+`source_input` or `result` member carries local-processing 1.1.
 
 This is an illustrative shape, not a selected image, executable, or model. The
 repository downloads none of them and supplies no default. The image must
@@ -329,13 +341,24 @@ a read-only root, and has no host bind. After archive upload, the host payload
 is deleted after the carrier and volume are re-inspected to prove the carrier
 remained in its exact never-started state. The stopped carrier is then removed
 and verified absent before the untrusted final entrypoint starts. The bundle
-preserves `source_input_digest`, rewrites only evidence paths, and adds its own
-`isolated_input_digest`. There is no output mount. The processor emits one exact
-canonical `tacua.isolated-processing-output@1.0.0` JSON envelope on attached
-stdout. It contains a result object plus its digest and an ordered preview list;
-each preview binds a safe filename, canonical base64 body, decoded size and
-SHA-256. Envelope entries must be exactly the unique `body_file` set referenced
-by the result's candidate previews—missing and unreferenced bodies are rejected.
+accepts only the exact top-level shape for nested local input 1.0 or 1.1.
+Version 1.0 must not contain `stage_inputs`. Version 1.1 admits only
+`transcribe` with an empty artifact array or `align` with one transcript whose
+closed shape, source binding, retention timestamp, self-digest and 4 MiB bound
+are revalidated. The full inline artifact is preserved exactly as a JSON value
+and is never interpreted as a path or copied into another file. The runner
+preserves the original `source_input_digest`, rewrites only capture evidence
+descriptor paths, and adds an `isolated_input_digest` over the complete
+rewritten wrapper, including `stage_inputs`. The existing 16 MiB source and
+wrapper limits remain unchanged. There is no output mount. The processor emits
+one exact canonical `tacua.isolated-processing-output@1.0.0` JSON envelope on
+attached stdout. It contains a result object plus its digest and an ordered
+preview list. The nested local result must be 1.0 for source input 1.0 and 1.1
+for source input 1.1. Local result 1.1 remains checkpoint-only here and requires
+an empty preview list. Each admitted preview binds a safe filename, canonical
+base64 body, decoded size and SHA-256. Envelope entries must be exactly the
+unique `body_file` set referenced by the result's candidate previews—missing
+and unreferenced bodies are rejected.
 The runner caps stdout incrementally at 110 MiB, caps and requires empty
 stderr, kills on cap/deadline, and exact-inspects exit/OOM state. It accepts at
 most 64 MiB of decoded result/preview bytes, publishes previews atomically only

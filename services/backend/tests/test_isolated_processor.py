@@ -58,11 +58,175 @@ def sealed_input(evidence_path: str, evidence: bytes = b"synthetic evidence") ->
         },
         "contract_version": RUNNER.SOURCE_INPUT_CONTRACT,
         "input_digest": "sha256:" + "0" * 64,
+        "job": {
+            "job_id": "job_synthetic",
+            "pipeline": {"pipeline_version": RUNNER.LEGACY_PIPELINE_VERSION},
+        },
     }
     subject = copy.deepcopy(value)
     subject.pop("input_digest")
     value["input_digest"] = "sha256:" + hashlib.sha256(RUNNER.canonical_json(subject)).hexdigest()
     return value
+
+
+def sealed_input_v11(
+    evidence_path: str,
+    evidence: bytes = b"synthetic evidence",
+    *,
+    stage_name: str = "align",
+    transcript_text: str = "PRIVATE_ISOLATED_TRANSCRIPT_SENTINEL",
+) -> dict:
+    job_id = "job_artifact_synthetic"
+    session_id = "session_artifact_synthetic"
+    created_at = "2026-07-23T10:02:07Z"
+    derived_data_expires_at = "2026-08-22T10:02:06Z"
+    content_digest = "sha256:" + hashlib.sha256(evidence).hexdigest()
+    source_segment = {
+        "segment_id": "segment_artifact_synthetic",
+        "sequence": 0,
+        "content_digest": content_digest,
+        "start_ms": 0,
+        "end_ms": 1_000,
+    }
+    payload = {
+        "contract_version": RUNNER.TRANSCRIPT_CONTRACT,
+        "language_tag": "en-GB",
+        "speech_status": "detected",
+        "source_segments": [source_segment],
+        "spans": [
+            {
+                "segment_id": source_segment["segment_id"],
+                "start_ms": 0,
+                "end_ms": 1_000,
+                "text": transcript_text,
+            }
+        ],
+    }
+    artifact = {
+        "contract_version": RUNNER.PROCESSING_ARTIFACT_CONTRACT,
+        "media_type": RUNNER.PROCESSING_ARTIFACT_MEDIA_TYPE,
+        "artifact_id": RUNNER._processing_artifact_id(
+            job_id, "transcribe", "transcript"
+        ),
+        "artifact_kind": "transcript",
+        "organization_id": "organization_synthetic",
+        "project_id": "project_synthetic",
+        "session_id": session_id,
+        "job_id": job_id,
+        "stage_name": "transcribe",
+        "checkpoint_job_version": 3,
+        "created_at": created_at,
+        "derived_data_expires_at": derived_data_expires_at,
+        "payload": payload,
+        "artifact_digest": "sha256:" + "0" * 64,
+    }
+    artifact_subject = copy.deepcopy(artifact)
+    artifact_subject.pop("artifact_digest")
+    artifact["artifact_digest"] = "sha256:" + hashlib.sha256(
+        RUNNER.canonical_json(artifact_subject)
+    ).hexdigest()
+    transcribe_state = "succeeded" if stage_name == "align" else "running"
+    stages = [
+        {
+            "name": "transcribe",
+            "state": transcribe_state,
+            "attempt_count": 1,
+            "started_at": "2026-07-23T10:02:06Z",
+            "completed_at": created_at if stage_name == "align" else None,
+            "detail": (
+                "The transcript artifact was published atomically."
+                if stage_name == "align"
+                else None
+            ),
+        },
+        {
+            "name": "align",
+            "state": "running" if stage_name == "align" else "pending",
+            "attempt_count": 1 if stage_name == "align" else 0,
+            "started_at": "2026-07-23T10:02:08Z" if stage_name == "align" else None,
+            "completed_at": None,
+            "detail": None,
+        },
+        *[
+            {
+                "name": name,
+                "state": "pending",
+                "attempt_count": 0,
+                "started_at": None,
+                "completed_at": None,
+                "detail": None,
+            }
+            for name in ("correlate", "research", "generate_tickets")
+        ],
+    ]
+    value = {
+        "binding": {
+            "organization_id": "organization_synthetic",
+            "project_id": "project_synthetic",
+            "session_id": session_id,
+            "job_id": job_id,
+            "job_version": 4 if stage_name == "align" else 2,
+            "stage_name": stage_name,
+        },
+        "capture": {
+            "derived_data_expires_at": derived_data_expires_at,
+            "diagnostics": [],
+            "manifest": {
+                "segments": [
+                    {
+                        "availability": "available",
+                        "content": {"content_digest": content_digest},
+                        "segment_id": source_segment["segment_id"],
+                        "sequence": source_segment["sequence"],
+                        "time_range": {"start_ms": 0, "end_ms": 1_000},
+                    }
+                ]
+            },
+            "segments": [
+                {
+                    "content_digest": content_digest,
+                    "read_only_path": evidence_path,
+                    "segment_id": source_segment["segment_id"],
+                }
+            ],
+        },
+        "contract_version": RUNNER.SOURCE_INPUT_CONTRACT_V11,
+        "input_digest": "sha256:" + "0" * 64,
+        "job": {
+            "job_id": job_id,
+            "pipeline": {
+                "pipeline_version": RUNNER.ARTIFACT_PIPELINE_VERSION,
+                "stages": stages,
+            },
+        },
+        "stage_inputs": {
+            "artifacts": [artifact] if stage_name == "align" else []
+        },
+    }
+    subject = copy.deepcopy(value)
+    subject.pop("input_digest")
+    value["input_digest"] = "sha256:" + hashlib.sha256(
+        RUNNER.canonical_json(subject)
+    ).hexdigest()
+    return value
+
+
+def reseal_source_input(value: dict) -> dict:
+    subject = copy.deepcopy(value)
+    subject.pop("input_digest")
+    value["input_digest"] = "sha256:" + hashlib.sha256(
+        RUNNER.canonical_json(subject)
+    ).hexdigest()
+    return value
+
+
+def reseal_stage_artifact(artifact: dict) -> dict:
+    subject = copy.deepcopy(artifact)
+    subject.pop("artifact_digest")
+    artifact["artifact_digest"] = "sha256:" + hashlib.sha256(
+        RUNNER.canonical_json(subject)
+    ).hexdigest()
+    return artifact
 
 
 def output_envelope(result: dict, previews: list[tuple[str, bytes]] | None = None) -> bytes:
@@ -669,12 +833,28 @@ module._release_runner_lock(descriptor)
                 input_directory = root / "bundle"
                 input_directory.mkdir()
                 output = input_directory / "input.json"
-                RUNNER.prepare_input(source_path, output)
+                result_contract = RUNNER.prepare_input(source_path, output)
                 wrapper = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(RUNNER.SOURCE_RESULT_CONTRACT, result_contract)
                 self.assertEqual(RUNNER.INPUT_CONTRACT, wrapper["contract_version"])
                 self.assertEqual(source["input_digest"], wrapper["source_input_digest"])
                 rewritten = wrapper["source_input"]["capture"]["segments"][0]["read_only_path"]
                 self.assertEqual("/run/tacua-input/evidence/evidence-000000.bin", rewritten)
+                self.assertNotIn("stage_inputs", wrapper["source_input"])
+                expected_source = copy.deepcopy(source)
+                expected_source["capture"]["segments"][0]["read_only_path"] = rewritten
+                expected_wrapper = {
+                    "contract_version": RUNNER.INPUT_CONTRACT,
+                    "isolated_input_digest": "sha256:" + "0" * 64,
+                    "source_input": expected_source,
+                    "source_input_digest": source["input_digest"],
+                }
+                digest_subject = copy.deepcopy(expected_wrapper)
+                digest_subject.pop("isolated_input_digest")
+                expected_wrapper["isolated_input_digest"] = "sha256:" + hashlib.sha256(
+                    RUNNER.canonical_json(digest_subject)
+                ).hexdigest()
+                self.assertEqual(RUNNER.canonical_json(expected_wrapper), output.read_bytes())
                 self.assertEqual(b"synthetic evidence", (input_directory / "evidence" / "evidence-000000.bin").read_bytes())
                 self.assertEqual(0o444, output.stat().st_mode & 0o777)
                 self.assertEqual(
@@ -684,6 +864,180 @@ module._release_runner_lock(descriptor)
                 (input_directory / "evidence").chmod(0o700)
             finally:
                 os.close(descriptor)
+
+    def test_v11_stage_artifact_is_preserved_and_both_digests_bind_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence = root / "evidence.bin"
+            evidence.write_bytes(b"synthetic evidence")
+            descriptor = os.open(evidence, os.O_RDONLY)
+            bundle = root / "bundle"
+            bundle.mkdir()
+            try:
+                source = sealed_input_v11(f"/dev/fd/{descriptor}")
+                source_path = root / "source.json"
+                source_path.write_bytes(RUNNER.canonical_json(source))
+                output = bundle / "input.json"
+                result_contract = RUNNER.prepare_input(source_path, output)
+
+                self.assertEqual(RUNNER.SOURCE_RESULT_CONTRACT_V11, result_contract)
+                wrapper = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    {
+                        "contract_version",
+                        "isolated_input_digest",
+                        "source_input",
+                        "source_input_digest",
+                    },
+                    set(wrapper),
+                )
+                self.assertEqual(RUNNER.INPUT_CONTRACT, wrapper["contract_version"])
+                self.assertEqual(source["input_digest"], wrapper["source_input_digest"])
+                self.assertEqual(
+                    source["stage_inputs"], wrapper["source_input"]["stage_inputs"]
+                )
+                self.assertIn(
+                    "PRIVATE_ISOLATED_TRANSCRIPT_SENTINEL",
+                    RUNNER.canonical_json(wrapper["source_input"]["stage_inputs"]).decode(),
+                )
+                expected_source = copy.deepcopy(source)
+                expected_source["capture"]["segments"][0]["read_only_path"] = (
+                    "/run/tacua-input/evidence/evidence-000000.bin"
+                )
+                self.assertEqual(expected_source, wrapper["source_input"])
+                digest_subject = copy.deepcopy(wrapper)
+                isolated_digest = digest_subject.pop("isolated_input_digest")
+                self.assertEqual(
+                    "sha256:" + hashlib.sha256(
+                        RUNNER.canonical_json(digest_subject)
+                    ).hexdigest(),
+                    isolated_digest,
+                )
+                self.assertEqual(RUNNER.canonical_json(wrapper), output.read_bytes())
+
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                transcribe_source = sealed_input_v11(
+                    f"/dev/fd/{descriptor}", stage_name="transcribe"
+                )
+                transcribe_path = root / "transcribe-source.json"
+                transcribe_path.write_bytes(
+                    RUNNER.canonical_json(transcribe_source)
+                )
+                transcribe_bundle = root / "transcribe-bundle"
+                transcribe_bundle.mkdir()
+                self.assertEqual(
+                    RUNNER.SOURCE_RESULT_CONTRACT_V11,
+                    RUNNER.prepare_input(
+                        transcribe_path, transcribe_bundle / "input.json"
+                    ),
+                )
+                transcribe_wrapper = json.loads(
+                    (transcribe_bundle / "input.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    {"artifacts": []},
+                    transcribe_wrapper["source_input"]["stage_inputs"],
+                )
+            finally:
+                if (bundle / "evidence").exists():
+                    (bundle / "evidence").chmod(0o700)
+                transcribe_evidence = root / "transcribe-bundle" / "evidence"
+                if transcribe_evidence.exists():
+                    transcribe_evidence.chmod(0o700)
+                os.close(descriptor)
+
+    def test_source_contracts_reject_cross_version_stage_inputs_and_tampering(self) -> None:
+        legacy_with_artifacts = sealed_input("/dev/fd/0")
+        legacy_with_artifacts["stage_inputs"] = {"artifacts": []}
+        reseal_source_input(legacy_with_artifacts)
+
+        align_without_artifact = sealed_input_v11("/dev/fd/0")
+        align_without_artifact["stage_inputs"]["artifacts"] = []
+        reseal_source_input(align_without_artifact)
+
+        transcribe_with_artifact = sealed_input_v11("/dev/fd/0")
+        transcribe_with_artifact["binding"]["stage_name"] = "transcribe"
+        reseal_source_input(transcribe_with_artifact)
+
+        extra_stage_input_field = sealed_input_v11("/dev/fd/0")
+        extra_stage_input_field["stage_inputs"]["unexpected"] = []
+        reseal_source_input(extra_stage_input_field)
+
+        wrong_artifact_digest = sealed_input_v11(
+            "/dev/fd/0", transcript_text="PRIVATE_TAMPER_SENTINEL"
+        )
+        wrong_artifact_digest["stage_inputs"]["artifacts"][0]["payload"]["spans"][0][
+            "text"
+        ] = "PRIVATE_CHANGED_SENTINEL"
+        reseal_source_input(wrong_artifact_digest)
+
+        wrong_source_binding = sealed_input_v11("/dev/fd/0")
+        artifact = wrong_source_binding["stage_inputs"]["artifacts"][0]
+        artifact["payload"]["source_segments"][0]["content_digest"] = (
+            "sha256:" + "0" * 64
+        )
+        reseal_stage_artifact(artifact)
+        reseal_source_input(wrong_source_binding)
+
+        nul_transcript_text = sealed_input_v11("/dev/fd/0")
+        artifact = nul_transcript_text["stage_inputs"]["artifacts"][0]
+        artifact["payload"]["spans"][0]["text"] = "private\x00text"
+        reseal_stage_artifact(artifact)
+        reseal_source_input(nul_transcript_text)
+
+        fixture_only_stage_key = sealed_input_v11("/dev/fd/0")
+        transcribe_stage = fixture_only_stage_key["job"]["pipeline"]["stages"][0]
+        transcribe_stage["stage_name"] = transcribe_stage.pop("name")
+        reseal_source_input(fixture_only_stage_key)
+
+        for index, invalid in enumerate(
+            (
+                legacy_with_artifacts,
+                align_without_artifact,
+                transcribe_with_artifact,
+                extra_stage_input_field,
+                wrong_artifact_digest,
+                wrong_source_binding,
+                nul_transcript_text,
+                fixture_only_stage_key,
+            )
+        ):
+            with tempfile.TemporaryDirectory() as directory, self.subTest(index=index):
+                root = Path(directory)
+                source_path = root / "source.json"
+                source_path.write_bytes(RUNNER.canonical_json(invalid))
+                bundle = root / "bundle"
+                bundle.mkdir()
+                with self.assertRaises(RUNNER.IsolationError) as raised:
+                    RUNNER.prepare_input(source_path, bundle / "input.json")
+                self.assertEqual("INVALID_PROCESSING_INPUT", raised.exception.code)
+                self.assertNotIn("PRIVATE_", str(raised.exception))
+
+    def test_v11_artifact_and_source_input_byte_limits_fail_before_copy(self) -> None:
+        source = sealed_input_v11(
+            "/dev/fd/0", transcript_text="PRIVATE_OVERSIZE_SENTINEL"
+        )
+        source_bytes = RUNNER.canonical_json(source)
+        artifact_bytes = RUNNER.canonical_json(
+            source["stage_inputs"]["artifacts"][0]
+        )
+        limits = (
+            ("MAX_PROCESSING_ARTIFACT_BYTES", len(artifact_bytes) - 1),
+            ("MAX_INPUT_BYTES", len(source_bytes) - 1),
+        )
+        for name, maximum in limits:
+            with tempfile.TemporaryDirectory() as directory, self.subTest(name=name):
+                root = Path(directory)
+                source_path = root / "source.json"
+                source_path.write_bytes(source_bytes)
+                bundle = root / "bundle"
+                bundle.mkdir()
+                with mock.patch.object(RUNNER, name, maximum):
+                    with self.assertRaises(RUNNER.IsolationError) as raised:
+                        RUNNER.prepare_input(source_path, bundle / "input.json")
+                self.assertEqual("INVALID_PROCESSING_INPUT", raised.exception.code)
+                self.assertNotIn("PRIVATE_OVERSIZE_SENTINEL", str(raised.exception))
+                self.assertEqual([], list(bundle.iterdir()))
 
     def test_processing_input_rejects_float_unsafe_integer_non_nfc_and_deep_json(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -751,7 +1105,11 @@ module._release_runner_lock(descriptor)
             labeled_staging: Path | None = None
             try:
                 source_path = root / "input.json"
-                source_path.write_bytes(RUNNER.canonical_json(sealed_input(f"/dev/fd/{descriptor}")))
+                source_path.write_bytes(
+                    RUNNER.canonical_json(
+                        sealed_input_v11(f"/dev/fd/{descriptor}")
+                    )
+                )
                 command = {
                     "argv": [
                         "/opt/tacua/processor",
@@ -819,7 +1177,12 @@ module._release_runner_lock(descriptor)
                 def fake_attached(container_name, deadline, cleanup_deadline):
                     commands.append(["docker", "start", "--attach", container_name])
                     command_options.append({"deadline": deadline, "cleanup_deadline": cleanup_deadline})
-                    return output_envelope({"disposition": "checkpoint"}), 0, False
+                    return output_envelope(
+                        {
+                            "contract_version": RUNNER.SOURCE_RESULT_CONTRACT_V11,
+                            "disposition": "checkpoint",
+                        }
+                    ), 0, False
 
                 def fake_cleanup(argv, _deadline):
                     cleanup_commands.append(list(argv))
@@ -850,7 +1213,15 @@ module._release_runner_lock(descriptor)
                     RUNNER, "_validate_completed_processor"
                 ), mock.patch.object(RUNNER.os, "urandom", return_value=b"a" * 12):
                     result = RUNNER.run(command, source_path, output)
-                self.assertEqual(RUNNER.canonical_json({"disposition": "checkpoint"}), result)
+                self.assertEqual(
+                    RUNNER.canonical_json(
+                        {
+                            "contract_version": RUNNER.SOURCE_RESULT_CONTRACT_V11,
+                            "disposition": "checkpoint",
+                        }
+                    ),
+                    result,
+                )
                 payload_copy_index = next(
                     index
                     for index, argv in enumerate(commands)
@@ -878,11 +1249,19 @@ module._release_runner_lock(descriptor)
             finally:
                 os.close(descriptor)
 
-    def test_sensitive_population_failure_still_removes_staging_before_container(self) -> None:
+    def test_v11_sensitive_population_failure_removes_artifact_staging(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             output = root / "output"
             output.mkdir()
+            evidence = root / "evidence.bin"
+            evidence.write_bytes(b"synthetic evidence")
+            descriptor = os.open(evidence, os.O_RDONLY)
+            self.addCleanup(os.close, descriptor)
+            source_path = root / "input.json"
+            source_path.write_bytes(
+                RUNNER.canonical_json(sealed_input_v11(f"/dev/fd/{descriptor}"))
+            )
             command = {
                 "argv": [
                     "/opt/tacua/processor",
@@ -935,6 +1314,17 @@ module._release_runner_lock(descriptor)
                     self.assertFalse(staging.exists())
                 return True
 
+            def fail_model_copy(*_args, **_kwargs):
+                assert staging is not None
+                isolated_input = staging / "payload" / "input" / "input.json"
+                self.assertIn(
+                    b"PRIVATE_ISOLATED_TRANSCRIPT_SENTINEL",
+                    isolated_input.read_bytes(),
+                )
+                raise RUNNER.IsolationError(
+                    "COPY_PHASE_FAILED", "synthetic model copy failure"
+                )
+
             with mock.patch.object(RUNNER, "validate_runtime_environment"), mock.patch.object(
                 RUNNER, "_reap_stale_containers"
             ), mock.patch.object(
@@ -943,8 +1333,8 @@ module._release_runner_lock(descriptor)
                 side_effect=fake_run,
             ), mock.patch.object(
                 RUNNER,
-                "prepare_input",
-                side_effect=RUNNER.IsolationError("COPY_PHASE_FAILED", "synthetic copy failure"),
+                "_copy_selected_model",
+                side_effect=fail_model_copy,
             ), mock.patch.object(
                 RUNNER,
                 "_cleanup_container_running",
@@ -958,8 +1348,10 @@ module._release_runner_lock(descriptor)
                 side_effect=fake_cleanup,
             ), mock.patch.object(RUNNER.os, "urandom", return_value=b"c" * 12):
                 with self.assertRaises(RUNNER.IsolationError) as raised:
-                    RUNNER.run(command, root / "unused-input.json", output)
+                    RUNNER.run(command, source_path, output)
             self.assertEqual("COPY_PHASE_FAILED", raised.exception.code)
+            assert staging is not None
+            self.assertFalse(staging.exists())
             self.assertEqual(["docker", "image", "inspect"], calls[0][:3])
             self.assertEqual(["docker", "volume", "create"], calls[1][:3])
             self.assertEqual(["docker", "create"], calls[2][:2])
@@ -1356,6 +1748,74 @@ module._release_runner_lock(descriptor)
                         RUNNER._validate_output_envelope(invalid, output)
                     self.assertEqual("INVALID_PROCESSOR_OUTPUT", raised.exception.code)
                     self.assertEqual([], list(output.iterdir()))
+
+    def test_output_envelope_keeps_wrapper_v1_and_matches_nested_result_version(self) -> None:
+        result_v11 = {
+            "contract_version": RUNNER.SOURCE_RESULT_CONTRACT_V11,
+            "disposition": "checkpoint",
+            "input_digest": "sha256:" + "1" * 64,
+            "job_digest": "sha256:" + "2" * 64,
+            "job_id": "job_artifact_synthetic",
+            "result": {"artifacts": [], "consumed_artifacts": []},
+            "session_id": "session_artifact_synthetic",
+            "stage_name": "align",
+        }
+        payload_v11 = output_envelope(result_v11)
+        decoded = json.loads(payload_v11)
+        self.assertEqual(RUNNER.OUTPUT_CONTRACT, decoded["contract_version"])
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            self.assertEqual(
+                RUNNER.canonical_json(result_v11),
+                RUNNER._validate_output_envelope(
+                    payload_v11,
+                    output,
+                    expected_result_contract=RUNNER.SOURCE_RESULT_CONTRACT_V11,
+                ),
+            )
+            self.assertEqual([], list(output.iterdir()))
+
+        result_v10 = copy.deepcopy(result_v11)
+        result_v10["contract_version"] = RUNNER.SOURCE_RESULT_CONTRACT
+        preview = b"not-admitted-for-v11-checkpoint"
+        result_v11_with_preview = copy.deepcopy(result_v11)
+        result_v11_with_preview["result"] = {
+            "candidates": [
+                {
+                    "previews": [
+                        {
+                            "body_file": "unexpected.txt",
+                            "content_digest": "sha256:"
+                            + hashlib.sha256(preview).hexdigest(),
+                            "size_bytes": len(preview),
+                        }
+                    ]
+                }
+            ]
+        }
+        mismatches = (
+            (payload_v11, RUNNER.SOURCE_RESULT_CONTRACT),
+            (output_envelope(result_v10), RUNNER.SOURCE_RESULT_CONTRACT_V11),
+            (
+                output_envelope(
+                    result_v11_with_preview, [("unexpected.txt", preview)]
+                ),
+                RUNNER.SOURCE_RESULT_CONTRACT_V11,
+            ),
+        )
+        for payload, expected in mismatches:
+            with tempfile.TemporaryDirectory() as directory, self.subTest(
+                expected=expected
+            ):
+                output = Path(directory)
+                with self.assertRaises(RUNNER.IsolationError) as raised:
+                    RUNNER._validate_output_envelope(
+                        payload,
+                        output,
+                        expected_result_contract=expected,
+                    )
+                self.assertEqual("INVALID_PROCESSOR_OUTPUT", raised.exception.code)
+                self.assertEqual([], list(output.iterdir()))
 
     def test_output_envelope_rejects_noncanonical_base64_and_digest_before_publication(self) -> None:
         preview = b"preview"

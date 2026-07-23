@@ -60,6 +60,10 @@ def _sealed_input(descriptor: int, evidence: bytes) -> dict:
         },
         "contract_version": RUNNER.SOURCE_INPUT_CONTRACT,
         "input_digest": "sha256:" + "0" * 64,
+        "job": {
+            "job_id": "job_synthetic_docker",
+            "pipeline": {"pipeline_version": RUNNER.LEGACY_PIPELINE_VERSION},
+        },
     }
     subject = copy.deepcopy(value)
     subject.pop("input_digest")

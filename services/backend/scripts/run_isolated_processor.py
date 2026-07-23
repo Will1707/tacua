@@ -8,6 +8,7 @@ import argparse
 import base64
 import binascii
 import copy
+from datetime import datetime, timezone
 import errno
 import fcntl
 import hashlib
@@ -29,7 +30,17 @@ from typing import Any
 COMMAND_CONTRACT = "tacua.isolated-processing-command@1.0.0"
 INPUT_CONTRACT = "tacua.isolated-processing-input@1.0.0"
 SOURCE_INPUT_CONTRACT = "tacua.local-processing-input@1.0.0"
+SOURCE_INPUT_CONTRACT_V11 = "tacua.local-processing-input@1.1.0"
+SOURCE_RESULT_CONTRACT = "tacua.local-processing-result@1.0.0"
+SOURCE_RESULT_CONTRACT_V11 = "tacua.local-processing-result@1.1.0"
 OUTPUT_CONTRACT = "tacua.isolated-processing-output@1.0.0"
+ARTIFACT_PIPELINE_VERSION = "tacua.pipeline@1.1.0"
+LEGACY_PIPELINE_VERSION = "tacua.pipeline@1.0.0"
+PROCESSING_ARTIFACT_CONTRACT = "tacua.processing-stage-artifact@1.0.0"
+PROCESSING_ARTIFACT_MEDIA_TYPE = (
+    "application/vnd.tacua.processing-stage-artifact+json;version=1.0.0"
+)
+TRANSCRIPT_CONTRACT = "tacua.transcript@1.0.0"
 INPUT_PLACEHOLDER = "{input}"
 MODEL_PLACEHOLDER = "{model}"
 MAX_COMMAND_BYTES = 65_536
@@ -41,6 +52,9 @@ MAX_OUTPUT_BYTES = 67_108_864
 MAX_OUTPUT_STREAM_BYTES = 115_343_360
 MAX_OUTPUT_FILES = 512
 MAX_RESULT_BYTES = 16_777_216
+MAX_PROCESSING_ARTIFACT_BYTES = 4_194_304
+MAX_TRANSCRIPT_TEXT_BYTES = 2_097_152
+MAX_TRANSCRIPT_SPANS = 10_000
 MAX_PREVIEW_BYTES = 2_097_152
 MAX_ARGUMENTS = 64
 MAX_ARGUMENT_BYTES = 32_768
@@ -79,6 +93,9 @@ PROCESSOR_ROLE = "processor"
 CARRIER_ROLE = "payload-carrier"
 IMAGE_RE = re.compile(r"^(?:[^\s@]+@)?sha256:[a-f0-9]{64}$")
 DIGEST_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
+LANGUAGE_TAG_RE = re.compile(
+    r"^(?:und|[a-z]{2,3}(?:-[A-Z][a-z]{3})?(?:-(?:[A-Z]{2}|[0-9]{3}))?)$"
+)
 DESCRIPTOR_PATH_RE = re.compile(r"^/dev/fd/[0-9]+$")
 MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SAFE_OUTPUT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -506,13 +523,361 @@ def _copy_selected_model(
         raise IsolationError("MODEL_DIGEST_MISMATCH", "isolated model copy does not match the command document")
 
 
+def _parse_artifact_timestamp(value: Any) -> datetime:
+    try:
+        if type(value) is not str or not value.endswith("Z"):
+            raise ValueError
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+        canonical = parsed.astimezone(timezone.utc).replace(microsecond=0).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        if canonical != value:
+            raise ValueError
+        return parsed
+    except (TypeError, ValueError) as error:
+        raise IsolationError(
+            "INVALID_PROCESSING_INPUT",
+            "source transcript artifact timestamp is invalid",
+        ) from error
+
+
+def _processing_artifact_id(
+    job_id: str, stage_name: str, artifact_kind: str
+) -> str:
+    subject = (
+        "tacua.processing-stage-artifact-id@1.0.0\0"
+        f"{job_id}\0{stage_name}\0{artifact_kind}"
+    ).encode("utf-8")
+    token = base64.urlsafe_b64encode(hashlib.sha256(subject).digest()).decode(
+        "ascii"
+    )
+    return "artifact_" + token.rstrip("=")
+
+
+def _expected_transcript_sources(source: dict[str, Any]) -> list[dict[str, Any]]:
+    try:
+        segments = source["capture"]["manifest"]["segments"]
+        if type(segments) is not list:
+            raise TypeError
+        expected: list[dict[str, Any]] = []
+        for segment in segments:
+            if type(segment) is not dict:
+                raise TypeError
+            if segment["availability"] != "available":
+                continue
+            reference = {
+                "segment_id": segment["segment_id"],
+                "sequence": segment["sequence"],
+                "content_digest": segment["content"]["content_digest"],
+                "start_ms": segment["time_range"]["start_ms"],
+                "end_ms": segment["time_range"]["end_ms"],
+            }
+            if (
+                type(reference["segment_id"]) is not str
+                or type(reference["sequence"]) is not int
+                or type(reference["content_digest"]) is not str
+                or DIGEST_RE.fullmatch(reference["content_digest"]) is None
+                or type(reference["start_ms"]) is not int
+                or type(reference["end_ms"]) is not int
+                or reference["start_ms"] < 0
+                or reference["end_ms"] <= reference["start_ms"]
+            ):
+                raise TypeError
+            expected.append(reference)
+        return expected
+    except (KeyError, TypeError) as error:
+        raise IsolationError(
+            "INVALID_PROCESSING_INPUT",
+            "source capture manifest cannot bind the transcript artifact",
+        ) from error
+
+
+def _validate_transcript_artifact(
+    artifact: Any, source: dict[str, Any]
+) -> None:
+    artifact_fields = {
+        "contract_version",
+        "media_type",
+        "artifact_id",
+        "artifact_kind",
+        "organization_id",
+        "project_id",
+        "session_id",
+        "job_id",
+        "stage_name",
+        "checkpoint_job_version",
+        "created_at",
+        "derived_data_expires_at",
+        "payload",
+        "artifact_digest",
+    }
+    if type(artifact) is not dict or set(artifact) != artifact_fields:
+        raise IsolationError(
+            "INVALID_PROCESSING_INPUT",
+            "source transcript artifact fields are invalid",
+        )
+    encoded = canonical_json(artifact)
+    digest_subject = copy.deepcopy(artifact)
+    digest_subject.pop("artifact_digest")
+    expected_digest = "sha256:" + hashlib.sha256(
+        canonical_json(digest_subject)
+    ).hexdigest()
+    try:
+        binding = source["binding"]
+        job = source["job"]
+        capture = source["capture"]
+        stages = job["pipeline"]["stages"]
+        if (
+            type(binding) is not dict
+            or type(job) is not dict
+            or type(capture) is not dict
+            or type(stages) is not list
+            or len(stages) < 2
+            or type(stages[0]) is not dict
+            or type(binding["job_id"]) is not str
+            or type(binding["organization_id"]) is not str
+            or type(binding["project_id"]) is not str
+            or type(binding["session_id"]) is not str
+        ):
+            raise TypeError
+        transcribe = stages[0]
+        checkpoint_job_version = artifact["checkpoint_job_version"]
+        current_job_version = binding["job_version"]
+        expected_binding = {
+            "contract_version": PROCESSING_ARTIFACT_CONTRACT,
+            "media_type": PROCESSING_ARTIFACT_MEDIA_TYPE,
+            "artifact_id": _processing_artifact_id(
+                binding["job_id"], "transcribe", "transcript"
+            ),
+            "artifact_kind": "transcript",
+            "organization_id": binding["organization_id"],
+            "project_id": binding["project_id"],
+            "session_id": binding["session_id"],
+            "job_id": binding["job_id"],
+            "stage_name": "transcribe",
+            "created_at": transcribe["completed_at"],
+            "derived_data_expires_at": capture["derived_data_expires_at"],
+        }
+    except (IndexError, KeyError, TypeError) as error:
+        raise IsolationError(
+            "INVALID_PROCESSING_INPUT",
+            "source transcript artifact binding is unavailable",
+        ) from error
+    if (
+        len(encoded) > MAX_PROCESSING_ARTIFACT_BYTES
+        or any(artifact[key] != value for key, value in expected_binding.items())
+        or job.get("job_id") != binding["job_id"]
+        or transcribe.get("name") != "transcribe"
+        or transcribe.get("state") != "succeeded"
+        or type(checkpoint_job_version) is not int
+        or type(current_job_version) is not int
+        or checkpoint_job_version < 2
+        or checkpoint_job_version >= current_job_version
+        or type(artifact["artifact_digest"]) is not str
+        or DIGEST_RE.fullmatch(artifact["artifact_digest"]) is None
+        or artifact["artifact_digest"] != expected_digest
+        or _parse_artifact_timestamp(artifact["created_at"])
+        >= _parse_artifact_timestamp(artifact["derived_data_expires_at"])
+    ):
+        raise IsolationError(
+            "INVALID_PROCESSING_INPUT",
+            "source transcript artifact binding, digest, or size is invalid",
+        )
+
+    payload = artifact["payload"]
+    payload_fields = {
+        "contract_version",
+        "language_tag",
+        "speech_status",
+        "source_segments",
+        "spans",
+    }
+    expected_sources = _expected_transcript_sources(source)
+    if (
+        type(payload) is not dict
+        or set(payload) != payload_fields
+        or payload.get("contract_version") != TRANSCRIPT_CONTRACT
+        or type(payload.get("language_tag")) is not str
+        or len(payload["language_tag"]) > 35
+        or LANGUAGE_TAG_RE.fullmatch(payload["language_tag"]) is None
+        or type(payload.get("speech_status")) is not str
+        or payload["speech_status"] not in {"detected", "not_detected"}
+        or type(payload.get("source_segments")) is not list
+        or payload["source_segments"] != expected_sources
+        or type(payload.get("spans")) is not list
+        or len(payload["spans"]) > MAX_TRANSCRIPT_SPANS
+    ):
+        raise IsolationError(
+            "INVALID_PROCESSING_INPUT",
+            "source transcript artifact payload is invalid",
+        )
+    source_by_id = {
+        reference["segment_id"]: reference for reference in expected_sources
+    }
+    ordering: list[tuple[int, int, str]] = []
+    previous_end: int | None = None
+    text_bytes = 0
+    for span in payload["spans"]:
+        if type(span) is not dict or set(span) != {
+            "segment_id",
+            "start_ms",
+            "end_ms",
+            "text",
+        }:
+            raise IsolationError(
+                "INVALID_PROCESSING_INPUT",
+                "source transcript span fields are invalid",
+            )
+        segment_id = span["segment_id"]
+        if type(segment_id) is not str:
+            raise IsolationError(
+                "INVALID_PROCESSING_INPUT",
+                "source transcript span is invalid",
+            )
+        segment = source_by_id.get(segment_id)
+        start = span["start_ms"]
+        end = span["end_ms"]
+        text = span["text"]
+        if (
+            segment is None
+            or type(start) is not int
+            or type(end) is not int
+            or start < segment["start_ms"]
+            or end > segment["end_ms"]
+            or end <= start
+            or type(text) is not str
+            or len(text) > MAX_TRANSCRIPT_TEXT_BYTES
+            or not text.strip()
+            or "\x00" in text
+            or (previous_end is not None and start < previous_end)
+        ):
+            raise IsolationError(
+                "INVALID_PROCESSING_INPUT",
+                "source transcript span is invalid",
+            )
+        previous_end = end
+        ordering.append((start, end, segment_id))
+        text_bytes += len(text.encode("utf-8"))
+        if text_bytes > MAX_TRANSCRIPT_TEXT_BYTES:
+            raise IsolationError(
+                "INVALID_PROCESSING_INPUT",
+                "source transcript text exceeds its byte limit",
+            )
+    if (
+        ordering != sorted(ordering)
+        or (payload["speech_status"] == "detected") != bool(payload["spans"])
+        or (
+            payload["speech_status"] == "not_detected"
+            and payload["language_tag"] != "und"
+        )
+    ):
+        raise IsolationError(
+            "INVALID_PROCESSING_INPUT",
+            "source transcript status or ordering is invalid",
+        )
+
+
+def _validate_source_input_contract(source: dict[str, Any]) -> str:
+    contract = source.get("contract_version")
+    common_fields = {
+        "binding",
+        "capture",
+        "contract_version",
+        "input_digest",
+        "job",
+    }
+    if contract == SOURCE_INPUT_CONTRACT:
+        expected_fields = common_fields
+        expected_pipeline = LEGACY_PIPELINE_VERSION
+        result_contract = SOURCE_RESULT_CONTRACT
+    elif contract == SOURCE_INPUT_CONTRACT_V11:
+        expected_fields = common_fields | {"stage_inputs"}
+        expected_pipeline = ARTIFACT_PIPELINE_VERSION
+        result_contract = SOURCE_RESULT_CONTRACT_V11
+    else:
+        raise IsolationError(
+            "INVALID_PROCESSING_INPUT", "unsupported source processing contract"
+        )
+    if (
+        set(source) != expected_fields
+        or type(source.get("binding")) is not dict
+        or type(source.get("capture")) is not dict
+        or type(source.get("job")) is not dict
+        or type(source["job"].get("pipeline")) is not dict
+        or source["job"]["pipeline"].get("pipeline_version")
+        != expected_pipeline
+    ):
+        raise IsolationError(
+            "INVALID_PROCESSING_INPUT",
+            "source processing input fields or pipeline are invalid",
+        )
+    if contract == SOURCE_INPUT_CONTRACT:
+        return result_contract
+
+    stage_inputs = source["stage_inputs"]
+    artifacts = stage_inputs.get("artifacts") if type(stage_inputs) is dict else None
+    stage_name = source["binding"].get("stage_name")
+    stages = source["job"]["pipeline"].get("stages")
+    expected_stage_names = (
+        "transcribe",
+        "align",
+        "correlate",
+        "research",
+        "generate_tickets",
+    )
+    stage_fields = {
+        "name",
+        "state",
+        "attempt_count",
+        "started_at",
+        "completed_at",
+        "detail",
+    }
+    exact_stages = (
+        type(stages) is list
+        and len(stages) == len(expected_stage_names)
+        and all(
+            type(stage) is dict
+            and set(stage) == stage_fields
+            and stage.get("name") == expected_name
+            for expected_name, stage in zip(expected_stage_names, stages, strict=True)
+        )
+    )
+    stage_index = 0 if stage_name == "transcribe" else 1
+    current_stage = (
+        stages[stage_index]
+        if exact_stages
+        else None
+    )
+    if (
+        type(stage_inputs) is not dict
+        or set(stage_inputs) != {"artifacts"}
+        or type(artifacts) is not list
+        or not exact_stages
+        or type(stage_name) is not str
+        or stage_name not in {"transcribe", "align"}
+        or type(current_stage) is not dict
+        or current_stage.get("name") != stage_name
+        or current_stage.get("state") != "running"
+        or (stage_name == "transcribe" and artifacts)
+        or (stage_name == "align" and len(artifacts) != 1)
+    ):
+        raise IsolationError(
+            "INVALID_PROCESSING_INPUT",
+            "source processing stage inputs are invalid",
+        )
+    if stage_name == "align":
+        _validate_transcript_artifact(artifacts[0], source)
+    return result_contract
+
+
 def prepare_input(
     source_path: Path,
     destination: Path,
     *,
     container_input_directory: str = "/run/tacua-input",
     deadline: float | None = None,
-) -> None:
+) -> str:
     if not container_input_directory.startswith("/tacua-private-") and container_input_directory != "/run/tacua-input":
         raise IsolationError("INVALID_CONTAINER_IDENTITY", "container input directory is not a closed runner path")
     source = _load_canonical_object(
@@ -521,8 +886,7 @@ def prepare_input(
         "INVALID_PROCESSING_INPUT",
         deadline=deadline,
     )
-    if source.get("contract_version") != SOURCE_INPUT_CONTRACT:
-        raise IsolationError("INVALID_PROCESSING_INPUT", "unsupported source processing contract")
+    expected_result_contract = _validate_source_input_contract(source)
     source_input_digest = source.get("input_digest")
     if not isinstance(source_input_digest, str) or not DIGEST_RE.fullmatch(source_input_digest):
         raise IsolationError("INVALID_PROCESSING_INPUT", "source input digest is missing")
@@ -579,6 +943,7 @@ def prepare_input(
     destination.write_bytes(encoded)
     destination.chmod(0o444)
     _check_deadline(deadline)
+    return expected_result_contract
 
 
 def _runtime_config_digest(
@@ -1638,8 +2003,17 @@ def _validate_output_envelope(
     payload: bytes,
     output_directory: Path,
     *,
+    expected_result_contract: str = SOURCE_RESULT_CONTRACT,
     deadline: float | None = None,
 ) -> bytes:
+    if type(expected_result_contract) is not str or expected_result_contract not in (
+        SOURCE_RESULT_CONTRACT,
+        SOURCE_RESULT_CONTRACT_V11,
+    ):
+        raise IsolationError(
+            "INVALID_PROCESSOR_OUTPUT",
+            "expected processor result contract is invalid",
+        )
     if not payload or len(payload) > MAX_OUTPUT_STREAM_BYTES:
         raise IsolationError("PROCESSOR_OUTPUT_LIMIT", "processor output envelope violates its stream bound")
     try:
@@ -1660,8 +2034,17 @@ def _validate_output_envelope(
         or set(envelope) != {"contract_version", "previews", "result", "result_digest"}
         or envelope.get("contract_version") != OUTPUT_CONTRACT
         or not isinstance(envelope.get("result"), dict)
+        or envelope["result"].get("contract_version")
+        != expected_result_contract
         or not isinstance(envelope.get("previews"), list)
         or len(envelope["previews"]) > MAX_OUTPUT_FILES
+        or (
+            expected_result_contract == SOURCE_RESULT_CONTRACT_V11
+            and (
+                envelope["result"].get("disposition") != "checkpoint"
+                or envelope["previews"]
+            )
+        )
     ):
         raise IsolationError("INVALID_PROCESSOR_OUTPUT", "processor output envelope shape differs")
     result_bytes = canonical_json(envelope["result"])
@@ -2003,7 +2386,7 @@ def _run_exclusive(
         payload_directory.mkdir(mode=0o700)
         input_directory = payload_directory / "input"
         input_directory.mkdir(mode=0o700)
-        prepare_input(
+        expected_result_contract = prepare_input(
             input_path,
             input_directory / "input.json",
             container_input_directory=f"{payload_root}/input",
@@ -2066,7 +2449,12 @@ def _run_exclusive(
             raise IsolationError("PROCESSOR_FAILED", "isolated processor exited unsuccessfully")
         if wrote_diagnostics:
             raise IsolationError("INVALID_PROCESSOR_OUTPUT", "isolated processor wrote to its closed diagnostic stream")
-        result_bytes = _validate_output_envelope(output_envelope, output_directory, deadline=work_deadline)
+        result_bytes = _validate_output_envelope(
+            output_envelope,
+            output_directory,
+            expected_result_contract=expected_result_contract,
+            deadline=work_deadline,
+        )
     finally:
         cleanup_failure: Exception | None = None
         all_containers_stopped = True
