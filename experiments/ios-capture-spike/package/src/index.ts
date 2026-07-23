@@ -141,6 +141,35 @@ export function createBackendManagedHostController(
 ): BackendManagedHostController {
   return createBackendManagedHostControllerForPrimitives(
     {
+      subscribeCaptureLifecycle: ({ onState, onError }) => {
+        let active = true;
+        const stateSubscription = subscribe("onState", () => {
+          if (active) onState();
+        });
+        let errorSubscription: EventSubscription;
+        try {
+          errorSubscription = subscribe("onError", () => {
+            if (active) onError();
+          });
+        } catch (error) {
+          active = false;
+          try {
+            stateSubscription.remove();
+          } catch {
+            // Preserve the subscription failure while still making a best-effort removal.
+          }
+          throw error;
+        }
+        return () => {
+          if (!active) return;
+          active = false;
+          try {
+            stateSubscription.remove();
+          } finally {
+            errorSubscription.remove();
+          }
+        };
+      },
       prepareBackendLaunch,
       confirmBackendLaunchConsent,
       cancelBackendLaunch,

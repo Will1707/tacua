@@ -28,6 +28,7 @@ test("release paths are closed to an audited runtime file set", () => {
     "ios/AppAudioAppendAccounting.swift",
     "ios/CaptureModels.swift",
     "ios/TacuaLocalHarnessPolicy.swift",
+    "ios/PrivacyInfo.xcprivacy",
     "ios/TacuaSDKLocalRetention.swift",
     "ios/TacuaCaptureSpike.podspec",
     "plugin/config.js",

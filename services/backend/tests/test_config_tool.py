@@ -146,6 +146,42 @@ class ConfigToolTests(unittest.TestCase):
         )
         parse_config_text(self.render(changed))
 
+    def test_native_binary_digest_reseals_only_the_handoff_projection(self) -> None:
+        original_config_text, original_profile_text = compile_config_artifacts(
+            self.template_text()
+        )
+        original_config = json.loads(original_config_text)
+        document = self.template_document()
+        measured_digest = "sha256:" + "9" * 64
+        document["approved_handoff"]["build_identity"]["mobile"][
+            "native_binary_digest"
+        ] = measured_digest
+
+        changed_config_text, changed_profile_text = compile_config_artifacts(
+            self.render(document)
+        )
+        changed_config = json.loads(changed_config_text)
+
+        self.assertEqual(
+            measured_digest,
+            changed_config["approved_handoff"]["build_identity"]["mobile"][
+                "native_binary_digest"
+            ],
+        )
+        self.assertNotEqual(
+            original_config["approved_handoff"]["build_identity"][
+                "build_identity_digest"
+            ],
+            changed_config["approved_handoff"]["build_identity"][
+                "build_identity_digest"
+            ],
+        )
+        self.assertEqual(
+            original_config["build_identity"],
+            changed_config["build_identity"],
+        )
+        self.assertEqual(original_profile_text, changed_profile_text)
+
     def test_scope_policy_is_an_exact_projection_of_operator_pins(self) -> None:
         document = self.template_document()
         document["organization_id"] = "org_changed"

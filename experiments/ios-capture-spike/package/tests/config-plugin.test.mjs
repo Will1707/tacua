@@ -165,6 +165,36 @@ test("uses one 2-64 character dedicated QA launch-scheme policy", () => {
   }
 });
 
+test("ships privacy, Apache license, and NOTICE resources with the iOS SDK", () => {
+  const packageRoot = path.resolve(testDirectory, "..");
+  const privacy = fs.readFileSync(path.join(packageRoot, "ios", "PrivacyInfo.xcprivacy"), "utf8");
+  const podspec = fs.readFileSync(
+    path.join(packageRoot, "ios", "TacuaCaptureSpike.podspec"),
+    "utf8",
+  );
+
+  for (const value of [
+    "NSPrivacyCollectedDataTypePhotosorVideos",
+    "NSPrivacyCollectedDataTypeAudioData",
+    "NSPrivacyCollectedDataTypeProductInteraction",
+    "NSPrivacyCollectedDataTypeOtherDiagnosticData",
+    "NSPrivacyAccessedAPICategoryFileTimestamp",
+    "C617.1",
+    "NSPrivacyAccessedAPICategorySystemBootTime",
+    "35F9.1",
+    "NSPrivacyAccessedAPICategoryDiskSpace",
+    "E174.1",
+  ]) {
+    assert.match(privacy, new RegExp(`<string>${value.replace(".", "\\.")}</string>`));
+  }
+  assert.match(privacy, /<key>NSPrivacyTracking<\/key>\s*<false\/>/);
+  assert.match(podspec, /PrivacyInfo\.xcprivacy/);
+  assert.match(podspec, /\.\.\/LICENSE/);
+  assert.match(podspec, /\.\.\/NOTICE/);
+  assert.match(fs.readFileSync(path.join(packageRoot, "LICENSE"), "utf8"), /Apache License/);
+  assert.match(fs.readFileSync(path.join(packageRoot, "NOTICE"), "utf8"), /Tacua contributors/);
+});
+
 test("rejects tampering even when an attacker recomputes the outer profile digest", () => {
   const cases = [
     (profile) => { profile.capture_scope_policy.organization_id = "Org-invalid"; },

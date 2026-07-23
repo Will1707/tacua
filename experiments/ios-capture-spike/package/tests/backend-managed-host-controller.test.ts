@@ -6,7 +6,9 @@ import test from "node:test";
 import {
   BackendManagedHostControllerError,
   createBackendManagedHostControllerForPrimitives,
+  type BackendManagedHostController,
   type BackendManagedHostPrimitives,
+  type BackendManagedHostSnapshot,
 } from "../src/BackendManagedHostController.ts";
 import type {
   BackendQueueStatus,
@@ -51,7 +53,7 @@ function captureStatus(
   segmentCount = 0,
 ): CaptureStatus {
   return {
-    sessionId: localSessionId,
+    ...(localSessionId === undefined ? {} : { sessionId: localSessionId }),
     state,
     segmentCount,
     gapCount: 0,
@@ -170,7 +172,10 @@ function resumedPlan(
       localSessionId,
       remoteSessionId: REMOTE_SESSION_ID,
       backendSessionState: "receiving",
-    } as ResumedCaptureSessionPlan["backendSession"],
+    } as Extract<
+      ResumedCaptureSessionPlan["backendSession"],
+      { readonly backendSessionState: "receiving" }
+    >,
   };
 }
 
@@ -178,6 +183,10 @@ type TestHarness = ReturnType<typeof createHarness>;
 
 function createHarness() {
   const calls: string[] = [];
+  const lifecycleListeners = new Set<{
+    readonly onState: () => void;
+    readonly onError: () => void;
+  }>();
   const queues = new Map<string, BackendQueueStatus>();
   const startRecovery = new Map<string, BackendStartRecoveryStatus>();
   const resumeRecovery = new Map<string, BackendResumeRecoveryStatus>();
@@ -188,6 +197,14 @@ function createHarness() {
   let deleteCount = 0;
 
   const sdk: BackendManagedHostPrimitives = {
+    subscribeCaptureLifecycle: (listeners) => {
+      calls.push("subscribe-lifecycle");
+      lifecycleListeners.add(listeners);
+      return () => {
+        calls.push("unsubscribe-lifecycle");
+        lifecycleListeners.delete(listeners);
+      };
+    },
     prepareBackendLaunch: () => {
       calls.push("prepare");
       return {
@@ -331,6 +348,18 @@ function createHarness() {
     queues,
     startRecovery,
     resumeRecovery,
+    setStatus(value: CaptureStatus) {
+      status = value;
+    },
+    emitState(_nativePayload?: unknown) {
+      calls.push("emit-state");
+      for (const listener of lifecycleListeners) listener.onState();
+    },
+    emitError(_nativePayload?: unknown) {
+      calls.push("emit-error");
+      for (const listener of lifecycleListeners) listener.onError();
+    },
+    lifecycleListenerCount: () => lifecycleListeners.size,
     setRecoverable(value: readonly RecoverableSession[]) {
       recoverable = [...value];
     },
@@ -354,6 +383,26 @@ async function approveAndExchangeStart(harness: TestHarness) {
   await controller.respondToLaunchConsent(true);
   await controller.exchangeApprovedLaunch();
   return controller;
+}
+
+async function waitForSnapshot(
+  controller: BackendManagedHostController,
+  predicate: (snapshot: BackendManagedHostSnapshot) => boolean,
+): Promise<BackendManagedHostSnapshot> {
+  const current = controller.getSnapshot();
+  if (predicate(current)) return current;
+  return new Promise<BackendManagedHostSnapshot>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      unsubscribe();
+      reject(new Error("Timed out waiting for a controller snapshot"));
+    }, 2_000);
+    const unsubscribe = controller.subscribe((snapshot) => {
+      if (!predicate(snapshot)) return;
+      clearTimeout(timeout);
+      unsubscribe();
+      resolve(snapshot);
+    });
+  });
 }
 
 test("START keeps launch authority native and exposes a bounded plan workflow", async () => {
@@ -496,6 +545,330 @@ test("a thrown start outcome still exposes a recording session that can be stopp
   );
 });
 
+test("a mismatched native start remains stoppable but requires reconciliation", async () => {
+  const harness = createHarness();
+  harness.queues.set(LOCAL_SESSION_ID, readyQueue());
+  const otherSessionId = "local_controller_unexpected_recording";
+  const sdk: BackendManagedHostPrimitives = {
+    ...harness.sdk,
+    start: async () => {
+      const mismatched = captureStatus(
+        "recording",
+        true,
+        otherSessionId,
+      );
+      harness.setStatus(mismatched);
+      return mismatched;
+    },
+  };
+  const controller = createBackendManagedHostControllerForPrimitives(sdk);
+  await controller.prepareLaunch(
+    `tacua-test://tacua/start?launch_code=${LAUNCH_CODE}`,
+  );
+  await controller.respondToLaunchConsent(true);
+  await controller.exchangeApprovedLaunch();
+
+  await assert.rejects(controller.startPlannedCapture());
+  const snapshot = controller.getSnapshot();
+  assert.deepEqual(snapshot.phase, {
+    kind: "blocked",
+    reason: "operator_reconciliation_required",
+    localSessionId: LOCAL_SESSION_ID,
+  });
+  assert.equal(snapshot.recorder.localSessionId, otherSessionId);
+  assert.equal(
+    snapshot.actions.some(
+      (action) =>
+        action.kind === "stop_capture" &&
+        action.localSessionId === otherSessionId,
+    ),
+    true,
+  );
+});
+
+test("a failed constructor subscription cannot schedule orphaned reconciliation", async () => {
+  const harness = createHarness();
+  const sdk: BackendManagedHostPrimitives = {
+    ...harness.sdk,
+    subscribeCaptureLifecycle: ({ onState }) => {
+      onState();
+      throw new Error("subscription installation failed");
+    },
+  };
+
+  assert.throws(() => createBackendManagedHostControllerForPrimitives(sdk));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(harness.calls.includes("list-backend"), false);
+  assert.equal(harness.calls.includes("list-recoverable"), false);
+});
+
+test("native auto-stop reconciles to explicit finalized-capture actions without uploading", async () => {
+  const harness = createHarness();
+  harness.queues.set(LOCAL_SESSION_ID, readyQueue());
+  const controller = await approveAndExchangeStart(harness);
+  await controller.startPlannedCapture();
+  harness.setRecoverable([
+    {
+      sessionId: LOCAL_SESSION_ID,
+      state: "completed",
+      segmentCount: 3,
+      partialFileCount: 0,
+    },
+  ]);
+  harness.setStatus(
+    captureStatus("completed", false, LOCAL_SESSION_ID, 3),
+  );
+
+  harness.emitState({
+    sessionId: LOCAL_SESSION_ID,
+    state: "completed",
+    recorderRecording: false,
+  });
+  const snapshot = await waitForSnapshot(
+    controller,
+    (candidate) =>
+      candidate.phase.kind === "stopped" && candidate.mutation === null,
+  );
+
+  assert.deepEqual(snapshot.phase, {
+    kind: "stopped",
+    localSessionId: LOCAL_SESSION_ID,
+    captureState: "completed",
+    verifiedSegmentCount: 3,
+  });
+  assert.equal(snapshot.recorder.recording, false);
+  assert.equal(
+    snapshot.actions.some(
+      (action) =>
+        action.kind === "admit_and_drain" &&
+        action.localSessionId === LOCAL_SESSION_ID,
+    ),
+    true,
+  );
+  assert.equal(harness.calls.some((call) => call.startsWith("admit:")), false);
+  assert.equal(harness.calls.some((call) => call.startsWith("process:")), false);
+});
+
+test("native error wake-ups expose only bounded status codes and retain safe stop control", async () => {
+  const harness = createHarness();
+  harness.queues.set(LOCAL_SESSION_ID, readyQueue());
+  const controller = await approveAndExchangeStart(harness);
+  await controller.startPlannedCapture();
+  harness.setStatus({
+    ...captureStatus("recording", true, LOCAL_SESSION_ID, 1),
+    errorCodes: [
+      ...Array.from(
+        { length: 70 },
+        (_, index) => `ERR_TACUA_BOUNDED_${String(index)}`,
+      ),
+      "PRIVATE_NATIVE_ERROR_CONTENT",
+      "ERR_TACUA_CAPTURE_INTERRUPTED",
+    ],
+  });
+  const revision = controller.getSnapshot().revision;
+
+  harness.emitError({
+    code: "PRIVATE_NATIVE_ERROR_CONTENT",
+    reason: "credential-and-device-detail-must-not-cross-boundary",
+  });
+  const snapshot = await waitForSnapshot(
+    controller,
+    (candidate) => candidate.revision > revision && candidate.mutation === null,
+  );
+
+  assert.equal(snapshot.phase.kind, "capturing");
+  assert.equal(snapshot.recorder.errorCodeCount, 64);
+  assert.equal(
+    snapshot.recorder.latestErrorCode,
+    "ERR_TACUA_CAPTURE_INTERRUPTED",
+  );
+  assert.equal(
+    snapshot.actions.some((action) => action.kind === "stop_capture"),
+    true,
+  );
+  const serialized = JSON.stringify(snapshot);
+  assert.equal(serialized.includes("PRIVATE_NATIVE_ERROR_CONTENT"), false);
+  assert.equal(serialized.includes("credential-and-device-detail"), false);
+  assert.equal(snapshot.lastError, null);
+});
+
+test("native recorder reconciliation survives unrelated session-discovery failure", async () => {
+  const harness = createHarness();
+  harness.queues.set(LOCAL_SESSION_ID, readyQueue());
+  const sdk: BackendManagedHostPrimitives = {
+    ...harness.sdk,
+    listBackendSessions: async () => {
+      throw Object.assign(new Error("private queue storage detail"), {
+        code: "PRIVATE_DISCOVERY_CODE",
+      });
+    },
+  };
+  const controller = createBackendManagedHostControllerForPrimitives(sdk);
+  await controller.prepareLaunch(
+    `tacua-test://tacua/start?launch_code=${LAUNCH_CODE}`,
+  );
+  await controller.respondToLaunchConsent(true);
+  await controller.exchangeApprovedLaunch();
+  await controller.startPlannedCapture();
+  harness.setStatus(captureStatus("completed", false, LOCAL_SESSION_ID, 2));
+
+  harness.emitState();
+  const snapshot = await waitForSnapshot(
+    controller,
+    (candidate) =>
+      candidate.phase.kind === "stopped" &&
+      candidate.mutation === null &&
+      candidate.lastError?.operation === "reconcile_native_lifecycle",
+  );
+
+  assert.equal(snapshot.recorder.recording, false);
+  assert.deepEqual(snapshot.lastError, {
+    operation: "reconcile_native_lifecycle",
+    category: "native_rejected",
+    nativeCode: null,
+  });
+  assert.equal(
+    JSON.stringify(snapshot).includes("private queue storage detail"),
+    false,
+  );
+});
+
+test("a terminal status for a different session blocks instead of misattributing capture", async () => {
+  const harness = createHarness();
+  harness.queues.set(LOCAL_SESSION_ID, readyQueue());
+  const controller = await approveAndExchangeStart(harness);
+  await controller.startPlannedCapture();
+  const otherSessionId = "local_controller_other";
+  harness.setStatus(captureStatus("completed", false, otherSessionId, 2));
+
+  harness.emitState();
+  const snapshot = await waitForSnapshot(
+    controller,
+    (candidate) =>
+      candidate.phase.kind === "blocked" && candidate.mutation === null,
+  );
+
+  assert.deepEqual(snapshot.phase, {
+    kind: "blocked",
+    reason: "operator_reconciliation_required",
+    localSessionId: LOCAL_SESSION_ID,
+  });
+  assert.equal(snapshot.recorder.localSessionId, otherSessionId);
+  assert.equal(
+    snapshot.actions.some(
+      (action) =>
+        (action.kind === "keep_verified_partial" ||
+          action.kind === "admit_and_drain") &&
+        action.localSessionId === otherSessionId,
+    ),
+    false,
+  );
+});
+
+test("duplicate and reordered native wake-ups coalesce without reverting authoritative state", async () => {
+  const harness = createHarness();
+  harness.queues.set(LOCAL_SESSION_ID, readyQueue());
+  const baseController = await approveAndExchangeStart(harness);
+  await baseController.startPlannedCapture();
+  baseController.dispose();
+
+  let releaseDiscovery: (() => void) | null = null;
+  let blockNextDiscovery = true;
+  const originalList = harness.sdk.listBackendSessions;
+  const sdk: BackendManagedHostPrimitives = {
+    ...harness.sdk,
+    listBackendSessions: async () => {
+      harness.calls.push("lifecycle-discovery-enter");
+      if (blockNextDiscovery) {
+        blockNextDiscovery = false;
+        await new Promise<void>((resolve) => {
+          releaseDiscovery = resolve;
+        });
+      }
+      return originalList();
+    },
+  };
+  const controller = createBackendManagedHostControllerForPrimitives(sdk);
+  harness.setRecoverable([
+    {
+      sessionId: LOCAL_SESSION_ID,
+      state: "completed",
+      segmentCount: 4,
+      partialFileCount: 0,
+    },
+  ]);
+
+  harness.setStatus(captureStatus("stopping", false, LOCAL_SESSION_ID, 3));
+  harness.emitState({ state: "recording", recorderRecording: true });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.notEqual(releaseDiscovery, null);
+
+  // These payloads are deliberately stale and out of order. They are wake-up signals only;
+  // authoritative getStatus() must win, and duplicates during a refresh require one follow-up.
+  harness.setStatus(captureStatus("completed", false, LOCAL_SESSION_ID, 4));
+  harness.emitError({ code: "ERR_TACUA_OLDER_ERROR", reason: "private" });
+  harness.emitState({ state: "stopping", recorderRecording: false });
+  harness.emitState({ state: "recording", recorderRecording: true });
+  const releaseFirstDiscovery = releaseDiscovery as (() => void) | null;
+  releaseFirstDiscovery?.();
+
+  const snapshot = await waitForSnapshot(
+    controller,
+    (candidate) =>
+      candidate.phase.kind === "stopped" &&
+      candidate.phase.captureState === "completed" &&
+      candidate.mutation === null &&
+      harness.calls.filter(
+        (call) => call === "lifecycle-discovery-enter",
+      ).length === 2,
+  );
+  assert.equal(snapshot.recorder.state, "completed");
+  assert.equal(snapshot.recorder.recording, false);
+  assert.equal(
+    harness.calls.filter(
+      (call) => call === "lifecycle-discovery-enter",
+    ).length,
+    2,
+  );
+});
+
+test("dispose removes native lifecycle listeners and ignores later callbacks", async () => {
+  const harness = createHarness();
+  const baseSubscribe = harness.sdk.subscribeCaptureLifecycle;
+  const sdk: BackendManagedHostPrimitives = {
+    ...harness.sdk,
+    subscribeCaptureLifecycle: (listeners) => {
+      const remove = baseSubscribe(listeners);
+      return () => {
+        remove();
+        throw new Error("native listener remover failed");
+      };
+    },
+  };
+  const controller = createBackendManagedHostControllerForPrimitives(
+    sdk,
+  );
+  assert.equal(harness.lifecycleListenerCount(), 1);
+  const revision = controller.getSnapshot().revision;
+
+  assert.doesNotThrow(() => controller.dispose());
+  assert.equal(harness.lifecycleListenerCount(), 0);
+  harness.setStatus(captureStatus("completed", false, LOCAL_SESSION_ID, 1));
+  harness.emitState();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(controller.getSnapshot().revision, revision);
+  assert.equal(
+    harness.calls.filter((call) => call === "unsubscribe-lifecycle").length,
+    1,
+  );
+  controller.dispose();
+  assert.equal(
+    harness.calls.filter((call) => call === "unsubscribe-lifecycle").length,
+    1,
+  );
+});
+
 test("mutations are serialized across asynchronous native discovery", async () => {
   const harness = createHarness();
   let releaseDiscovery: (() => void) | null = null;
@@ -519,7 +892,8 @@ test("mutations are serialized across asynchronous native discovery", async () =
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(harness.calls.includes("prepare"), false);
   assert.notEqual(releaseDiscovery, null);
-  releaseDiscovery?.();
+  const releasePendingDiscovery = releaseDiscovery as (() => void) | null;
+  releasePendingDiscovery?.();
   await Promise.all([refresh, prepare]);
   assert.equal(harness.calls.includes("prepare"), true);
 });
@@ -573,9 +947,10 @@ test("RESUME can keep a verified partial, admit it, and drain native transport",
   );
   await controller.respondToLaunchConsent(true);
   await controller.exchangeApprovedLaunch();
+  const resumePlanSnapshot = controller.getSnapshot();
   assert.equal(
-    controller.getSnapshot().phase.kind === "plan_ready"
-      ? controller.getSnapshot().phase.nextAction
+    resumePlanSnapshot.phase.kind === "plan_ready"
+      ? resumePlanSnapshot.phase.nextAction
       : null,
     "resume_capture",
   );
@@ -684,9 +1059,10 @@ test("a stopped verified partial remains explicit before admission", async () =>
   assert.equal(actionKinds.includes("keep_verified_partial"), true);
   assert.equal(actionKinds.includes("admit_and_drain"), false);
   await controller.keepVerifiedPartial();
+  const keptSnapshot = controller.getSnapshot();
   assert.equal(
-    controller.getSnapshot().phase.kind === "stopped"
-      ? controller.getSnapshot().phase.captureState
+    keptSnapshot.phase.kind === "stopped"
+      ? keptSnapshot.phase.captureState
       : null,
     "partial_ready_for_upload",
   );

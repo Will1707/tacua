@@ -80,6 +80,80 @@ plugin independently validates the profile and measured build pins before
 embedding it. [`sdk-profile.example.json`](sdk-profile.example.json) is the
 exact output produced from the checked-in example template.
 
+## Seal a signed iOS QA build without a digest cycle
+
+For iOS, `approved_handoff.build_identity.mobile.native_binary_digest` means
+the SHA-256 digest of the final operator-controlled, code-signed main Mach-O
+executable named by `CFBundleExecutable`. For a local build, measure the exact
+`.app` that will be installed. For TestFlight, measure the executable inside
+the exact signed archive submitted to App Store Connect. This is a
+producer-artifact identity: Apple may re-sign, encrypt, thin, or otherwise
+process a TestFlight artifact, so the digest does not attest the post-processed
+or installed TestFlight bytes. It is not a digest of the unsigned build
+product, `.app` directory metadata, an ad-hoc zip, or an IPA container. The
+static Tacua SDK is linked into this executable. The source revision and sealed
+SDK profile separately record the intended JavaScript/resources source and
+deployment configuration.
+
+The digest cannot exist until the signed app exists, while the signed app must
+already contain the final SDK profile. Use this two-pass procedure; do not put a
+placeholder digest into a live backend:
+
+1. Fill every measured template value except the native binary digest, retain
+   all four derive markers, and use a clearly non-live digest value only for
+   this first compilation of `config.json` plus `tacua-sdk-profile.json`.
+   Never deploy the first-pass config.
+2. Save an exact copy of that profile, then build and code-sign the QA `.app`
+   from the clean source revision using that profile. Do not mutate or re-sign
+   the app after measurement.
+3. Verify the app's signature and hash its main executable:
+
+   ```bash
+   set -euo pipefail
+   qa_app='/absolute/path/to/TacuaQA.app'
+   test -d "$qa_app"
+   test ! -L "$qa_app"
+   /usr/bin/codesign --verify --deep --strict --verbose=2 "$qa_app"
+   bundle_executable="$(
+     /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' \
+       "$qa_app/Info.plist"
+   )"
+   case "$bundle_executable" in
+     ''|.|..|*/*) echo 'invalid CFBundleExecutable' >&2; exit 1 ;;
+   esac
+   native_executable="$qa_app/$bundle_executable"
+   test -f "$native_executable"
+   test ! -L "$native_executable"
+   native_binary_sha256="$(
+     /usr/bin/shasum -a 256 "$native_executable"
+   )"
+   native_binary_sha256="${native_binary_sha256%% *}"
+   case "$native_binary_sha256" in
+     *[!0-9a-f]*|'') echo 'invalid SHA-256 result' >&2; exit 1 ;;
+   esac
+   test "${#native_binary_sha256}" -eq 64
+   ```
+
+4. Replace only
+   `approved_handoff.build_identity.mobile.native_binary_digest` in the
+   template with `sha256:` followed by `native_binary_sha256`. Re-run the
+   compiler. It must reseal the approved-handoff build identity and backend
+   config.
+5. Compare the regenerated SDK profile byte for byte with the saved first-pass
+   profile using `cmp -s`. A difference means another build input changed:
+   discard the measured app, resolve the mismatch, and repeat from step 1.
+6. Deploy the final backend config together with that unchanged SDK profile,
+   and install only the measured signed app. Any re-sign, rebuild, profile
+   change, source change, or backend-origin change requires a new measurement
+   and an empty deployment pin.
+
+The main-executable convention is deterministic for operator-controlled local
+and pre-submission TestFlight producer artifacts and avoids treating
+archive/zip timestamps as build identity. It does not claim to attest Apple's
+distribution transformations or every resource independently; the clean source
+revision and byte-identical sealed profile remain mandatory parts of the same
+build identity.
+
 ## Values the operator must supply
 
 The compiler cannot measure or safely infer these values:

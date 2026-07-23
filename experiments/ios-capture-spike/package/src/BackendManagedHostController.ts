@@ -23,6 +23,7 @@ const MAXIMUM_SEGMENT_DURATION_SECONDS = 60;
 const DEFAULT_SEGMENT_DURATION_SECONDS = 10;
 const DEFAULT_MAXIMUM_DISCOVERED_SESSIONS = 64;
 const ABSOLUTE_MAXIMUM_DISCOVERED_SESSIONS = 128;
+const MAXIMUM_PROJECTED_ERROR_CODES = 64;
 
 const RESUMABLE_CAPTURE_STATES = new Set([
   "prepared",
@@ -42,6 +43,7 @@ const ADMISSIBLE_CAPTURE_STATES = new Set([
 
 export type BackendManagedHostMutation =
   | "refresh"
+  | "reconcile_native_lifecycle"
   | "prepare_launch"
   | "respond_to_consent"
   | "exchange_launch"
@@ -190,6 +192,10 @@ export type BackendManagedRecorderSnapshot = Readonly<{
   state: string;
   localSessionId: string | null;
   recording: boolean;
+  /** Bounded count of allowlisted public SDK codes; native error reasons are never retained. */
+  errorCodeCount: number;
+  /** Latest bounded public SDK error code, or null when native supplied no safe code. */
+  latestErrorCode: string | null;
 }>;
 
 export type BackendManagedHostSnapshot = Readonly<{
@@ -214,6 +220,14 @@ export type BackendManagedHostControllerOptions = Readonly<{
  * object private and never projects it into a snapshot.
  */
 export type BackendManagedHostPrimitives = Readonly<{
+  /**
+   * Installs native onState/onError wake-up signals. Event payloads deliberately stop at this
+   * boundary: reconciliation reads an authoritative status and never retains native error reasons.
+   */
+  subscribeCaptureLifecycle: (listeners: {
+    readonly onState: () => void;
+    readonly onError: () => void;
+  }) => () => void;
   prepareBackendLaunch: (launchURL: string) => BackendLaunchConsentRequest;
   confirmBackendLaunchConsent: (
     consentRequestId: string,
@@ -354,7 +368,11 @@ class Controller implements BackendManagedHostController {
   private readonly listeners = new Set<
     (snapshot: BackendManagedHostSnapshot) => void
   >();
+  private removeCaptureLifecycleListeners: (() => void) | null = null;
   private mutationTail: Promise<void> = Promise.resolve();
+  private lifecycleSignalGeneration = 0;
+  private lifecycleReconciliationScheduled = false;
+  private lifecycleSubscriptionReady = false;
   private disposed = false;
   private pendingConsent: PendingConsent | null = null;
   private approvedLaunch: ApprovedLaunch | null = null;
@@ -380,14 +398,19 @@ class Controller implements BackendManagedHostController {
     this.activeCaptureSessionId = recorder.recording
       ? recorder.localSessionId
       : null;
-    const phase: BackendManagedHostPhase =
-      recorder.recording && recorder.localSessionId
+    const phase: BackendManagedHostPhase = recorder.recording
+      ? recorder.localSessionId
         ? {
             kind: "capturing",
             localSessionId: recorder.localSessionId,
             mode: "resumed",
           }
-        : { kind: "idle" };
+        : {
+            kind: "blocked",
+            reason: "operator_reconciliation_required",
+            localSessionId: null,
+          }
+      : { kind: "idle" };
     this.snapshot = {
       revision: 0,
       phase,
@@ -398,6 +421,30 @@ class Controller implements BackendManagedHostController {
       lastError: null,
     };
     this.snapshot = this.withActions(this.snapshot);
+    let removeCaptureLifecycleListeners: (() => void) | null = null;
+    try {
+      removeCaptureLifecycleListeners =
+        this.primitives.subscribeCaptureLifecycle({
+          onState: this.handleCaptureLifecycleSignal,
+          onError: this.handleCaptureLifecycleSignal,
+        });
+      if (typeof removeCaptureLifecycleListeners !== "function") {
+        throw controllerError(
+          "native_rejected",
+          "Native lifecycle subscription did not return a remover",
+        );
+      }
+    } catch (error) {
+      // A synchronously fired callback is held behind lifecycleSubscriptionReady, so a failed
+      // constructor cannot leave reconciliation work running on an unreachable controller.
+      this.disposed = true;
+      throw error;
+    }
+    this.removeCaptureLifecycleListeners = removeCaptureLifecycleListeners;
+    this.lifecycleSubscriptionReady = true;
+    if (this.lifecycleSignalGeneration > 0) {
+      this.scheduleLifecycleReconciliation();
+    }
   }
 
   getSnapshot = (): BackendManagedHostSnapshot => this.snapshot;
@@ -983,6 +1030,17 @@ class Controller implements BackendManagedHostController {
   dispose = (): void => {
     if (this.disposed) return;
     this.disposed = true;
+    const removeCaptureLifecycleListeners =
+      this.removeCaptureLifecycleListeners;
+    this.removeCaptureLifecycleListeners = null;
+    if (removeCaptureLifecycleListeners) {
+      try {
+        removeCaptureLifecycleListeners();
+      } catch {
+        // Listener removal is best-effort during teardown. The disposed gate also ignores any
+        // callback already queued by the native event emitter.
+      }
+    }
     if (this.pendingConsent) {
       this.primitives.cancelBackendLaunch(this.pendingConsent.consentRequestId);
     }
@@ -993,6 +1051,49 @@ class Controller implements BackendManagedHostController {
     this.approvedLaunch = null;
     this.listeners.clear();
   };
+
+  private readonly handleCaptureLifecycleSignal = (): void => {
+    if (this.disposed) return;
+    this.lifecycleSignalGeneration += 1;
+    if (!this.lifecycleSubscriptionReady) return;
+    this.scheduleLifecycleReconciliation();
+  };
+
+  private scheduleLifecycleReconciliation(): void {
+    if (this.disposed || this.lifecycleReconciliationScheduled) return;
+    this.lifecycleReconciliationScheduled = true;
+    let reconciledThroughGeneration = 0;
+    const reconciliation = this.run(
+      "reconcile_native_lifecycle",
+      async () => {
+        const targetGeneration = this.lifecycleSignalGeneration;
+        try {
+          // Reconcile the recorder first so an unrelated queue-discovery failure cannot leave an
+          // auto-stopped or errored ReplayKit session projected as actively recording.
+          this.replaceRecorder(this.primitives.getStatus());
+          await this.refreshInternal();
+        } finally {
+          // A failed reconciliation is surfaced through the controller's bounded error projection.
+          // Do not spin on the same signal, but preserve a signal that arrived during the attempt.
+          reconciledThroughGeneration = targetGeneration;
+        }
+      },
+    );
+    void reconciliation
+      .catch(() => {
+        // Native lifecycle callbacks cannot return a promise to Expo. `run` already publishes the
+        // privacy-safe controller error, so consume the internal rejection here.
+      })
+      .finally(() => {
+        this.lifecycleReconciliationScheduled = false;
+        if (
+          !this.disposed &&
+          this.lifecycleSignalGeneration > reconciledThroughGeneration
+        ) {
+          this.scheduleLifecycleReconciliation();
+        }
+      });
+  }
 
   private run(
     operation: BackendManagedHostMutation,
@@ -1026,22 +1127,57 @@ class Controller implements BackendManagedHostController {
     sessions: readonly BackendManagedSessionSummary[],
   ): void {
     const recorderStatus = this.primitives.getStatus();
+    this.replaceRecorder(recorderStatus, sessions);
+  }
+
+  private replaceRecorder(
+    recorderStatus: CaptureStatus,
+    sessions?: readonly BackendManagedSessionSummary[],
+  ): void {
     const recorder = projectRecorder(recorderStatus);
     let phase = this.snapshot.phase;
     if (recorder.recording && recorder.localSessionId) {
       this.activeCaptureSessionId = recorder.localSessionId;
+      const expectedLocalSessionId = phaseLocalSessionId(phase);
       if (
-        phase.kind !== "capturing" ||
-        phase.localSessionId !== recorder.localSessionId
+        expectedLocalSessionId !== null &&
+        expectedLocalSessionId !== recorder.localSessionId
       ) {
+        phase = {
+          kind: "blocked",
+          reason: "operator_reconciliation_required",
+          localSessionId: expectedLocalSessionId,
+        };
+      } else if (phase.kind !== "capturing") {
         phase = {
           kind: "capturing",
           localSessionId: recorder.localSessionId,
           mode: "resumed",
         };
       }
-    } else if (!recorder.recording) {
-      if (phase.kind === "capturing") {
+    } else if (recorder.recording) {
+      this.activeCaptureSessionId = null;
+      phase = {
+        kind: "blocked",
+        reason: "operator_reconciliation_required",
+        localSessionId: phaseLocalSessionId(phase),
+      };
+    } else {
+      if (
+        phase.kind === "capturing" &&
+        recorder.localSessionId !== null &&
+        recorder.localSessionId !== phase.localSessionId
+      ) {
+        phase = {
+          kind: "blocked",
+          reason: "operator_reconciliation_required",
+          localSessionId: phase.localSessionId,
+        };
+      } else if (
+        phase.kind === "capturing" ||
+        (phase.kind === "stopped" &&
+          recorder.localSessionId === phase.localSessionId)
+      ) {
         phase = {
           kind: "stopped",
           localSessionId: phase.localSessionId,
@@ -1051,7 +1187,11 @@ class Controller implements BackendManagedHostController {
       }
       this.activeCaptureSessionId = null;
     }
-    this.patchSnapshot({ sessions, recorder, phase });
+    this.patchSnapshot({
+      ...(sessions === undefined ? {} : { sessions }),
+      recorder,
+      phase,
+    });
   }
 
   private async discoverSessions(): Promise<
@@ -1336,6 +1476,14 @@ class Controller implements BackendManagedHostController {
       this.updateRecorder(current);
       if (current.recorderRecording && current.sessionId) {
         this.activeCaptureSessionId = current.sessionId;
+        if (current.sessionId !== plannedLocalSessionId) {
+          this.setPhase({
+            kind: "blocked",
+            reason: "operator_reconciliation_required",
+            localSessionId: plannedLocalSessionId,
+          });
+          return;
+        }
         this.setPhase({
           kind: "capturing",
           localSessionId: current.sessionId,
@@ -1389,6 +1537,16 @@ class Controller implements BackendManagedHostController {
       return freezeSnapshot({ ...snapshot, actions: [] });
     }
     const actions: BackendManagedHostAction[] = [{ kind: "refresh" }];
+    if (
+      snapshot.recorder.recording &&
+      snapshot.recorder.localSessionId !== null &&
+      snapshot.phase.kind !== "capturing"
+    ) {
+      actions.push({
+        kind: "stop_capture",
+        localSessionId: snapshot.recorder.localSessionId,
+      });
+    }
     if (
       !snapshot.recorder.recording &&
       ![
@@ -1596,10 +1754,17 @@ function emptyQueue(localSessionId: string): BackendQueueStatus {
 }
 
 function projectRecorder(status: CaptureStatus): BackendManagedRecorderSnapshot {
+  const safeErrorCodes = (
+    Array.isArray(status.errorCodes) ? status.errorCodes : []
+  )
+    .filter(isSafeNativeErrorCode)
+    .slice(-MAXIMUM_PROJECTED_ERROR_CODES);
   return {
     state: status.state,
     localSessionId: status.sessionId ?? null,
     recording: status.recorderRecording,
+    errorCodeCount: safeErrorCodes.length,
+    latestErrorCode: safeErrorCodes.at(-1) ?? null,
   };
 }
 
@@ -1671,11 +1836,18 @@ function projectError(
     typeof error === "object" &&
     "code" in error &&
     typeof error.code === "string" &&
-    /^ERR_TACUA_[A-Z0-9_]{1,85}$/u.test(error.code)
+    isSafeNativeErrorCode(error.code)
   ) {
     nativeCode = error.code;
   }
   return { operation, category, nativeCode };
+}
+
+function isSafeNativeErrorCode(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^ERR_TACUA_[A-Z0-9_]{1,85}$/u.test(value)
+  );
 }
 
 function freezeSnapshot(

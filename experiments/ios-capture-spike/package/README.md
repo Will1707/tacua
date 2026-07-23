@@ -40,6 +40,22 @@ building a new native QA client; an over-the-air JavaScript update cannot add
 this native module. Release maintainers must follow the repository's
 [mobile SDK release runbook](https://github.com/Will1707/tacua/blob/main/docs/maintainers/MOBILE_SDK_RELEASE.md).
 
+## Privacy manifest and host disclosures
+
+The CocoaPods target bundles `PrivacyInfo.xcprivacy` with the SDK. It declares
+screen video, microphone/app audio, product-interaction diagnostics, and other
+diagnostic data as linked data used for app functionality, with tracking
+disabled. Its required-reason declarations cover only the SDK's app-container
+file inspection, session-relative system-uptime measurements, and free-space
+admission check. The package also bundles its Apache-2.0 `LICENSE` and `NOTICE`.
+
+This component manifest describes the SDK, not the complete host app or
+deployment. Before distributing a QA build, the host maintainer must review
+the merged privacy report and provide accurate App Store privacy details for
+all code, configured processors, and destinations in that build. The host
+must also retain Tacua's explicit screen, microphone, diagnostics, and raw
+media upload consent flow; bundling the manifest does not replace consent.
+
 ## Candidate behavior
 
 - Captures the host app's ReplayKit video, app-audio, and microphone sample buffers.
@@ -249,6 +265,16 @@ remain operator-reconciliation actions; the controller never guesses whether a
 remote exchange succeeded. Subscriber exceptions cannot interrupt lifecycle
 work, and public errors expose only a closed controller category plus an
 allowlisted, bounded native error code—not native error text.
+
+The controller also installs native `onState` and `onError` listeners. Those
+callbacks are wake-up signals only: their payloads and error reasons never enter
+controller state. A signal schedules a fresh authoritative status/discovery
+read on the same serialized queue, with bursts coalesced and a signal arriving
+during reconciliation preserved for one follow-up pass. ReplayKit automatic
+stop therefore moves `capturing` to `stopped` while the app remains foregrounded
+and projects the applicable explicit `keep_verified_partial` or
+`admit_and_drain` action. It does not automatically finalize, admit, upload, or
+delete anything. `dispose()` removes both native listeners.
 
 The fixed interrupted-capture choices are projected as typed actions. With a
 current recovered or freshly resumed plan, the host can call
@@ -628,9 +654,13 @@ When a committed backend queue and usable credential exist,
 the manifest. The host product must still present that destructive action to
 the user explicitly.
 
-Raw `partial` state is never backend-admissible. A person must first choose
-`markPartialReadyForUpload(options)`; only `completed` and the resulting explicit
-`partial_ready_for_upload` state cross the admission boundary.
+Raw `partial` state is never backend-admissible. The host must apply an explicit
+product policy before it calls `markPartialReadyForUpload(options)`: either ask
+the person after interruption, or disclose before capture that consent also
+authorizes deterministic preservation and upload of a verified partial after
+an autonomous stop. The SDK never makes that policy choice itself. Only
+`completed` and the resulting explicit `partial_ready_for_upload` state cross
+the admission boundary.
 
 ## App-audio acceptance artifact
 
