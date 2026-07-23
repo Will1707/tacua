@@ -18,14 +18,24 @@ from .processing_adapter import (
     ProcessingAdapterError,
     load_local_processor_command,
 )
+from .processing_bridge import WORKER_ERROR_CODE
 from .service import ApiError, PilotBackend
 
 
 MAX_DRAIN_STAGES = 10_000
 
 
+class _WorkerArgumentError(RuntimeError):
+    pass
+
+
+class _WorkerArgumentParser(argparse.ArgumentParser):
+    def error(self, _message: str) -> None:
+        raise _WorkerArgumentError
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _WorkerArgumentParser(
         description="Run the opt-in Tacua local processing worker"
     )
     parser.add_argument("--config-file", type=Path, required=True)
@@ -102,19 +112,40 @@ def _run(args: argparse.Namespace) -> dict[str, object]:
         }
 
 
+def _write_failure(code: str) -> int:
+    selected = (
+        code
+        if isinstance(code, str)
+        and WORKER_ERROR_CODE.fullmatch(code) is not None
+        else "WORKER_FAILED"
+    )
+    sys.stderr.write(selected + "\n")
+    return 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     os.umask(0o077)
-    parser = _parser()
-    args = parser.parse_args(argv)
     try:
+        args = _parser().parse_args(argv)
         result = _run(args)
+        rendered = canonical_json(result) + "\n"
+        sys.stdout.write(rendered)
+    except _WorkerArgumentError:
+        return _write_failure("WORKER_ARGUMENT_INVALID")
     except ProcessingAdapterError as error:
-        parser.error(f"{error.code}: {error}")
+        return _write_failure(error.code)
     except ApiError as error:
-        parser.error(f"{error.code}: {error.message}")
-    except (ConfigError, InstanceLockError, ValueError) as error:
-        parser.error(str(error))
-    sys.stdout.write(canonical_json(result) + "\n")
+        return _write_failure(
+            getattr(error, "worker_code", error.code)
+        )
+    except ConfigError:
+        return _write_failure("WORKER_CONFIG_INVALID")
+    except InstanceLockError:
+        return _write_failure("WORKER_STATE_LOCK_FAILED")
+    except ValueError:
+        return _write_failure("WORKER_INPUT_INVALID")
+    except Exception:
+        return _write_failure("WORKER_FAILED")
     return 0
 
 

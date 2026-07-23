@@ -791,6 +791,129 @@ class ComposeProcessingBridgeTests(unittest.TestCase):
             file=BRIDGE.sys.stderr,
         )
 
+    def test_worker_failure_accepts_only_one_stable_code(self) -> None:
+        self.assertEqual(
+            BRIDGE._worker_failure_code(b"BRIDGE_UNAVAILABLE\n"),
+            "BRIDGE_UNAVAILABLE",
+        )
+        self.assertEqual(
+            BRIDGE._worker_failure_code(b"PROCESSOR_COMMAND_UNSAFE\n"),
+            "BRIDGE_PROCESSOR_COMMAND_UNSAFE",
+        )
+        maximum = b"BRIDGE_" + b"A" * 88 + b"\n"
+        self.assertEqual(
+            BRIDGE._worker_failure_code(maximum),
+            maximum.decode("ascii").strip(),
+        )
+        for payload in (
+            b"",
+            b"BRIDGE_UNAVAILABLE",
+            b"BRIDGE_UNAVAILABLE\r\n",
+            b"BRIDGE_UNAVAILABLE\nsynthetic secret",
+            b"BRIDGE_" + b"A" * 89 + b"\n",
+            b"bridge_unavailable\n",
+            b"ARBITRARY_FAILURE\n",
+            b"A" * 128 + b"\n",
+        ):
+            self.assertEqual(
+                BRIDGE._worker_failure_code(payload),
+                "BRIDGE_WORKER_FAILED",
+            )
+
+    def test_broker_normalizes_and_client_validates_error_namespace(
+        self,
+    ) -> None:
+        self.assertEqual(
+            BRIDGE._bridge_error_code("INVALID_PROCESSOR_IMAGE"),
+            "BRIDGE_INVALID_PROCESSOR_IMAGE",
+        )
+        self.assertEqual(
+            BRIDGE._bridge_error_code("BRIDGE_UNAVAILABLE"),
+            "BRIDGE_UNAVAILABLE",
+        )
+        maximum = "A" * 88
+        self.assertEqual(
+            BRIDGE._bridge_error_code(maximum),
+            "BRIDGE_" + maximum,
+        )
+        for code in (
+            "bridge_unavailable",
+            "A" * 89,
+            "BRIDGE_" + "A" * 89,
+        ):
+            self.assertEqual(
+                BRIDGE._bridge_error_code(code),
+                "BRIDGE_PROCESSOR_FAILED",
+            )
+        response = {
+            "code": "BRIDGE_UNAVAILABLE",
+            "contract_version": CLIENT.RESPONSE_CONTRACT,
+            "status": "error",
+        }
+        self.assertEqual(
+            CLIENT._response_error_code(response),
+            "BRIDGE_UNAVAILABLE",
+        )
+        response["code"] = "PROCESSOR_FAKE"
+        with self.assertRaises(CLIENT.ProcessingBridgeError) as raised:
+            CLIENT._response_error_code(response)
+        self.assertEqual(raised.exception.code, "BRIDGE_RESPONSE_INVALID")
+
+    def test_worker_stderr_code_requires_coherent_failed_exit(self) -> None:
+        def failure_code(
+            *,
+            oom_killed: bool = False,
+            running: bool = False,
+            stdout: bytes = b"",
+        ) -> str:
+            inspected = {
+                "State": {
+                    "Error": "",
+                    "ExitCode": 1,
+                    "OOMKilled": oom_killed,
+                    "Running": running,
+                    "Status": "exited",
+                }
+            }
+            with (
+                mock.patch.object(
+                    BRIDGE,
+                    "_docker",
+                    return_value=subprocess.CompletedProcess(
+                        ["docker"],
+                        1,
+                        stdout,
+                        b"BRIDGE_UNAVAILABLE\n",
+                    ),
+                ),
+                mock.patch.object(
+                    BRIDGE,
+                    "_inspect_container",
+                    return_value=inspected,
+                ),
+                self.assertRaises(
+                    BRIDGE.ComposeProcessingError
+                ) as raised,
+            ):
+                BRIDGE._run_created_worker(
+                    "a" * 64,
+                    stage_limit=1,
+                    expected_mode="run_once",
+                )
+            return raised.exception.code
+
+        self.assertEqual(failure_code(), "BRIDGE_UNAVAILABLE")
+        for kwargs in (
+            {"oom_killed": True},
+            {"running": True},
+            {"stdout": b"unexpected"},
+        ):
+            with self.subTest(**kwargs):
+                self.assertEqual(
+                    failure_code(**kwargs),
+                    "BRIDGE_WORKER_FAILED",
+                )
+
     def test_response_header_bound_carries_maximum_preview_manifest(
         self,
     ) -> None:

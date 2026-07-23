@@ -34,8 +34,11 @@ there is no shell, interpolation, glob expansion, or command substitution.
 exactly once. The executable path must be absolute. Arguments containing any
 other brace are rejected. Timeout is 1–240 seconds, stdout is 1 KiB–16 MiB,
 and stderr is 1 KiB–1 MiB. Exceeding either pipe bound or the timeout kills the
-child process group. Stderr and invalid stdout are never copied into job state
-or an operator error.
+child process group. Raw stderr and invalid stdout are never copied into job
+state or an operator error. The provenance-verified Compose bridge may promote
+one exact, bounded `BRIDGE_*` failure code across each trusted internal
+boundary; every other stderr payload is discarded, and no stderr content is
+persisted or returned through the public API.
 
 The frozen document above selects adapter wire 1.0. An operator may explicitly
 select `tacua.local-processing-command@1.1.0` using the same exact five-field

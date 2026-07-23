@@ -911,6 +911,7 @@ from tacua_backend.operator_tool import (  # noqa: E402
     smoke_deployment,
 )
 from tacua_backend.processing_bridge import (  # noqa: E402
+    BRIDGE_ERROR_CODE,
     ERROR_CODE,
     MAX_ADAPTER_DESCRIPTOR,
     MAX_OUTPUT_BYTES,
@@ -920,6 +921,7 @@ from tacua_backend.processing_bridge import (  # noqa: E402
     REQUEST_CONTRACT,
     RESPONSE_CONTRACT,
     SAFE_OUTPUT_NAME,
+    WORKER_ERROR_CODE,
     ProcessingBridgeError,
     canonical_json,
     receive_descriptor_batches,
@@ -2933,11 +2935,7 @@ def _send_success(
 
 
 def _send_error(connection: socket.socket, code: str) -> None:
-    safe_code = (
-        code
-        if isinstance(code, str) and ERROR_CODE.fullmatch(code) is not None
-        else "BRIDGE_PROCESSOR_FAILED"
-    )
+    safe_code = _bridge_error_code(code)
     try:
         send_frame(
             connection,
@@ -2949,6 +2947,17 @@ def _send_error(connection: socket.socket, code: str) -> None:
         )
     except (OSError, ProcessingBridgeError):
         pass
+
+
+def _bridge_error_code(code: object) -> str:
+    if not isinstance(code, str) or ERROR_CODE.fullmatch(code) is None:
+        return "BRIDGE_PROCESSOR_FAILED"
+    normalized = code if code.startswith("BRIDGE_") else f"BRIDGE_{code}"
+    return (
+        normalized
+        if BRIDGE_ERROR_CODE.fullmatch(normalized) is not None
+        else "BRIDGE_PROCESSOR_FAILED"
+    )
 
 
 def _run_one_request(
@@ -3511,6 +3520,17 @@ def _run_created_worker(
     )
     inspected = _inspect_container(container_id)
     state = inspected.get("State")
+    worker_reported_failure = (
+        result.returncode != 0
+        and not result.stdout
+        and isinstance(state, dict)
+        and state.get("Status") == "exited"
+        and state.get("Running") is False
+        and type(state.get("ExitCode")) is int
+        and state["ExitCode"] != 0
+        and state.get("OOMKilled") is False
+        and state.get("Error") in {None, ""}
+    )
     if (
         result.returncode != 0
         or not isinstance(state, dict)
@@ -3520,7 +3540,11 @@ def _run_created_worker(
         or state.get("Error") not in {None, ""}
     ):
         raise ComposeProcessingError(
-            "BRIDGE_WORKER_FAILED",
+            (
+                _worker_failure_code(result.stderr)
+                if worker_reported_failure
+                else "BRIDGE_WORKER_FAILED"
+            ),
             "one-shot worker exited unsuccessfully",
         )
     summary = _parse_json(result.stdout, "worker summary")
@@ -3566,6 +3590,20 @@ def _run_created_worker(
             "one-shot worker summary is invalid",
         )
     return summary
+
+
+def _worker_failure_code(payload: bytes) -> str:
+    if len(payload) <= 128 and payload.endswith(b"\n"):
+        try:
+            code = payload[:-1].decode("ascii")
+        except UnicodeDecodeError:
+            pass
+        else:
+            if WORKER_ERROR_CODE.fullmatch(code) is not None:
+                return (
+                    code if code.startswith("BRIDGE_") else f"BRIDGE_{code}"
+                )
+    return "BRIDGE_WORKER_FAILED"
 
 
 def _state_verifier_command_argv() -> list[str]:

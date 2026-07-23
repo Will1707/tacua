@@ -45,6 +45,10 @@ DESCRIPTOR_PATH = re.compile(r"^/dev/fd/([0-9]+)$")
 SAFE_OUTPUT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 DIGEST = re.compile(r"^sha256:[a-f0-9]{64}$")
 ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
+BRIDGE_ERROR_CODE = re.compile(r"^BRIDGE_[A-Z0-9_]{1,88}$")
+WORKER_ERROR_CODE = re.compile(
+    r"^(?:BRIDGE|PROCESSOR|PROCESSING|WORKER)_[A-Z0-9_]{1,88}$"
+)
 
 
 class ProcessingBridgeError(RuntimeError):
@@ -633,17 +637,9 @@ def run_client(
                 "bridge response contract differs",
             )
         if response.get("status") == "error":
-            if (
-                set(response) != {"code", "contract_version", "status"}
-                or not isinstance(response.get("code"), str)
-                or ERROR_CODE.fullmatch(response["code"]) is None
-            ):
-                raise ProcessingBridgeError(
-                    "BRIDGE_RESPONSE_INVALID",
-                    "bridge error response is invalid",
-                )
+            code = _response_error_code(response)
             raise ProcessingBridgeError(
-                response["code"],
+                code,
                 "trusted host processor rejected the request",
             )
         if response.get("status") != "ok":
@@ -666,6 +662,21 @@ def run_client(
                 "bridge response contained trailing bytes",
             )
         return result
+
+
+def _response_error_code(response: dict[str, Any]) -> str:
+    if (
+        set(response) != {"code", "contract_version", "status"}
+        or response.get("contract_version") != RESPONSE_CONTRACT
+        or response.get("status") != "error"
+        or not isinstance(response.get("code"), str)
+        or BRIDGE_ERROR_CODE.fullmatch(response["code"]) is None
+    ):
+        raise ProcessingBridgeError(
+            "BRIDGE_RESPONSE_INVALID",
+            "bridge error response is invalid",
+        )
+    return response["code"]
 
 
 def _parser() -> argparse.ArgumentParser:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import io
 import json
 import os
 from pathlib import Path
@@ -32,11 +33,15 @@ from tacua_backend.processing_adapter import (  # noqa: E402
     LocalProcessingAdapter,
     LocalProcessorCommand,
     ProcessingAdapterError,
+    _processor_failure_code,
     _run_bounded_command,
     load_local_processor_command,
 )
 from tacua_backend.processing_jobs import ARTIFACT_PIPELINE_VERSION  # noqa: E402
-from tacua_backend.processing_worker import _run as run_worker  # noqa: E402
+from tacua_backend.processing_worker import (  # noqa: E402
+    _run as run_worker,
+    main as worker_main,
+)
 from tacua_backend.service import ApiError, PilotBackend  # noqa: E402
 from test_backend import BackendHarness  # noqa: E402
 
@@ -552,6 +557,172 @@ class LocalProcessingAdapterTests(BackendHarness):
                         pass_fds=(),
                     )
                 self.assertEqual(expected_code, captured.exception.code)
+
+    def test_only_one_stable_child_error_code_crosses_adapter_boundary(
+        self,
+    ) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        work = Path(directory.name)
+        cases = (
+            (
+                "import sys; sys.stderr.write('BRIDGE_UNAVAILABLE\\n'); "
+                "sys.exit(1)",
+                "BRIDGE_UNAVAILABLE",
+            ),
+            (
+                "import sys; sys.stderr.write("
+                "'BRIDGE_UNAVAILABLE\\nsynthetic secret'); sys.exit(1)",
+                "PROCESSOR_EXIT_FAILED",
+            ),
+            (
+                "import sys; sys.stderr.write('PROCESSOR_FAKE\\n'); "
+                "sys.exit(1)",
+                "PROCESSOR_EXIT_FAILED",
+            ),
+        )
+        for source, expected_code in cases:
+            with self.subTest(expected_code=expected_code):
+                script = self.processor_script(source)
+                command = self.command(script)
+                with self.assertRaises(ProcessingAdapterError) as captured:
+                    _run_bounded_command(
+                        command,
+                        command.expand(
+                            input_path="/dev/null",
+                            output_directory=work,
+                        ),
+                        cwd=work,
+                        pass_fds=(),
+                    )
+                self.assertEqual(expected_code, captured.exception.code)
+
+    def test_adapter_bridge_error_code_boundary_is_exact(self) -> None:
+        maximum = b"BRIDGE_" + b"A" * 88 + b"\n"
+        self.assertEqual(
+            _processor_failure_code(maximum),
+            maximum.decode("ascii").strip(),
+        )
+        for payload in (
+            b"BRIDGE_UNAVAILABLE",
+            b"BRIDGE_UNAVAILABLE\r\n",
+            b"BRIDGE_" + b"A" * 89 + b"\n",
+            b"PROCESSOR_FAKE\n",
+        ):
+            self.assertEqual(
+                _processor_failure_code(payload),
+                "PROCESSOR_EXIT_FAILED",
+            )
+
+    def test_worker_runtime_error_is_one_content_free_code(self) -> None:
+        error_output = io.StringIO()
+        with (
+            patch(
+                "tacua_backend.processing_worker._run",
+                side_effect=ProcessingAdapterError(
+                    "BRIDGE_UNAVAILABLE",
+                    "synthetic secret detail",
+                ),
+            ),
+            patch("tacua_backend.processing_worker.os.umask"),
+            patch(
+                "tacua_backend.processing_worker.sys.stderr",
+                error_output,
+            ),
+        ):
+            result = worker_main(
+                [
+                    "--config-file",
+                    "/synthetic/config.json",
+                    "--admin-secret-file",
+                    "/synthetic/admin-secret",
+                    "--command-file",
+                    "/synthetic/command.json",
+                    "--worker-id",
+                    "worker_test",
+                    "--run-once",
+                ]
+            )
+        self.assertEqual(result, 1)
+        self.assertEqual(error_output.getvalue(), "BRIDGE_UNAVAILABLE\n")
+        self.assertNotIn("synthetic secret detail", error_output.getvalue())
+
+    def test_worker_argument_and_unexpected_errors_are_content_free(
+        self,
+    ) -> None:
+        cases = (
+            (
+                ["--config-file", "synthetic secret path"],
+                None,
+                "WORKER_ARGUMENT_INVALID\n",
+            ),
+            (
+                [
+                    "--config-file",
+                    "/synthetic/config.json",
+                    "--admin-secret-file",
+                    "/synthetic/admin-secret",
+                    "--command-file",
+                    "/synthetic/command.json",
+                    "--run-once",
+                ],
+                RuntimeError("synthetic secret detail"),
+                "WORKER_FAILED\n",
+            ),
+        )
+        for arguments, failure, expected in cases:
+            with self.subTest(expected=expected):
+                error_output = io.StringIO()
+                run = (
+                    patch(
+                        "tacua_backend.processing_worker._run",
+                        side_effect=failure,
+                    )
+                    if failure is not None
+                    else patch(
+                        "tacua_backend.processing_worker._run"
+                    )
+                )
+                with (
+                    run,
+                    patch("tacua_backend.processing_worker.os.umask"),
+                    patch(
+                        "tacua_backend.processing_worker.sys.stderr",
+                        error_output,
+                    ),
+                ):
+                    self.assertEqual(worker_main(arguments), 1)
+                self.assertEqual(error_output.getvalue(), expected)
+                self.assertNotIn("synthetic secret", error_output.getvalue())
+
+    def test_backend_keeps_worker_diagnostic_out_of_public_failure(
+        self,
+    ) -> None:
+        lifecycle = self.full_completed_session()
+        job_id = lifecycle["completion_receipt"]["processing_job"]["job_id"]
+
+        class FailingEngine:
+            def process_stage(self, _claim):
+                raise ProcessingAdapterError(
+                    "BRIDGE_UNAVAILABLE",
+                    "synthetic secret detail",
+                )
+
+        self.backend._processing_engine = FailingEngine()
+        with self.assertRaises(ApiError) as captured:
+            self.backend.run_processing_once("worker_diagnostic_test")
+        self.assertEqual(
+            captured.exception.code,
+            "PROCESSING_ENGINE_FAILED",
+        )
+        self.assertEqual(
+            captured.exception.worker_code,
+            "BRIDGE_UNAVAILABLE",
+        )
+        self.assertIsNone(captured.exception.__cause__)
+        public_job = self.backend.get_job(job_id)
+        self.assertNotIn("BRIDGE_UNAVAILABLE", canonical_json(public_job))
+        self.assertNotIn("synthetic secret detail", canonical_json(public_job))
 
     @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX process groups")
     def test_successful_processor_cannot_leave_a_descriptor_holding_descendant(self) -> None:

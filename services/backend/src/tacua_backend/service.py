@@ -80,6 +80,7 @@ from .processing_jobs import (
     ProcessingJobStoreError,
     initialize_processing_job_schema,
 )
+from .processing_bridge import WORKER_ERROR_CODE
 
 
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
@@ -198,6 +199,24 @@ class ApiError(Exception):
         self.message = message
         self.sdk_reconciliation = sdk_reconciliation
         self.details = copy.deepcopy(details)
+
+
+class _ProcessingEngineFailure(ApiError):
+    """Generic public failure with one content-free worker-only code."""
+
+    def __init__(self, worker_code: object):
+        selected = (
+            worker_code
+            if isinstance(worker_code, str)
+            and WORKER_ERROR_CODE.fullmatch(worker_code) is not None
+            else "PROCESSING_ENGINE_FAILED"
+        )
+        super().__init__(
+            500,
+            "PROCESSING_ENGINE_FAILED",
+            "configured processing engine failed",
+        )
+        self.worker_code = selected
 
 
 @dataclass(frozen=True)
@@ -5133,7 +5152,8 @@ class PilotBackend:
 
         try:
             stage_result = engine.process_stage(claim)
-        except Exception:
+        except Exception as error:
+            worker_code = vars(error).get("code")
             try:
                 self.fail_processing_job(
                     claim.job["job_id"],
@@ -5145,11 +5165,7 @@ class PilotBackend:
                 )
             except ApiError:
                 pass
-            raise ApiError(
-                500,
-                "PROCESSING_ENGINE_FAILED",
-                "configured processing engine failed",
-            ) from None
+            raise _ProcessingEngineFailure(worker_code) from None
 
         final_stage = claim.stage_name == JOB_STAGES[-1]
         if final_stage and isinstance(stage_result, ProcessingResult):
