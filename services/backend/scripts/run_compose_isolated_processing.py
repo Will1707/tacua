@@ -3068,10 +3068,10 @@ def run_broker(
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         listener.bind(str(socket_path))
-        socket_path.chmod(0o666)
         listener.listen(1)
         listener = _move_socket_high(listener)
         listener.settimeout(1)
+        socket_path.chmod(0o666)
         for _request_index in range(max_requests):
             while True:
                 if os.getppid() != parent_pid:
@@ -3142,22 +3142,8 @@ def _broker_process(
         start_new_session=True,
         env=environment,
     )
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            break
-        try:
-            metadata = socket_path.lstat()
-        except FileNotFoundError:
-            time.sleep(0.02)
-            continue
-        if (
-            stat.S_ISSOCK(metadata.st_mode)
-            and metadata.st_uid == os.geteuid()
-            and stat.S_IMODE(metadata.st_mode) == 0o666
-        ):
-            return process
-        break
+    if _wait_for_broker_socket(process, socket_path):
+        return process
     broker_diagnostic = _stop_broker(
         process,
         capture_stderr=True,
@@ -3166,6 +3152,41 @@ def _broker_process(
         _broker_failure_code(broker_diagnostic),
         "trusted host broker did not become ready",
     )
+
+
+def _wait_for_broker_socket(
+    process: subprocess.Popen[bytes],
+    socket_path: Path,
+) -> bool:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            return False
+        try:
+            metadata = socket_path.lstat()
+        except FileNotFoundError:
+            time.sleep(0.02)
+            continue
+        readiness = _broker_socket_readiness(metadata)
+        if readiness == "ready":
+            return True
+        if readiness == "unsafe":
+            return False
+        time.sleep(0.02)
+    return False
+
+
+def _broker_socket_readiness(metadata: os.stat_result) -> str:
+    if (
+        not stat.S_ISSOCK(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+    ):
+        return "unsafe"
+    if stat.S_IMODE(metadata.st_mode) == 0o666:
+        return "ready"
+    if stat.S_IMODE(metadata.st_mode) == 0o700:
+        return "pending"
+    return "unsafe"
 
 
 def _broker_failure_code(payload: bytes) -> str:

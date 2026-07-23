@@ -545,6 +545,201 @@ class ComposeProcessingBridgeTests(unittest.TestCase):
                 "BRIDGE_BROKER_FAILED",
             )
 
+    def test_broker_socket_readiness_waits_for_permission_transition(
+        self,
+    ) -> None:
+        def metadata(file_type: int, mode: int, owner: int) -> os.stat_result:
+            return os.stat_result(
+                (file_type | mode, 0, 0, 0, owner, 0, 0, 0, 0, 0)
+            )
+
+        with mock.patch.object(BRIDGE.os, "geteuid", return_value=1000):
+            self.assertEqual(
+                BRIDGE._broker_socket_readiness(
+                    metadata(stat.S_IFSOCK, 0o700, 1000)
+                ),
+                "pending",
+            )
+            self.assertEqual(
+                BRIDGE._broker_socket_readiness(
+                    metadata(stat.S_IFSOCK, 0o666, 1000)
+                ),
+                "ready",
+            )
+            for value in (
+                metadata(stat.S_IFSOCK, 0o600, 1000),
+                metadata(stat.S_IFSOCK, 0o666, 1001),
+                metadata(stat.S_IFREG, 0o666, 1000),
+            ):
+                self.assertEqual(
+                    BRIDGE._broker_socket_readiness(value),
+                    "unsafe",
+                )
+
+    def test_broker_socket_wait_tolerates_bind_permission_transition(
+        self,
+    ) -> None:
+        pending = os.stat_result(
+            (stat.S_IFSOCK | 0o700, 0, 0, 0, 1000, 0, 0, 0, 0, 0)
+        )
+        ready = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 0, 0, 0, 1000, 0, 0, 0, 0, 0)
+        )
+        process = mock.Mock()
+        process.poll.return_value = None
+        socket_path = mock.Mock()
+        socket_path.lstat.side_effect = (pending, ready)
+        with (
+            mock.patch.object(BRIDGE.os, "geteuid", return_value=1000),
+            mock.patch.object(BRIDGE.time, "sleep") as sleep,
+        ):
+            self.assertTrue(
+                BRIDGE._wait_for_broker_socket(process, socket_path)
+            )
+        self.assertEqual(socket_path.lstat.call_count, 2)
+        sleep.assert_called_once_with(0.02)
+
+    def test_broker_process_returns_after_socket_becomes_ready(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(dir=SHORT_TEMP_ROOT) as temporary:
+            operation = Path(temporary).resolve()
+            socket_path = operation / "processing-bridge.sock"
+            script = (
+                operation
+                / BRIDGE._SOURCE_DIRECTORY_NAME
+                / BRIDGE._SOURCE_EXACT_PATHS[0]
+            )
+            process = mock.Mock()
+            stop = mock.Mock()
+            with (
+                mock.patch.object(
+                    BRIDGE,
+                    "_VERIFIED_SOURCE_CONTEXT",
+                    {
+                        "manifest": {"source_digest": "sha256:" + "a" * 64},
+                        "operation": operation,
+                    },
+                ),
+                mock.patch.object(BRIDGE, "__file__", str(script)),
+                mock.patch.object(
+                    BRIDGE,
+                    "_bootstrap_exec_environment",
+                    return_value={},
+                ),
+                mock.patch.object(
+                    BRIDGE.subprocess,
+                    "Popen",
+                    return_value=process,
+                ),
+                mock.patch.object(
+                    BRIDGE,
+                    "_wait_for_broker_socket",
+                    return_value=True,
+                ),
+                mock.patch.object(BRIDGE, "_stop_broker", stop),
+            ):
+                self.assertIs(
+                    BRIDGE._broker_process(
+                        socket_path,
+                        operation / "isolated-command.json",
+                        "sha256:" + "b" * 64,
+                        1,
+                    ),
+                    process,
+                )
+            stop.assert_not_called()
+
+    def test_broker_publishes_ready_mode_after_listener_setup(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(dir=SHORT_TEMP_ROOT) as temporary:
+            operation = Path(temporary).resolve()
+            socket_path = operation / "processing-bridge.sock"
+            digest = "sha256:" + "a" * 64
+            events: list[str] = []
+            listener = mock.Mock()
+            listener.bind.side_effect = lambda _path: events.append("bind")
+            listener.listen.side_effect = lambda _count: events.append(
+                "listen"
+            )
+            listener.settimeout.side_effect = lambda _timeout: events.append(
+                "timeout"
+            )
+
+            def move(value):
+                self.assertIs(value, listener)
+                events.append("move")
+                return listener
+
+            def chmod(_path, mode):
+                self.assertEqual(mode, 0o666)
+                events.append("chmod")
+
+            with (
+                mock.patch.object(
+                    BRIDGE,
+                    "_VERIFIED_SOURCE_CONTEXT",
+                    {
+                        "mode": "broker",
+                        "operation": operation,
+                        "original_root": ROOT,
+                        "source_digest": digest,
+                    },
+                ),
+                mock.patch.object(
+                    BRIDGE,
+                    "_load_operation_journal",
+                    return_value={
+                        "host_bundle_digest": digest,
+                        "original_repository_root": str(ROOT),
+                    },
+                ),
+                mock.patch.object(
+                    BRIDGE,
+                    "_prepare_broker_descriptor_limit",
+                ),
+                mock.patch.object(BRIDGE, "_require_snapshot_digest"),
+                mock.patch.object(
+                    BRIDGE.RUNNER,
+                    "load_command",
+                    return_value={"synthetic": True},
+                ),
+                mock.patch.object(
+                    BRIDGE.threading,
+                    "Thread",
+                    return_value=mock.Mock(),
+                ),
+                mock.patch.object(
+                    BRIDGE.socket,
+                    "socket",
+                    return_value=listener,
+                ),
+                mock.patch.object(BRIDGE, "_move_socket_high", side_effect=move),
+                mock.patch.object(BRIDGE.os, "umask"),
+                mock.patch.object(BRIDGE.os, "getppid", return_value=999),
+                mock.patch.object(
+                    type(socket_path),
+                    "chmod",
+                    autospec=True,
+                    side_effect=chmod,
+                ),
+            ):
+                self.assertEqual(
+                    BRIDGE.run_broker(
+                        socket_path,
+                        operation / "isolated-command.json",
+                        digest,
+                        1,
+                        123,
+                    ),
+                    0,
+                )
+            self.assertEqual(
+                events,
+                ["bind", "listen", "move", "timeout", "chmod"],
+            )
+
     def test_response_header_bound_carries_maximum_preview_manifest(
         self,
     ) -> None:
