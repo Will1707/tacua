@@ -689,6 +689,11 @@ class ComposeProcessingBridgeTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     BRIDGE,
+                    "_BROKER_FAILURE_STAGE",
+                    "ENTRY",
+                ),
+                mock.patch.object(
+                    BRIDGE,
                     "_load_operation_journal",
                     return_value={
                         "host_bundle_digest": digest,
@@ -739,6 +744,40 @@ class ComposeProcessingBridgeTests(unittest.TestCase):
                 events,
                 ["bind", "listen", "move", "timeout", "chmod"],
             )
+
+    def test_broker_unexpected_failure_reports_only_stable_stage(
+        self,
+    ) -> None:
+        arguments = argparse.Namespace(
+            isolated_command_digest="sha256:" + "a" * 64,
+            isolated_command_file=Path("/synthetic/command.json"),
+            max_requests=1,
+            parent_pid=123,
+            socket=Path("/synthetic/bridge.sock"),
+        )
+        output = mock.Mock()
+        parser = mock.Mock()
+        parser.parse_args.return_value = arguments
+        with (
+            mock.patch.object(
+                BRIDGE,
+                "_BROKER_FAILURE_STAGE",
+                "SOCKET_BIND",
+            ),
+            mock.patch.object(BRIDGE, "_broker_parser", return_value=parser),
+            mock.patch.object(BRIDGE.os, "umask"),
+            mock.patch.object(
+                BRIDGE,
+                "run_broker",
+                side_effect=RuntimeError("synthetic secret detail"),
+            ),
+            mock.patch("builtins.print", output),
+        ):
+            self.assertEqual(BRIDGE.main(["_broker"]), 1)
+        output.assert_called_once_with(
+            "BRIDGE_BROKER_SOCKET_BIND_FAILED",
+            file=BRIDGE.sys.stderr,
+        )
 
     def test_response_header_bound_carries_maximum_preview_manifest(
         self,

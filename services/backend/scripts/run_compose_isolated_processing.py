@@ -79,6 +79,7 @@ _BOOTSTRAP_ENV_NAMES = (
     "TACUA_SOURCE_ORIGINAL_ROOT",
     "TACUA_SOURCE_LOCK_FD",
 )
+_BROKER_FAILURE_STAGE = "ENTRY"
 
 
 class _SourceBootstrapError(RuntimeError):
@@ -3013,8 +3014,11 @@ def run_broker(
     max_requests: int,
     parent_pid: int,
 ) -> int:
+    global _BROKER_FAILURE_STAGE
     os.umask(0o077)
+    _BROKER_FAILURE_STAGE = "DESCRIPTOR_PREFLIGHT"
     _prepare_broker_descriptor_limit()
+    _BROKER_FAILURE_STAGE = "PROVENANCE"
     if (
         _VERIFIED_SOURCE_CONTEXT is None
         or _VERIFIED_SOURCE_CONTEXT["mode"] != "broker"
@@ -3024,6 +3028,7 @@ def run_broker(
             "BRIDGE_PROVENANCE_MISMATCH",
             "broker is not executing from the verified operation snapshot",
         )
+    _BROKER_FAILURE_STAGE = "JOURNAL"
     operation_journal = _load_operation_journal(socket_path.parent)
     if (
         operation_journal["host_bundle_digest"]
@@ -3035,6 +3040,7 @@ def run_broker(
             "BRIDGE_PROVENANCE_MISMATCH",
             "broker source differs from the durable operation journal",
         )
+    _BROKER_FAILURE_STAGE = "INPUT"
     if (
         not socket_path.is_absolute()
         or socket_path.exists()
@@ -3053,7 +3059,10 @@ def run_broker(
         "isolated command snapshot",
         isolated_command_digest,
     )
+    _BROKER_FAILURE_STAGE = "COMMAND"
     isolated_command = RUNNER.load_command(isolated_command_file)
+
+    _BROKER_FAILURE_STAGE = "PARENT_WATCH"
 
     def watch_parent() -> None:
         while os.getppid() == parent_pid:
@@ -3065,13 +3074,20 @@ def run_broker(
         name="tacua-compose-bridge-parent-watch",
         daemon=True,
     ).start()
+    _BROKER_FAILURE_STAGE = "SOCKET_CREATE"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
+        _BROKER_FAILURE_STAGE = "SOCKET_BIND"
         listener.bind(str(socket_path))
+        _BROKER_FAILURE_STAGE = "SOCKET_LISTEN"
         listener.listen(1)
+        _BROKER_FAILURE_STAGE = "DESCRIPTOR_RELOCATION"
         listener = _move_socket_high(listener)
+        _BROKER_FAILURE_STAGE = "SOCKET_TIMEOUT"
         listener.settimeout(1)
+        _BROKER_FAILURE_STAGE = "SOCKET_PUBLISH"
         socket_path.chmod(0o666)
+        _BROKER_FAILURE_STAGE = "SERVE"
         for _request_index in range(max_requests):
             while True:
                 if os.getppid() != parent_pid:
@@ -3085,8 +3101,15 @@ def run_broker(
                 _run_one_request(high_connection, isolated_command)
         return 0
     finally:
-        listener.close()
-        socket_path.unlink(missing_ok=True)
+        failure_stage = _BROKER_FAILURE_STAGE
+        try:
+            listener.close()
+            socket_path.unlink(missing_ok=True)
+        except Exception:
+            _BROKER_FAILURE_STAGE = "CLEANUP"
+            raise
+        else:
+            _BROKER_FAILURE_STAGE = failure_stage
 
 
 def _broker_process(
@@ -5574,7 +5597,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception:
         print(
             (
-                "BRIDGE_BROKER_FAILED"
+                f"BRIDGE_BROKER_{_BROKER_FAILURE_STAGE}_FAILED"
                 if arguments[:1] == ["_broker"]
                 else "BRIDGE_OPERATION_FAILED"
             ),
