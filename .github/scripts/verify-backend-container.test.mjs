@@ -90,10 +90,11 @@ for (const precreateLocalDirectory of [false, true]) {
       const localDirectory = path.join(root, "services/backend/local");
       if (precreateLocalDirectory) {
         mkdirSync(localDirectory);
+        chmodSync(localDirectory, 0o700);
       }
-      writeExecutable(path.join(fakeBin, "docker"), "#!/bin/sh\nexit 1\n");
+      writeExecutable(path.join(fakeBin, "docker"), "#!/bin/sh\nexit 0\n");
       writeExecutable(
-        path.join(fakeBin, "cp"),
+        path.join(fakeBin, "install"),
         "#!/bin/sh\nfor tacua_last_arg do :; done\nprintf partial > \"$tacua_last_arg\"\nexit 23\n",
       );
 
@@ -114,3 +115,63 @@ for (const precreateLocalDirectory of [false, true]) {
     },
   );
 }
+
+test("a non-private pre-existing local directory is rejected before Docker", (t) => {
+  const { fakeBin, root } = makeFixture(t);
+  const localDirectory = path.join(root, "services/backend/local");
+  const dockerMarker = path.join(root, "docker-was-called");
+  mkdirSync(localDirectory);
+  chmodSync(localDirectory, 0o755);
+  writeExecutable(
+    path.join(fakeBin, "docker"),
+    "#!/bin/sh\nprintf called > \"$TACUA_DOCKER_MARKER\"\nexit 99\n",
+  );
+
+  const result = runFixture(root, fakeBin, {
+    TACUA_DOCKER_MARKER: dockerMarker,
+  });
+
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /operator-owned mode-0700 directory/u);
+  assert.equal(existsSync(dockerMarker), false);
+  assert.deepEqual(readdirSync(localDirectory), []);
+});
+
+test("a Docker discovery error fails before creating verification inputs", (t) => {
+  const { fakeBin, root } = makeFixture(t);
+  writeExecutable(path.join(fakeBin, "docker"), "#!/bin/sh\nexit 47\n");
+
+  const result = runFixture(root, fakeBin);
+
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /cannot list Docker containers safely/u);
+  assert.equal(
+    existsSync(path.join(root, "services/backend/local")),
+    false,
+  );
+});
+
+test("an exact pre-existing Compose state volume is never adopted", (t) => {
+  const { fakeBin, root } = makeFixture(t);
+  writeExecutable(
+    path.join(fakeBin, "docker"),
+    `#!/bin/sh
+if [ "$1" = volume ] && [ "$2" = ls ]; then
+  printf '%s\\n' tacua-backend-script-test-compose_tacua-state
+fi
+exit 0
+`,
+  );
+
+  const result = runFixture(root, fakeBin);
+
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(
+    result.stderr,
+    /refusing to replace existing Docker volume: tacua-backend-script-test-compose_tacua-state/u,
+  );
+  assert.equal(
+    existsSync(path.join(root, "services/backend/local")),
+    false,
+  );
+});

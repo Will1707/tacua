@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import secrets
 import shutil
 import sqlite3
 import ssl
@@ -65,6 +66,16 @@ _TIMESTAMP = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
 )
 _IMMUTABLE_IMAGE = re.compile(r"^\S+@sha256:[a-f0-9]{64}$")
+_COMPOSE_PROJECT = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
+_INGRESS_IMAGE = (
+    "docker.io/library/haproxy:3.2.21-alpine3.24@"
+    "sha256:66e25cc9a8332635f4e897f7f4b1e5622c25f09f0ee23cddc6ce9bdb3a24772a"
+)
+_INGRESS_CONFIG_DIGEST = (
+    "sha256:e2d2c264d05e4a1167d5593122793e5fce51c6e599312a4d98cfa512617a721b"
+)
+_INGRESS_CONFIG_TARGET = "/usr/local/etc/haproxy/haproxy.cfg"
 _COMPOSE_HEALTHCHECK = [
     "CMD",
     "python",
@@ -74,6 +85,15 @@ _COMPOSE_HEALTHCHECK = [
         "d=json.load(urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)); "
         "assert d['status']=='ok' and d['retention_worker_running'] and "
         "d['pending_deletions']==0 and d['retention_last_failed_sessions']==0"
+    ),
+]
+_INGRESS_HEALTHCHECK = [
+    "CMD",
+    "sh",
+    "-ec",
+    (
+        "wget -qO- -T 2 http://127.0.0.1:8080/healthz "
+        "| grep -q '\"status\":\"ok\"'"
     ),
 ]
 
@@ -208,6 +228,114 @@ def _bounded_regular_bytes(path: Path, maximum: int, label: str) -> bytes:
         os.close(descriptor)
 
 
+def _inspect_protected_directory_chain(
+    directory: Path,
+    *,
+    label: str,
+    private_leaf: bool,
+) -> None:
+    try:
+        resolved = directory.resolve(strict=True)
+    except OSError as exc:
+        raise OperatorError(f"{label} directory chain cannot be inspected") from exc
+
+    lexical = Path(os.path.abspath(directory))
+    current = Path(lexical.anchor)
+    lexical_parts = lexical.parts[1:]
+    for index, part in enumerate(lexical_parts):
+        current /= part
+        try:
+            metadata = current.lstat()
+        except OSError as exc:
+            raise OperatorError(
+                f"{label} directory chain cannot be inspected"
+            ) from exc
+        leaf = index == len(lexical_parts) - 1
+        permissions = stat.S_IMODE(metadata.st_mode)
+        owner_allowed = metadata.st_uid in {0, os.geteuid()}
+        sticky_writable = (
+            permissions & 0o022
+            and permissions & stat.S_ISVTX
+            and owner_allowed
+        )
+        if stat.S_ISLNK(metadata.st_mode):
+            if leaf or metadata.st_uid != 0:
+                raise OperatorError(
+                    f"{label} path contains an unsafe lexical symlink"
+                )
+            continue
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or not owner_allowed
+            or (
+                leaf
+                and (
+                    metadata.st_uid != os.geteuid()
+                    or (
+                        permissions != 0o700
+                        if private_leaf
+                        else permissions & 0o022
+                    )
+                )
+            )
+            or (not leaf and permissions & 0o022 and not sticky_writable)
+        ):
+            raise OperatorError(
+                f"{label} path must have a protected operator/root-owned "
+                "lexical directory chain"
+            )
+
+    current = resolved
+    leaf = True
+    while True:
+        try:
+            metadata = current.lstat()
+        except OSError as exc:
+            raise OperatorError(
+                f"{label} directory chain cannot be inspected"
+            ) from exc
+        permissions = stat.S_IMODE(metadata.st_mode)
+        owner_allowed = metadata.st_uid in {0, os.geteuid()}
+        sticky_writable = (
+            permissions & 0o022
+            and permissions & stat.S_ISVTX
+            and owner_allowed
+        )
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or not owner_allowed
+            or (
+                leaf
+                and (
+                    metadata.st_uid != os.geteuid()
+                    or (
+                        permissions != 0o700
+                        if private_leaf
+                        else permissions & 0o022
+                    )
+                )
+            )
+            or (not leaf and permissions & 0o022 and not sticky_writable)
+        ):
+            raise OperatorError(
+                f"{label} path must have a protected operator/root-owned "
+                "directory chain"
+            )
+        if current.parent == current:
+            break
+        current = current.parent
+        leaf = False
+
+
+def _inspect_input_directory(directory: Path) -> None:
+    _inspect_protected_directory_chain(
+        directory,
+        label="administrator input",
+        private_leaf=True,
+    )
+
+
 def _inspect_host_file(path: Path, label: str, *, secret: bool) -> None:
     try:
         metadata = path.lstat()
@@ -222,10 +350,51 @@ def _inspect_host_file(path: Path, label: str, *, secret: bool) -> None:
     if metadata.st_uid != os.geteuid():
         raise OperatorError(f"{label} must be owned by the preflight user")
     permissions = stat.S_IMODE(metadata.st_mode)
-    if secret and permissions & 0o077:
-        raise OperatorError("admin secret host file must not grant group/world access")
-    if not secret and permissions & 0o022:
-        raise OperatorError("public config host file must not be group/world writable")
+    _inspect_input_directory(path.parent)
+    if secret:
+        if permissions != 0o444:
+            raise OperatorError("admin secret must be mode 0444")
+    elif permissions != 0o644:
+        raise OperatorError("public config must be mode 0644")
+
+
+def _inspect_public_deployment_file(path: Path, label: str) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise OperatorError(f"{label} cannot be inspected") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o644
+    ):
+        raise OperatorError(
+            f"{label} must be one mode-0644 file in a safe operator-owned directory"
+        )
+    _inspect_protected_directory_chain(
+        path.parent,
+        label=label,
+        private_leaf=False,
+    )
+
+
+def create_admin_secret(destination: Path) -> dict[str, Any]:
+    """Create one opaque Compose-readable secret without exposing its bytes."""
+
+    if destination.exists() or destination.is_symlink():
+        raise OperatorError("administrator secret destination already exists")
+    # Reuse the preflight directory boundary before generating any secret bytes.
+    _inspect_input_directory(destination.parent)
+    payload = secrets.token_urlsafe(48).encode("ascii")
+    parse_admin_secret(payload)
+    _write_file(destination, payload, 0o444)
+    _inspect_host_file(destination, "admin secret", secret=True)
+    return {
+        "status": "ok",
+        "destination": str(destination),
+    }
 
 
 def _validate_state_database(
@@ -490,8 +659,10 @@ def _write_file(path: Path, payload: bytes, mode: int) -> None:
         | getattr(os, "O_NOFOLLOW", 0)
     )
     descriptor = -1
+    created = False
     try:
         descriptor = os.open(path, flags, mode)
+        created = True
         view = memoryview(payload)
         while view:
             written = os.write(descriptor, view)
@@ -499,6 +670,14 @@ def _write_file(path: Path, payload: bytes, mode: int) -> None:
         os.fchmod(descriptor, mode)
         os.fsync(descriptor)
     except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+            descriptor = -1
+        if created:
+            try:
+                path.unlink()
+            except OSError:
+                pass
         raise OperatorError("recovery metadata could not be written durably") from exc
     finally:
         if descriptor >= 0:
@@ -519,16 +698,11 @@ def _atomic_new_directory(target: Path) -> Iterator[Path]:
     if target.exists() or target.is_symlink():
         raise OperatorError("recovery destination already exists")
     parent = target.parent
-    try:
-        metadata = parent.lstat()
-    except OSError as exc:
-        raise OperatorError("recovery destination parent does not exist") from exc
-    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-        raise OperatorError("recovery destination parent must be a real directory")
-    if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o022:
-        raise OperatorError(
-            "recovery destination parent must be user-owned and not group/world writable"
-        )
+    _inspect_protected_directory_chain(
+        parent,
+        label="recovery destination",
+        private_leaf=False,
+    )
     temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=parent))
     temporary.chmod(0o700)
     published = False
@@ -1012,6 +1186,100 @@ def restore_backup(
     return {**result, "applied": True, "destination": str(destination)}
 
 
+def prepare_compose_inputs(
+    recovery_directory: Path,
+    destination: Path,
+) -> dict[str, Any]:
+    """Publish verified recovery config/secret bytes in Compose-readable modes."""
+
+    result = verify_backup(recovery_directory)
+    with _atomic_new_directory(destination) as staging:
+        _copy_file(
+            recovery_directory / BACKUP_CONFIG,
+            staging / BACKUP_CONFIG,
+            0o644,
+        )
+        _copy_file(
+            recovery_directory / BACKUP_ADMIN_SECRET,
+            staging / BACKUP_ADMIN_SECRET,
+            0o444,
+        )
+        # The recovery set was verified before copying, but it can still change
+        # between that check and a copy. Re-verify the complete source identity,
+        # then validate the exact host paths and bytes that Compose will consume.
+        if verify_backup(recovery_directory) != result:
+            raise OperatorError("recovery identity changed while inputs were prepared")
+        _inspect_host_file(staging / BACKUP_CONFIG, "public config", secret=False)
+        _inspect_host_file(
+            staging / BACKUP_ADMIN_SECRET,
+            "admin secret",
+            secret=True,
+        )
+        load_config(
+            staging / BACKUP_CONFIG,
+            staging / BACKUP_ADMIN_SECRET,
+        )
+    _inspect_host_file(destination / BACKUP_CONFIG, "public config", secret=False)
+    _inspect_host_file(
+        destination / BACKUP_ADMIN_SECRET,
+        "admin secret",
+        secret=True,
+    )
+    return {
+        "status": "ok",
+        "backup_digest": result["backup_digest"],
+        "destination": str(destination),
+    }
+
+
+def _validate_compose_service_common(
+    service: dict[str, Any],
+    *,
+    label: str,
+    user: str,
+    pids_limit: int,
+    healthcheck_test: list[str],
+) -> None:
+    deploy = service.get("deploy")
+    if (
+        not isinstance(deploy, dict)
+        or not {"replicas"} <= set(deploy) <= {
+            "placement",
+            "replicas",
+            "resources",
+        }
+        or deploy.get("replicas") != 1
+        or deploy.get("placement", {}) != {}
+        or deploy.get("resources", {}) != {}
+        or service.get("user") != user
+        or service.get("read_only") is not True
+        or service.get("init") is not True
+        or service.get("cap_drop") != ["ALL"]
+        or service.get("security_opt") != ["no-new-privileges:true"]
+        or service.get("pids_limit") != pids_limit
+        or service.get("stop_grace_period") != "30s"
+        or service.get("restart") != "unless-stopped"
+        or service.get("command") is not None
+        or service.get("entrypoint") is not None
+    ):
+        raise OperatorError(f"{label} Compose process isolation is incomplete")
+    logging = service.get("logging")
+    if logging != {
+        "driver": "json-file",
+        "options": {"max-file": "3", "max-size": "10m"},
+    }:
+        raise OperatorError(f"{label} Compose logs must have bounded rotation")
+    healthcheck = service.get("healthcheck")
+    if healthcheck != {
+        "interval": "30s",
+        "retries": 3,
+        "start_period": "5s",
+        "test": healthcheck_test,
+        "timeout": "3s",
+    }:
+        raise OperatorError(f"{label} Compose health check is missing or weakened")
+
+
 def validate_compose_document(
     document: Any,
     config: PilotConfig,
@@ -1020,120 +1288,190 @@ def validate_compose_document(
 ) -> dict[str, Any]:
     """Validate the resolved Compose model, not hand-written YAML text."""
 
-    if not isinstance(document, dict) or not isinstance(document.get("services"), dict):
-        raise OperatorError("resolved Compose document has no services object")
-    if set(document["services"]) != {"backend"}:
-        raise OperatorError("resolved Compose must contain only the backend service")
-    service = document["services"].get("backend")
-    if not isinstance(service, dict):
-        raise OperatorError("resolved Compose document has no backend service")
-    deploy = service.get("deploy")
-    if not isinstance(deploy, dict) or deploy.get("replicas") != 1:
-        raise OperatorError("backend Compose service must declare exactly one replica")
-    if service.get("scale", 1) != 1:
-        raise OperatorError("backend Compose scale must remain one")
     if (
-        service.get("user") != "10001:10001"
-        or service.get("read_only") is not True
-        or service.get("privileged", False) is not False
-        or service.get("init") is not True
-        or service.get("network_mode") is not None
-        or service.get("cap_drop") != ["ALL"]
-        or service.get("cap_add")
-        or service.get("security_opt") != ["no-new-privileges:true"]
-        or service.get("pids_limit") != 128
-        or service.get("stop_grace_period") != "30s"
-        or service.get("stop_signal") not in {None, "SIGTERM"}
-        or service.get("command") is not None
-        or service.get("entrypoint") is not None
-        or service.get("environment")
-        or service.get("env_file")
-        or service.get("pid") == "host"
-        or service.get("ipc") == "host"
-        or service.get("uts") == "host"
-        or service.get("userns_mode") == "host"
-        or service.get("cgroup") == "host"
-        or service.get("cgroup_parent")
-        or service.get("group_add")
-        or service.get("configs")
-        or service.get("tmpfs")
-        or service.get("volumes_from")
-        or service.get("extra_hosts")
-        or service.get("dns")
-        or service.get("dns_opt")
-        or service.get("dns_search")
-        or service.get("links")
-        or service.get("external_links")
+        not isinstance(document, dict)
+        or set(document)
+        != {"configs", "name", "networks", "secrets", "services", "volumes"}
+        or not isinstance(document.get("services"), dict)
+        or set(document["services"]) != {"backend", "ingress"}
     ):
-        raise OperatorError("backend Compose process isolation is incomplete")
-    if service.get("devices") or service.get("device_cgroup_rules"):
-        raise OperatorError("backend Compose service must not receive host devices")
+        raise OperatorError(
+            "resolved Compose must contain only the backend and ingress services"
+        )
+    backend = document["services"].get("backend")
+    ingress = document["services"].get("ingress")
+    if not isinstance(backend, dict) or not isinstance(ingress, dict):
+        raise OperatorError("resolved Compose services are invalid")
+    project_name = document.get("name")
+    if (
+        not isinstance(project_name, str)
+        or _COMPOSE_PROJECT.fullmatch(project_name) is None
+    ):
+        raise OperatorError("resolved Compose project identity is invalid")
 
-    # ``internal: true`` is the Compose boundary that makes the backend's V1
-    # processing egress policy real at runtime.  Merely declaring an internal
-    # network in the file is insufficient if the service also joins the
-    # implicit default bridge or any second network.
-    service_networks = service.get("networks")
-    top_level_networks = document.get("networks")
-    if (
-        not isinstance(service_networks, dict)
-        or len(service_networks) != 1
-        or not isinstance(top_level_networks, dict)
-        or set(top_level_networks) != set(service_networks)
-    ):
-        raise OperatorError("backend must join exactly one declared network")
-    network_name = next(iter(service_networks))
-    network_attachment = service_networks[network_name]
-    network = top_level_networks.get(network_name)
-    if (
-        network_attachment is not None and network_attachment != {}
-    ) or (
-        not isinstance(network, dict)
-        or network.get("internal") is not True
-        or network.get("external", False) is not False
-    ):
-        raise OperatorError("backend network must be one closed internal network")
-    if service.get("restart") not in {"always", "unless-stopped"}:
-        raise OperatorError("backend Compose restart policy is not production-safe")
-    logging = service.get("logging")
-    if (
-        not isinstance(logging, dict)
-        or logging.get("driver") != "json-file"
-        or not isinstance(logging.get("options"), dict)
-        or logging["options"].get("max-size") != "10m"
-        or str(logging["options"].get("max-file")) != "3"
-    ):
-        raise OperatorError("backend Compose logs must have bounded rotation")
-    healthcheck = service.get("healthcheck")
-    if (
-        not isinstance(healthcheck, dict)
-        or healthcheck.get("disable", False) is not False
-        or healthcheck.get("interval") != "30s"
-        or healthcheck.get("timeout") != "3s"
-        or healthcheck.get("start_period") != "5s"
-        or healthcheck.get("retries") != 3
-        or healthcheck.get("test") != _COMPOSE_HEALTHCHECK
-    ):
-        raise OperatorError("backend Compose health check is missing or weakened")
+    backend_keys = {
+        "cap_drop",
+        "command",
+        "deploy",
+        "entrypoint",
+        "healthcheck",
+        "image",
+        "init",
+        "logging",
+        "networks",
+        "pids_limit",
+        "read_only",
+        "restart",
+        "secrets",
+        "security_opt",
+        "stop_grace_period",
+        "user",
+        "volumes",
+    }
+    if backend.get("build") is not None:
+        backend_keys.add("build")
+    ingress_keys = {
+        "cap_drop",
+        "command",
+        "configs",
+        "depends_on",
+        "deploy",
+        "entrypoint",
+        "healthcheck",
+        "image",
+        "init",
+        "logging",
+        "networks",
+        "pids_limit",
+        "ports",
+        "read_only",
+        "restart",
+        "security_opt",
+        "stop_grace_period",
+        "user",
+    }
+    if set(backend) != backend_keys or set(ingress) != ingress_keys:
+        raise OperatorError("resolved Compose services contain unexpected authority")
+    backend_build = backend.get("build")
+    if backend_build is not None and backend_build != {
+        "context": str(_REPOSITORY_ROOT),
+        "dockerfile": "services/backend/Dockerfile",
+    }:
+        raise OperatorError("backend build authority differs from the repository root")
 
-    ports = service.get("ports")
+    _validate_compose_service_common(
+        backend,
+        label="backend",
+        user="10001:10001",
+        pids_limit=128,
+        healthcheck_test=_COMPOSE_HEALTHCHECK,
+    )
+    _validate_compose_service_common(
+        ingress,
+        label="ingress",
+        user="99:99",
+        pids_limit=64,
+        healthcheck_test=_INGRESS_HEALTHCHECK,
+    )
+    if backend.get("ports") or backend.get("depends_on") or backend.get("configs"):
+        raise OperatorError("backend must not publish or join the ingress authority")
+    if ingress.get("volumes") or ingress.get("secrets") or ingress.get("build"):
+        raise OperatorError("ingress must not receive state, config, or secret authority")
+
+    networks = document.get("networks")
+    if not isinstance(networks, dict) or set(networks) != {
+        "tacua-default-deny",
+        "tacua-loopback-publish",
+    }:
+        raise OperatorError("resolved Compose networks are not closed")
+    private_network = networks["tacua-default-deny"]
+    publish_network = networks["tacua-loopback-publish"]
+    allowed_network_keys = {"driver", "external", "internal", "ipam", "name"}
+    if (
+        not isinstance(private_network, dict)
+        or not set(private_network) <= allowed_network_keys
+        or private_network.get("internal") is not True
+        or private_network.get("external", False) is not False
+        or private_network.get("driver") not in {None, "bridge"}
+        or private_network.get("ipam", {}) != {}
+        or private_network.get("name")
+        != f"{project_name}_tacua-default-deny"
+        or not isinstance(publish_network, dict)
+        or not set(publish_network) <= allowed_network_keys
+        or publish_network.get("internal", False) is not False
+        or publish_network.get("external", False) is not False
+        or publish_network.get("driver") not in {None, "bridge"}
+        or publish_network.get("ipam", {}) != {}
+        or publish_network.get("name")
+        != f"{project_name}_tacua-loopback-publish"
+    ):
+        raise OperatorError("Compose networks violate the closed bridge topology")
+    if backend.get("networks") != {"tacua-default-deny": None}:
+        raise OperatorError("backend must join only the egress-denied network")
+    if ingress.get("networks") != {
+        "tacua-default-deny": None,
+        "tacua-loopback-publish": None,
+    }:
+        raise OperatorError("ingress must bridge only the private and publish networks")
+
+    if ingress.get("depends_on") != {
+        "backend": {
+            "condition": "service_healthy",
+            "required": True,
+            "restart": True,
+        }
+    }:
+        raise OperatorError("ingress must wait for the one healthy backend")
+    ports = ingress.get("ports")
     if not isinstance(ports, list) or len(ports) != 1:
-        raise OperatorError("backend Compose service must publish one loopback port")
+        raise OperatorError("ingress must publish one loopback port")
     port = ports[0]
     published = port.get("published") if isinstance(port, dict) else None
     if (
         not isinstance(port, dict)
-        or port.get("host_ip") not in {"127.0.0.1", "::1"}
-        or port.get("protocol", "tcp") != "tcp"
-        or port.get("mode", "ingress") != "ingress"
+        or port.get("host_ip") != "127.0.0.1"
+        or port.get("protocol") != "tcp"
+        or port.get("mode") != "ingress"
         or port.get("target") != config.listen_port
-        or not isinstance(published, str)
-        or re.fullmatch(r"(?:[1-9][0-9]{0,4})", published) is None
-        or int(published) > 65_535
+        or published != str(config.listen_port)
     ):
-        raise OperatorError("backend listener must be published only on host loopback")
+        raise OperatorError("ingress listener must be published only on host loopback")
 
-    volumes = service.get("volumes")
+    ingress_configs = ingress.get("configs")
+    if ingress_configs != [
+        {
+            "source": "tacua_loopback_ingress",
+            "target": _INGRESS_CONFIG_TARGET,
+        }
+    ]:
+        raise OperatorError("ingress must receive only the fixed HAProxy config")
+    top_configs = document.get("configs")
+    ingress_definition = (
+        top_configs.get("tacua_loopback_ingress")
+        if isinstance(top_configs, dict)
+        else None
+    )
+    if (
+        not isinstance(top_configs, dict)
+        or set(top_configs) != {"tacua_loopback_ingress"}
+        or not isinstance(ingress_definition, dict)
+        or not {"file"} <= set(ingress_definition) <= {"file", "name"}
+        or not isinstance(ingress_definition.get("file"), str)
+        or not ingress_definition["file"]
+        or ingress_definition.get("name")
+        != f"{project_name}_tacua_loopback_ingress"
+        or _digest_bytes(
+            _bounded_regular_bytes(
+                Path(ingress_definition["file"]),
+                MAX_CONFIG_BYTES,
+                "ingress config",
+            )
+        )
+        != _INGRESS_CONFIG_DIGEST
+    ):
+        raise OperatorError("ingress config bytes or definition are not pinned")
+
+    volumes = backend.get("volumes")
     if not isinstance(volumes, list) or len(volumes) != 2:
         raise OperatorError("backend Compose volumes are missing")
     by_target = {
@@ -1143,67 +1481,98 @@ def validate_compose_document(
     }
     state_mount = by_target.get(str(config.state_directory))
     config_mount = by_target.get("/run/tacua/config.json")
+    expected_state_mount = {
+        "source": "tacua-state",
+        "target": str(config.state_directory),
+        "type": "volume",
+    }
     if (
         not isinstance(state_mount, dict)
-        or state_mount.get("type") not in {"volume", "bind"}
-        or state_mount.get("read_only", False) is not False
+        or {
+            key: value
+            for key, value in state_mount.items()
+            if key != "volume"
+        }
+        != expected_state_mount
+        or frozenset(state_mount) not in {
+            frozenset(expected_state_mount),
+            frozenset({*expected_state_mount, "volume"}),
+        }
+        or state_mount.get("volume", {}) != {}
         or not isinstance(config_mount, dict)
-        or config_mount.get("type") != "bind"
+        or set(config_mount)
+        != {"bind", "read_only", "source", "target", "type"}
+        or config_mount.get("bind")
+        not in ({}, {"create_host_path": False})
         or config_mount.get("read_only") is not True
-        or "/var/run/docker.sock" in by_target
-        or set(by_target) != {
+        or not isinstance(config_mount.get("source"), str)
+        or not config_mount["source"]
+        or config_mount.get("target") != "/run/tacua/config.json"
+        or config_mount.get("type") != "bind"
+        or set(by_target)
+        != {
             str(config.state_directory),
             "/run/tacua/config.json",
         }
     ):
         raise OperatorError("backend state/config mounts violate the closed layout")
-    secrets = service.get("secrets")
+    top_volumes = document.get("volumes")
     if (
-        not isinstance(secrets, list)
-        or len(secrets) != 1
-        or not isinstance(secrets[0], dict)
-        or set(secrets[0]) != {"source", "target"}
-        or not isinstance(secrets[0].get("source"), str)
-        or not secrets[0]["source"]
-        or secrets[0].get("target") != "/run/secrets/tacua_admin"
+        not isinstance(top_volumes, dict)
+        or set(top_volumes) != {"tacua-state"}
+        or not isinstance(top_volumes["tacua-state"], dict)
+        or not set(top_volumes["tacua-state"]) <= {"driver", "name"}
+        or top_volumes["tacua-state"].get("driver") not in {None, "local"}
+        or top_volumes["tacua-state"].get("name")
+        != f"{project_name}_tacua-state"
+    ):
+        raise OperatorError("backend state volume definition is not closed")
+
+    mounted_secrets = backend.get("secrets")
+    if (
+        not isinstance(mounted_secrets, list)
+        or mounted_secrets
+        != [{"source": "tacua_admin", "target": "/run/secrets/tacua_admin"}]
     ):
         raise OperatorError("backend must mount one administrator secret")
-    top_level_secrets = document.get("secrets")
-    secret_source = secrets[0]["source"]
+    top_secrets = document.get("secrets")
+    secret_definition = (
+        top_secrets.get("tacua_admin") if isinstance(top_secrets, dict) else None
+    )
     if (
-        not isinstance(top_level_secrets, dict)
-        or set(top_level_secrets) != {secret_source}
-        or not isinstance(top_level_secrets[secret_source], dict)
-        or not {"file"} <= set(top_level_secrets[secret_source]) <= {"file", "name"}
-        or not isinstance(top_level_secrets[secret_source].get("file"), str)
-        or not top_level_secrets[secret_source]["file"]
+        not isinstance(top_secrets, dict)
+        or set(top_secrets) != {"tacua_admin"}
+        or not isinstance(secret_definition, dict)
+        or not {"file"} <= set(secret_definition) <= {"file", "name"}
+        or not isinstance(secret_definition.get("file"), str)
+        or not secret_definition["file"]
+        or secret_definition.get("name") != f"{project_name}_tacua_admin"
+    ):
+        raise OperatorError("backend Compose secret definition is not one file")
+
+    backend_image = backend.get("image")
+    if (
+        not isinstance(backend_image, str)
+        or ingress.get("image") != _INGRESS_IMAGE
         or (
-            "name" in top_level_secrets[secret_source]
+            require_immutable_image
             and (
-                not isinstance(top_level_secrets[secret_source]["name"], str)
-                or not top_level_secrets[secret_source]["name"]
+                _IMMUTABLE_IMAGE.fullmatch(backend_image) is None
+                or backend.get("build") is not None
             )
         )
     ):
-        raise OperatorError("backend Compose secret definition is not a single file")
-
-    image = service.get("image")
-    if require_immutable_image and (
-        not isinstance(image, str)
-        or not _IMMUTABLE_IMAGE.fullmatch(image)
-        or service.get("build") is not None
-    ):
-        raise OperatorError(
-            "production Compose must use one digest-pinned image without a build override"
-        )
+        raise OperatorError("Compose image identities are not pinned as required")
     return {
         "status": "ok",
         "replicas": 1,
+        "topology": "loopback-ingress",
+        "publisher_service": "ingress",
         "published_host": port["host_ip"],
         "published_port": published,
-        "image": image,
-        "immutable_image": isinstance(image, str)
-        and _IMMUTABLE_IMAGE.fullmatch(image) is not None,
+        "image": backend_image,
+        "ingress_image": _INGRESS_IMAGE,
+        "immutable_image": _IMMUTABLE_IMAGE.fullmatch(backend_image) is not None,
     }
 
 
@@ -1217,6 +1586,18 @@ def deployment_preflight(
 ) -> dict[str, Any]:
     _inspect_host_file(config_file, "public config", secret=False)
     _inspect_host_file(admin_secret_file, "admin secret", secret=True)
+    try:
+        same_input_directory = config_file.parent.samefile(
+            admin_secret_file.parent
+        )
+    except OSError as exc:
+        raise OperatorError(
+            "administrator input directory identity cannot be verified"
+        ) from exc
+    if not same_input_directory:
+        raise OperatorError(
+            "public config and admin secret must share one private input directory"
+        )
     config, _secret = load_config(config_file, admin_secret_file)
     if not config.backend_origin.startswith("https://"):
         raise OperatorError("production backend_origin must use HTTPS")
@@ -1227,6 +1608,20 @@ def deployment_preflight(
         config,
         require_immutable_image=require_immutable_image,
     )
+    ingress_definition = compose_document["configs"]["tacua_loopback_ingress"]
+    ingress_config_file = Path(ingress_definition["file"])
+    _inspect_public_deployment_file(ingress_config_file, "ingress config")
+    if (
+        _digest_bytes(
+            _bounded_regular_bytes(
+                ingress_config_file,
+                MAX_CONFIG_BYTES,
+                "ingress config",
+            )
+        )
+        != _INGRESS_CONFIG_DIGEST
+    ):
+        raise OperatorError("ingress config changed after Compose validation")
     service = compose_document["services"]["backend"]
     config_mount = next(
         (
@@ -1284,6 +1679,42 @@ def deployment_preflight(
             "host_firewall",
             "off_host_encrypted_backup_storage",
         ],
+    }
+
+
+def verify_compose_state(
+    config_file: Path,
+    state_directory: Path,
+) -> dict[str, Any]:
+    """Verify one stopped Compose state mount against its sealed public config."""
+
+    config = load_public_config(config_file)
+    configured_state = Path(config.state_directory)
+    if state_directory != configured_state:
+        raise OperatorError(
+            "state verification path must equal the configured container mount"
+        )
+    with acquire_state_instance_lock(
+        state_directory,
+        create_directory=False,
+    ):
+        _state_entries(state_directory)
+        state_pin, _retention = _validate_state_database_copy(
+            state_directory,
+            require_service_owner=True,
+            expected_deployment_pin_digest=_digest_json(config.deployment_pin),
+        )
+    return {
+        "status": "ok",
+        "config_digest": _digest_bytes(
+            _bounded_regular_bytes(
+                config_file,
+                MAX_CONFIG_BYTES,
+                "public config",
+            )
+        ),
+        "deployment_pin_digest": state_pin,
+        "state_directory": str(state_directory),
     }
 
 
@@ -1498,6 +1929,9 @@ def _parser() -> argparse.ArgumentParser:
     preflight.add_argument("--allow-mutable-image", action="store_true")
     preflight.add_argument("--check-state", action="store_true")
 
+    create_secret = subparsers.add_parser("create-admin-secret")
+    create_secret.add_argument("--destination", required=True, type=Path)
+
     compose = subparsers.add_parser("validate-compose")
     compose.add_argument("--config-file", required=True, type=Path)
     compose.add_argument("--compose-json", required=True, type=Path)
@@ -1515,6 +1949,14 @@ def _parser() -> argparse.ArgumentParser:
     restore.add_argument("backup", type=Path)
     restore.add_argument("--destination", required=True, type=Path)
     restore.add_argument("--apply", action="store_true")
+
+    prepare = subparsers.add_parser("prepare-compose-inputs")
+    prepare.add_argument("recovery", type=Path)
+    prepare.add_argument("--destination", required=True, type=Path)
+
+    verify_state = subparsers.add_parser("verify-compose-state")
+    verify_state.add_argument("--config-file", required=True, type=Path)
+    verify_state.add_argument("--state-directory", required=True, type=Path)
 
     smoke = subparsers.add_parser("smoke")
     smoke.add_argument("--config-file", required=True, type=Path)
@@ -1536,6 +1978,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 require_immutable_image=not args.allow_mutable_image,
                 check_state=args.check_state,
             )
+        elif args.command == "create-admin-secret":
+            result = create_admin_secret(args.destination)
         elif args.command == "validate-compose":
             config = load_public_config(args.config_file)
             result = validate_compose_document(
@@ -1556,6 +2000,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.backup,
                 args.destination,
                 apply=args.apply,
+            )
+        elif args.command == "prepare-compose-inputs":
+            result = prepare_compose_inputs(
+                args.recovery,
+                args.destination,
+            )
+        elif args.command == "verify-compose-state":
+            result = verify_compose_state(
+                args.config_file,
+                args.state_directory,
             )
         elif args.command == "smoke":
             result = smoke_deployment(

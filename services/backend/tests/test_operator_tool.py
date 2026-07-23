@@ -28,18 +28,22 @@ from tacua_backend.instance_lock import (  # noqa: E402
 )
 from tacua_backend.operator_tool import (  # noqa: E402
     OperatorError,
+    create_admin_secret,
     create_backup,
     deployment_preflight,
+    prepare_compose_inputs,
     restore_backup,
     smoke_deployment,
     validate_compose_document,
     verify_backup,
+    verify_compose_state,
 )
 import tacua_backend.operator_tool as operator_tool  # noqa: E402
 from tacua_backend.service import PilotBackend  # noqa: E402
 
 
 TEMPLATE = REPOSITORY / "services" / "backend" / "config.template.example.json"
+INGRESS_CONFIG = REPOSITORY / "services" / "backend" / "ingress" / "haproxy.cfg"
 
 
 class FakeResponse:
@@ -87,9 +91,11 @@ class FakeOpener:
 class OperatorToolTests(unittest.TestCase):
     def deployment(self, root: Path) -> tuple[Path, Path, Path]:
         state = root / "state"
+        local = root / "local"
+        local.mkdir(mode=0o700)
         document = json.loads(TEMPLATE.read_text(encoding="utf-8"))
         document["state_directory"] = str(state)
-        config_file = root / "config.json"
+        config_file = local / "config.json"
         config_file.write_text(
             compile_config_template(
                 json.dumps(document, ensure_ascii=False, allow_nan=False, indent=2)
@@ -97,10 +103,10 @@ class OperatorToolTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        config_file.chmod(0o600)
-        secret_file = root / "admin-secret"
+        config_file.chmod(0o644)
+        secret_file = local / "admin-secret"
         secret_file.write_bytes(b"operator-test-secret-0123456789abcdef")
-        secret_file.chmod(0o600)
+        secret_file.chmod(0o444)
         config, secret = load_config(config_file, secret_file)
         PilotBackend(config, secret)
         return config_file, secret_file, state
@@ -163,9 +169,11 @@ class OperatorToolTests(unittest.TestCase):
         config_source: str = "/deployment/config.json",
         secret_source: str = "/deployment/admin-secret",
     ) -> dict:
-        service = {
+        backend = {
             "cap_drop": ["ALL"],
+            "command": None,
             "deploy": {"replicas": 1},
+            "entrypoint": None,
             "image": (
                 "registry.example/tacua@sha256:" + "a" * 64
                 if immutable
@@ -185,14 +193,6 @@ class OperatorToolTests(unittest.TestCase):
                 "timeout": "3s",
             },
             "pids_limit": 128,
-            "ports": [
-                {
-                    "host_ip": "127.0.0.1",
-                    "target": 8080,
-                    "published": "8080",
-                    "protocol": "tcp",
-                }
-            ],
             "read_only": True,
             "restart": "unless-stopped",
             "secrets": [
@@ -208,6 +208,7 @@ class OperatorToolTests(unittest.TestCase):
                     "target": state_target,
                 },
                 {
+                    "bind": {},
                     "type": "bind",
                     "source": config_source,
                     "target": "/run/tacua/config.json",
@@ -216,16 +217,90 @@ class OperatorToolTests(unittest.TestCase):
             ],
         }
         if not immutable:
-            service["build"] = {
-                "context": "/repository",
+            backend["build"] = {
+                "context": str(REPOSITORY),
                 "dockerfile": "services/backend/Dockerfile",
             }
+        ingress = {
+            "cap_drop": ["ALL"],
+            "command": None,
+            "configs": [
+                {
+                    "source": "tacua_loopback_ingress",
+                    "target": operator_tool._INGRESS_CONFIG_TARGET,
+                }
+            ],
+            "depends_on": {
+                "backend": {
+                    "condition": "service_healthy",
+                    "required": True,
+                    "restart": True,
+                }
+            },
+            "deploy": {"replicas": 1},
+            "entrypoint": None,
+            "healthcheck": {
+                "interval": "30s",
+                "retries": 3,
+                "start_period": "5s",
+                "test": list(operator_tool._INGRESS_HEALTHCHECK),
+                "timeout": "3s",
+            },
+            "image": operator_tool._INGRESS_IMAGE,
+            "init": True,
+            "logging": {
+                "driver": "json-file",
+                "options": {"max-file": "3", "max-size": "10m"},
+            },
+            "networks": {
+                "tacua-default-deny": None,
+                "tacua-loopback-publish": None,
+            },
+            "pids_limit": 64,
+            "ports": [
+                {
+                    "host_ip": "127.0.0.1",
+                    "target": 8080,
+                    "published": "8080",
+                    "protocol": "tcp",
+                    "mode": "ingress",
+                }
+            ],
+            "read_only": True,
+            "restart": "unless-stopped",
+            "security_opt": ["no-new-privileges:true"],
+            "stop_grace_period": "30s",
+            "user": "99:99",
+        }
         return {
-            "services": {"backend": service},
-            "networks": {"tacua-default-deny": {"internal": True}},
+            "configs": {
+                "tacua_loopback_ingress": {
+                    "file": str(INGRESS_CONFIG),
+                    "name": "test_tacua_loopback_ingress",
+                }
+            },
+            "name": "test",
+            "services": {"backend": backend, "ingress": ingress},
+            "networks": {
+                "tacua-default-deny": {
+                    "internal": True,
+                    "ipam": {},
+                    "name": "test_tacua-default-deny",
+                },
+                "tacua-loopback-publish": {
+                    "ipam": {},
+                    "name": "test_tacua-loopback-publish",
+                },
+            },
             "secrets": {
                 "tacua_admin": {
                     "file": secret_source,
+                    "name": "test_tacua_admin",
+                }
+            },
+            "volumes": {
+                "tacua-state": {
+                    "name": "test_tacua-state",
                 }
             },
         }
@@ -290,7 +365,6 @@ class OperatorToolTests(unittest.TestCase):
 
             mutations = [
                 lambda service: service["deploy"].update(replicas=2),
-                lambda service: service["ports"][0].update(host_ip="0.0.0.0"),
                 lambda service: service.update(privileged=True),
                 lambda service: service.update(cap_add=["NET_ADMIN"]),
                 lambda service: service["security_opt"].append(
@@ -308,8 +382,21 @@ class OperatorToolTests(unittest.TestCase):
                 lambda service: service["healthcheck"].update(
                     test=["CMD", "python", "-c", "print('healthz')"]
                 ),
-                lambda service: service["ports"][0].update(published="0"),
                 lambda service: service.update(networks={"external": None}),
+                lambda service: service["volumes"][0].update(
+                    type="bind",
+                    source="/etc",
+                    bind={"propagation": "rshared"},
+                ),
+                lambda service: service["volumes"][0].update(
+                    volume={"nocopy": True}
+                ),
+                lambda service: service["volumes"][1]["bind"].update(
+                    create_host_path=True
+                ),
+                lambda service: service["volumes"][1]["bind"].update(
+                    propagation="rshared"
+                ),
             ]
             for mutate in mutations:
                 document = self.compose_document(
@@ -319,6 +406,56 @@ class OperatorToolTests(unittest.TestCase):
                     secret_source=str(secret_file),
                 )
                 mutate(document["services"]["backend"])
+                with self.assertRaises(OperatorError):
+                    validate_compose_document(
+                        document,
+                        config,
+                        require_immutable_image=True,
+                    )
+
+            for mutate in (
+                lambda build: build.update(context="/tmp/other"),
+                lambda build: build.update(network="host"),
+            ):
+                document = self.compose_document(
+                    immutable=False,
+                    state_target=str(state),
+                    config_source=str(config_file),
+                    secret_source=str(secret_file),
+                )
+                mutate(document["services"]["backend"]["build"])
+                with self.assertRaises(OperatorError):
+                    validate_compose_document(
+                        document,
+                        config,
+                        require_immutable_image=False,
+                    )
+
+            ingress_mutations = [
+                lambda service: service["ports"][0].update(host_ip="0.0.0.0"),
+                lambda service: service["ports"][0].update(published="0"),
+                lambda service: service.update(
+                    image="docker.io/library/haproxy:latest"
+                ),
+                lambda service: service.update(volumes=["/var/lib/tacua"]),
+                lambda service: service["configs"][0].update(mode=0o644),
+                lambda service: service["depends_on"]["backend"].update(
+                    condition="service_started"
+                ),
+                lambda service: service.update(user="0:0"),
+                lambda service: service["cap_drop"].clear(),
+                lambda service: service["networks"].pop(
+                    "tacua-default-deny"
+                ),
+            ]
+            for mutate in ingress_mutations:
+                document = self.compose_document(
+                    immutable=True,
+                    state_target=str(state),
+                    config_source=str(config_file),
+                    secret_source=str(secret_file),
+                )
+                mutate(document["services"]["ingress"])
                 with self.assertRaises(OperatorError):
                     validate_compose_document(
                         document,
@@ -366,12 +503,48 @@ class OperatorToolTests(unittest.TestCase):
                 "privileged": True,
                 "volumes_from": ["backend"],
             }
-            with self.assertRaisesRegex(OperatorError, "only the backend service"):
+            with self.assertRaisesRegex(
+                OperatorError,
+                "only the backend and ingress services",
+            ):
                 validate_compose_document(
                     document,
                     config,
                     require_immutable_image=True,
                 )
+
+            resource_name_mutations = [
+                lambda document: document["networks"][
+                    "tacua-default-deny"
+                ].update(name="shared"),
+                lambda document: document["networks"][
+                    "tacua-loopback-publish"
+                ].update(name="shared"),
+                lambda document: document["volumes"]["tacua-state"].update(
+                    name="shared"
+                ),
+                lambda document: document["configs"][
+                    "tacua_loopback_ingress"
+                ].update(name="shared"),
+                lambda document: document["secrets"]["tacua_admin"].update(
+                    name="shared"
+                ),
+                lambda document: document.update(name="../invalid"),
+            ]
+            for mutate in resource_name_mutations:
+                document = self.compose_document(
+                    immutable=True,
+                    state_target=str(state),
+                    config_source=str(config_file),
+                    secret_source=str(secret_file),
+                )
+                mutate(document)
+                with self.assertRaises(OperatorError):
+                    validate_compose_document(
+                        document,
+                        config,
+                        require_immutable_image=True,
+                    )
 
     def test_state_preflight_handles_uri_metacharacters_in_the_state_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -403,7 +576,7 @@ class OperatorToolTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            config_file.chmod(0o600)
+            config_file.chmod(0o644)
             compose = self.compose_document(
                 immutable=True,
                 state_target=str(state),
@@ -422,11 +595,67 @@ class OperatorToolTests(unittest.TestCase):
                     check_state=True,
                 )
 
-    def test_preflight_rejects_a_group_readable_host_secret(self) -> None:
+    def test_stopped_compose_state_verification_is_exact_and_content_free(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            config_file, secret_file, state = self.deployment(Path(temporary))
-            secret_file.chmod(0o640)
-            with self.assertRaises(OperatorError):
+            root = Path(temporary)
+            config_file, _secret_file, state = self.deployment(root)
+            result = verify_compose_state(config_file, state)
+            self.assertEqual("ok", result["status"])
+            self.assertEqual(str(state), result["state_directory"])
+            self.assertNotIn("operator-test-secret", json.dumps(result))
+
+            with self.assertRaisesRegex(
+                OperatorError,
+                "must equal the configured container mount",
+            ):
+                verify_compose_state(config_file, root / "other-state")
+
+            document = json.loads(config_file.read_text(encoding="utf-8"))
+            document["reviewer_id"] = "reviewer_changed"
+            config_file.write_text(
+                json.dumps(document, ensure_ascii=False, allow_nan=False, indent=2)
+                + "\n",
+                encoding="utf-8",
+            )
+            config_file.chmod(0o644)
+            with self.assertRaisesRegex(
+                OperatorError,
+                "state deployment pin differs from the supplied config",
+            ):
+                verify_compose_state(config_file, state)
+
+    def test_preflight_rejects_every_non_compose_secret_mode(self) -> None:
+        for mode in (0o400, 0o440, 0o600, 0o640):
+            with self.subTest(mode=oct(mode)), tempfile.TemporaryDirectory() as temporary:
+                config_file, secret_file, state = self.deployment(Path(temporary))
+                secret_file.chmod(mode)
+                with self.assertRaisesRegex(
+                    OperatorError,
+                    "admin secret must be mode 0444",
+                ):
+                    deployment_preflight(
+                        config_file,
+                        secret_file,
+                        self.compose_document(
+                            immutable=True,
+                            state_target=str(state),
+                            config_source=str(config_file),
+                            secret_source=str(secret_file),
+                        ),
+                        require_immutable_image=True,
+                        check_state=False,
+                    )
+
+    def test_preflight_rejects_unsafe_or_symlinked_input_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_file, secret_file, state = self.deployment(root)
+            local = config_file.parent
+            local.chmod(0o755)
+            with self.assertRaisesRegex(
+                OperatorError,
+                "protected operator/root-owned",
+            ):
                 deployment_preflight(
                     config_file,
                     secret_file,
@@ -439,6 +668,114 @@ class OperatorToolTests(unittest.TestCase):
                     require_immutable_image=True,
                     check_state=False,
                 )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_file, secret_file, state = self.deployment(root)
+            linked = root / "linked-local"
+            linked.symlink_to(config_file.parent, target_is_directory=True)
+            linked_config = linked / config_file.name
+            linked_secret = linked / secret_file.name
+            with self.assertRaisesRegex(
+                OperatorError,
+                "unsafe lexical symlink",
+            ):
+                deployment_preflight(
+                    linked_config,
+                    linked_secret,
+                    self.compose_document(
+                        immutable=True,
+                        state_target=str(state),
+                        config_source=str(linked_config),
+                        secret_source=str(linked_secret),
+                    ),
+                    require_immutable_image=True,
+                    check_state=False,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            unsafe_parent = root / "unsafe"
+            unsafe_parent.mkdir()
+            unsafe_parent.chmod(0o777)
+            config_file, secret_file, state = self.deployment(unsafe_parent)
+            with self.assertRaisesRegex(
+                OperatorError,
+                "protected operator/root-owned",
+            ):
+                deployment_preflight(
+                    config_file,
+                    secret_file,
+                    self.compose_document(
+                        immutable=True,
+                        state_target=str(state),
+                        config_source=str(config_file),
+                        secret_source=str(secret_file),
+                    ),
+                    require_immutable_image=True,
+                    check_state=False,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            safe = root / "safe"
+            safe.mkdir(mode=0o700)
+            config_file, secret_file, state = self.deployment(safe)
+            unsafe = root / "unsafe"
+            unsafe.mkdir(mode=0o777)
+            link = unsafe / "replaceable"
+            link.symlink_to(safe)
+            linked_config = link / config_file.relative_to(safe)
+            linked_secret = link / secret_file.relative_to(safe)
+            with self.assertRaisesRegex(
+                OperatorError,
+                "unsafe lexical symlink|lexical directory chain",
+            ):
+                deployment_preflight(
+                    linked_config,
+                    linked_secret,
+                    self.compose_document(
+                        immutable=True,
+                        state_target=str(state),
+                        config_source=str(linked_config),
+                        secret_source=str(linked_secret),
+                    ),
+                    require_immutable_image=True,
+                    check_state=False,
+                )
+
+    def test_create_admin_secret_is_exclusive_and_content_free(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            local = root / "local"
+            local.mkdir(mode=0o700)
+            destination = local / "admin-secret"
+
+            result = create_admin_secret(destination)
+
+            self.assertEqual(
+                {"status": "ok", "destination": str(destination)},
+                result,
+            )
+            self.assertEqual(0o444, stat.S_IMODE(destination.stat().st_mode))
+            self.assertGreaterEqual(len(destination.read_bytes()), 32)
+            self.assertNotIn(destination.read_text(encoding="ascii"), json.dumps(result))
+
+            with self.assertRaisesRegex(
+                OperatorError,
+                "destination already exists",
+            ):
+                create_admin_secret(destination)
+
+            dangling = local / "dangling-secret"
+            escaped = root / "must-not-exist"
+            dangling.symlink_to(escaped)
+            with self.assertRaisesRegex(
+                OperatorError,
+                "destination already exists",
+            ):
+                create_admin_secret(dangling)
+            self.assertFalse(escaped.exists())
 
     def test_preflight_rejects_config_that_would_fail_backend_startup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -464,6 +801,46 @@ class OperatorToolTests(unittest.TestCase):
                     ),
                     require_immutable_image=True,
                     check_state=False,
+                )
+
+    def test_preflight_rejects_unpinned_or_unsafe_ingress_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_file, secret_file, state = self.deployment(root)
+            ingress_config = root / "haproxy.cfg"
+            ingress_config.write_bytes(INGRESS_CONFIG.read_bytes())
+            ingress_config.chmod(0o666)
+            compose = self.compose_document(
+                immutable=True,
+                state_target=str(state),
+                config_source=str(config_file),
+                secret_source=str(secret_file),
+            )
+            compose["configs"]["tacua_loopback_ingress"]["file"] = str(
+                ingress_config
+            )
+            with self.assertRaisesRegex(
+                OperatorError,
+                "mode-0644 file",
+            ):
+                deployment_preflight(
+                    config_file,
+                    secret_file,
+                    compose,
+                    require_immutable_image=True,
+                    check_state=False,
+                )
+
+            ingress_config.chmod(0o644)
+            ingress_config.write_text("global\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                OperatorError,
+                "bytes or definition are not pinned",
+            ):
+                validate_compose_document(
+                    compose,
+                    load_config(config_file, secret_file)[0],
+                    require_immutable_image=True,
                 )
 
     def test_offline_backup_verification_and_apply_only_restore(self) -> None:
@@ -708,6 +1085,59 @@ class OperatorToolTests(unittest.TestCase):
 
             self.assertFalse(destination.exists())
             self.assertEqual([], list(root.glob(".restored.staging-*")))
+
+    def test_recovery_prepares_exact_compose_readable_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_file, secret_file, state = self.deployment(root)
+            backup = root / "backup"
+            create_backup(config_file, secret_file, backup)
+            recovery = root / "recovery"
+            restore_backup(backup, recovery, apply=True)
+            compose_inputs = root / "compose-inputs"
+
+            result = prepare_compose_inputs(recovery, compose_inputs)
+
+            self.assertEqual("ok", result["status"])
+            self.assertEqual(
+                0o700,
+                stat.S_IMODE(compose_inputs.stat().st_mode),
+            )
+            self.assertEqual(
+                0o644,
+                stat.S_IMODE((compose_inputs / "config.json").stat().st_mode),
+            )
+            self.assertEqual(
+                0o444,
+                stat.S_IMODE((compose_inputs / "admin-secret").stat().st_mode),
+            )
+            self.assertEqual(
+                (recovery / "config.json").read_bytes(),
+                (compose_inputs / "config.json").read_bytes(),
+            )
+            self.assertEqual(
+                (recovery / "admin-secret").read_bytes(),
+                (compose_inputs / "admin-secret").read_bytes(),
+            )
+            preflight = deployment_preflight(
+                compose_inputs / "config.json",
+                compose_inputs / "admin-secret",
+                self.compose_document(
+                    immutable=True,
+                    state_target=str(state),
+                    config_source=str(compose_inputs / "config.json"),
+                    secret_source=str(compose_inputs / "admin-secret"),
+                ),
+                require_immutable_image=True,
+                check_state=False,
+            )
+            self.assertEqual("ok", preflight["status"])
+
+            with self.assertRaisesRegex(
+                OperatorError,
+                "recovery destination already exists",
+            ):
+                prepare_compose_inputs(recovery, compose_inputs)
 
     def test_backup_rejects_public_state_permissions_and_mismatched_config(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

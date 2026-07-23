@@ -254,11 +254,13 @@ enabled.
 
 ## Egress and residual isolation boundary
 
-The checked-in Compose network is `internal: true`; the backend and local
-processor therefore retain the V1 default-deny egress posture. Do not attach an
-external network or pass provider credentials merely to make a sample work.
-Any future network authorization needs an explicit decision, destination allow
-list, credential boundary, and corresponding processing-job authorization.
+The checked-in backend network is `internal: true`; the backend and local
+processor therefore retain the V1 default-deny egress posture. The separate
+loopback ingress relay is dual-homed but receives no state, secret, processor,
+or command authority. Do not attach the backend/processor to its publish
+network or pass provider credentials merely to make a sample work. Any future
+network authorization needs an explicit decision, destination allow list,
+credential boundary, and corresponding processing-job authorization.
 
 Read-only descriptors, mode-`0400` objects, a minimal environment, closed file
 descriptors, private workspaces, exact argv, and no shell prevent accidental
