@@ -278,7 +278,13 @@ docker start "$backend_container" >/dev/null
 wait_for_healthy "$backend_container"
 smoke_backend
 
-"${bridge_arguments[@]}" > "$bridge_summary" 2> "$bridge_diagnostic"
+if ! "${bridge_arguments[@]}" > "$bridge_summary" 2> "$bridge_diagnostic"; then
+  if [ -s "$bridge_diagnostic" ]; then
+    cat "$bridge_diagnostic" >&2
+  fi
+  echo "Compose processing bridge execution failed" >&2
+  exit 1
+fi
 if [ "$(cat "$bridge_summary")" \
     != '{"claim_retries":0,"mode":"run_once","processed_stages":1,"queue_empty":false,"stage_limit_reached":true,"status":"ok"}' ] \
   || [ -s "$bridge_diagnostic" ]; then
