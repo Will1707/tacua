@@ -22,10 +22,10 @@ nested adapter 1.1 alignment exchange. It includes the original canonical local
 input so the bundle validator can prove its digest before applying the runner's
 only permitted mutation: a common-root, contiguous rewrite of evidence paths.
 The rewritten wrapper alone cannot recompute that pre-rewrite digest; its
-validity is inherited from the trusted runner's original-input pre-check. At
-this commit the host runner still admits only nested adapter input 1.0, so input
-pass-through remains the separately reviewed isolated-runner follow-up. The
-fixture is not a claim that this dormant path is production-active.
+validity is inherited from the trusted runner's original-input pre-check. The
+host runner can carry this nested adapter-1.1 wire only when an operator
+explicitly selects outer local-command 1.1; its isolation wrappers remain 1.0.
+The fixture is not a claim that this dormant path is production-active.
 
 ## What validation covers
 
@@ -95,12 +95,15 @@ PYTHONWARNINGS=error python3 -B -m unittest discover \
   -p 'test_local_processing_contract_compatibility.py' -v
 ```
 
-Validate an individual document or paired exchange with `artifact`, `exchange`,
-or `bundle`. `isolated-exchange` requires the original adapter input, rewritten
-isolated input, and isolated output so it can prove source provenance as well as
-post-rewrite self-consistency. Run `--help` for exact arguments. Regeneration is
-deterministic and emits canonical JSON with no trailing newline plus the one
-exact synthetic PNG body.
+Validate a top-level command, input, result, or isolation wrapper with
+`artifact`, and validate paired or bundled documents with `exchange` or
+`bundle`. A transcript stage artifact is intentionally validated only inside
+its contextual adapter input, where its job, stage, capture, source-segment,
+and retention bindings are available. `isolated-exchange` requires the original
+adapter input, rewritten isolated input, and isolated output so it can prove
+source provenance as well as post-rewrite self-consistency. Run `--help` for
+exact arguments. Regeneration is deterministic and emits canonical JSON with no
+trailing newline plus the one exact synthetic PNG body.
 
 ## Deliberate non-goals
 

@@ -91,7 +91,9 @@ must never be redirected.
   artifact id/digest, and retention expiry. Failure or lease expiry publishes no
   receipt. This first slice then deliberately pauses at `correlate`; production
   job creation, HTTP/reviewer/SDK contracts, Docker defaults, model selection,
-  egress, and the isolated runner remain unchanged. See
+  and egress remain unchanged. The isolated runner can carry the opt-in 1.1
+  local input/result inside its frozen 1.0 isolation envelopes without changing
+  mounts, labels, paths, limits, or defaults. See
   [ADR-019](../../docs/decisions/ADR-019-processing-artifact-consumption.md).
 - An injected engine exception records a bounded retryable failure before the
   runner returns a content-free error. Returning a terminal result on a

@@ -236,6 +236,7 @@ class LocalProcessingRuntimeCompatibilityTests(BackendHarness):
         self,
     ) -> None:
         directory = FIXTURES / "isolated-v1.0-adapter-v1.1-align"
+        source_input = load_json(directory / "input.json")
         isolated_input = load_json(directory / "isolated-input.json")
         isolated_output_path = directory / "isolated-output.json"
         isolated_output = load_json(isolated_output_path)
@@ -243,10 +244,14 @@ class LocalProcessingRuntimeCompatibilityTests(BackendHarness):
         self.assertEqual(ISOLATED_OUTPUT_V10, RUNNER.OUTPUT_CONTRACT)
         self.assertEqual(ISOLATED_INPUT_V10, isolated_input["contract_version"])
         self.assertEqual(INPUT_V11, isolated_input["source_input"]["contract_version"])
+        expected_result_contract = RUNNER._validate_source_input_contract(source_input)
+        self.assertEqual(RUNNER.SOURCE_RESULT_CONTRACT_V11, expected_result_contract)
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             result_bytes = RUNNER._validate_output_envelope(
-                isolated_output_path.read_bytes(), output
+                isolated_output_path.read_bytes(),
+                output,
+                expected_result_contract=expected_result_contract,
             )
         self.assertEqual(canonical_bytes(isolated_output["result"]), result_bytes)
 
