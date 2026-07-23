@@ -139,6 +139,7 @@ class ComposeProcessingBridgeTests(unittest.TestCase):
         release_effect: object = None,
         verify_effect: object = None,
         wait_effect: object = None,
+        preflight_failure: Exception | None = None,
     ) -> tuple[
         dict[str, object] | None,
         list[list[str]],
@@ -218,6 +219,8 @@ class ComposeProcessingBridgeTests(unittest.TestCase):
                     kwargs["expected_published_port"],
                     18080,
                 )
+                if preflight_failure is not None:
+                    raise preflight_failure
                 return {"compose": {"published_port": "18080"}}
 
             def prepare_create(**kwargs):
@@ -3556,6 +3559,31 @@ class ComposeProcessingBridgeTests(unittest.TestCase):
             smoke.call_args.kwargs["origin_override"],
             "http://127.0.0.1:18080",
         )
+
+    def test_prejournal_failure_reports_content_free_stage(self) -> None:
+        (
+            result,
+            calls,
+            verify_state,
+            smoke,
+            wait_healthy,
+            raised,
+        ) = self._exercise_lifecycle(
+            worker_failure=None,
+            preflight_failure=BRIDGE.OperatorError("synthetic secret detail"),
+        )
+        self.assertIsNone(result)
+        self.assertIsNotNone(raised)
+        assert raised is not None
+        self.assertEqual(
+            raised.code,
+            "BRIDGE_DEPLOYMENT_PREFLIGHT_FAILED",
+        )
+        self.assertNotIn("synthetic", str(raised))
+        self.assertEqual(calls, [])
+        verify_state.assert_not_called()
+        smoke.assert_not_called()
+        wait_healthy.assert_not_called()
 
     def test_failed_worker_reverifies_before_recovery_restart(self) -> None:
         (

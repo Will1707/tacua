@@ -4936,6 +4936,7 @@ def run_compose_processing(args: argparse.Namespace) -> dict[str, Any]:
     config_identity: dict[str, Any] = {}
     secret_identity: dict[str, Any] = {}
     summary: dict[str, Any] | None = None
+    pre_journal_stage = "COMPOSE_READ"
     try:
         compose_payload = _read_bounded_file(
             args.compose_json,
@@ -4948,6 +4949,7 @@ def run_compose_processing(args: argparse.Namespace) -> dict[str, Any]:
                 "BRIDGE_COMPOSE_INVALID",
                 "resolved Compose model must be an object",
             )
+        pre_journal_stage = "DEPLOYMENT_PREFLIGHT"
         preflight = deployment_preflight(
             args.config_file,
             args.admin_secret_file,
@@ -4960,15 +4962,20 @@ def run_compose_processing(args: argparse.Namespace) -> dict[str, Any]:
         published_port = preflight["compose"]["published_port"]
         # Fail before stopping service availability when the private
         # processor selection or model file is malformed.
+        pre_journal_stage = "PROCESSOR_COMMAND"
         selected_command = RUNNER.load_command(args.isolated_command_file)
+        pre_journal_stage = "RUNTIME_PREFLIGHT"
         RUNNER.validate_runtime_environment(
             time.monotonic() + DOCKER_COMMAND_TIMEOUT_SECONDS
         )
+        pre_journal_stage = "DESCRIPTOR_PREFLIGHT"
         _prepare_broker_descriptor_limit()
+        pre_journal_stage = "DEPLOYMENT_RESOLUTION"
         state_volume, configured_image = _resolve_deployment(
             compose,
             project=args.project,
         )
+        pre_journal_stage = "OPERATION_SNAPSHOT"
         if operation is None:
             operation = _create_operation_directory(
                 args.operation_directory,
@@ -4994,11 +5001,13 @@ def run_compose_processing(args: argparse.Namespace) -> dict[str, Any]:
             isolated_command_payload,
             0o400,
         )
+        pre_journal_stage = "BACKEND_RESOLUTION"
         compose_prefix = _compose_prefix(args.project, compose_snapshot)
         backend_container_id = _single_identifier(
             _docker([*compose_prefix, "ps", "--no-trunc", "-aq", "backend"]).stdout,
             "backend",
         )
+        pre_journal_stage = "BACKEND_INSPECTION"
         image_id = _inspect_backend(
             container_id=backend_container_id,
             project=args.project,
@@ -5008,7 +5017,9 @@ def run_compose_processing(args: argparse.Namespace) -> dict[str, Any]:
             require_healthy=True,
         )
         backend_was_running = True
+        pre_journal_stage = "SOURCE_PROVENANCE"
         host_bundle_digest = _verify_host_bundle_matches_image(image_id)
+        pre_journal_stage = "MOUNT_IDENTITY"
         config_identity = _regular_mount_identity(
             args.config_file,
             "public config",
@@ -5017,12 +5028,15 @@ def run_compose_processing(args: argparse.Namespace) -> dict[str, Any]:
             args.admin_secret_file,
             "administrator secret",
         )
+        pre_journal_stage = "VOLUME_OWNERSHIP"
         if _volume_consumers(state_volume) != {backend_container_id}:
             raise ComposeProcessingError(
                 "BRIDGE_DEPLOYMENT_CHANGED",
                 "another container references the Tacua state volume",
             )
+        pre_journal_stage = "VERIFIER_CAPACITY"
         _preflight_state_verifier_capacity(backend_container_id)
+        pre_journal_stage = "JOURNAL_PUBLICATION"
         journal = _write_operation_journal(
             operation,
             {
@@ -5313,7 +5327,11 @@ def run_compose_processing(args: argparse.Namespace) -> dict[str, Any]:
         }
     except (ConfigError, OperatorError, OSError, ValueError) as error:
         raise ComposeProcessingError(
-            "BRIDGE_OPERATION_FAILED",
+            (
+                "BRIDGE_OPERATION_FAILED"
+                if journal is not None
+                else f"BRIDGE_{pre_journal_stage}_FAILED"
+            ),
             "Compose processing operation failed safely",
         ) from error
     finally:
