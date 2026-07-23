@@ -37,6 +37,10 @@ class AppAudioAcceptanceTests(unittest.TestCase):
             GATE.validate_artifact(historical, require_physical=True)
         self.assertEqual("UNACCOUNTED_APP_AUDIO_DROPS", raised.exception.code)
 
+    def test_schema_four_physical_run_passes_structural_release_gate(self) -> None:
+        physical = GATE.load_artifact(FIXTURES / "physical-2026-07-23-passing.json")
+        GATE.validate_artifact(physical, require_physical=True)
+
     def test_rate_above_point_two_percent_fails_with_integer_arithmetic(self) -> None:
         candidate = copy.deepcopy(self.synthetic)
         candidate["app_audio_append_attempts"] = 999
