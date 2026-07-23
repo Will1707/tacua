@@ -72,6 +72,7 @@ from .handoff_store import (
 )
 from .processing_jobs import (
     JOB_STAGES,
+    ProcessingCheckpoint,
     ProcessingResult,
     PublicationCandidate,
     ProcessingJobClaim,
@@ -224,7 +225,7 @@ class ProcessingEngine(Protocol):
 
     def process_stage(
         self, claim: ProcessingJobClaim
-    ) -> ProcessingResult | None:
+    ) -> ProcessingCheckpoint | ProcessingResult | None:
         """Process one lease-owned stage without receiving backend authority."""
 
 
@@ -3207,6 +3208,8 @@ class PilotBackend:
                        (SELECT COUNT(*) FROM diagnostics WHERE session_id = ?) +
                        (SELECT COUNT(*) FROM completions WHERE session_id = ?) +
                        (SELECT COUNT(*) FROM jobs WHERE session_id = ?) +
+                       (SELECT COUNT(*) FROM tacua_processing_artifacts
+                          WHERE session_id = ?) +
                        (SELECT 2 * COUNT(*) FROM approved_handoffs
                           WHERE organization_id = ? AND project_id = ?
                             AND session_id = ?) +
@@ -3217,6 +3220,7 @@ class PilotBackend:
                                  AND session_id = ?
                           ) AND relative_path IS NOT NULL)""",
                     (
+                        session_id,
                         session_id,
                         session_id,
                         session_id,
@@ -5126,7 +5130,7 @@ class PilotBackend:
 
         try:
             stage_result = engine.process_stage(claim)
-        except Exception as error:
+        except Exception:
             try:
                 self.fail_processing_job(
                     claim.job["job_id"],
@@ -5142,12 +5146,19 @@ class PilotBackend:
                 500,
                 "PROCESSING_ENGINE_FAILED",
                 "configured processing engine failed",
-            ) from error
+            ) from None
 
         final_stage = claim.stage_name == JOB_STAGES[-1]
         if final_stage and isinstance(stage_result, ProcessingResult):
             return self.publish_processing_result(
                 claim.job["job_id"], claim.lease_token, stage_result
+            )
+        if not final_stage and type(stage_result) is ProcessingCheckpoint:
+            return self.publish_processing_checkpoint(
+                claim.job["job_id"],
+                claim.stage_name,
+                claim.lease_token,
+                stage_result,
             )
         if not final_stage and stage_result is None:
             return self.checkpoint_processing_stage(
@@ -5312,6 +5323,41 @@ class PilotBackend:
             try:
                 return self._processing_job_store(conn).checkpoint(
                     job_id, stage_name, lease_token, detail=detail
+                )
+            except ProcessingJobStoreError as error:
+                self._raise_processing_job_error(error)
+
+    def publish_processing_checkpoint(
+        self,
+        job_id: str,
+        stage_name: str,
+        lease_token: str,
+        checkpoint: ProcessingCheckpoint,
+    ) -> dict[str, Any]:
+        """Atomically publish one internal checkpoint and its inline artifacts.
+
+        This is intentionally a Python-only engine boundary.  It is not
+        exposed over HTTP and does not alter the frozen local-adapter result
+        contract.  Artifact identities and lifecycle fields are derived by
+        the store while the live stage lease is revalidated.
+        """
+
+        _require_id(job_id, "job_id")
+        if type(checkpoint) is not ProcessingCheckpoint:
+            raise ApiError(
+                422,
+                "PROCESSING_CHECKPOINT_INVALID",
+                "processing checkpoint is invalid",
+            )
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                return self._processing_job_store(conn).checkpoint(
+                    job_id,
+                    stage_name,
+                    lease_token,
+                    detail="The configured processor completed this stage.",
+                    artifacts=checkpoint.artifacts,
                 )
             except ProcessingJobStoreError as error:
                 self._raise_processing_job_error(error)
