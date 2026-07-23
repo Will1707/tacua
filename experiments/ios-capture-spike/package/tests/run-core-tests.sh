@@ -392,6 +392,9 @@ for plugin_file in plugin/*.js; do
 done
 node --test tests/config-plugin.test.mjs
 node --test tests/app-audio-generator.test.mjs
+node --test --experimental-strip-types \
+  --disable-warning=MODULE_TYPELESS_PACKAGE_JSON \
+  tests/backend-managed-host-controller.test.ts
 
 npm --prefix "$PACKAGE_ROOT/../harness" run typecheck
 
