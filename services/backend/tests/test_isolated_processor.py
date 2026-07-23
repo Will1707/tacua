@@ -865,6 +865,125 @@ module._release_runner_lock(descriptor)
             finally:
                 os.close(descriptor)
 
+    def test_descriptor_capabilities_avoid_reopen_and_preserve_offsets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence = root / "evidence.bin"
+            evidence.write_bytes(b"synthetic evidence")
+            evidence_descriptor = os.open(evidence, os.O_RDONLY)
+            source_path = root / "source.json"
+            source_descriptor = -1
+            bundle = root / "bundle"
+            bundle.mkdir()
+            try:
+                source = sealed_input(f"/dev/fd/{evidence_descriptor}")
+                source_path.write_bytes(RUNNER.canonical_json(source))
+                source_descriptor = os.open(source_path, os.O_RDONLY)
+                os.lseek(source_descriptor, 7, os.SEEK_SET)
+                os.lseek(evidence_descriptor, 3, os.SEEK_SET)
+                source_offset = os.lseek(source_descriptor, 0, os.SEEK_CUR)
+                evidence_offset = os.lseek(evidence_descriptor, 0, os.SEEK_CUR)
+                original_read_bytes = Path.read_bytes
+                original_open = os.open
+
+                def reject_descriptor_read_bytes(path: Path) -> bytes:
+                    if RUNNER.DESCRIPTOR_PATH_RE.fullmatch(str(path)):
+                        raise PermissionError(13, "synthetic reopen denial")
+                    return original_read_bytes(path)
+
+                def reject_descriptor_open(path, flags, *args, **kwargs):
+                    if RUNNER.DESCRIPTOR_PATH_RE.fullmatch(str(path)):
+                        raise PermissionError(13, "synthetic reopen denial")
+                    return original_open(path, flags, *args, **kwargs)
+
+                with (
+                    mock.patch.object(
+                        Path,
+                        "read_bytes",
+                        reject_descriptor_read_bytes,
+                    ),
+                    mock.patch.object(
+                        RUNNER.os,
+                        "open",
+                        side_effect=reject_descriptor_open,
+                    ),
+                ):
+                    result_contract = RUNNER.prepare_input(
+                        Path(f"/dev/fd/{source_descriptor}"),
+                        bundle / "input.json",
+                    )
+                self.assertEqual(
+                    RUNNER.SOURCE_RESULT_CONTRACT,
+                    result_contract,
+                )
+                self.assertEqual(
+                    source_offset,
+                    os.lseek(source_descriptor, 0, os.SEEK_CUR),
+                )
+                self.assertEqual(
+                    evidence_offset,
+                    os.lseek(evidence_descriptor, 0, os.SEEK_CUR),
+                )
+                self.assertEqual(
+                    b"synthetic evidence",
+                    (
+                        bundle
+                        / "evidence"
+                        / "evidence-000000.bin"
+                    ).read_bytes(),
+                )
+                (bundle / "evidence").chmod(0o700)
+            finally:
+                if source_descriptor >= 0:
+                    os.close(source_descriptor)
+                os.close(evidence_descriptor)
+
+    def test_descriptor_capabilities_reject_unsafe_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path = root / "source.json"
+            source_path.write_bytes(
+                RUNNER.canonical_json(sealed_input("/dev/fd/3"))
+            )
+            writable = os.open(source_path, os.O_RDWR)
+            try:
+                with self.assertRaises(RUNNER.IsolationError) as raised:
+                    RUNNER.prepare_input(
+                        Path(f"/dev/fd/{writable}"),
+                        root / "input.json",
+                    )
+                self.assertEqual(
+                    "INVALID_PROCESSING_INPUT",
+                    raised.exception.code,
+                )
+            finally:
+                os.close(writable)
+
+            read_descriptor, write_descriptor = os.pipe()
+            try:
+                with self.assertRaises(RUNNER.IsolationError) as raised:
+                    RUNNER._duplicate_descriptor_capability(
+                        f"/dev/fd/{read_descriptor}",
+                        "INVALID_EVIDENCE_INPUT",
+                    )
+                self.assertEqual(
+                    "INVALID_EVIDENCE_INPUT",
+                    raised.exception.code,
+                )
+            finally:
+                os.close(read_descriptor)
+                os.close(write_descriptor)
+
+            with self.assertRaises(RUNNER.IsolationError) as raised:
+                RUNNER._duplicate_descriptor_capability(
+                    f"/dev/fd/{RUNNER.MAX_SOURCE_DESCRIPTOR + 1}",
+                    "INVALID_EVIDENCE_INPUT",
+                )
+            self.assertEqual(
+                "INVALID_EVIDENCE_INPUT",
+                raised.exception.code,
+            )
+
     def test_v11_stage_artifact_is_preserved_and_both_digests_bind_rewrite(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
