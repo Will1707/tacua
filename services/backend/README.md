@@ -82,6 +82,17 @@ must never be redirected.
   remains alive. An expired lease is an immutable failed-attempt checkpoint
   before a bounded reclaim; the old token can never checkpoint or renew the new
   attempt.
+- The frozen local adapter `1.0` wire remains byte-for-byte unchanged. An
+  explicit `1.1` command is the only way to run the opt-in artifact pipeline:
+  `transcribe` publishes one sealed transcript artifact, then `align` reads that
+  exact artifact only while holding the matching live lease. Successful align
+  atomically appends its checkpoint and an immutable consumption receipt bound
+  to the session, build, source checkpoint, claimed job version/digest/attempt,
+  artifact id/digest, and retention expiry. Failure or lease expiry publishes no
+  receipt. This first slice then deliberately pauses at `correlate`; production
+  job creation, HTTP/reviewer/SDK contracts, Docker defaults, model selection,
+  egress, and the isolated runner remain unchanged. See
+  [ADR-019](../../docs/decisions/ADR-019-processing-artifact-consumption.md).
 - An injected engine exception records a bounded retryable failure before the
   runner returns a content-free error. Returning a terminal result on a
   non-final stage, or failing to return one on `generate_tickets`, is an engine
@@ -206,7 +217,11 @@ published deletion, restart recovery, and preview-integrity failure. Local
 adapter tests cover exact argv, no inherited credentials/environment, verified
 read-only descriptors, zero- and multi-candidate results, canonical output,
 timeouts, stdout/stderr caps, symlink output, tampered evidence, crash cleanup,
-and state-lock exclusion.
+and state-lock exclusion. Artifact-pipeline tests additionally cover the
+lease-bound transcript reader, exact `1.0` compatibility, opt-in `1.1`
+transcribe-to-align handoff, receipt immutability and binding, retry and queue
+ordering, transactional rollback, retention/deletion, backup/restore, and the
+intentional pause before `correlate`.
 
 ## Run with Docker Compose
 

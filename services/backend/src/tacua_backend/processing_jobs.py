@@ -38,7 +38,11 @@ JOB_STAGES = ("transcribe", "align", "correlate", "research", "generate_tickets"
 LEGACY_PIPELINE_VERSION = "tacua.pipeline@1.0.0"
 ARTIFACT_PIPELINE_VERSION = "tacua.pipeline@1.1.0"
 PROCESSING_ARTIFACT_SCHEMA_VERSION = 1
+PROCESSING_ARTIFACT_CONSUMPTION_SCHEMA_VERSION = 1
 PROCESSING_ARTIFACT_CONTRACT = "tacua.processing-stage-artifact@1.0.0"
+PROCESSING_ARTIFACT_CONSUMPTION_CONTRACT = (
+    "tacua.processing-artifact-consumption@1.0.0"
+)
 PROCESSING_ARTIFACT_MEDIA_TYPE = (
     "application/vnd.tacua.processing-stage-artifact+json;version=1.0.0"
 )
@@ -47,6 +51,9 @@ MAX_PROCESSING_ARTIFACT_BYTES = 4_194_304
 MAX_TRANSCRIPT_TEXT_BYTES = 2_097_152
 MAX_TRANSCRIPT_SPANS = 10_000
 ARTIFACT_CHECKPOINT_DETAIL = "The transcript artifact was published atomically."
+ARTIFACT_CONSUMPTION_CHECKPOINT_DETAIL = (
+    "The transcript artifact was consumed by the alignment stage."
+)
 FOUNDATION_STATUSES = frozenset({"queued", "running", "succeeded", "failed"})
 LEASE_SECONDS = 300
 MAX_CLAIM_SCAN = 50
@@ -122,6 +129,86 @@ WHEN EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'processing artifacts are append-only');
+END
+"""
+_ARTIFACT_CONSUMPTION_SCHEMA_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS tacua_processing_artifact_consumption_schema (
+    schema_version INTEGER PRIMARY KEY CHECK (schema_version = 1)
+)
+"""
+_ARTIFACT_CONSUMPTION_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS tacua_processing_artifact_consumptions (
+    consumption_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    organization_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    build_id TEXT NOT NULL,
+    build_identity_digest TEXT NOT NULL,
+    consumer_stage_name TEXT NOT NULL CHECK (consumer_stage_name = 'align'),
+    artifact_id TEXT NOT NULL REFERENCES tacua_processing_artifacts(artifact_id)
+        ON DELETE CASCADE,
+    artifact_digest TEXT NOT NULL,
+    source_checkpoint_job_version INTEGER NOT NULL CHECK (
+        source_checkpoint_job_version >= 2
+    ),
+    claimed_job_version INTEGER NOT NULL CHECK (claimed_job_version >= 2),
+    claimed_job_digest TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL CHECK (attempt_count BETWEEN 1 AND 3),
+    checkpoint_job_version INTEGER NOT NULL CHECK (checkpoint_job_version >= 2),
+    consumed_at TEXT NOT NULL,
+    derived_data_expires_at TEXT NOT NULL,
+    receipt_digest TEXT NOT NULL UNIQUE,
+    canonical_json TEXT NOT NULL,
+    UNIQUE (artifact_id, consumer_stage_name),
+    UNIQUE (job_id, consumer_stage_name),
+    FOREIGN KEY (job_id, source_checkpoint_job_version)
+        REFERENCES tacua_processing_job_versions(job_id, job_version)
+        ON DELETE CASCADE,
+    FOREIGN KEY (job_id, claimed_job_version)
+        REFERENCES tacua_processing_job_versions(job_id, job_version)
+        ON DELETE CASCADE,
+    FOREIGN KEY (job_id, checkpoint_job_version)
+        REFERENCES tacua_processing_job_versions(job_id, job_version)
+        ON DELETE CASCADE
+)
+"""
+_ARTIFACT_CONSUMPTION_SESSION_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS tacua_processing_artifact_consumptions_session_idx
+    ON tacua_processing_artifact_consumptions(session_id, consumption_id)
+"""
+_ARTIFACT_CONSUMPTION_NO_UPDATE_TRIGGER_SQL = """
+CREATE TRIGGER IF NOT EXISTS tacua_processing_artifact_consumptions_no_update
+BEFORE UPDATE ON tacua_processing_artifact_consumptions
+BEGIN
+    SELECT RAISE(ABORT, 'processing artifact consumptions are immutable');
+END
+"""
+_ARTIFACT_CONSUMPTION_NO_REPLACE_TRIGGER_SQL = """
+CREATE TRIGGER IF NOT EXISTS tacua_processing_artifact_consumptions_no_replace
+BEFORE INSERT ON tacua_processing_artifact_consumptions
+WHEN EXISTS (
+    SELECT 1 FROM tacua_processing_artifact_consumptions
+     WHERE consumption_id = NEW.consumption_id
+        OR receipt_digest = NEW.receipt_digest
+        OR artifact_id = NEW.artifact_id
+        OR (
+            job_id = NEW.job_id
+            AND consumer_stage_name = NEW.consumer_stage_name
+        )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'processing artifact consumptions cannot be replaced');
+END
+"""
+_ARTIFACT_CONSUMPTION_NO_DIRECT_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER IF NOT EXISTS tacua_processing_artifact_consumptions_no_direct_delete
+BEFORE DELETE ON tacua_processing_artifact_consumptions
+WHEN EXISTS (
+    SELECT 1 FROM jobs WHERE job_id = OLD.job_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'processing artifact consumptions are append-only');
 END
 """
 
@@ -204,11 +291,19 @@ class ProcessingResult:
 class ProcessingCheckpoint:
     """One internal non-terminal result and its immutable stage artifacts.
 
-    Artifact drafts are deliberately not part of the local adapter's frozen
-    wire contract.  An in-process engine may return exact dictionaries with
-    ``artifact_kind`` and ``payload`` keys.  The backend, not the engine,
-    derives every identity, scope, timestamp, retention boundary, and digest.
+    Artifact drafts and consumed references remain a private engine boundary.
+    Local adapter 1.0 never carries them; explicitly selected adapter 1.1 may
+    return their exact closed forms.  The backend, not the engine, derives
+    every identity, scope, timestamp, retention boundary, and receipt digest.
     """
+
+    artifacts: tuple[dict[str, Any], ...] = ()
+    consumed_artifacts: tuple[dict[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class ProcessingStageInputs:
+    """Private, lease-bound inputs made available to one internal stage."""
 
     artifacts: tuple[dict[str, Any], ...] = ()
 
@@ -266,6 +361,30 @@ def _validate_processing_artifact_schema_shape(
             "trigger",
             "tacua_processing_artifacts_no_direct_delete",
         ): _ARTIFACT_NO_DIRECT_DELETE_TRIGGER_SQL,
+        (
+            "table",
+            "tacua_processing_artifact_consumption_schema",
+        ): _ARTIFACT_CONSUMPTION_SCHEMA_TABLE_SQL,
+        (
+            "table",
+            "tacua_processing_artifact_consumptions",
+        ): _ARTIFACT_CONSUMPTION_TABLE_SQL,
+        (
+            "index",
+            "tacua_processing_artifact_consumptions_session_idx",
+        ): _ARTIFACT_CONSUMPTION_SESSION_INDEX_SQL,
+        (
+            "trigger",
+            "tacua_processing_artifact_consumptions_no_update",
+        ): _ARTIFACT_CONSUMPTION_NO_UPDATE_TRIGGER_SQL,
+        (
+            "trigger",
+            "tacua_processing_artifact_consumptions_no_replace",
+        ): _ARTIFACT_CONSUMPTION_NO_REPLACE_TRIGGER_SQL,
+        (
+            "trigger",
+            "tacua_processing_artifact_consumptions_no_direct_delete",
+        ): _ARTIFACT_CONSUMPTION_NO_DIRECT_DELETE_TRIGGER_SQL,
     }
     names = [name for _kind, name in expected]
     placeholders = ",".join("?" for _name in names)
@@ -287,7 +406,10 @@ def _validate_processing_artifact_schema_shape(
             raise ValueError("processing artifact schema shape is incompatible")
     related = connection.execute(
         """SELECT type,name,sql FROM sqlite_master
-             WHERE tbl_name = 'tacua_processing_artifacts'
+             WHERE tbl_name IN (
+                       'tacua_processing_artifacts',
+                       'tacua_processing_artifact_consumptions'
+                   )
                AND type IN ('index','trigger')"""
     ).fetchall()
     allowed_named = {
@@ -298,8 +420,13 @@ def _validate_processing_artifact_schema_shape(
         automatic_index = (
             row["type"] == "index"
             and row["sql"] is None
-            and row["name"].startswith(
-                "sqlite_autoindex_tacua_processing_artifacts_"
+            and (
+                row["name"].startswith(
+                    "sqlite_autoindex_tacua_processing_artifacts_"
+                )
+                or row["name"].startswith(
+                    "sqlite_autoindex_tacua_processing_artifact_consumptions_"
+                )
             )
         )
         if not automatic_index and key not in allowed_named:
@@ -617,6 +744,166 @@ def _decode_processing_stage_artifact(raw: str | bytes) -> dict[str, Any]:
     return _strict_json_object(encoded)
 
 
+def _processing_artifact_consumption_id(
+    job_id: str, consumer_stage_name: str, artifact_id: str
+) -> str:
+    subject = (
+        "tacua.processing-artifact-consumption-id@1.0.0\0"
+        f"{job_id}\0{consumer_stage_name}\0{artifact_id}"
+    ).encode("utf-8")
+    token = base64.urlsafe_b64encode(hashlib.sha256(subject).digest()).decode("ascii")
+    return "consumption_" + token.rstrip("=")
+
+
+def _seal_processing_artifact_consumption(
+    *,
+    initial_job: dict[str, Any],
+    claimed_job: dict[str, Any],
+    checkpoint_job_version: int,
+    consumer_stage_name: str,
+    artifact: dict[str, Any],
+    consumed_at: str,
+    derived_data_expires_at: str,
+) -> dict[str, Any]:
+    attempt_count = claimed_job["pipeline"]["stages"][1]["attempt_count"]
+    document = {
+        "contract_version": PROCESSING_ARTIFACT_CONSUMPTION_CONTRACT,
+        "consumption_id": _processing_artifact_consumption_id(
+            initial_job["job_id"], consumer_stage_name, artifact["artifact_id"]
+        ),
+        "organization_id": initial_job["organization_id"],
+        "project_id": initial_job["project_id"],
+        "build_id": initial_job["build_id"],
+        "build_identity_digest": initial_job["build_identity_digest"],
+        "session_id": initial_job["session_id"],
+        "job_id": initial_job["job_id"],
+        "consumer_stage_name": consumer_stage_name,
+        "artifact_ref": {
+            "artifact_id": artifact["artifact_id"],
+            "artifact_digest": artifact["artifact_digest"],
+            "artifact_kind": artifact["artifact_kind"],
+            "producer_stage_name": artifact["stage_name"],
+            "source_checkpoint_job_version": artifact[
+                "checkpoint_job_version"
+            ],
+        },
+        "claimed_job": {
+            "job_version": claimed_job["job_version"],
+            "job_digest": claimed_job["job_digest"],
+            "attempt_count": attempt_count,
+        },
+        "checkpoint_job_version": checkpoint_job_version,
+        "consumed_at": consumed_at,
+        "derived_data_expires_at": derived_data_expires_at,
+        "receipt_digest": "sha256:" + "0" * 64,
+    }
+    document["receipt_digest"] = digest_without(document, "receipt_digest")
+    _validate_processing_artifact_consumption(
+        document,
+        initial_job=initial_job,
+        claimed_job=claimed_job,
+        checkpoint_job_version=checkpoint_job_version,
+        consumer_stage_name=consumer_stage_name,
+        artifact=artifact,
+        consumed_at=consumed_at,
+        derived_data_expires_at=derived_data_expires_at,
+    )
+    return document
+
+
+def _validate_processing_artifact_consumption(
+    document: Any,
+    *,
+    initial_job: dict[str, Any],
+    claimed_job: dict[str, Any],
+    checkpoint_job_version: int,
+    consumer_stage_name: str,
+    artifact: dict[str, Any],
+    consumed_at: str,
+    derived_data_expires_at: str,
+) -> None:
+    _validate_json_basics(document)
+    if type(document) is not dict or set(document) != {
+        "contract_version",
+        "consumption_id",
+        "organization_id",
+        "project_id",
+        "build_id",
+        "build_identity_digest",
+        "session_id",
+        "job_id",
+        "consumer_stage_name",
+        "artifact_ref",
+        "claimed_job",
+        "checkpoint_job_version",
+        "consumed_at",
+        "derived_data_expires_at",
+        "receipt_digest",
+    }:
+        raise ValueError("processing artifact consumption fields are invalid")
+    artifact_ref = document["artifact_ref"]
+    claim_ref = document["claimed_job"]
+    if (
+        type(artifact_ref) is not dict
+        or set(artifact_ref)
+        != {
+            "artifact_id",
+            "artifact_digest",
+            "artifact_kind",
+            "producer_stage_name",
+            "source_checkpoint_job_version",
+        }
+        or type(claim_ref) is not dict
+        or set(claim_ref) != {"job_version", "job_digest", "attempt_count"}
+    ):
+        raise ValueError("processing artifact consumption references are invalid")
+    expected = {
+        "contract_version": PROCESSING_ARTIFACT_CONSUMPTION_CONTRACT,
+        "consumption_id": _processing_artifact_consumption_id(
+            initial_job["job_id"], consumer_stage_name, artifact["artifact_id"]
+        ),
+        "organization_id": initial_job["organization_id"],
+        "project_id": initial_job["project_id"],
+        "build_id": initial_job["build_id"],
+        "build_identity_digest": initial_job["build_identity_digest"],
+        "session_id": initial_job["session_id"],
+        "job_id": initial_job["job_id"],
+        "consumer_stage_name": consumer_stage_name,
+        "checkpoint_job_version": checkpoint_job_version,
+        "consumed_at": consumed_at,
+        "derived_data_expires_at": derived_data_expires_at,
+    }
+    expected_artifact_ref = {
+        "artifact_id": artifact["artifact_id"],
+        "artifact_digest": artifact["artifact_digest"],
+        "artifact_kind": artifact["artifact_kind"],
+        "producer_stage_name": artifact["stage_name"],
+        "source_checkpoint_job_version": artifact["checkpoint_job_version"],
+    }
+    expected_claim_ref = {
+        "job_version": claimed_job["job_version"],
+        "job_digest": claimed_job["job_digest"],
+        "attempt_count": claimed_job["pipeline"]["stages"][1][
+            "attempt_count"
+        ],
+    }
+    if (
+        any(document[key] != value for key, value in expected.items())
+        or artifact_ref != expected_artifact_ref
+        or claim_ref != expected_claim_ref
+        or consumer_stage_name != JOB_STAGES[1]
+        or claimed_job["status"] != "running"
+        or claimed_job["pipeline"]["stages"][1]["state"] != "running"
+        or checkpoint_job_version != claimed_job["job_version"] + 1
+        or DIGEST_PATTERN.fullmatch(str(document["receipt_digest"])) is None
+        or document["receipt_digest"]
+        != digest_without(document, "receipt_digest")
+        or _parse_timestamp(consumed_at)
+        >= _parse_timestamp(derived_data_expires_at)
+    ):
+        raise ValueError("processing artifact consumption binding is invalid")
+
+
 def _validate_completion_anchor(
     connection: sqlite3.Connection,
     job_row: sqlite3.Row,
@@ -836,6 +1123,14 @@ def initialize_processing_job_schema(connection: sqlite3.Connection) -> None:
             _ARTIFACT_NO_UPDATE_TRIGGER_SQL,
             _ARTIFACT_NO_REPLACE_TRIGGER_SQL,
             _ARTIFACT_NO_DIRECT_DELETE_TRIGGER_SQL,
+            _ARTIFACT_CONSUMPTION_SCHEMA_TABLE_SQL,
+            """INSERT OR IGNORE INTO tacua_processing_artifact_consumption_schema
+               (schema_version) VALUES (1)""",
+            _ARTIFACT_CONSUMPTION_TABLE_SQL,
+            _ARTIFACT_CONSUMPTION_SESSION_INDEX_SQL,
+            _ARTIFACT_CONSUMPTION_NO_UPDATE_TRIGGER_SQL,
+            _ARTIFACT_CONSUMPTION_NO_REPLACE_TRIGGER_SQL,
+            _ARTIFACT_CONSUMPTION_NO_DIRECT_DELETE_TRIGGER_SQL,
         )
     )
     connection.executescript(artifact_schema + ";")
@@ -850,6 +1145,17 @@ def initialize_processing_job_schema(connection: sqlite3.Connection) -> None:
             (PROCESSING_ARTIFACT_SCHEMA_VERSION,)
         ]:
             raise ValueError("processing artifact schema version is incompatible")
+        consumption_schema_versions = connection.execute(
+            """SELECT schema_version
+                 FROM tacua_processing_artifact_consumption_schema
+                 ORDER BY schema_version"""
+        ).fetchall()
+        if [tuple(row) for row in consumption_schema_versions] != [
+            (PROCESSING_ARTIFACT_CONSUMPTION_SCHEMA_VERSION,)
+        ]:
+            raise ValueError(
+                "processing artifact consumption schema version is incompatible"
+            )
         orphan = connection.execute(
             """SELECT versions.job_id
                  FROM tacua_processing_job_versions AS versions
@@ -1306,7 +1612,7 @@ def _validate_processing_artifact_population_for_job(
     connection: sqlite3.Connection,
     job_row: sqlite3.Row,
     history: list[dict[str, Any]],
-) -> None:
+) -> tuple[dict[str, Any], ...]:
     """Bind every inline artifact to one exact durable stage transition."""
 
     _validate_processing_artifact_schema_shape(connection)
@@ -1318,6 +1624,17 @@ def _validate_processing_artifact_population_for_job(
         (PROCESSING_ARTIFACT_SCHEMA_VERSION,)
     ]:
         raise ValueError("processing artifact schema version is incompatible")
+    consumption_schema_versions = connection.execute(
+        """SELECT schema_version
+             FROM tacua_processing_artifact_consumption_schema
+             ORDER BY schema_version"""
+    ).fetchall()
+    if [tuple(row) for row in consumption_schema_versions] != [
+        (PROCESSING_ARTIFACT_CONSUMPTION_SCHEMA_VERSION,)
+    ]:
+        raise ValueError(
+            "processing artifact consumption schema version is incompatible"
+        )
     rows = connection.execute(
         """SELECT artifact_id,job_id,session_id,stage_name,artifact_kind,
                   checkpoint_job_version,artifact_digest,created_at,
@@ -1326,11 +1643,25 @@ def _validate_processing_artifact_population_for_job(
             WHERE job_id = ? ORDER BY stage_name,artifact_kind,artifact_id""",
         (job_row["job_id"],),
     ).fetchall()
+    consumptions = connection.execute(
+        """SELECT consumption_id,job_id,session_id,organization_id,project_id,
+                  build_id,build_identity_digest,consumer_stage_name,
+                  artifact_id,artifact_digest,source_checkpoint_job_version,
+                  claimed_job_version,claimed_job_digest,attempt_count,
+                  checkpoint_job_version,consumed_at,derived_data_expires_at,
+                  receipt_digest,canonical_json
+             FROM tacua_processing_artifact_consumptions
+            WHERE job_id = ?
+            ORDER BY consumer_stage_name,artifact_id""",
+        (job_row["job_id"],),
+    ).fetchall()
     pipeline_version = history[0]["pipeline"]["pipeline_version"]
     if pipeline_version == LEGACY_PIPELINE_VERSION:
-        if rows:
-            raise ValueError("legacy processing pipeline retained a stage artifact")
-        return
+        if rows or consumptions:
+            raise ValueError(
+                "legacy processing pipeline retained artifact state"
+            )
+        return ()
     if pipeline_version != ARTIFACT_PIPELINE_VERSION:
         raise ValueError("processing artifact pipeline version is unsupported")
 
@@ -1339,13 +1670,9 @@ def _validate_processing_artifact_population_for_job(
     if len(rows) != expected_artifact_count:
         raise ValueError("processing artifact population differs from stage history")
     if not rows:
-        return
-    if (
-        history[-1]["status"] != "queued"
-        or _current_stage_index(history[-1]) != 1
-        or history[-1]["pipeline"]["stages"][1]["state"] != "pending"
-    ):
-        raise ValueError("artifact pipeline advanced before its reader was available")
+        if consumptions:
+            raise ValueError("processing artifact consumption has no artifact")
+        return ()
 
     session = connection.execute(
         """SELECT session_id,derived_data_expires_at FROM sessions
@@ -1400,6 +1727,85 @@ def _validate_processing_artifact_population_for_job(
     ):
         raise ValueError("processing artifact row differs from its canonical body")
 
+    if len(consumptions) > 1:
+        raise ValueError("processing artifact has multiple consumption receipts")
+    head = history[-1]
+    align = head["pipeline"]["stages"][1]
+    current = _current_stage_index(head)
+    if not consumptions:
+        if (
+            current != 1
+            or head["status"] not in {"queued", "running", "failed"}
+            or align["state"] not in {"pending", "running", "failed"}
+        ):
+            raise ValueError(
+                "artifact pipeline advanced without a consumption receipt"
+            )
+        return (document,)
+
+    consumption = consumptions[0]
+    consumption_version = consumption["checkpoint_job_version"]
+    if (
+        isinstance(consumption_version, bool)
+        or not isinstance(consumption_version, int)
+        or not 2 <= consumption_version <= len(history)
+    ):
+        raise ValueError("processing artifact consumption checkpoint is invalid")
+    consumption_checkpoint = history[consumption_version - 1]
+    consumption_previous = history[consumption_version - 2]
+    consumed_align = consumption_checkpoint["pipeline"]["stages"][1]
+    previous_align = consumption_previous["pipeline"]["stages"][1]
+    receipt = _decode_processing_stage_artifact(consumption["canonical_json"])
+    _validate_processing_artifact_consumption(
+        receipt,
+        initial_job=history[0],
+        claimed_job=consumption_previous,
+        checkpoint_job_version=consumption_version,
+        consumer_stage_name=JOB_STAGES[1],
+        artifact=document,
+        consumed_at=consumed_align["completed_at"],
+        derived_data_expires_at=session["derived_data_expires_at"],
+    )
+    if (
+        consumption["consumption_id"] != receipt["consumption_id"]
+        or consumption["job_id"] != receipt["job_id"]
+        or consumption["session_id"] != document["session_id"]
+        or consumption["organization_id"] != receipt["organization_id"]
+        or consumption["project_id"] != receipt["project_id"]
+        or consumption["build_id"] != receipt["build_id"]
+        or consumption["build_identity_digest"]
+        != receipt["build_identity_digest"]
+        or consumption["consumer_stage_name"] != JOB_STAGES[1]
+        or consumption["artifact_id"] != document["artifact_id"]
+        or consumption["artifact_digest"] != document["artifact_digest"]
+        or consumption["source_checkpoint_job_version"]
+        != document["checkpoint_job_version"]
+        or consumption["claimed_job_version"]
+        != consumption_previous["job_version"]
+        or consumption["claimed_job_digest"]
+        != consumption_previous["job_digest"]
+        or consumption["attempt_count"]
+        != previous_align["attempt_count"]
+        or consumed_align["state"] != "succeeded"
+        or consumed_align["completed_at"] is None
+        or consumption["consumed_at"] != consumed_align["completed_at"]
+        or consumption["derived_data_expires_at"]
+        != session["derived_data_expires_at"]
+        or consumption["receipt_digest"] != receipt["receipt_digest"]
+        or consumption["canonical_json"] != canonical_json(receipt)
+        or previous_align["state"] != "running"
+        or consumption_checkpoint["previous_job_digest"]
+        != consumption_previous["job_digest"]
+        or head["status"] != "queued"
+        or current != 2
+        or head["pipeline"]["stages"][2]["state"] != "pending"
+        or consumption_version != len(history)
+    ):
+        raise ValueError(
+            "processing artifact consumption differs from its stage transition"
+        )
+    return (document,)
+
 
 def _validate_processing_artifact_population(
     connection: sqlite3.Connection, *, session_id: str | None = None
@@ -1414,6 +1820,17 @@ def _validate_processing_artifact_population(
         (PROCESSING_ARTIFACT_SCHEMA_VERSION,)
     ]:
         raise ValueError("processing artifact schema version is incompatible")
+    consumption_schema_versions = connection.execute(
+        """SELECT schema_version
+             FROM tacua_processing_artifact_consumption_schema
+             ORDER BY schema_version"""
+    ).fetchall()
+    if [tuple(row) for row in consumption_schema_versions] != [
+        (PROCESSING_ARTIFACT_CONSUMPTION_SCHEMA_VERSION,)
+    ]:
+        raise ValueError(
+            "processing artifact consumption schema version is incompatible"
+        )
     orphan = connection.execute(
         """SELECT artifacts.artifact_id
              FROM tacua_processing_artifacts AS artifacts
@@ -1424,6 +1841,25 @@ def _validate_processing_artifact_population(
     ).fetchone()
     if orphan is not None:
         raise ValueError("processing artifact population has an orphan row")
+    orphan_consumption = connection.execute(
+        """SELECT consumptions.artifact_id
+             FROM tacua_processing_artifact_consumptions AS consumptions
+             LEFT JOIN jobs ON jobs.job_id = consumptions.job_id
+             LEFT JOIN sessions ON sessions.session_id = consumptions.session_id
+             LEFT JOIN tacua_processing_artifacts AS artifacts
+                    ON artifacts.artifact_id = consumptions.artifact_id
+            WHERE jobs.job_id IS NULL
+               OR sessions.session_id IS NULL
+               OR artifacts.artifact_id IS NULL
+               OR artifacts.job_id != consumptions.job_id
+               OR artifacts.session_id != consumptions.session_id
+               OR artifacts.artifact_digest != consumptions.artifact_digest
+            LIMIT 1"""
+    ).fetchone()
+    if orphan_consumption is not None:
+        raise ValueError(
+            "processing artifact consumption population has an orphan row"
+        )
 
 
 class ProcessingJobStore:
@@ -1873,6 +2309,76 @@ class ProcessingJobStore:
         return copy.deepcopy(history[-1]), lease["worker_id"]
 
     @_map_sqlite_errors
+    def validate_stage_lease_inputs(
+        self, job_id: str, stage_name: str, lease_token: str
+    ) -> tuple[dict[str, Any], str, ProcessingStageInputs]:
+        """Resolve private stage artifacts under one exact live lease.
+
+        The returned documents are deep copies.  Callers still must retain
+        their deletion-excluding critical section until every derived input
+        descriptor has been closed.
+        """
+
+        self._require_transaction()
+        if stage_name not in JOB_STAGES:
+            raise ProcessingJobStoreError(
+                409,
+                "PROCESSING_STAGE_MISMATCH",
+                "processing stage is not lease-owned",
+            )
+        history, lease = self._assert_lease(
+            job_id, stage_name, lease_token, self._now()
+        )
+        pipeline_version = history[0]["pipeline"]["pipeline_version"]
+        if pipeline_version == LEGACY_PIPELINE_VERSION:
+            return (
+                copy.deepcopy(history[-1]),
+                lease["worker_id"],
+                ProcessingStageInputs(),
+            )
+        if pipeline_version != ARTIFACT_PIPELINE_VERSION:
+            raise self._storage_error(
+                ValueError("processing stage input pipeline is unsupported")
+            )
+        if stage_name == JOB_STAGES[0]:
+            return (
+                copy.deepcopy(history[-1]),
+                lease["worker_id"],
+                ProcessingStageInputs(),
+            )
+        if stage_name != JOB_STAGES[1]:
+            raise ProcessingJobStoreError(
+                409,
+                "PROCESSING_STAGE_INPUTS_UNSUPPORTED",
+                "processing stage inputs are not available",
+            )
+        row = self.connection.execute(
+            """SELECT job_id,session_id,organization_id,project_id,status,
+                      requested_at,job_json
+                 FROM jobs WHERE job_id = ?""",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            raise self._storage_error(
+                ValueError("processing stage input lost its job")
+            )
+        try:
+            artifacts = _validate_processing_artifact_population_for_job(
+                self.connection, row, history
+            )
+        except (KeyError, TypeError, ValueError, sqlite3.Error) as error:
+            raise self._storage_error(error) from error
+        if len(artifacts) != 1 or artifacts[0]["artifact_kind"] != "transcript":
+            raise self._storage_error(
+                ValueError("alignment stage input differs from its transcript")
+            )
+        return (
+            copy.deepcopy(history[-1]),
+            lease["worker_id"],
+            ProcessingStageInputs(artifacts=copy.deepcopy(artifacts)),
+        )
+
+    @_map_sqlite_errors
     def validate_publication_lease(
         self, job_id: str, lease_token: str
     ) -> tuple[dict[str, Any], str]:
@@ -1965,10 +2471,10 @@ class ProcessingJobStore:
             raise self._storage_error(
                 ValueError("processing-job head/lease population is inconsistent")
             )
-        # The first slice persists a transcript but deliberately has no
-        # lease-bound artifact reader yet.  Once an artifact exists the job is
-        # therefore durable but unclaimable; a later slice must add the reader
-        # before removing this predicate and activating pipeline 1.1.
+        # Pipeline 1.1 is deliberately admitted only through alignment in this
+        # slice.  Its immutable consumption receipt is the durable pause before
+        # correlate.  Legacy jobs never have such a receipt and remain fully
+        # claimable through the existing pipeline.
         candidates = self.connection.execute(
             """SELECT jobs.job_id
                  FROM jobs
@@ -1984,8 +2490,9 @@ class ProcessingJobStore:
                        WHERE pending_deletions.session_id = jobs.session_id
                   )
                   AND NOT EXISTS (
-                      SELECT 1 FROM tacua_processing_artifacts AS artifacts
-                       WHERE artifacts.job_id = jobs.job_id
+                      SELECT 1
+                        FROM tacua_processing_artifact_consumptions AS consumed
+                       WHERE consumed.job_id = jobs.job_id
                   )
                   AND (
                       (jobs.status = 'queued' AND leases.job_id IS NULL)
@@ -2171,6 +2678,7 @@ class ProcessingJobStore:
         *,
         detail: str | None = None,
         artifacts: tuple[dict[str, Any], ...] = (),
+        consumed_artifacts: tuple[dict[str, str], ...] = (),
     ) -> dict[str, Any]:
         self._require_transaction()
         now = self._now()
@@ -2182,7 +2690,7 @@ class ProcessingJobStore:
                 "PROCESSING_PUBLICATION_REQUIRED",
                 "final processing completion requires an atomic processing result",
             )
-        if type(artifacts) is not tuple:
+        if type(artifacts) is not tuple or type(consumed_artifacts) is not tuple:
             raise ProcessingJobStoreError(
                 422,
                 "PROCESSING_CHECKPOINT_INVALID",
@@ -2195,18 +2703,33 @@ class ProcessingJobStore:
             and stage_name == JOB_STAGES[0]
             else 0
         )
+        expected_consumed_count = (
+            1
+            if pipeline_version == ARTIFACT_PIPELINE_VERSION
+            and stage_name == JOB_STAGES[1]
+            else 0
+        )
         if (
             pipeline_version not in {
                 LEGACY_PIPELINE_VERSION,
                 ARTIFACT_PIPELINE_VERSION,
             }
             or len(artifacts) != expected_artifact_count
+            or len(consumed_artifacts) != expected_consumed_count
             or any(
                 type(artifact) is not dict
                 or set(artifact) != {"artifact_kind", "payload"}
                 or artifact["artifact_kind"] != "transcript"
                 or type(artifact["payload"]) is not dict
                 for artifact in artifacts
+            )
+            or any(
+                type(reference) is not dict
+                or set(reference) != {"artifact_id", "artifact_digest"}
+                or type(reference["artifact_id"]) is not str
+                or type(reference["artifact_digest"]) is not str
+                or DIGEST_PATTERN.fullmatch(reference["artifact_digest"]) is None
+                for reference in consumed_artifacts
             )
         ):
             raise ProcessingJobStoreError(
@@ -2218,6 +2741,8 @@ class ProcessingJobStore:
             # Artifact bodies must not acquire an alternate route into the
             # reviewer-visible processing-job projection.
             detail = ARTIFACT_CHECKPOINT_DETAIL
+        if consumed_artifacts:
+            detail = ARTIFACT_CONSUMPTION_CHECKPOINT_DETAIL
         if detail is not None and (
             not isinstance(detail, str)
             or not 1 <= len(detail) <= 4096
@@ -2237,6 +2762,7 @@ class ProcessingJobStore:
                 ValueError("processing checkpoint has no session retention anchor")
             )
         sealed_artifacts: list[dict[str, Any]] = []
+        sealed_consumptions: list[dict[str, Any]] = []
         if artifacts:
             try:
                 expected_sources = _expected_transcript_source_segments(
@@ -2258,6 +2784,52 @@ class ProcessingJobStore:
                     for artifact in artifacts
                 ]
             except (KeyError, TypeError, ValueError):
+                raise ProcessingJobStoreError(
+                    422,
+                    "PROCESSING_CHECKPOINT_INVALID",
+                    "processing checkpoint is invalid",
+                ) from None
+        if consumed_artifacts:
+            row = self.connection.execute(
+                """SELECT job_id,session_id,organization_id,project_id,status,
+                          requested_at,job_json
+                     FROM jobs WHERE job_id = ?""",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise self._storage_error(
+                    ValueError("processing consumption lost its job")
+                )
+            try:
+                available = _validate_processing_artifact_population_for_job(
+                    self.connection, row, history
+                )
+                expected_references = tuple(
+                    {
+                        "artifact_id": document["artifact_id"],
+                        "artifact_digest": document["artifact_digest"],
+                    }
+                    for document in available
+                )
+                if consumed_artifacts != expected_references:
+                    raise ValueError(
+                        "processing checkpoint consumed artifacts differ"
+                    )
+                sealed_consumptions = [
+                    _seal_processing_artifact_consumption(
+                        initial_job=history[0],
+                        claimed_job=history[-1],
+                        checkpoint_job_version=history[-1]["job_version"] + 1,
+                        consumer_stage_name=stage_name,
+                        artifact=document,
+                        consumed_at=_timestamp(event_time),
+                        derived_data_expires_at=session[
+                            "derived_data_expires_at"
+                        ],
+                    )
+                    for document in available
+                ]
+            except (KeyError, TypeError, ValueError, sqlite3.Error):
                 raise ProcessingJobStoreError(
                     422,
                     "PROCESSING_CHECKPOINT_INVALID",
@@ -2287,6 +2859,40 @@ class ProcessingJobStore:
                     document["created_at"],
                     document["derived_data_expires_at"],
                     canonical_json(document),
+                ),
+            )
+        for receipt in sealed_consumptions:
+            artifact_ref = receipt["artifact_ref"]
+            claimed_job = receipt["claimed_job"]
+            self.connection.execute(
+                """INSERT INTO tacua_processing_artifact_consumptions
+                   (consumption_id,job_id,session_id,organization_id,project_id,
+                    build_id,build_identity_digest,consumer_stage_name,
+                    artifact_id,artifact_digest,source_checkpoint_job_version,
+                    claimed_job_version,claimed_job_digest,attempt_count,
+                    checkpoint_job_version,consumed_at,
+                    derived_data_expires_at,receipt_digest,canonical_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    receipt["consumption_id"],
+                    receipt["job_id"],
+                    receipt["session_id"],
+                    receipt["organization_id"],
+                    receipt["project_id"],
+                    receipt["build_id"],
+                    receipt["build_identity_digest"],
+                    receipt["consumer_stage_name"],
+                    artifact_ref["artifact_id"],
+                    artifact_ref["artifact_digest"],
+                    artifact_ref["source_checkpoint_job_version"],
+                    claimed_job["job_version"],
+                    claimed_job["job_digest"],
+                    claimed_job["attempt_count"],
+                    receipt["checkpoint_job_version"],
+                    receipt["consumed_at"],
+                    receipt["derived_data_expires_at"],
+                    receipt["receipt_digest"],
+                    canonical_json(receipt),
                 ),
             )
         removed = self.connection.execute(

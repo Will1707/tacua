@@ -3210,6 +3210,8 @@ class PilotBackend:
                        (SELECT COUNT(*) FROM jobs WHERE session_id = ?) +
                        (SELECT COUNT(*) FROM tacua_processing_artifacts
                           WHERE session_id = ?) +
+                       (SELECT COUNT(*) FROM tacua_processing_artifact_consumptions
+                          WHERE session_id = ?) +
                        (SELECT 2 * COUNT(*) FROM approved_handoffs
                           WHERE organization_id = ? AND project_id = ?
                             AND session_id = ?) +
@@ -3220,6 +3222,7 @@ class PilotBackend:
                                  AND session_id = ?
                           ) AND relative_path IS NOT NULL)""",
                     (
+                        session_id,
                         session_id,
                         session_id,
                         session_id,
@@ -5358,6 +5361,7 @@ class PilotBackend:
                     lease_token,
                     detail="The configured processor completed this stage.",
                     artifacts=checkpoint.artifacts,
+                    consumed_artifacts=checkpoint.consumed_artifacts,
                 )
             except ProcessingJobStoreError as error:
                 self._raise_processing_job_error(error)

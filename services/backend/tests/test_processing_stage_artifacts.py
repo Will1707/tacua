@@ -31,14 +31,17 @@ from tacua_backend import operator_tool  # noqa: E402
 from tacua_backend import processing_jobs  # noqa: E402
 from tacua_backend.processing_jobs import (  # noqa: E402
     ARTIFACT_CHECKPOINT_DETAIL,
+    ARTIFACT_CONSUMPTION_CHECKPOINT_DETAIL,
     ARTIFACT_PIPELINE_VERSION,
     MAX_TRANSCRIPT_TEXT_BYTES,
     PROCESSING_ARTIFACT_CONTRACT,
+    PROCESSING_ARTIFACT_CONSUMPTION_CONTRACT,
     ProcessingCheckpoint,
+    ProcessingJobStoreError,
     _processing_artifact_id,
 )
 from tacua_backend.service import ApiError, PilotBackend  # noqa: E402
-from test_backend import BackendHarness, instant  # noqa: E402
+from test_backend import BackendHarness, instant, seal  # noqa: E402
 
 
 class ArtifactPipelineBackend(PilotBackend):
@@ -115,6 +118,62 @@ class ProcessingStageArtifactTests(BackendHarness):
             self.config, self.admin_secret, clock=self.clock
         )
 
+    def full_completed_session_named(self, suffix: str) -> dict:
+        """Create a second lifecycle without reusing any frozen idempotency key."""
+
+        self.clock.set("2026-07-21T09:57:01Z")
+        launch_request, launch_receipt, _, _ = self.start_session(
+            credential_id=f"credential_{suffix}",
+            secret="T" * 43,
+            exchange_id=f"exchange_{suffix}",
+        )
+        session_id = launch_receipt["session_id"]
+        credential_id = launch_receipt["credential"]["credential_id"]
+        secret = launch_request["credential"]["secret"]
+        segment_request, segment_receipt, segment_bytes = self.store_segment(
+            session_id,
+            credential_id,
+            secret,
+            upload_id=f"upload_segment_{suffix}",
+            segment_id=f"segment_{suffix}",
+            content=f"synthetic movie bytes {suffix}".encode(),
+        )
+        diagnostic_request, diagnostic_receipt, diagnostic_bytes = (
+            self.store_diagnostic(
+                session_id,
+                credential_id,
+                secret,
+                upload_id=f"upload_diagnostic_{suffix}",
+                envelope_id=f"envelope_{suffix}",
+            )
+        )
+        completion_request = self.completion_request(
+            session_id, credential_id, [segment_receipt], [diagnostic_receipt]
+        )
+        completion_request["completion_id"] = f"completion_{suffix}"
+        completion_request = seal(completion_request)
+        self.clock.set("2026-07-21T10:02:06Z")
+        response = self.backend.complete_session(
+            session_id,
+            completion_request["completion_id"],
+            secret,
+            completion_request,
+        )
+        return {
+            "launch_request": launch_request,
+            "launch_receipt": launch_receipt,
+            "secret": secret,
+            "segment_request": segment_request,
+            "segment_receipt": segment_receipt,
+            "segment_bytes": segment_bytes,
+            "diagnostic_request": diagnostic_request,
+            "diagnostic_receipt": diagnostic_receipt,
+            "diagnostic_bytes": diagnostic_bytes,
+            "completion_request": completion_request,
+            "completion_receipt": response.json(),
+            "completion_bytes": response.body,
+        }
+
     @staticmethod
     def transcript_payload(lifecycle: dict, *, text: str = "Wrong button label.") -> dict:
         segment = lifecycle["completion_request"]["capture_manifest"]["segments"][0]
@@ -165,6 +224,38 @@ class ProcessingStageArtifactTests(BackendHarness):
             assert row is not None
             artifact = json.loads(row["canonical_json"])
         return checkpoint, artifact
+
+    def consume_transcript(self, lifecycle: dict) -> tuple[dict, dict, dict]:
+        job = lifecycle["completion_receipt"]["processing_job"]
+        claim = self.backend.claim_processing_job("worker_alignment")
+        assert claim is not None
+        self.assertEqual("align", claim["lease"]["stage_name"])
+        with self.backend._connect() as connection:
+            connection.execute("BEGIN")
+            _head, _worker, inputs = self.backend._processing_job_store(
+                connection
+            ).validate_stage_lease_inputs(
+                job["job_id"], "align", claim["lease"]["lease_token"]
+            )
+        self.assertEqual(1, len(inputs.artifacts))
+        artifact = inputs.artifacts[0]
+        reference = {
+            "artifact_id": artifact["artifact_id"],
+            "artifact_digest": artifact["artifact_digest"],
+        }
+        checkpoint = self.backend.publish_processing_checkpoint(
+            job["job_id"],
+            "align",
+            claim["lease"]["lease_token"],
+            ProcessingCheckpoint(consumed_artifacts=(reference,)),
+        )
+        with self.backend._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM tacua_processing_artifact_consumptions"
+            ).fetchone()
+            assert row is not None
+            receipt = json.loads(row["canonical_json"])
+        return checkpoint, artifact, receipt
 
     def test_synthetic_engine_publishes_strict_inline_transcript_atomically(self) -> None:
         lifecycle = self.full_completed_session()
@@ -218,9 +309,263 @@ class ProcessingStageArtifactTests(BackendHarness):
         )
         restarted = PilotBackend(self.config, self.admin_secret, clock=self.clock)
         self.assertEqual(checkpoint, restarted.get_job(job["job_id"]))
-        self.assertIsNone(
-            restarted.claim_processing_job("worker_artifact_reader_not_yet_available")
+        align_claim = restarted.claim_processing_job("worker_artifact_reader")
+        assert align_claim is not None
+        self.assertEqual("align", align_claim["lease"]["stage_name"])
+        with restarted._connect() as connection:
+            connection.execute("BEGIN")
+            _job, worker_id, inputs = restarted._processing_job_store(
+                connection
+            ).validate_stage_lease_inputs(
+                job["job_id"],
+                "align",
+                align_claim["lease"]["lease_token"],
+            )
+        self.assertEqual("worker_artifact_reader", worker_id)
+        self.assertEqual((artifact,), inputs.artifacts)
+
+    def test_align_consumption_is_lease_bound_atomic_and_pauses_correlate(self) -> None:
+        lifecycle = self.full_completed_session()
+        job = lifecycle["completion_receipt"]["processing_job"]
+        self.publish_transcript(lifecycle)
+        claim = self.backend.claim_processing_job("worker_alignment_exact")
+        assert claim is not None
+        with self.backend._connect() as connection:
+            store = self.backend._processing_job_store(connection)
+            with self.assertRaises(ProcessingJobStoreError) as no_transaction:
+                store.validate_stage_lease_inputs(
+                    job["job_id"], "align", claim["lease"]["lease_token"]
+                )
+            self.assertEqual(
+                "PROCESSING_JOB_TRANSACTION_REQUIRED",
+                no_transaction.exception.code,
+            )
+            connection.execute("BEGIN")
+            with self.assertRaises(ProcessingJobStoreError) as wrong_token:
+                store.validate_stage_lease_inputs(
+                    job["job_id"], "align", "x" * 43
+                )
+            self.assertEqual("PROCESSING_LEASE_STALE", wrong_token.exception.code)
+            with self.assertRaises(ProcessingJobStoreError) as wrong_stage:
+                store.validate_stage_lease_inputs(
+                    job["job_id"],
+                    "correlate",
+                    claim["lease"]["lease_token"],
+                )
+            self.assertEqual("PROCESSING_LEASE_STALE", wrong_stage.exception.code)
+            head, worker, inputs = store.validate_stage_lease_inputs(
+                job["job_id"], "align", claim["lease"]["lease_token"]
+            )
+        self.assertEqual(claim["job"], head)
+        self.assertEqual("worker_alignment_exact", worker)
+        self.assertEqual(1, len(inputs.artifacts))
+        artifact = inputs.artifacts[0]
+        private_text = artifact["payload"]["spans"][0]["text"]
+        reference = {
+            "artifact_id": artifact["artifact_id"],
+            "artifact_digest": artifact["artifact_digest"],
+        }
+        checkpoint = self.backend.publish_processing_checkpoint(
+            job["job_id"],
+            "align",
+            claim["lease"]["lease_token"],
+            ProcessingCheckpoint(consumed_artifacts=(reference,)),
         )
+        self.assertEqual("queued", checkpoint["status"])
+        self.assertEqual("succeeded", checkpoint["pipeline"]["stages"][1]["state"])
+        self.assertEqual(
+            ARTIFACT_CONSUMPTION_CHECKPOINT_DETAIL,
+            checkpoint["pipeline"]["stages"][1]["detail"],
+        )
+        self.assertNotIn(private_text, canonical_json(checkpoint))
+        with self.backend._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM tacua_processing_artifact_consumptions"
+            ).fetchone()
+            assert row is not None
+            receipt = json.loads(row["canonical_json"])
+        self.assertEqual(
+            PROCESSING_ARTIFACT_CONSUMPTION_CONTRACT,
+            receipt["contract_version"],
+        )
+        self.assertEqual(
+            reference
+            | {
+                "artifact_kind": "transcript",
+                "producer_stage_name": "transcribe",
+                "source_checkpoint_job_version": artifact[
+                    "checkpoint_job_version"
+                ],
+            },
+            receipt["artifact_ref"],
+        )
+        self.assertEqual(claim["job"]["job_version"], receipt["claimed_job"]["job_version"])
+        self.assertEqual(claim["job"]["job_digest"], receipt["claimed_job"]["job_digest"])
+        self.assertEqual(1, receipt["claimed_job"]["attempt_count"])
+        self.assertEqual(checkpoint["job_version"], receipt["checkpoint_job_version"])
+        self.assertEqual(
+            lifecycle["completion_request"]["capture_manifest"]["retention"][
+                "derived_data_expires_at"
+            ],
+            receipt["derived_data_expires_at"],
+        )
+        with self.backend._connect() as connection:
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """UPDATE tacua_processing_artifact_consumptions
+                          SET canonical_json = '{}'"""
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "DELETE FROM tacua_processing_artifact_consumptions"
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """INSERT OR REPLACE INTO tacua_processing_artifact_consumptions
+                       SELECT * FROM tacua_processing_artifact_consumptions"""
+                )
+        self.assertIsNone(self.backend.claim_processing_job("worker_correlate_blocked"))
+        restarted = PilotBackend(self.config, self.admin_secret, clock=self.clock)
+        self.assertEqual(checkpoint, restarted.get_job(job["job_id"]))
+
+    def test_alignment_retry_creates_no_receipt_then_binds_second_attempt(self) -> None:
+        lifecycle = self.full_completed_session()
+        job = lifecycle["completion_receipt"]["processing_job"]
+        self.publish_transcript(lifecycle)
+        first = self.backend.claim_processing_job("worker_alignment_retry")
+        assert first is not None
+        self.backend.fail_processing_job(
+            job["job_id"],
+            "align",
+            first["lease"]["lease_token"],
+            code="ALIGNMENT_RETRY",
+            detail="The alignment attempt failed safely.",
+            retryable=True,
+        )
+        with self.backend._connect() as connection:
+            self.assertEqual(
+                0,
+                connection.execute(
+                    "SELECT COUNT(*) FROM tacua_processing_artifact_consumptions"
+                ).fetchone()[0],
+            )
+        checkpoint, _artifact, receipt = self.consume_transcript(lifecycle)
+        self.assertEqual(2, checkpoint["pipeline"]["stages"][1]["attempt_count"])
+        self.assertEqual(2, receipt["claimed_job"]["attempt_count"])
+
+    def test_expired_alignment_lease_creates_no_consumption_receipt(self) -> None:
+        lifecycle = self.full_completed_session()
+        job = lifecycle["completion_receipt"]["processing_job"]
+        self.publish_transcript(lifecycle)
+        first = self.backend.claim_processing_job("worker_alignment_expired")
+        assert first is not None
+        with self.backend._connect() as connection:
+            connection.execute("BEGIN")
+            _head, _worker, inputs = self.backend._processing_job_store(
+                connection
+            ).validate_stage_lease_inputs(
+                job["job_id"], "align", first["lease"]["lease_token"]
+            )
+        artifact = inputs.artifacts[0]
+        reference = {
+            "artifact_id": artifact["artifact_id"],
+            "artifact_digest": artifact["artifact_digest"],
+        }
+
+        self.clock.set(first["lease"]["lease_expires_at"])
+        reclaimed = self.backend.claim_processing_job("worker_alignment_reclaimed")
+        assert reclaimed is not None
+        self.assertEqual(2, reclaimed["job"]["pipeline"]["stages"][1]["attempt_count"])
+        self.assert_api_error(
+            409,
+            "PROCESSING_LEASE_STALE",
+            lambda: self.backend.publish_processing_checkpoint(
+                job["job_id"],
+                "align",
+                first["lease"]["lease_token"],
+                ProcessingCheckpoint(consumed_artifacts=(reference,)),
+            ),
+        )
+        with self.backend._connect() as connection:
+            self.assertEqual(
+                0,
+                connection.execute(
+                    "SELECT COUNT(*) FROM tacua_processing_artifact_consumptions"
+                ).fetchone()[0],
+            )
+
+    def test_consumed_older_job_does_not_block_next_claim_scan(self) -> None:
+        older = self.full_completed_session()
+        self.publish_transcript(older)
+        self.consume_transcript(older)
+        newer = self.full_completed_session_named("newer")
+        self.publish_transcript(newer)
+
+        claim = self.backend.claim_processing_job("worker_scan_after_consumption")
+        assert claim is not None
+        self.assertEqual(
+            newer["completion_receipt"]["processing_job"]["job_id"],
+            claim["job"]["job_id"],
+        )
+        self.assertEqual("align", claim["lease"]["stage_name"])
+
+    def test_consumption_validation_failure_rolls_back_checkpoint_and_receipt(self) -> None:
+        lifecycle = self.full_completed_session()
+        job = lifecycle["completion_receipt"]["processing_job"]
+        self.publish_transcript(lifecycle)
+        claim = self.backend.claim_processing_job("worker_consumption_rollback")
+        assert claim is not None
+        with self.backend._connect() as connection:
+            connection.execute("BEGIN")
+            _head, _worker, inputs = self.backend._processing_job_store(
+                connection
+            ).validate_stage_lease_inputs(
+                job["job_id"], "align", claim["lease"]["lease_token"]
+            )
+        artifact = inputs.artifacts[0]
+        reference = {
+            "artifact_id": artifact["artifact_id"],
+            "artifact_digest": artifact["artifact_digest"],
+        }
+        original = processing_jobs._validate_processing_artifact_population_for_job
+
+        def fail_after_receipt(connection, row, history):
+            result = original(connection, row, history)
+            if connection.execute(
+                "SELECT COUNT(*) FROM tacua_processing_artifact_consumptions"
+            ).fetchone()[0]:
+                raise ValueError("synthetic receipt validation failure")
+            return result
+
+        with patch.object(
+            processing_jobs,
+            "_validate_processing_artifact_population_for_job",
+            side_effect=fail_after_receipt,
+        ):
+            self.assert_api_error(
+                500,
+                "PROCESSING_JOB_STORAGE_CORRUPT",
+                lambda: self.backend.publish_processing_checkpoint(
+                    job["job_id"],
+                    "align",
+                    claim["lease"]["lease_token"],
+                    ProcessingCheckpoint(consumed_artifacts=(reference,)),
+                ),
+            )
+        self.assertEqual(claim["job"], self.backend.get_job(job["job_id"]))
+        with self.backend._connect() as connection:
+            self.assertEqual(
+                0,
+                connection.execute(
+                    "SELECT COUNT(*) FROM tacua_processing_artifact_consumptions"
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                1,
+                connection.execute(
+                    "SELECT COUNT(*) FROM tacua_processing_job_leases"
+                ).fetchone()[0],
+            )
 
     def test_invalid_body_rolls_back_checkpoint_and_never_appears_in_error(self) -> None:
         lifecycle = self.full_completed_session()
@@ -508,13 +853,34 @@ class ProcessingStageArtifactTests(BackendHarness):
         ):
             PilotBackend(self.config, self.admin_secret, clock=self.clock)
 
+    def test_startup_rejects_same_named_weakened_consumption_trigger(self) -> None:
+        lifecycle = self.full_completed_session()
+        self.publish_transcript(lifecycle)
+        self.consume_transcript(lifecycle)
+        with self.backend._connect() as connection:
+            connection.execute(
+                "DROP TRIGGER tacua_processing_artifact_consumptions_no_update"
+            )
+            connection.execute(
+                """CREATE TRIGGER tacua_processing_artifact_consumptions_no_update
+                   BEFORE UPDATE ON tacua_processing_artifact_consumptions
+                   BEGIN
+                       SELECT 1;
+                   END"""
+            )
+        with self.assertRaisesRegex(
+            ValueError, "persisted processing-job state failed"
+        ):
+            PilotBackend(self.config, self.admin_secret, clock=self.clock)
+
     def test_session_deletion_cascades_artifacts_and_counts_them(self) -> None:
         lifecycle = self.full_completed_session()
         session_id = lifecycle["launch_receipt"]["session_id"]
         self.publish_transcript(lifecycle)
+        self.consume_transcript(lifecycle)
         tombstone = self.backend.delete_session(session_id)
-        # Segment, diagnostics, completion, processing job, and transcript.
-        self.assertEqual(5, tombstone["erasure"]["erased_object_count"])
+        # Segment, diagnostics, completion, job, transcript, and consumption.
+        self.assertEqual(6, tombstone["erasure"]["erased_object_count"])
         with self.backend._connect() as connection:
             self.assertEqual(
                 0,
@@ -522,10 +888,17 @@ class ProcessingStageArtifactTests(BackendHarness):
                     "SELECT COUNT(*) FROM tacua_processing_artifacts"
                 ).fetchone()[0],
             )
+            self.assertEqual(
+                0,
+                connection.execute(
+                    "SELECT COUNT(*) FROM tacua_processing_artifact_consumptions"
+                ).fetchone()[0],
+            )
 
     def test_retention_expiry_cascades_inline_artifact(self) -> None:
         lifecycle = self.full_completed_session()
         self.publish_transcript(lifecycle)
+        self.consume_transcript(lifecycle)
         expiry = instant(
             lifecycle["completion_request"]["capture_manifest"]["retention"]
             ["derived_data_expires_at"]
@@ -539,6 +912,12 @@ class ProcessingStageArtifactTests(BackendHarness):
                 0,
                 connection.execute(
                     "SELECT COUNT(*) FROM tacua_processing_artifacts"
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                0,
+                connection.execute(
+                    "SELECT COUNT(*) FROM tacua_processing_artifact_consumptions"
                 ).fetchone()[0],
             )
 
@@ -579,7 +958,8 @@ class ProcessingStageArtifactTests(BackendHarness):
     def test_operator_backup_and_restore_preserve_validated_inline_artifact(self) -> None:
         lifecycle = self.full_completed_session()
         job = lifecycle["completion_receipt"]["processing_job"]
-        checkpoint, artifact = self.publish_transcript(lifecycle)
+        self.publish_transcript(lifecycle)
+        checkpoint, artifact, receipt = self.consume_transcript(lifecycle)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             config_file, secret_file = self._write_operator_configuration(root)
@@ -604,9 +984,14 @@ class ProcessingStageArtifactTests(BackendHarness):
                 backed_body = backup_connection.execute(
                     "SELECT canonical_json FROM tacua_processing_artifacts"
                 ).fetchone()[0]
+                backed_receipt = backup_connection.execute(
+                    """SELECT canonical_json
+                         FROM tacua_processing_artifact_consumptions"""
+                ).fetchone()[0]
             finally:
                 backup_connection.close()
             self.assertEqual(canonical_json(artifact), backed_body)
+            self.assertEqual(canonical_json(receipt), backed_receipt)
 
             restored_config = replace(
                 self.config, state_directory=restored / "state"
