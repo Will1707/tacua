@@ -33,6 +33,23 @@ if [ "${#test_id}" -gt 32 ]; then
   exit 2
 fi
 
+test_port="${TACUA_CONTAINER_TEST_PORT:-8080}"
+if [ "${#test_port}" -gt 5 ]; then
+  echo "TACUA_CONTAINER_TEST_PORT must be a canonical unprivileged TCP port" >&2
+  exit 2
+fi
+case "$test_port" in
+  *[!0-9]*|''|0*)
+    echo "TACUA_CONTAINER_TEST_PORT must be a canonical unprivileged TCP port" >&2
+    exit 2
+    ;;
+esac
+if [ "$test_port" -lt 1024 ] || [ "$test_port" -gt 65535 ]; then
+  echo "TACUA_CONTAINER_TEST_PORT must be a canonical unprivileged TCP port" >&2
+  exit 2
+fi
+test_origin="http://127.0.0.1:$test_port"
+
 if [ ! -f services/backend/Dockerfile ] || [ ! -f services/backend/config.example.json ]; then
   echo "run this script from the Tacua repository root" >&2
   exit 2
@@ -61,7 +78,7 @@ resolved_compose="$runtime_directory/compose.json"
 resolved_test_compose="$runtime_directory/compose-test.json"
 resolved_production_compose="$runtime_directory/compose-production.json"
 bridge_compose="$runtime_directory/compose-bridge.json"
-test_compose_override="$runtime_directory/compose-test-override.json"
+test_compose_override="$runtime_directory/compose-test-override.yaml"
 restore_volume_override="$runtime_directory/compose-restore-volume.json"
 verified_restored_backup="$runtime_directory/restored-backup.json"
 local_config="services/backend/local/config.json"
@@ -284,8 +301,15 @@ fi
 
 printf '%s' 'tacua-ci-admin-secret-0123456789abcdef' > "$secret"
 chmod 0444 "$secret"
-printf '{"services":{"backend":{"image":"%s"},"reviewer":{"image":"%s"}}}\n' \
-  "$image" "$reviewer_image" \
+printf '%s\n' \
+  'services:' \
+  '  backend:' \
+  "    image: $image" \
+  '  ingress:' \
+  '    ports: !override' \
+  "      - \"127.0.0.1:$test_port:8080\"" \
+  '  reviewer:' \
+  "    image: $reviewer_image" \
   > "$test_compose_override"
 printf '{"volumes":{"tacua-state":{"name":"%s"}}}\n' "$restored_volume" \
   > "$restore_volume_override"
@@ -318,7 +342,8 @@ PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool \
   validate-compose \
   --config-file services/backend/config.example.json \
   --compose-json "$resolved_test_compose" \
-  --allow-mutable-image
+  --allow-mutable-image \
+  --expected-published-port "$test_port"
 TACUA_BACKEND_IMAGE="registry.invalid/tacua@sha256:$(printf 'a%.0s' {1..64})" \
 TACUA_REVIEWER_IMAGE="registry.invalid/tacua-reviewer@sha256:$(printf 'b%.0s' {1..64})" \
   docker compose \
@@ -444,16 +469,16 @@ docker exec "$compose_container" python -m tacua_backend.operator_tool smoke \
 PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool smoke \
   --config-file "$local_config" \
   --admin-secret-file "$local_secret" \
-  --origin http://127.0.0.1:8080 \
+  --origin "$test_origin" \
   --allow-loopback-http
 python3 -B -c \
-  "import urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8080/', timeout=2); body=r.read(65537); assert r.status==200 and b'<div id=\"root\"></div>' in body and r.headers['Cache-Control']=='no-store' and r.headers['X-Content-Type-Options']=='nosniff'"
+  "import urllib.request; r=urllib.request.urlopen('$test_origin/', timeout=2); body=r.read(65537); assert r.status==200 and b'<div id=\"root\"></div>' in body and r.headers['Cache-Control']=='no-store' and r.headers['X-Content-Type-Options']=='nosniff'"
 python3 -B -c \
-  "import urllib.request; q=urllib.request.Request('http://127.0.0.1:8080/', headers={'Authorization':'Bearer synthetic-never-log','Cookie':'synthetic=1','Idempotency-Key':'synthetic','If-Match':'\"synthetic\"','Proxy-Authorization':'Basic synthetic','Tacua-Content-Digest':'sha256:synthetic','Tacua-Credential-ID':'synthetic','Tacua-Evidence-Manifest-Digest':'sha256:synthetic','Tacua-Intent-Digest':'sha256:synthetic','Tacua-Page-Cursor':'synthetic','Tacua-Protocol-Version':'synthetic','Tacua-Requested-At':'2026-01-01T00:00:00Z','Tacua-Scope-Digest':'sha256:synthetic','Tacua-Sidecar-Digest':'sha256:synthetic','Tailscale-User-Login':'synthetic@example.invalid','Tailscale-User-Name':'Synthetic','Tailscale-User-Profile-Pic':'https://example.invalid/synthetic'}); r=urllib.request.urlopen(q, timeout=2); body=r.read(65537); assert r.status==200 and b'<div id=\"root\"></div>' in body"
+  "import urllib.request; q=urllib.request.Request('$test_origin/', headers={'Authorization':'Bearer synthetic-never-log','Cookie':'synthetic=1','Idempotency-Key':'synthetic','If-Match':'\"synthetic\"','Proxy-Authorization':'Basic synthetic','Tacua-Content-Digest':'sha256:synthetic','Tacua-Credential-ID':'synthetic','Tacua-Evidence-Manifest-Digest':'sha256:synthetic','Tacua-Intent-Digest':'sha256:synthetic','Tacua-Page-Cursor':'synthetic','Tacua-Protocol-Version':'synthetic','Tacua-Requested-At':'2026-01-01T00:00:00Z','Tacua-Scope-Digest':'sha256:synthetic','Tacua-Sidecar-Digest':'sha256:synthetic','Tailscale-User-Login':'synthetic@example.invalid','Tailscale-User-Name':'Synthetic','Tailscale-User-Profile-Pic':'https://example.invalid/synthetic'}); r=urllib.request.urlopen(q, timeout=2); body=r.read(65537); assert r.status==200 and b'<div id=\"root\"></div>' in body"
 
 docker stop "$compose_ingress_container" >/dev/null
 if python3 -B -c \
-  "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=1)" \
+  "import urllib.request; urllib.request.urlopen('$test_origin/healthz', timeout=1)" \
   >/dev/null 2>&1; then
   echo "loopback remained reachable after the sole ingress stopped" >&2
   exit 1
@@ -467,7 +492,7 @@ wait_for_healthy "$compose_ingress_container"
 PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool smoke \
   --config-file "$local_config" \
   --admin-secret-file "$local_secret" \
-  --origin http://127.0.0.1:8080 \
+  --origin "$test_origin" \
   --allow-loopback-http
 
 if [ "$verify_compose_processing_bridge" = true ]; then
@@ -491,7 +516,8 @@ if [ "$verify_compose_processing_bridge" = true ]; then
     "$compose_container" \
     "$compose_state_volume" \
     "$processor_image_id" \
-    "$backend_image_id"
+    "$backend_image_id" \
+    "$test_port"
 fi
 
 docker compose \

@@ -470,5 +470,6 @@ through the Compose bridge and the verified product processor image. The
 bridge's pipe-gated create and conservative recovery phases remain covered by
 the deterministic operation-journal unit matrix; no test-only barrier is
 exposed by the production bridge. Run the full gate only on an idle,
-non-production runner whose loopback port `8080` is free; it is not an
-in-place upgrade check for a host already serving Tacua.
+non-production runner with a free unprivileged loopback port. The default is
+`8080`; set `TACUA_CONTAINER_TEST_PORT` when another local service owns it.
+The gate is not an in-place upgrade check for a host already serving Tacua.

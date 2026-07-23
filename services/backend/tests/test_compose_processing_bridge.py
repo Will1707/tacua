@@ -15,7 +15,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -198,6 +197,7 @@ class ComposeProcessingBridgeTests(unittest.TestCase):
                 compose_json=compose_file,
                 config_file=config_file,
                 drain=False,
+                expected_published_port=18080,
                 isolated_command_file=isolated_file,
                 max_stages=1,
                 operation_directory=root.resolve(),
@@ -212,6 +212,13 @@ class ComposeProcessingBridgeTests(unittest.TestCase):
             if worker_failure is not None:
                 worker_effect = worker_failure
             create_sequence = 0
+
+            def preflight(*_args, **kwargs):
+                self.assertEqual(
+                    kwargs["expected_published_port"],
+                    18080,
+                )
+                return {"compose": {"published_port": "18080"}}
 
             def prepare_create(**kwargs):
                 nonlocal create_sequence
@@ -267,7 +274,9 @@ class ComposeProcessingBridgeTests(unittest.TestCase):
                         return_value="sha256:" + "d" * 64
                     ),
                     _wait_backend_healthy=wait_healthy,
-                    deployment_preflight=mock.Mock(),
+                    deployment_preflight=mock.Mock(
+                        side_effect=preflight
+                    ),
                 ),
                 mock.patch.object(
                     BRIDGE,
@@ -333,11 +342,6 @@ class ComposeProcessingBridgeTests(unittest.TestCase):
                     return_value={
                         "State": {"Status": recovery_backend_status}
                     },
-                ),
-                mock.patch.object(
-                    BRIDGE,
-                    "load_public_config",
-                    return_value=SimpleNamespace(listen_port=8080),
                 ),
                 mock.patch.object(BRIDGE, "smoke_deployment", smoke),
             ):
@@ -2951,10 +2955,19 @@ class ComposeProcessingBridgeTests(unittest.TestCase):
                 admin_secret_file=secret,
                 allow_mutable_image=True,
                 config_file=config,
+                expected_published_port=18080,
                 operation_directory=parent,
                 project="tacua-test",
             )
             remove_worker = mock.Mock()
+            recovery_smoke = mock.Mock()
+
+            def recovery_preflight(*_args, **kwargs):
+                self.assertEqual(
+                    kwargs["expected_published_port"],
+                    18080,
+                )
+                return {"compose": {"published_port": "18080"}}
 
             def complete_verifier(**kwargs):
                 kwargs["on_created"]("f" * 64)
@@ -2987,7 +3000,7 @@ class ComposeProcessingBridgeTests(unittest.TestCase):
                         )
                     ),
                     _retire_orphaned_broker_socket=mock.Mock(),
-                    _smoke_restarted_backend=mock.Mock(),
+                    _smoke_restarted_backend=recovery_smoke,
                     _verify_host_bundle_matches_image=mock.Mock(
                         return_value="sha256:" + "d" * 64
                     ),
@@ -2999,7 +3012,9 @@ class ComposeProcessingBridgeTests(unittest.TestCase):
                         side_effect=(worker_id, None)
                     ),
                     _wait_backend_healthy=mock.Mock(),
-                    deployment_preflight=mock.Mock(),
+                    deployment_preflight=mock.Mock(
+                        side_effect=recovery_preflight
+                    ),
                 ),
                 mock.patch.object(BRIDGE, "_docker", side_effect=fake_docker),
                 mock.patch.object(
@@ -3018,6 +3033,10 @@ class ComposeProcessingBridgeTests(unittest.TestCase):
                 result = BRIDGE.recover_compose_processing(args)
             self.assertEqual(result, {"status": "recovered"})
             remove_worker.assert_called_once_with(worker_id)
+            self.assertEqual(
+                recovery_smoke.call_args.args[2],
+                "18080",
+            )
             verify_state.assert_called_once()
             self.assertEqual(
                 verify_state.call_args.kwargs["project"],
@@ -3106,6 +3125,7 @@ class ComposeProcessingBridgeTests(unittest.TestCase):
                     compose_prefix=("compose",),
                     compose_snapshot=operation / "resolved-compose.json",
                     compose_digest="sha256:" + "c" * 64,
+                    published_port="18080",
                     config_file=parent / "config.json",
                     admin_secret_file=parent / "admin-secret",
                     config_identity={},
@@ -3532,6 +3552,10 @@ class ComposeProcessingBridgeTests(unittest.TestCase):
         self.assertLess(create_index, start_index)
         self.assertEqual(verify_state.call_count, 2)
         smoke.assert_called_once()
+        self.assertEqual(
+            smoke.call_args.kwargs["origin_override"],
+            "http://127.0.0.1:18080",
+        )
 
     def test_failed_worker_reverifies_before_recovery_restart(self) -> None:
         (

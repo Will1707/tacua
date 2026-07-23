@@ -408,6 +408,53 @@ class OperatorToolTests(unittest.TestCase):
                 )["immutable_image"]
             )
 
+            alternate_port = self.compose_document(
+                immutable=False,
+                state_target=str(state),
+                config_source=str(config_file),
+                secret_source=str(secret_file),
+            )
+            alternate_port["services"]["ingress"]["ports"][0][
+                "published"
+            ] = "18080"
+            with self.assertRaises(OperatorError):
+                validate_compose_document(
+                    alternate_port,
+                    config,
+                    require_immutable_image=False,
+                )
+            alternate_result = validate_compose_document(
+                alternate_port,
+                config,
+                require_immutable_image=False,
+                expected_published_port=18080,
+            )
+            self.assertEqual("18080", alternate_result["published_port"])
+            immutable_alternate_port = self.compose_document(
+                immutable=True,
+                state_target=str(state),
+                config_source=str(config_file),
+                secret_source=str(secret_file),
+            )
+            immutable_alternate_port["services"]["ingress"]["ports"][0][
+                "published"
+            ] = "18080"
+            with self.assertRaises(OperatorError):
+                validate_compose_document(
+                    immutable_alternate_port,
+                    config,
+                    require_immutable_image=True,
+                    expected_published_port=18080,
+                )
+            for invalid_port in (True, 0, 65_536):
+                with self.assertRaises(OperatorError):
+                    validate_compose_document(
+                        local,
+                        config,
+                        require_immutable_image=False,
+                        expected_published_port=invalid_port,
+                    )
+
             mutations = [
                 lambda service: service["deploy"].update(replicas=2),
                 lambda service: service.update(privileged=True),

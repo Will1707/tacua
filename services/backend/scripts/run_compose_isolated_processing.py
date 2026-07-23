@@ -513,6 +513,7 @@ def _bootstrap_validate_cli_arguments(
     parser.add_argument("--config-file", required=True)
     parser.add_argument("--admin-secret-file", required=True)
     parser.add_argument("--allow-mutable-image", action="store_true")
+    parser.add_argument("--expected-published-port", type=int)
     if not recovery:
         parser.add_argument("--compose-json", required=True)
         parser.add_argument("--isolated-command-file", required=True)
@@ -530,6 +531,11 @@ def _bootstrap_validate_cli_arguments(
         mode.add_argument("--drain", action="store_true")
         parser.add_argument("--max-stages", type=int, default=100)
     parsed = parser.parse_args(arguments)
+    if (
+        parsed.expected_published_port is not None
+        and not 1 <= parsed.expected_published_port <= 65_535
+    ):
+        parser.error("expected published port is invalid")
     if not recovery and (
         re.fullmatch(r"^[a-z][a-z0-9_-]{2,63}$", parsed.worker_id)
         is None
@@ -896,7 +902,7 @@ ORIGINAL_REPOSITORY_ROOT = (
 )
 sys.path.insert(0, str(BACKEND_ROOT / "src"))
 
-from tacua_backend.config import ConfigError, load_public_config  # noqa: E402
+from tacua_backend.config import ConfigError  # noqa: E402
 from tacua_backend.operator_tool import (  # noqa: E402
     MAX_COMPOSE_STATE_DATABASE_COPY_BYTES,
     OperatorError,
@@ -4379,12 +4385,20 @@ def _remove_verifier(
 def _smoke_restarted_backend(
     config_file: Path,
     admin_secret_file: Path,
+    published_port: str,
 ) -> None:
-    config = load_public_config(config_file)
+    if (
+        re.fullmatch(r"[1-9][0-9]{0,4}", published_port) is None
+        or int(published_port) > 65_535
+    ):
+        raise ComposeProcessingError(
+            "BRIDGE_COMPOSE_INVALID",
+            "validated Compose published port is invalid",
+        )
     smoke_deployment(
         config_file,
         admin_secret_file,
-        origin_override=f"http://127.0.0.1:{config.listen_port}",
+        origin_override=f"http://127.0.0.1:{published_port}",
         allow_loopback_http=True,
     )
 
@@ -4401,6 +4415,7 @@ def _recover_backend(
     compose_prefix: Sequence[str],
     compose_snapshot: Path,
     compose_digest: str,
+    published_port: str,
     config_file: Path,
     admin_secret_file: Path,
     config_identity: Mapping[str, Any],
@@ -4517,7 +4532,11 @@ def _recover_backend(
         state_volume,
         project,
     )
-    _smoke_restarted_backend(config_file, admin_secret_file)
+    _smoke_restarted_backend(
+        config_file,
+        admin_secret_file,
+        published_port,
+    )
     _require_snapshot_digest(
         compose_snapshot,
         MAX_COMPOSE_BYTES,
@@ -4672,14 +4691,16 @@ def recover_compose_processing(args: argparse.Namespace) -> dict[str, Any]:
             "administrator secret",
             journal["secret_identity"],
         )
-        deployment_preflight(
+        preflight = deployment_preflight(
             args.config_file,
             args.admin_secret_file,
             compose,
             require_immutable_image=not args.allow_mutable_image,
             check_state=False,
             expected_repository_root=ORIGINAL_REPOSITORY_ROOT,
+            expected_published_port=args.expected_published_port,
         )
+        published_port = preflight["compose"]["published_port"]
         state_volume, configured_image = _resolve_deployment(
             compose,
             project=args.project,
@@ -4779,6 +4800,7 @@ def recover_compose_processing(args: argparse.Namespace) -> dict[str, Any]:
             _smoke_restarted_backend(
                 args.config_file,
                 args.admin_secret_file,
+                published_port,
             )
             _remove_operation_directory(operation)
             operation_cleared = True
@@ -4838,6 +4860,7 @@ def recover_compose_processing(args: argparse.Namespace) -> dict[str, Any]:
         _smoke_restarted_backend(
             args.config_file,
             args.admin_secret_file,
+            published_port,
         )
         _require_mount_identity(
             args.config_file,
@@ -4909,6 +4932,7 @@ def run_compose_processing(args: argparse.Namespace) -> dict[str, Any]:
     configured_image = ""
     state_volume = ""
     compose_digest = ""
+    published_port = ""
     config_identity: dict[str, Any] = {}
     secret_identity: dict[str, Any] = {}
     summary: dict[str, Any] | None = None
@@ -4924,14 +4948,16 @@ def run_compose_processing(args: argparse.Namespace) -> dict[str, Any]:
                 "BRIDGE_COMPOSE_INVALID",
                 "resolved Compose model must be an object",
             )
-        deployment_preflight(
+        preflight = deployment_preflight(
             args.config_file,
             args.admin_secret_file,
             compose,
             require_immutable_image=not args.allow_mutable_image,
             check_state=False,
             expected_repository_root=ORIGINAL_REPOSITORY_ROOT,
+            expected_published_port=args.expected_published_port,
         )
+        published_port = preflight["compose"]["published_port"]
         # Fail before stopping service availability when the private
         # processor selection or model file is malformed.
         selected_command = RUNNER.load_command(args.isolated_command_file)
@@ -5255,7 +5281,11 @@ def run_compose_processing(args: argparse.Namespace) -> dict[str, Any]:
             state_volume,
             args.project,
         )
-        _smoke_restarted_backend(args.config_file, args.admin_secret_file)
+        _smoke_restarted_backend(
+            args.config_file,
+            args.admin_secret_file,
+            published_port,
+        )
         _require_mount_identity(
             args.config_file,
             "public config",
@@ -5321,6 +5351,7 @@ def run_compose_processing(args: argparse.Namespace) -> dict[str, Any]:
                         compose_prefix=compose_prefix,
                         compose_snapshot=Path(compose_prefix[-1]),
                         compose_digest=compose_digest,
+                        published_port=published_port,
                         config_file=args.config_file,
                         admin_secret_file=args.admin_secret_file,
                         config_identity=config_identity,
@@ -5386,6 +5417,7 @@ def _parser() -> argparse.ArgumentParser:
         default="tacua.local-processing-command@1.0.0",
     )
     parser.add_argument("--allow-mutable-image", action="store_true")
+    parser.add_argument("--expected-published-port", type=int)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--run-once", action="store_true")
     mode.add_argument("--drain", action="store_true")
@@ -5402,6 +5434,7 @@ def _recovery_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config-file", type=Path, required=True)
     parser.add_argument("--admin-secret-file", type=Path, required=True)
     parser.add_argument("--allow-mutable-image", action="store_true")
+    parser.add_argument("--expected-published-port", type=int)
     return parser
 
 

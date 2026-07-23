@@ -13,7 +13,7 @@ jobs:
     # requires a rootless daemon with cgroup v2/systemd delegation and builtin
     # seccomp, which the ordinary rootful GitHub-hosted daemon does not prove.
     # The runner must be idle and non-production because the complete gate
-    # temporarily owns the fixed loopback acceptance port 8080.
+    # temporarily owns its loopback acceptance port (8080 by default).
     runs-on: [self-hosted, linux, x64, tacua-rootless]
     timeout-minutes: 45
     steps:

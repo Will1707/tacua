@@ -3,8 +3,8 @@
 
 set -euo pipefail
 
-if [ "$#" -ne 8 ]; then
-  echo "usage: verify-compose-processing-bridge.sh PROJECT COMPOSE_JSON CONFIG SECRET BACKEND_CONTAINER STATE_VOLUME PROCESSOR_IMAGE_ID BACKEND_IMAGE_ID" >&2
+if [ "$#" -ne 9 ]; then
+  echo "usage: verify-compose-processing-bridge.sh PROJECT COMPOSE_JSON CONFIG SECRET BACKEND_CONTAINER STATE_VOLUME PROCESSOR_IMAGE_ID BACKEND_IMAGE_ID HOST_PORT" >&2
   exit 2
 fi
 
@@ -16,6 +16,7 @@ backend_container="$5"
 state_volume="$6"
 processor_image_id="$7"
 backend_image_id="$8"
+host_port="$9"
 
 case "$project" in
   *[!a-z0-9_-]*|''|-*)
@@ -33,6 +34,20 @@ for image_id in "$processor_image_id" "$backend_image_id"; do
     exit 2
   fi
 done
+if [ "${#host_port}" -gt 5 ]; then
+  echo "bridge verification host port is invalid" >&2
+  exit 2
+fi
+case "$host_port" in
+  *[!0-9]*|''|0*)
+    echo "bridge verification host port is invalid" >&2
+    exit 2
+    ;;
+esac
+if [ "$host_port" -lt 1024 ] || [ "$host_port" -gt 65535 ]; then
+  echo "bridge verification host port is invalid" >&2
+  exit 2
+fi
 if [ ! -f .github/scripts/seed-compose-processing-fixture.py ] \
   || [ ! -f services/backend/scripts/run_compose_isolated_processing.py ]; then
   echo "run this script from the Tacua repository root" >&2
@@ -106,6 +121,7 @@ bridge_arguments=(
   --isolated-command-file "$isolated_command"
   --worker-id worker_rootless_gate
   --allow-mutable-image
+  --expected-published-port "$host_port"
   --run-once
 )
 
@@ -119,6 +135,7 @@ recover_bridge() {
     --config-file "$config_file" \
     --admin-secret-file "$admin_secret_file" \
     --allow-mutable-image \
+    --expected-published-port "$host_port" \
     > "$recovery_output" 2> "$recovery_error"; then
     return 1
   fi
@@ -161,7 +178,7 @@ smoke_backend() {
     smoke \
     --config-file "$config_file" \
     --admin-secret-file "$admin_secret_file" \
-    --origin http://127.0.0.1:8080 \
+    --origin "http://127.0.0.1:$host_port" \
     --allow-loopback-http
 }
 

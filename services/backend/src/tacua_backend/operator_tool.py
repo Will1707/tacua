@@ -1337,6 +1337,7 @@ def validate_compose_document(
     *,
     require_immutable_image: bool,
     expected_repository_root: Path | None = None,
+    expected_published_port: int | None = None,
 ) -> dict[str, Any]:
     """Validate the resolved Compose model, not hand-written YAML text."""
 
@@ -1537,13 +1538,24 @@ def validate_compose_document(
         raise OperatorError("ingress must publish one loopback port")
     port = ports[0]
     published = port.get("published") if isinstance(port, dict) else None
+    selected_published_port = (
+        config.listen_port
+        if expected_published_port is None
+        else expected_published_port
+    )
     if (
-        not isinstance(port, dict)
+        type(selected_published_port) is not int
+        or not 1 <= selected_published_port <= 65_535
+        or (
+            require_immutable_image
+            and selected_published_port != config.listen_port
+        )
+        or not isinstance(port, dict)
         or port.get("host_ip") != "127.0.0.1"
         or port.get("protocol") != "tcp"
         or port.get("mode") != "ingress"
         or port.get("target") != config.listen_port
-        or published != str(config.listen_port)
+        or published != str(selected_published_port)
     ):
         raise OperatorError("ingress listener must be published only on host loopback")
 
@@ -1702,6 +1714,7 @@ def deployment_preflight(
     require_immutable_image: bool,
     check_state: bool,
     expected_repository_root: Path | None = None,
+    expected_published_port: int | None = None,
 ) -> dict[str, Any]:
     _inspect_host_file(config_file, "public config", secret=False)
     _inspect_host_file(admin_secret_file, "admin secret", secret=True)
@@ -1727,6 +1740,7 @@ def deployment_preflight(
         config,
         require_immutable_image=require_immutable_image,
         expected_repository_root=expected_repository_root,
+        expected_published_port=expected_published_port,
     )
     ingress_definition = compose_document["configs"]["tacua_loopback_ingress"]
     ingress_config_file = Path(ingress_definition["file"])
@@ -2111,6 +2125,7 @@ def _parser() -> argparse.ArgumentParser:
     compose.add_argument("--config-file", required=True, type=Path)
     compose.add_argument("--compose-json", required=True, type=Path)
     compose.add_argument("--allow-mutable-image", action="store_true")
+    compose.add_argument("--expected-published-port", type=int)
 
     backup = subparsers.add_parser("backup")
     backup.add_argument("--config-file", required=True, type=Path)
@@ -2164,6 +2179,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _load_compose_json(args.compose_json),
                 config,
                 require_immutable_image=not args.allow_mutable_image,
+                expected_published_port=args.expected_published_port,
             )
         elif args.command == "backup":
             result = create_backup(
