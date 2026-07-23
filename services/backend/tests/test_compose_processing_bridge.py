@@ -7,6 +7,7 @@ from array import array
 import fcntl
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -858,6 +859,51 @@ class ComposeProcessingBridgeTests(unittest.TestCase):
         with self.assertRaises(CLIENT.ProcessingBridgeError) as raised:
             CLIENT._response_error_code(response)
         self.assertEqual(raised.exception.code, "BRIDGE_RESPONSE_INVALID")
+
+    def test_bridge_cli_errors_are_one_content_free_code(self) -> None:
+        cases = (
+            (
+                ["--socket", "synthetic secret path"],
+                None,
+                "BRIDGE_ARGUMENT_INVALID\n",
+            ),
+            (
+                [
+                    "--socket",
+                    "/synthetic/bridge.sock",
+                    "--input",
+                    "/synthetic/input.json",
+                    "--output-directory",
+                    "/synthetic/output",
+                ],
+                RuntimeError("synthetic secret detail"),
+                "BRIDGE_FAILED\n",
+            ),
+        )
+        for arguments, failure, expected in cases:
+            with self.subTest(expected=expected):
+                error_output = io.StringIO()
+                run_client = (
+                    mock.patch.object(
+                        CLIENT,
+                        "run_client",
+                        side_effect=failure,
+                    )
+                    if failure is not None
+                    else mock.patch.object(CLIENT, "run_client")
+                )
+                with (
+                    run_client,
+                    mock.patch.object(CLIENT.os, "umask"),
+                    mock.patch.object(
+                        CLIENT.sys,
+                        "stderr",
+                        error_output,
+                    ),
+                ):
+                    self.assertEqual(CLIENT.main(arguments), 1)
+                self.assertEqual(error_output.getvalue(), expected)
+                self.assertNotIn("synthetic secret", error_output.getvalue())
 
     def test_worker_stderr_code_requires_coherent_failed_exit(self) -> None:
         def failure_code(
@@ -3739,6 +3785,25 @@ class ComposeProcessingBridgeTests(unittest.TestCase):
             self.assertEqual(
                 BRIDGE_CLIENT_MODULE,
                 "tacua_backend.processing_bridge",
+            )
+            parsed_command = json.loads(command_document)
+            self.assertEqual(
+                parsed_command["argv"][:5],
+                [
+                    "/usr/local/bin/python",
+                    "-I",
+                    "-B",
+                    "-c",
+                    BRIDGE.BRIDGE_CLIENT_BOOTSTRAP,
+                ],
+            )
+            self.assertIn(
+                BRIDGE.BACKEND_SOURCE_IN_CONTAINER,
+                BRIDGE.BRIDGE_CLIENT_BOOTSTRAP,
+            )
+            self.assertNotIn(
+                "PYTHONPATH",
+                BRIDGE.BRIDGE_CLIENT_BOOTSTRAP,
             )
 
     def test_worker_inspection_rejects_command_or_docker_socket_drift(

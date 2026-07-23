@@ -59,6 +59,15 @@ class ProcessingBridgeError(RuntimeError):
         super().__init__(detail)
 
 
+class _BridgeArgumentError(RuntimeError):
+    pass
+
+
+class _BridgeArgumentParser(argparse.ArgumentParser):
+    def error(self, _message: str) -> None:
+        raise _BridgeArgumentError
+
+
 def _reject_duplicate(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -680,7 +689,7 @@ def _response_error_code(response: dict[str, Any]) -> str:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _BridgeArgumentParser(
         description="Use the trusted host Compose processing bridge",
     )
     parser.add_argument("--socket", type=Path, required=True)
@@ -691,26 +700,34 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     os.umask(0o077)
-    args = _parser().parse_args(argv)
     try:
+        args = _parser().parse_args(argv)
         result = run_client(
             args.socket,
             args.input,
             args.output_directory,
         )
-    except (ProcessingBridgeError, OSError) as error:
-        code = (
-            error.code
-            if isinstance(error, ProcessingBridgeError)
-            else "BRIDGE_IO_FAILED"
-        )
-        print(code, file=sys.stderr)
-        return 1
+        sys.stdout.buffer.write(result)
+    except _BridgeArgumentError:
+        return _write_failure("BRIDGE_ARGUMENT_INVALID")
+    except ProcessingBridgeError as error:
+        return _write_failure(error.code)
+    except OSError:
+        return _write_failure("BRIDGE_IO_FAILED")
     except Exception:
-        print("BRIDGE_FAILED", file=sys.stderr)
-        return 1
-    sys.stdout.buffer.write(result)
+        return _write_failure("BRIDGE_FAILED")
     return 0
+
+
+def _write_failure(code: str) -> int:
+    selected = (
+        code
+        if isinstance(code, str)
+        and BRIDGE_ERROR_CODE.fullmatch(code) is not None
+        else "BRIDGE_FAILED"
+    )
+    sys.stderr.write(selected + "\n")
+    return 1
 
 
 if __name__ == "__main__":

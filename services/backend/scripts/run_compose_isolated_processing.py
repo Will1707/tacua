@@ -933,6 +933,13 @@ from tacua_backend.processing_worker import MAX_DRAIN_STAGES  # noqa: E402
 
 RUNNER_PATH = BACKEND_ROOT / "scripts" / "run_isolated_processor.py"
 BRIDGE_CLIENT_MODULE = "tacua_backend.processing_bridge"
+BACKEND_SOURCE_IN_CONTAINER = "/app/services/backend/src"
+BRIDGE_CLIENT_BOOTSTRAP = (
+    "import sys;"
+    f"sys.path.insert(0,{BACKEND_SOURCE_IN_CONTAINER!r});"
+    f"from {BRIDGE_CLIENT_MODULE} import main;"
+    "sys.exit(main())"
+)
 BRIDGE_SOCKET_IN_CONTAINER = "/run/tacua/processing-bridge.sock"
 BRIDGE_COMMAND_IN_CONTAINER = "/run/tacua/processing-command.json"
 CONFIG_IN_CONTAINER = "/run/tacua/config.json"
@@ -2699,9 +2706,10 @@ def _write_outer_command(path: Path, contract_version: str) -> None:
     document = {
         "argv": [
             "/usr/local/bin/python",
+            "-I",
             "-B",
-            "-m",
-            BRIDGE_CLIENT_MODULE,
+            "-c",
+            BRIDGE_CLIENT_BOOTSTRAP,
             "--socket",
             BRIDGE_SOCKET_IN_CONTAINER,
             "--input",
