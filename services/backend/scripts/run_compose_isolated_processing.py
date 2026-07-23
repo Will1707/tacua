@@ -3137,7 +3137,7 @@ def _broker_process(
         ],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         close_fds=True,
         start_new_session=True,
         env=environment,
@@ -3158,28 +3158,53 @@ def _broker_process(
         ):
             return process
         break
-    _stop_broker(process)
+    broker_diagnostic = _stop_broker(
+        process,
+        capture_stderr=True,
+    )
     raise ComposeProcessingError(
-        "BRIDGE_BROKER_FAILED",
+        _broker_failure_code(broker_diagnostic),
         "trusted host broker did not become ready",
     )
 
 
-def _stop_broker(process: subprocess.Popen[bytes] | None) -> None:
-    if process is None or process.returncode is not None:
-        return
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
+def _broker_failure_code(payload: bytes) -> str:
+    if (
+        len(payload) <= 128
+        and re.fullmatch(rb"BRIDGE_[A-Z0-9_]{1,96}\n", payload) is not None
+    ):
+        return payload.decode("ascii").strip()
+    return "BRIDGE_BROKER_FAILED"
+
+
+def _stop_broker(
+    process: subprocess.Popen[bytes] | None,
+    *,
+    capture_stderr: bool = False,
+) -> bytes:
+    if process is None:
+        return b""
+    if process.returncode is None:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
-        process.wait(timeout=5)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
+    diagnostic = b""
+    if process.stderr is not None:
+        try:
+            if capture_stderr:
+                diagnostic = process.stderr.read(129)
+        finally:
+            process.stderr.close()
+    return diagnostic
 
 
 def _worker_create_argv(

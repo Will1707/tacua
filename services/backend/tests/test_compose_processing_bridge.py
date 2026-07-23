@@ -527,6 +527,24 @@ class ComposeProcessingBridgeTests(unittest.TestCase):
         ):
             BRIDGE._prepare_broker_descriptor_limit()
 
+    def test_broker_startup_diagnostic_accepts_only_one_stable_code(
+        self,
+    ) -> None:
+        self.assertEqual(
+            BRIDGE._broker_failure_code(b"BRIDGE_PROVENANCE_MISMATCH\n"),
+            "BRIDGE_PROVENANCE_MISMATCH",
+        )
+        for payload in (
+            b"",
+            b"BRIDGE_FAILURE\nsecret",
+            b"bridge_failure\n",
+            b"BRIDGE_" + b"A" * 121 + b"\n",
+        ):
+            self.assertEqual(
+                BRIDGE._broker_failure_code(payload),
+                "BRIDGE_BROKER_FAILED",
+            )
+
     def test_response_header_bound_carries_maximum_preview_manifest(
         self,
     ) -> None:
