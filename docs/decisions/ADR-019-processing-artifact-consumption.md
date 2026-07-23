@@ -55,12 +55,21 @@ replace it before correlate is enabled.
 Normal backend startup remains inert. Production completion still creates
 only `tacua.pipeline@1.0.0` jobs. No checked-in command selects adapter 1.1,
 and no model, external egress, HTTP route, SDK contract, reviewer surface, or
-Docker default changes. The isolated processor runner remains 1.0-only and
-must be evolved separately before a real pipeline-1.1 private pilot.
+Docker default changes. The ADR-016 isolated runner may carry nested local
+input/result 1.1 only when the operator explicitly selects outer local command
+1.1. Its isolated command, input wrapper, output wrapper, Docker labels,
+topology and limits remain frozen at 1.0. The runner revalidates the one inline
+transcript, preserves it exactly inside the digest-bound wrapper, rewrites only
+capture evidence descriptor paths, and rejects a nested result version that
+does not match its source input. This capability does not activate pipeline 1.1
+or select a processor.
 
 ## Consequences
 
 - Legacy adapter bytes and processing behavior remain unchanged.
+- Isolation wrapper contract versions and shapes, mounts, labels, resource
+  limits and default-deny posture remain unchanged for both admitted nested
+  local versions; their sealed payload bytes naturally bind their nested input.
 - Transcript disclosure requires an exact live alignment lease and remains
   inside the existing retention and deletion exclusion boundary.
 - Successful consumption has a crash-safe, append-only lineage record, while
