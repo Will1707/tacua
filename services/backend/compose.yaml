@@ -36,17 +36,69 @@ services:
       timeout: 3s
       start_period: 5s
       retries: 3
-    ports:
-      - "127.0.0.1:8080:8080"
     volumes:
-      - tacua-state:/var/lib/tacua
-      - ./local/config.json:/run/tacua/config.json:ro
+      - type: volume
+        source: tacua-state
+        target: /var/lib/tacua
+      - type: bind
+        source: ./local/config.json
+        target: /run/tacua/config.json
+        read_only: true
+        bind:
+          create_host_path: false
     secrets:
       - tacua_admin
+
+  ingress:
+    image: docker.io/library/haproxy:3.2.21-alpine3.24@sha256:66e25cc9a8332635f4e897f7f4b1e5622c25f09f0ee23cddc6ce9bdb3a24772a
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    pids_limit: 64
+    deploy:
+      replicas: 1
+    read_only: true
+    user: "99:99"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      backend:
+        condition: service_healthy
+        restart: true
+    networks:
+      - tacua-default-deny
+      - tacua-loopback-publish
+    configs:
+      - source: tacua_loopback_ingress
+        target: /usr/local/etc/haproxy/haproxy.cfg
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test:
+        - CMD
+        - sh
+        - -ec
+        - >-
+          wget -qO- -T 2 http://127.0.0.1:8080/healthz | grep -q '"status":"ok"'
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 secrets:
   tacua_admin:
     file: ./local/admin-secret
+
+configs:
+  tacua_loopback_ingress:
+    file: ./ingress/haproxy.cfg
 
 volumes:
   tacua-state:
@@ -54,3 +106,4 @@ volumes:
 networks:
   tacua-default-deny:
     internal: true
+  tacua-loopback-publish:

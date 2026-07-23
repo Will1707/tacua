@@ -173,6 +173,17 @@ admin-token rotation. The mounted value must be 32–4096 ASCII bytes in the RFC
 with at most two trailing `=` padding characters); Unicode, controls,
 whitespace, and embedded padding are rejected before startup.
 
+For a single-owner test deployment that should be reachable only from an
+existing Tailscale network, follow the
+[tailnet-only private-pilot runbook](TAILNET_PRIVATE_PILOT.md). Its validator
+cross-checks the sealed HTTPS origin, tailnet certificate name, exact Serve
+handler, pinned ingress relay with no mounted static Tacua authority, and the
+backend's egress-denied Compose boundary. The relay still handles plaintext
+authenticated traffic and has a publish-network route. Direct Serve and the
+content-blind relay are intentionally not claimed as the bounded production
+proxy required by the
+[single-node operations runbook](OPERATIONS.md).
+
 ## Fail-closed schema adoption
 
 The old server-generated-token pilot used SQLite schema version 1. Those
@@ -238,27 +249,45 @@ single-replica enforcement, retention monitoring, atomic offline recovery
 bundles, restore, upgrade, and rollback.
 
 ```sh
-mkdir -p services/backend/local
+chmod go-w . services services/backend
+test ! -L services/backend/local
+install -d -m 0700 services/backend/local
 cp services/backend/config.template.example.json services/backend/local/config.template.json
 ${EDITOR:-vi} services/backend/local/config.template.json
 PYTHONPATH=services/backend/src python3 -B -m tacua_backend.config_tool \
   services/backend/local/config.template.json \
   --output services/backend/local/config.json
-openssl rand -base64 48 > services/backend/local/admin-secret
-chmod 600 services/backend/local/admin-secret
+PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool \
+  create-admin-secret \
+  --destination services/backend/local/admin-secret
 docker compose -f services/backend/compose.yaml up --build
 ```
 
-The example runs as UID/GID `10001`, drops Linux capabilities, uses a read-only
-root filesystem, writes only to `/var/lib/tacua`, and binds port 8080 to host
-loopback. Its `internal: true` Compose network preserves default-deny outbound
-connectivity for the service and any explicitly invoked local processor.
+The backend runs as UID/GID `10001`, drops Linux capabilities, uses a read-only
+root filesystem, writes only to `/var/lib/tacua`, publishes no host port, and
+joins exactly one `internal: true` network. A separately digest-pinned,
+non-root HAProxy TCP relay joins that network plus one ordinary publish bridge
+and binds `127.0.0.1:8080`; it receives no Tacua config, secret, state, or
+Docker socket. This preserves default-deny outbound connectivity for the
+backend and any explicitly invoked local processor. The topology has been
+operated on the private pilot's rootless mini-PC; hosted CI exercises it on a
+standard daemon, so that result is not a general rootless portability claim.
+The relay is transport plumbing, not the bounded production HTTP proxy.
 `backend_origin` is the normalized public origin used by the QA build
 (normally the HTTPS reverse-proxy origin), not the container listener address.
+Compose bind-mounts its file-backed secret without owner remapping. The source
+is therefore exactly mode `0444` so fixed UID `10001` can read it in the
+container, while its operator-owned mode-`0700` parent directory blocks every
+other host user from reaching it. That directory's parent must also be
+protected. The secret-creation command uses exclusive, no-follow publication
+and returns no secret bytes or digest. Preflight validates the complete
+operator/root-owned ancestor chain, allowing only sticky protected shared
+ancestors.
 Its digest must equal `build_identity.transport_configuration_digest`.
 Do not edit any derived digest: leave all four derive markers in the template
 for the compiler. The generated config is public metadata; the admin secret is
-the separate mode-`0600` file mounted through Compose.
+the separate mode-`0444` file reachable only through its mode-`0700` private
+host directory, safe deployment parent, and the read-only Compose mount.
 
 The configuration pins one full sealed `build_identity` artifact for this V1
 deployment. Its `transport_configuration_digest` must match `backend_origin`

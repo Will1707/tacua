@@ -10,6 +10,11 @@ This runbook separates repository-enforced checks from infrastructure the
 operator must supply. The repository does not install or require a particular
 reverse proxy, DNS provider, firewall, container registry, or backup system.
 
+For a single-owner test that must remain private to an existing tailnet, use the
+separate [tailnet-only private-pilot profile](TAILNET_PRIVATE_PILOT.md). It
+deliberately avoids public hosting, but direct Tailscale Serve is not evidence
+for the production overload and proxy controls below.
+
 ## Operator-supplied infrastructure
 
 Before production use, provide all of the following:
@@ -25,6 +30,13 @@ Before production use, provide all of the following:
   volume); and
 - encrypted, access-controlled, off-host storage for recovery bundles.
 
+Require Docker Engine 28.0.0 or newer and Docker Compose 2.24.4 or newer.
+Engine 28 is the minimum because older releases had a documented same-L2
+reachability caveat for localhost-published ports. The exact resolved model is
+tested with Compose 2.30.3 and 5.1.3. Preflight intentionally rejects
+unreviewed renderer output, so record and revalidate every Compose upgrade.
+The host and provider firewalls remain mandatory regardless of Docker version.
+
 Tacua automates validation of the config, secret-file permissions, resolved
 Compose model, single-process volume lock, backup byte manifest, SQLite
 integrity, non-destructive restore, endpoint origin/status/body bounds,
@@ -39,8 +51,12 @@ Follow [CONFIGURATION.md](CONFIGURATION.md). The production values must use:
 - an exact normalized `https://` `backend_origin` with no path;
 - `listen_host` `0.0.0.0` and `listen_port` `8080` inside the container;
 - `state_directory` `/var/lib/tacua`; and
-- one freshly generated high-entropy administrator secret stored separately
-  with host mode `0600`.
+- one freshly generated high-entropy administrator secret stored as a
+  mode-`0444` file inside its operator-owned mode-`0700` directory, solely so
+  Compose's read-only bind mount is readable by fixed UID `10001`; the public
+  config in that same directory is exactly mode `0644`, and the directory's
+  resolved operator/root-owned ancestor chain is protected from replacement
+  (with only sticky protected shared ancestors allowed).
 
 Never rotate the administrator secret in place. It also roots launch-code and
 SDK-credential verifiers. Losing or replacing it invalidates outstanding
@@ -91,26 +107,54 @@ export TACUA_BACKEND_IMAGE='registry.example/tacua@sha256:<64 lowercase hex>'
 The optional production override removes the local build stanza. Inspect the
 fully resolved model, then run the fail-closed preflight:
 
-```sh
-docker compose \
+The base model separately pins the Docker Official
+`haproxy:3.2.21-alpine3.24` multi-architecture manifest by digest. HAProxy is
+GPL-licensed, runs as UID/GID `99`, and is not incorporated into Tacua's
+Apache-2.0 backend image. Mirror that exact manifest into an operator-controlled
+registry for production if Docker Hub is outside the approved supply chain;
+changing its reference or relay configuration requires updating and rerunning
+the closed validator.
+
+Run this deployment workflow in Bash. Create a private runtime path in the same
+shell and let the shell remove it on every exit:
+
+```bash
+set -euo pipefail
+project='tacua'
+umask 077
+runtime_directory="$(mktemp -d "${TMPDIR:-/tmp}/tacua-preflight.XXXXXX")"
+chmod 0700 "$runtime_directory"
+trap 'rm -rf -- "$runtime_directory"' EXIT HUP INT TERM
+
+docker compose -p "$project" \
   -f services/backend/compose.yaml \
   -f services/backend/compose.production.yaml \
-  config --format json > /tmp/tacua-compose.json
+  config --format json > "$runtime_directory/compose.json"
 
 PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool \
   preflight \
   --config-file services/backend/local/config.json \
   --admin-secret-file services/backend/local/admin-secret \
-  --compose-json /tmp/tacua-compose.json
+  --compose-json "$runtime_directory/compose.json"
+rm -rf -- "$runtime_directory"
+trap - EXIT HUP INT TERM
+unset runtime_directory
 ```
 
 Production preflight rejects a mutable image tag or remaining build stanza,
 multiple replicas, host networking, non-loopback publication, privileged
 operation, added capabilities, missing capability drops, writable root
 filesystems, weakened health checks, unbounded container logs, unsafe
-config/secret modes, unexpected devices or mounts, and an incorrect
-state/config/secret layout. The base development Compose model can be checked
-with `validate-compose --allow-mutable-image`.
+config/secret modes or parent directories, unexpected devices or mounts, and
+an incorrect state/config/secret layout. The base development Compose model
+can be checked with `validate-compose --allow-mutable-image`.
+
+Config and secret must live in one mode-`0700` directory. Preflight resolves
+and checks its complete ancestor chain through `/`; every non-shared ancestor
+must be operator- or root-owned and not group/world writable, while a writable
+shared ancestor is accepted only when root-owned sticky semantics protect its
+entries. Do not assume that changing only the checkout's three nearest
+directories repairs an unsafe higher ancestor.
 
 For an existing stopped deployment, run the preflight from a context where
 `/var/lib/tacua` is the mounted state volume and add `--check-state`. That
@@ -121,14 +165,23 @@ if the backend is still running and never opens the source database.
 
 ## 3. TLS reverse-proxy contract
 
-Compose publishes the backend only on host loopback
-`127.0.0.1:8080`. Keep TCP 8080 closed at both host and provider firewalls.
-The application listener is Python's `ThreadingHTTPServer`: it starts one
-thread per accepted connection and does not provide a bounded worker pool,
-connection quota, or socket/header/body read deadlines. It is not safe to
-expose directly. The reverse proxy is therefore both the TLS endpoint and the
-mandatory slow-client/overload boundary. It may connect to the loopback
-listener only while preserving this application contract:
+Compose keeps the backend on one egress-denied internal network and publishes
+only a digest-pinned, non-root HAProxy TCP relay on host loopback
+`127.0.0.1:8080`. The relay has no Tacua config, secret, state, or Docker
+socket. It joins one ordinary bridge to support the loopback publication path
+operated on the private pilot's rootless mini-PC, and forwards bytes to the
+backend's internal service name. Hosted CI exercises this topology on its
+standard daemon, so the live pilot is not a general rootless portability
+matrix. Keep TCP 8080 closed at both host and provider firewalls.
+
+The relay is deliberately content-blind plumbing, not the required production
+HTTP control plane. The application listener is Python's
+`ThreadingHTTPServer`: it starts one thread per accepted connection and does
+not provide a bounded worker pool, connection quota, or socket/header/body
+read deadlines. Neither component is safe to expose directly. The production
+reverse proxy is therefore both the TLS endpoint and the mandatory
+slow-client/overload boundary. It may connect to the loopback relay only while
+preserving this application contract:
 
 - the configured HTTPS origin terminates with a valid hostname-matching
   certificate and TLS 1.2 or newer;
@@ -177,7 +230,7 @@ and idempotency semantics.
 After startup, run the exact-origin smoke check from a network representative
 of the QA device:
 
-```sh
+```bash
 PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool \
   smoke \
   --config-file services/backend/local/config.json \
@@ -194,8 +247,10 @@ for a local container smoke test.
 
 ## 4. Start and monitor
 
-```sh
-docker compose \
+```bash
+set -euo pipefail
+project='tacua'
+docker compose -p "$project" \
   -f services/backend/compose.yaml \
   -f services/backend/compose.production.yaml \
   up -d --no-build
@@ -259,24 +314,143 @@ still contains the administrator secret and configuration, so its null evidence
 deadline is not a claim that it is non-sensitive or may be retained forever
 under the operator's secret-management policy.
 
-Stop the only backend and wait for it to exit before backup:
+Use the exact Compose project name and digest-pinned image of the running
+deployment. The following Bash workflow resolves and preflights that project,
+stops only its backend, confirms the stopped container's exact named volume,
+creates a new empty private backup carrier, and runs backup plus verification
+as service UID/GID `10001`. The ingress process remains bound to loopback while
+the state owner is stopped:
 
-```sh
-docker compose -f services/backend/compose.yaml stop backend
+```bash
+set -euo pipefail
+project='tacua'
+backup_carrier='/secure-backups/tacua-YYYYMMDDTHHMMSSZ'
+: "${TACUA_BACKEND_IMAGE:?export the running immutable image}"
 
+repo_root="$(pwd -P)"
+config_file="$repo_root/services/backend/local/config.json"
+secret_file="$repo_root/services/backend/local/admin-secret"
+runtime_dir="$(mktemp -d "${TMPDIR:-/tmp}/tacua-backup.XXXXXX")"
+runtime_dir="$(cd "$runtime_dir" && pwd -P)"
+chmod 0700 "$runtime_dir"
+trap 'rm -rf -- "$runtime_dir"' EXIT HUP INT TERM
+compose_json="$runtime_dir/compose.json"
+compose_source=(
+  docker compose -p "$project"
+  -f services/backend/compose.yaml
+  -f services/backend/compose.production.yaml
+)
+
+"${compose_source[@]}" config --format json > "$compose_json"
+chmod 0600 "$compose_json"
 PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool \
-  backup \
-  --config-file /run/tacua/config.json \
-  --admin-secret-file /run/secrets/tacua_admin \
-  --output /secure-backups/tacua-YYYYMMDDTHHMMSSZ
+  preflight \
+  --config-file "$config_file" \
+  --admin-secret-file "$secret_file" \
+  --compose-json "$compose_json"
 
-PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool \
-  verify-backup /secure-backups/tacua-YYYYMMDDTHHMMSSZ
+state_volume="$(
+  python3 -B -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    print(json.load(stream)["volumes"]["tacua-state"]["name"])
+' "$compose_json"
+)"
+expected_backend_image="$(
+  python3 -B -c '
+import json, re, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    image = json.load(stream)["services"]["backend"]["image"]
+if not isinstance(image, str) or re.fullmatch(r"\S+@sha256:[a-f0-9]{64}", image) is None:
+    raise SystemExit("resolved backend image is not immutable")
+print(image)
+' "$compose_json"
+)"
+test "$expected_backend_image" = "$TACUA_BACKEND_IMAGE"
+compose=(docker compose -p "$project" -f "$compose_json")
+
+"${compose[@]}" stop backend
+if ! backend_output="$("${compose[@]}" ps --no-trunc -aq backend)"; then
+  echo 'cannot inspect the stopped backend container' >&2
+  exit 1
+fi
+if [ -z "$backend_output" ] ||
+  [ "$(printf '%s\n' "$backend_output" | wc -l)" -ne 1 ]; then
+  echo 'expected one stopped backend container' >&2
+  exit 1
+fi
+backend_id="$backend_output"
+test "$(docker inspect --format '{{.State.Status}}' "$backend_id")" = exited
+test "$(docker inspect --format '{{.Config.Image}}' "$backend_id")" = \
+  "$expected_backend_image"
+test "$(
+  docker inspect --format \
+    '{{range .Mounts}}{{if eq .Destination "/var/lib/tacua"}}{{.Name}}{{end}}{{end}}' \
+    "$backend_id"
+)" = "$state_volume"
+
+test ! -e "$backup_carrier"
+test ! -L "$backup_carrier"
+install -d -m 0700 "$backup_carrier"
+docker run --rm \
+  --user 0:0 \
+  --read-only \
+  --network none \
+  --cap-drop ALL \
+  --cap-add CHOWN \
+  --cap-add FOWNER \
+  --security-opt no-new-privileges:true \
+  --mount "type=bind,src=$backup_carrier,dst=/backup" \
+  --entrypoint /bin/sh \
+  "$expected_backend_image" -ceu '
+    test -z "$(find /backup -mindepth 1 -print -quit)"
+    chown 10001:10001 /backup
+    chmod 0700 /backup
+  '
+
+docker run --rm \
+  --user 10001:10001 \
+  --read-only \
+  --network none \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  --env TMPDIR=/tmp \
+  --tmpfs '/tmp:rw,nosuid,nodev,noexec,mode=0700,uid=10001,gid=10001' \
+  --mount "type=volume,src=$state_volume,dst=/var/lib/tacua" \
+  --mount \
+    "type=bind,src=$config_file,dst=/run/tacua/config.json,readonly" \
+  --mount \
+    "type=bind,src=$secret_file,dst=/run/secrets/tacua_admin,readonly" \
+  --mount "type=bind,src=$backup_carrier,dst=/backup" \
+  --entrypoint python \
+  "$expected_backend_image" -m tacua_backend.operator_tool backup \
+    --config-file /run/tacua/config.json \
+    --admin-secret-file /run/secrets/tacua_admin \
+    --output /backup/bundle
+
+docker run --rm \
+  --user 10001:10001 \
+  --read-only \
+  --network none \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  --env TMPDIR=/tmp \
+  --tmpfs '/tmp:rw,nosuid,nodev,noexec,mode=0700,uid=10001,gid=10001' \
+  --mount "type=bind,src=$backup_carrier,dst=/backup,readonly" \
+  --entrypoint python \
+  "$expected_backend_image" -m tacua_backend.operator_tool \
+    verify-backup /backup/bundle
+
+"${compose[@]}" start backend
+rm -rf -- "$runtime_dir"
+trap - EXIT HUP INT TERM
+unset compose compose_json compose_source runtime_dir
 ```
 
-Run those commands either on a host bind-mounted deployment or in a one-off
-container using the same image, UID/GID `10001:10001`, stopped state volume,
-read-only config/secret mounts, and a writable secure backup mount. The tool
+The carrier becomes owned by the rootless/container mapping for UID `10001`;
+continue to inspect or transfer it through an equivalently isolated helper
+rather than weakening its modes. Run the loopback and exact-origin smoke tests
+after restarting. The tool
 acquires the state lock, so it refuses an online backup. It performs a
 SQLite check on a disposable copy, rejects linked, non-private, special, or
 foreign-owned state entries, cross-checks the database deployment pin against
@@ -309,9 +483,370 @@ PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool \
 Apply requires an absent destination, copies into a private staging directory,
 re-verifies every byte and SQLite state, and atomically creates one recovery
 root. It never overwrites or merges. The result contains `state/`,
-`config.json`, and `admin-secret`; mount those exact recovered artifacts into a
-new stopped deployment, re-run preflight with `--check-state`, then start and
-smoke-test. Test this process periodically on an isolated host.
+`config.json`, and `admin-secret`, all still in their verified private recovery
+modes.
+
+Compose file mounts do not remap host ownership. The workflow below uses
+`prepare-compose-inputs` to publish exact byte-for-byte config and secret
+copies in the modes readable by fixed container UID `10001`, inside a new
+owner-only directory. That command verifies the complete recovery set before
+and after copying, requires an absent destination with a safe parent,
+atomically creates a mode-`0700` directory, and emits only mode-`0644`
+`config.json` plus mode-`0444` `admin-secret`. It never modifies the
+mode-`0600` recovery artifacts. Keep the prepared secret inside that private
+directory.
+
+Use the following closed workflow from a fresh checkout to populate a **new**
+Compose project and named volume. Run it in Bash, choose a project name that
+will be retained as deployment metadata, and use the already verified
+digest-pinned image. It refuses any existing project resource or exact volume,
+leaves the backend stopped until copied state passes offline verification, and
+does not auto-delete failed recovery evidence:
+
+```bash
+set -euo pipefail
+
+project='tacua-restored'
+recovery='/secure-recovery/tacua-restore'
+: "${TACUA_BACKEND_IMAGE:?export the immutable digest-pinned backend image}"
+
+repo_root="$(pwd -P)"
+local_dir="$repo_root/services/backend/local"
+config_file="$local_dir/config.json"
+secret_file="$local_dir/admin-secret"
+runtime_dir="$(mktemp -d "${TMPDIR:-/tmp}/tacua-restore.XXXXXX")"
+runtime_dir="$(cd "$runtime_dir" && pwd -P)"
+chmod 0700 "$runtime_dir"
+compose_json="$runtime_dir/compose.json"
+selected_backup_json="$runtime_dir/selected-backup.json"
+trap 'rm -rf -- "$runtime_dir"' EXIT HUP INT TERM
+compose_source=(
+  docker compose -p "$project"
+  -f services/backend/compose.yaml
+  -f services/backend/compose.production.yaml
+)
+
+if ! project_containers="$(
+  docker ps -aq --no-trunc \
+    --filter "label=com.docker.compose.project=$project"
+)" || ! project_volumes="$(
+  docker volume ls -q --filter "label=com.docker.compose.project=$project"
+)" || ! project_networks="$(
+  docker network ls -q --filter "label=com.docker.compose.project=$project"
+)" || ! volume_names="$(docker volume ls --format '{{.Name}}')" ||
+  ! network_names="$(docker network ls --format '{{.Name}}')"; then
+  echo 'cannot inspect the recovery project safely' >&2
+  exit 1
+fi
+if [ -n "$project_containers$project_volumes$project_networks" ] ||
+  printf '%s\n' "$volume_names" |
+    grep -Fqx -- "${project}_tacua-state" ||
+  printf '%s\n' "$network_names" |
+    grep -Fqx -- "${project}_tacua-default-deny" ||
+  printf '%s\n' "$network_names" |
+    grep -Fqx -- "${project}_tacua-loopback-publish"; then
+  echo 'refusing existing recovery project resources' >&2
+  exit 1
+fi
+
+PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool \
+  verify-backup "$recovery" > "$selected_backup_json"
+chmod 0600 "$selected_backup_json"
+expected_backup_digest="$(
+  python3 -B -c '
+import json, re, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    digest = json.load(stream).get("backup_digest")
+if not isinstance(digest, str) or re.fullmatch(r"sha256:[a-f0-9]{64}", digest) is None:
+    raise SystemExit("verified backup output has no valid digest")
+print(digest)
+' "$selected_backup_json"
+)"
+
+if [ -e "$local_dir" ] || [ -L "$local_dir" ]; then
+  test -d "$local_dir"
+  test ! -L "$local_dir"
+  cmp -s "$recovery/config.json" "$config_file"
+  cmp -s "$recovery/admin-secret" "$secret_file"
+else
+  PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool \
+    prepare-compose-inputs "$recovery" --destination "$local_dir"
+fi
+
+"${compose_source[@]}" config --format json > "$compose_json"
+chmod 0600 "$compose_json"
+PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool \
+  preflight \
+  --config-file "$config_file" \
+  --admin-secret-file "$secret_file" \
+  --compose-json "$compose_json"
+
+state_volume="$(
+  python3 -B - "$compose_json" "$project" <<'PY'
+import json
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    document = json.load(stream)
+if document.get("name") != sys.argv[2]:
+    raise SystemExit("resolved Compose project differs from the fixed project")
+volume = document.get("volumes", {}).get("tacua-state", {}).get("name")
+if (
+    not isinstance(volume, str)
+    or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", volume) is None
+):
+    raise SystemExit("resolved state volume name is invalid")
+print(volume)
+PY
+)"
+expected_backend_image="$(
+  python3 -B - "$compose_json" <<'PY'
+import json
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    image = json.load(stream)["services"]["backend"]["image"]
+if (
+    not isinstance(image, str)
+    or re.fullmatch(r"\S+@sha256:[a-f0-9]{64}", image) is None
+):
+    raise SystemExit("resolved backend image is not immutable")
+print(image)
+PY
+)"
+test "$expected_backend_image" = "$TACUA_BACKEND_IMAGE"
+compose=(docker compose -p "$project" -f "$compose_json")
+
+if ! project_containers="$(
+  docker ps -aq --filter "label=com.docker.compose.project=$project"
+)" || ! project_volumes="$(
+  docker volume ls -q --filter "label=com.docker.compose.project=$project"
+)" || ! project_networks="$(
+  docker network ls -q --filter "label=com.docker.compose.project=$project"
+)" || ! volume_names="$(docker volume ls --format '{{.Name}}')" ||
+  ! network_names="$(docker network ls --format '{{.Name}}')"; then
+  echo 'cannot repeat the recovery collision checks' >&2
+  exit 1
+fi
+if [ -n "$project_containers$project_volumes$project_networks" ] ||
+  printf '%s\n' "$volume_names" | grep -Fqx -- "$state_volume" ||
+  printf '%s\n' "$network_names" |
+    grep -Fqx -- "${project}_tacua-default-deny" ||
+  printf '%s\n' "$network_names" |
+    grep -Fqx -- "${project}_tacua-loopback-publish"; then
+  echo "recovery project identity changed before creation" >&2
+  exit 1
+fi
+
+"${compose[@]}" create --no-build backend
+if ! backend_output="$("${compose[@]}" ps --no-trunc -aq backend)"; then
+  echo 'cannot inspect the created backend container' >&2
+  exit 1
+fi
+if [ -z "$backend_output" ] ||
+  [ "$(printf '%s\n' "$backend_output" | wc -l)" -ne 1 ]; then
+  echo 'expected one stopped backend container' >&2
+  exit 1
+fi
+backend_id="$backend_output"
+test "$(docker inspect --format '{{.State.Status}}' "$backend_id")" = created ||
+  { echo 'backend was not left stopped' >&2; exit 1; }
+test "$(docker inspect --format '{{.Config.Image}}' "$backend_id")" = \
+  "$expected_backend_image"
+mounted_volume="$(
+  docker inspect --format \
+    '{{range .Mounts}}{{if eq .Destination "/var/lib/tacua"}}{{.Name}}{{end}}{{end}}' \
+    "$backend_id"
+)"
+test "$mounted_volume" = "$state_volume" ||
+  { echo 'backend uses the wrong state volume' >&2; exit 1; }
+test "$(
+  docker volume inspect --format \
+    '{{index .Labels "com.docker.compose.project"}}' "$state_volume"
+)" = "$project"
+test "$(
+  docker volume inspect --format \
+    '{{index .Labels "com.docker.compose.volume"}}' "$state_volume"
+)" = tacua-state
+
+docker run --rm \
+  --user 0:0 \
+  --read-only \
+  --network none \
+  --cap-drop ALL \
+  --cap-add CHOWN \
+  --cap-add DAC_OVERRIDE \
+  --cap-add FOWNER \
+  --security-opt no-new-privileges:true \
+  --env "EXPECTED_BACKUP_DIGEST=$expected_backup_digest" \
+  --env TMPDIR=/tmp \
+  --tmpfs '/tmp:rw,nosuid,nodev,noexec,mode=0700' \
+  --tmpfs '/candidate:rw,nosuid,nodev,noexec,size=33554432,mode=0700' \
+  --mount "type=volume,src=$state_volume,dst=/candidate/state" \
+  --mount "type=bind,src=$recovery,dst=/recovery,readonly" \
+  --mount "type=bind,src=$config_file,dst=/expected/config.json,readonly" \
+  --mount "type=bind,src=$secret_file,dst=/expected/admin-secret,readonly" \
+  --entrypoint /bin/sh \
+  "$expected_backend_image" -ceu '
+    test -d /candidate/state/tmp
+    test ! -L /candidate/state/tmp
+    test "$(stat -c %u:%g:%a /candidate/state/tmp)" = 10001:10001:700
+    test -z "$(find /candidate/state/tmp -mindepth 1 -print -quit)"
+    test -z "$(find /candidate/state -mindepth 1 -maxdepth 1 ! -name tmp -print -quit)"
+    rmdir /candidate/state/tmp
+    test -z "$(find /candidate/state -mindepth 1 -print -quit)"
+    chown 0:0 /candidate/state
+    chmod 0700 /candidate/state
+    cp -a /recovery/manifest.json /recovery/config.json \
+      /recovery/admin-secret /candidate/
+    cp -a /recovery/state/. /candidate/state/
+    chown -R 0:0 /candidate
+    find /candidate -type d -exec chmod 0700 {} +
+    find /candidate -type f -exec chmod 0600 {} +
+    python -m tacua_backend.operator_tool verify-backup \
+      /candidate > /tmp/candidate-backup.json
+    python -c '"'"'
+import json, os
+with open("/tmp/candidate-backup.json", encoding="utf-8") as stream:
+    actual = json.load(stream).get("backup_digest")
+if actual != os.environ["EXPECTED_BACKUP_DIGEST"]:
+    raise SystemExit("copied recovery digest differs from the selected backup")
+'"'"'
+    cmp -s /candidate/config.json /expected/config.json
+    cmp -s /candidate/admin-secret /expected/admin-secret
+    chown -R 10001:10001 /candidate/state
+    sync -f /candidate/state
+  '
+
+docker run --rm \
+  --user 10001:10001 \
+  --read-only \
+  --network none \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  --env TMPDIR=/tmp \
+  --tmpfs '/tmp:rw,nosuid,nodev,noexec,mode=0700,uid=10001,gid=10001' \
+  --mount "type=volume,src=$state_volume,dst=/var/lib/tacua" \
+  --mount \
+    "type=bind,src=$config_file,dst=/run/tacua/config.json,readonly" \
+  --entrypoint python \
+  "$expected_backend_image" -m tacua_backend.operator_tool verify-compose-state \
+    --config-file /run/tacua/config.json \
+    --state-directory /var/lib/tacua
+```
+
+The image seeds a new named volume with exactly one empty, private `tmp/`
+directory. The copier accepts and removes only that exact seed, reconstructs a
+temporary complete recovery bundle, verifies every copied byte and SQLite pin,
+compares the prepared config and secret, and only then assigns state to UID/GID
+`10001`. `verify-compose-state` separately takes the service lock and checks
+ownership, modes, SQLite integrity, and the deployment pin as that UID.
+
+During the deliberate cutover, continue in that same Bash shell with the
+owner-only resolved Compose file still present. First stop the old deployment
+without deleting its volume and ensure its loopback listener is released. For
+the tailnet profile, disable and verify removal of Serve before stopping the
+old ingress as specified in
+[TAILNET_PRIVATE_PILOT.md](TAILNET_PRIVATE_PILOT.md). For a production reverse
+proxy that remains configured, only then:
+
+```bash
+PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool \
+  preflight \
+  --config-file "$config_file" \
+  --admin-secret-file "$secret_file" \
+  --compose-json "$compose_json"
+cmp -s "$recovery/config.json" "$config_file"
+cmp -s "$recovery/admin-secret" "$secret_file"
+
+docker run --rm \
+  --user 10001:10001 \
+  --read-only \
+  --network none \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  --env TMPDIR=/tmp \
+  --tmpfs '/tmp:rw,nosuid,nodev,noexec,mode=0700,uid=10001,gid=10001' \
+  --mount "type=volume,src=$state_volume,dst=/var/lib/tacua" \
+  --mount \
+    "type=bind,src=$config_file,dst=/run/tacua/config.json,readonly" \
+  --entrypoint python \
+  "$expected_backend_image" -m tacua_backend.operator_tool verify-compose-state \
+    --config-file /run/tacua/config.json \
+    --state-directory /var/lib/tacua
+
+private_network="${project}_tacua-default-deny"
+publish_network="${project}_tacua-loopback-publish"
+if ! project_containers="$(
+  docker ps -aq --no-trunc \
+    --filter "label=com.docker.compose.project=$project"
+)" || ! project_volumes="$(
+  docker volume ls -q --filter "label=com.docker.compose.project=$project"
+)" || ! project_networks="$(
+  docker network ls --format '{{.Name}}' \
+    --filter "label=com.docker.compose.project=$project"
+)" || ! volume_containers="$(
+  docker ps -aq --no-trunc --filter "volume=$state_volume"
+)" || ! network_names="$(docker network ls --format '{{.Name}}')"; then
+  echo 'cannot verify the stopped recovery project before cutover' >&2
+  exit 1
+fi
+if [ "$project_containers" != "$backend_id" ] ||
+  [ "$project_volumes" != "$state_volume" ] ||
+  [ "$project_networks" != "$private_network" ] ||
+  [ "$volume_containers" != "$backend_id" ] ||
+  printf '%s\n' "$network_names" | grep -Fqx -- "$publish_network"; then
+  echo 'stopped recovery project changed before cutover' >&2
+  exit 1
+fi
+test "$(docker inspect --format '{{.State.Status}}' "$backend_id")" = created
+test "$(docker inspect --format '{{.Config.Image}}' "$backend_id")" = \
+  "$expected_backend_image"
+test "$(
+  docker inspect --format \
+    '{{range .Mounts}}{{if eq .Destination "/var/lib/tacua"}}{{.Name}}{{end}}{{end}}' \
+    "$backend_id"
+)" = "$state_volume"
+test "$(
+  docker volume inspect --format \
+    '{{index .Labels "com.docker.compose.project"}}' "$state_volume"
+)" = "$project"
+test "$(
+  docker volume inspect --format \
+    '{{index .Labels "com.docker.compose.volume"}}' "$state_volume"
+)" = tacua-state
+test "$(
+  docker network inspect --format \
+    '{{index .Labels "com.docker.compose.project"}}' "$private_network"
+)" = "$project"
+test "$(
+  docker network inspect --format \
+    '{{index .Labels "com.docker.compose.network"}}' "$private_network"
+)" = tacua-default-deny
+
+"${compose[@]}" up -d --no-build
+PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool \
+  smoke \
+  --config-file "$config_file" \
+  --admin-secret-file "$secret_file"
+rm -rf -- "$runtime_dir"
+trap - EXIT HUP INT TERM
+unset compose compose_json compose_source runtime_dir selected_backup_json
+```
+
+For the tailnet profile, start with the runbook's loopback smoke, prove Serve is
+empty, re-enable its exact listener, validate the resulting Serve document,
+and only then run the exact-origin smoke above.
+
+On any failure before startup, leave that stopped project and volume
+quarantined and never rerun the copy against it. Inspect it, then either remove
+only those exact resources after deciding they contain no needed evidence or
+repeat with a new project name; the input step safely reuses the existing local
+directory only when both files still match the selected verified recovery
+bundle byte-for-byte. Exercise this complete process periodically on an
+isolated host.
 
 ## 7. Upgrade and rollback
 

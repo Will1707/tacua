@@ -32,7 +32,9 @@ which permits future multiple projects and members.
 From the repository root, compile a template to a mounted config file:
 
 ```sh
-mkdir -p services/backend/local
+chmod go-w . services services/backend
+test ! -L services/backend/local
+install -d -m 0700 services/backend/local
 cp services/backend/config.template.example.json \
   services/backend/local/config.template.json
 
@@ -102,10 +104,24 @@ After generating `config.json`, create the separate administrator secret and
 start Compose:
 
 ```sh
-openssl rand -base64 48 > services/backend/local/admin-secret
-chmod 600 services/backend/local/admin-secret
+PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool \
+  create-admin-secret \
+  --destination services/backend/local/admin-secret
 docker compose -f services/backend/compose.yaml up --build
 ```
+
+Compose implements file-backed secrets as read-only bind mounts and cannot
+remap their owner. The exact mode `0444` lets the fixed non-root container read
+the mounted file; the enclosing, operator-owned mode-`0700` directory prevents
+other host users from traversing to it. The repository-side parent must also
+be protected so the private directory cannot be replaced between preflight and
+Compose. The setup removes group/world write from the checkout, `services`, and
+`services/backend`; preflight walks the complete resolved ancestor chain and
+allows writable shared ancestors only when sticky ownership protects entries
+(for example, root-owned `/tmp`). The creation command uses exclusive,
+no-follow publication and never prints or hashes the generated secret. Never
+move or copy this mode-`0444` file outside that private directory. Production
+preflight validates the complete path boundary.
 
 Before production startup, validate the resolved digest-pinned Compose model,
 host file permissions, and public deployment metadata with the preflight in
