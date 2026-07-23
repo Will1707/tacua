@@ -46,7 +46,10 @@ off the host.
 
 ## 1. Prepare and seal configuration
 
-Follow [CONFIGURATION.md](CONFIGURATION.md). The production values must use:
+Follow [CONFIGURATION.md](CONFIGURATION.md), including its two-pass signed-iOS
+measurement procedure for `native_binary_digest`. Never deploy a placeholder,
+unsigned-build, directory, zip, or pre-signing digest. The production values
+must use:
 
 - an exact normalized `https://` `backend_origin` with no path;
 - `listen_host` `0.0.0.0` and `listen_port` `8080` inside the container;

@@ -39,6 +39,7 @@ const allowedRuntimePaths = new Set([
   "ios/CaptureModels.swift",
   "ios/CapturePolicy.swift",
   "ios/CaptureTransportPolicy.swift",
+  "ios/PrivacyInfo.xcprivacy",
   "ios/SegmentWriter.swift",
   "ios/TacuaBackendConfiguration.swift",
   "ios/TacuaCanonicalJSON.swift",

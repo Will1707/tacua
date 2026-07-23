@@ -11,7 +11,7 @@ Pod::Spec.new do |s|
   s.description      = 'Pre-release Expo native module for consent-gated ReplayKit capture and authenticated transport to a self-hosted Tacua backend.'
   s.author           = 'Tacua contributors'
   s.homepage         = 'https://github.com/Will1707/tacua'
-  s.license          = { :type => 'Apache-2.0' }
+  s.license          = { :type => 'Apache-2.0', :file => '../LICENSE' }
   s.platforms        = { :ios => '17.0' }
   s.source           = {
     :git => 'https://github.com/Will1707/tacua.git',
@@ -22,6 +22,13 @@ Pod::Spec.new do |s|
 
   s.dependency 'ExpoModulesCore'
   s.frameworks = 'AVFAudio', 'AVFoundation', 'CoreMedia', 'ReplayKit', 'Security'
+  s.resource_bundles = {
+    'TacuaCaptureSpikeResources' => [
+      'PrivacyInfo.xcprivacy',
+      '../LICENSE',
+      '../NOTICE'
+    ]
+  }
 
   s.pod_target_xcconfig = {
     'DEFINES_MODULE' => 'YES',
