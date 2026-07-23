@@ -9,10 +9,12 @@ row remains the verified current-head projection used by the admin API.
 
 from __future__ import annotations
 
+import base64
 import copy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import wraps
+import hashlib
 import hmac
 import json
 import re
@@ -23,6 +25,7 @@ from typing import Any, Callable
 from .contracts import (
     ContractError,
     canonical_json,
+    digest_without,
     runtime_seal,
     runtime_validate,
     validate as protocol_validate,
@@ -32,6 +35,18 @@ from .contracts import (
 
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 JOB_STAGES = ("transcribe", "align", "correlate", "research", "generate_tickets")
+LEGACY_PIPELINE_VERSION = "tacua.pipeline@1.0.0"
+ARTIFACT_PIPELINE_VERSION = "tacua.pipeline@1.1.0"
+PROCESSING_ARTIFACT_SCHEMA_VERSION = 1
+PROCESSING_ARTIFACT_CONTRACT = "tacua.processing-stage-artifact@1.0.0"
+PROCESSING_ARTIFACT_MEDIA_TYPE = (
+    "application/vnd.tacua.processing-stage-artifact+json;version=1.0.0"
+)
+TRANSCRIPT_CONTRACT = "tacua.transcript@1.0.0"
+MAX_PROCESSING_ARTIFACT_BYTES = 4_194_304
+MAX_TRANSCRIPT_TEXT_BYTES = 2_097_152
+MAX_TRANSCRIPT_SPANS = 10_000
+ARTIFACT_CHECKPOINT_DETAIL = "The transcript artifact was published atomically."
 FOUNDATION_STATUSES = frozenset({"queued", "running", "succeeded", "failed"})
 LEASE_SECONDS = 300
 MAX_CLAIM_SCAN = 50
@@ -39,6 +54,76 @@ ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{2,63}$")
 VERIFIER_PATTERN = re.compile(r"^hmac-sha256:[0-9a-f]{64}$")
 TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{43,128}$")
 FAILURE_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]{2,63}$")
+DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+LANGUAGE_TAG_PATTERN = re.compile(
+    r"^(?:und|[a-z]{2,3}(?:-[A-Z][a-z]{3})?(?:-(?:[A-Z]{2}|[0-9]{3}))?)$"
+)
+
+_ARTIFACT_SCHEMA_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS tacua_processing_artifact_schema (
+    schema_version INTEGER PRIMARY KEY CHECK (schema_version = 1)
+)
+"""
+_ARTIFACT_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS tacua_processing_artifacts (
+    artifact_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    stage_name TEXT NOT NULL,
+    artifact_kind TEXT NOT NULL CHECK (artifact_kind = 'transcript'),
+    checkpoint_job_version INTEGER NOT NULL CHECK (checkpoint_job_version >= 2),
+    artifact_digest TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    derived_data_expires_at TEXT NOT NULL,
+    canonical_json TEXT NOT NULL,
+    UNIQUE (job_id, stage_name, artifact_kind),
+    FOREIGN KEY (job_id, checkpoint_job_version)
+        REFERENCES tacua_processing_job_versions(job_id, job_version)
+        ON DELETE CASCADE
+)
+"""
+_ARTIFACT_SESSION_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS tacua_processing_artifacts_session_idx
+    ON tacua_processing_artifacts(session_id, artifact_id)
+"""
+_ARTIFACT_EXPIRY_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS tacua_processing_artifacts_expiry_idx
+    ON tacua_processing_artifacts(derived_data_expires_at, artifact_id)
+"""
+_ARTIFACT_NO_UPDATE_TRIGGER_SQL = """
+CREATE TRIGGER IF NOT EXISTS tacua_processing_artifacts_no_update
+BEFORE UPDATE ON tacua_processing_artifacts
+BEGIN
+    SELECT RAISE(ABORT, 'processing artifacts are immutable');
+END
+"""
+_ARTIFACT_NO_REPLACE_TRIGGER_SQL = """
+CREATE TRIGGER IF NOT EXISTS tacua_processing_artifacts_no_replace
+BEFORE INSERT ON tacua_processing_artifacts
+WHEN EXISTS (
+    SELECT 1 FROM tacua_processing_artifacts
+     WHERE artifact_id = NEW.artifact_id
+        OR artifact_digest = NEW.artifact_digest
+        OR (
+            job_id = NEW.job_id
+            AND stage_name = NEW.stage_name
+            AND artifact_kind = NEW.artifact_kind
+        )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'processing artifacts cannot be replaced');
+END
+"""
+_ARTIFACT_NO_DIRECT_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER IF NOT EXISTS tacua_processing_artifacts_no_direct_delete
+BEFORE DELETE ON tacua_processing_artifacts
+WHEN EXISTS (
+    SELECT 1 FROM jobs WHERE job_id = OLD.job_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'processing artifacts are append-only');
+END
+"""
 
 
 class ProcessingJobStoreError(Exception):
@@ -115,6 +200,19 @@ class ProcessingResult:
     candidates: tuple[PublicationCandidate, ...] = ()
 
 
+@dataclass(frozen=True)
+class ProcessingCheckpoint:
+    """One internal non-terminal result and its immutable stage artifacts.
+
+    Artifact drafts are deliberately not part of the local adapter's frozen
+    wire contract.  An in-process engine may return exact dictionaries with
+    ``artifact_kind`` and ``payload`` keys.  The backend, not the engine,
+    derives every identity, scope, timestamp, retention boundary, and digest.
+    """
+
+    artifacts: tuple[dict[str, Any], ...] = ()
+
+
 SuccessfulOutputValidator = Callable[[sqlite3.Connection, dict[str, Any]], None]
 
 
@@ -136,6 +234,76 @@ def _parse_timestamp(value: str) -> datetime:
         return parsed
     except (TypeError, ValueError) as error:
         raise ValueError("processing-job timestamp is invalid") from error
+
+
+def _normalized_sql(value: str) -> str:
+    return " ".join(value.strip().rstrip(";").split())
+
+
+def _validate_processing_artifact_schema_shape(
+    connection: sqlite3.Connection,
+) -> None:
+    expected = {
+        ("table", "tacua_processing_artifact_schema"): _ARTIFACT_SCHEMA_TABLE_SQL,
+        ("table", "tacua_processing_artifacts"): _ARTIFACT_TABLE_SQL,
+        (
+            "index",
+            "tacua_processing_artifacts_session_idx",
+        ): _ARTIFACT_SESSION_INDEX_SQL,
+        (
+            "index",
+            "tacua_processing_artifacts_expiry_idx",
+        ): _ARTIFACT_EXPIRY_INDEX_SQL,
+        (
+            "trigger",
+            "tacua_processing_artifacts_no_update",
+        ): _ARTIFACT_NO_UPDATE_TRIGGER_SQL,
+        (
+            "trigger",
+            "tacua_processing_artifacts_no_replace",
+        ): _ARTIFACT_NO_REPLACE_TRIGGER_SQL,
+        (
+            "trigger",
+            "tacua_processing_artifacts_no_direct_delete",
+        ): _ARTIFACT_NO_DIRECT_DELETE_TRIGGER_SQL,
+    }
+    names = [name for _kind, name in expected]
+    placeholders = ",".join("?" for _name in names)
+    rows = connection.execute(
+        f"""SELECT type,name,sql FROM sqlite_master
+              WHERE name IN ({placeholders})""",
+        names,
+    ).fetchall()
+    actual = {
+        (row["type"], row["name"]): row["sql"]
+        for row in rows
+        if isinstance(row["sql"], str)
+    }
+    if set(actual) != set(expected):
+        raise ValueError("processing artifact schema shape is incompatible")
+    for key, statement in expected.items():
+        stored_form = statement.replace(" IF NOT EXISTS", "")
+        if _normalized_sql(actual[key]) != _normalized_sql(stored_form):
+            raise ValueError("processing artifact schema shape is incompatible")
+    related = connection.execute(
+        """SELECT type,name,sql FROM sqlite_master
+             WHERE tbl_name = 'tacua_processing_artifacts'
+               AND type IN ('index','trigger')"""
+    ).fetchall()
+    allowed_named = {
+        key for key in expected if key[0] in {"index", "trigger"}
+    }
+    for row in related:
+        key = (row["type"], row["name"])
+        automatic_index = (
+            row["type"] == "index"
+            and row["sql"] is None
+            and row["name"].startswith(
+                "sqlite_autoindex_tacua_processing_artifacts_"
+            )
+        )
+        if not automatic_index and key not in allowed_named:
+            raise ValueError("processing artifact schema shape is incompatible")
 
 
 def _strict_json_object(raw: str | bytes) -> dict[str, Any]:
@@ -180,6 +348,273 @@ def _strict_document(raw: str | bytes) -> dict[str, Any]:
     value = _strict_json_object(raw)
     runtime_validate(value)
     return value
+
+
+def _validate_json_basics(value: Any) -> None:
+    """Apply the artifact contract's bounded, integer-only JSON profile."""
+
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    while stack:
+        child, depth = stack.pop()
+        if depth > 64:
+            raise ValueError("processing artifact JSON nesting is invalid")
+        if child is None or type(child) is bool:
+            continue
+        if type(child) is int:
+            if abs(child) > MAX_SAFE_INTEGER:
+                raise ValueError("processing artifact integer exceeds the safe range")
+            continue
+        if isinstance(child, float):
+            raise ValueError("processing artifact floating-point values are forbidden")
+        if type(child) is str:
+            if unicodedata.normalize("NFC", child) != child or "\x00" in child:
+                raise ValueError("processing artifact text is invalid")
+            continue
+        if type(child) is list:
+            stack.extend((item, depth + 1) for item in child)
+            continue
+        if type(child) is dict:
+            for key, item in child.items():
+                if (
+                    type(key) is not str
+                    or unicodedata.normalize("NFC", key) != key
+                    or "\x00" in key
+                ):
+                    raise ValueError("processing artifact object key is invalid")
+                stack.append((item, depth + 1))
+            continue
+        raise ValueError("processing artifact contains a non-JSON value")
+
+
+def _processing_artifact_id(job_id: str, stage_name: str, artifact_kind: str) -> str:
+    """Derive a stable opaque ID without incorporating processor output."""
+
+    subject = (
+        "tacua.processing-stage-artifact-id@1.0.0\0"
+        f"{job_id}\0{stage_name}\0{artifact_kind}"
+    ).encode("utf-8")
+    token = base64.urlsafe_b64encode(hashlib.sha256(subject).digest()).decode("ascii")
+    return "artifact_" + token.rstrip("=")
+
+
+def _expected_transcript_source_segments(
+    connection: sqlite3.Connection, session_id: str
+) -> list[dict[str, Any]]:
+    completion = connection.execute(
+        "SELECT request_json FROM completions WHERE session_id = ?", (session_id,)
+    ).fetchone()
+    if completion is None:
+        raise ValueError("processing artifact has no completion source")
+    request = _strict_json_object(completion["request_json"])
+    protocol_validate(request)
+    result: list[dict[str, Any]] = []
+    for segment in request["capture_manifest"]["segments"]:
+        if segment["availability"] != "available":
+            continue
+        result.append(
+            {
+                "segment_id": segment["segment_id"],
+                "sequence": segment["sequence"],
+                "content_digest": segment["content"]["content_digest"],
+                "start_ms": segment["time_range"]["start_ms"],
+                "end_ms": segment["time_range"]["end_ms"],
+            }
+        )
+    return result
+
+
+def _validate_transcript_payload(
+    payload: Any, *, expected_source_segments: list[dict[str, Any]]
+) -> None:
+    if type(payload) is not dict or set(payload) != {
+        "contract_version",
+        "language_tag",
+        "speech_status",
+        "source_segments",
+        "spans",
+    }:
+        raise ValueError("transcript artifact payload fields are invalid")
+    if (
+        payload["contract_version"] != TRANSCRIPT_CONTRACT
+        or type(payload["language_tag"]) is not str
+        or len(payload["language_tag"]) > 35
+        or LANGUAGE_TAG_PATTERN.fullmatch(payload["language_tag"]) is None
+        or type(payload["speech_status"]) is not str
+        or payload["speech_status"] not in {"detected", "not_detected"}
+        or type(payload["source_segments"]) is not list
+        or payload["source_segments"] != expected_source_segments
+        or type(payload["spans"]) is not list
+        or len(payload["spans"]) > MAX_TRANSCRIPT_SPANS
+    ):
+        raise ValueError("transcript artifact payload is invalid")
+
+    source_by_id = {
+        source["segment_id"]: source for source in expected_source_segments
+    }
+    span_order: list[tuple[int, int, str]] = []
+    text_bytes = 0
+    previous_end: int | None = None
+    for span in payload["spans"]:
+        if type(span) is not dict or set(span) != {
+            "segment_id",
+            "start_ms",
+            "end_ms",
+            "text",
+        }:
+            raise ValueError("transcript span fields are invalid")
+        source = source_by_id.get(span["segment_id"])
+        start = span["start_ms"]
+        end = span["end_ms"]
+        text = span["text"]
+        if (
+            source is None
+            or type(start) is not int
+            or type(end) is not int
+            or start < source["start_ms"]
+            or end > source["end_ms"]
+            or end <= start
+            or type(text) is not str
+            or len(text) > MAX_TRANSCRIPT_TEXT_BYTES
+            or not text.strip()
+        ):
+            raise ValueError("transcript span is invalid")
+        if previous_end is not None and start < previous_end:
+            raise ValueError("transcript spans overlap or regress")
+        previous_end = end
+        span_order.append((start, end, span["segment_id"]))
+        text_bytes += len(text.encode("utf-8"))
+        if text_bytes > MAX_TRANSCRIPT_TEXT_BYTES:
+            raise ValueError("transcript text exceeds its byte limit")
+    if span_order != sorted(span_order):
+        raise ValueError("transcript spans are not canonically sorted")
+    if (payload["speech_status"] == "detected") != bool(payload["spans"]):
+        raise ValueError("transcript speech status differs from its spans")
+    if payload["speech_status"] == "not_detected" and payload["language_tag"] != "und":
+        raise ValueError("no-speech transcript language must be undetermined")
+
+
+def _seal_processing_stage_artifact(
+    *,
+    job: dict[str, Any],
+    stage_name: str,
+    checkpoint_job_version: int,
+    created_at: str,
+    derived_data_expires_at: str,
+    artifact_kind: str,
+    payload: dict[str, Any],
+    expected_source_segments: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if artifact_kind != "transcript":
+        raise ValueError("processing artifact kind is unsupported")
+    _validate_transcript_payload(
+        payload, expected_source_segments=expected_source_segments
+    )
+    _validate_json_basics(payload)
+    document = {
+        "contract_version": PROCESSING_ARTIFACT_CONTRACT,
+        "media_type": PROCESSING_ARTIFACT_MEDIA_TYPE,
+        "artifact_id": _processing_artifact_id(
+            job["job_id"], stage_name, artifact_kind
+        ),
+        "artifact_kind": artifact_kind,
+        "organization_id": job["organization_id"],
+        "project_id": job["project_id"],
+        "session_id": job["session_id"],
+        "job_id": job["job_id"],
+        "stage_name": stage_name,
+        "checkpoint_job_version": checkpoint_job_version,
+        "created_at": created_at,
+        "derived_data_expires_at": derived_data_expires_at,
+        "payload": copy.deepcopy(payload),
+        "artifact_digest": "sha256:" + "0" * 64,
+    }
+    document["artifact_digest"] = digest_without(document, "artifact_digest")
+    _validate_processing_stage_artifact(
+        document,
+        job=job,
+        stage_name=stage_name,
+        checkpoint_job_version=checkpoint_job_version,
+        created_at=created_at,
+        derived_data_expires_at=derived_data_expires_at,
+        expected_source_segments=expected_source_segments,
+    )
+    return document
+
+
+def _validate_processing_stage_artifact(
+    document: Any,
+    *,
+    job: dict[str, Any],
+    stage_name: str,
+    checkpoint_job_version: int,
+    created_at: str,
+    derived_data_expires_at: str,
+    expected_source_segments: list[dict[str, Any]],
+) -> None:
+    _validate_json_basics(document)
+    if not isinstance(document, dict) or set(document) != {
+        "contract_version",
+        "media_type",
+        "artifact_id",
+        "artifact_kind",
+        "organization_id",
+        "project_id",
+        "session_id",
+        "job_id",
+        "stage_name",
+        "checkpoint_job_version",
+        "created_at",
+        "derived_data_expires_at",
+        "payload",
+        "artifact_digest",
+    }:
+        raise ValueError("processing artifact fields are invalid")
+    artifact_kind = document["artifact_kind"]
+    expected_binding = {
+        "contract_version": PROCESSING_ARTIFACT_CONTRACT,
+        "media_type": PROCESSING_ARTIFACT_MEDIA_TYPE,
+        "artifact_id": _processing_artifact_id(
+            job["job_id"], stage_name, artifact_kind
+        ),
+        "artifact_kind": "transcript",
+        "organization_id": job["organization_id"],
+        "project_id": job["project_id"],
+        "session_id": job["session_id"],
+        "job_id": job["job_id"],
+        "stage_name": stage_name,
+        "checkpoint_job_version": checkpoint_job_version,
+        "created_at": created_at,
+        "derived_data_expires_at": derived_data_expires_at,
+    }
+    if (
+        any(document[key] != value for key, value in expected_binding.items())
+        or stage_name != JOB_STAGES[0]
+        or isinstance(checkpoint_job_version, bool)
+        or not isinstance(checkpoint_job_version, int)
+        or checkpoint_job_version < 2
+        or DIGEST_PATTERN.fullmatch(str(document["artifact_digest"])) is None
+        or document["artifact_digest"]
+        != digest_without(document, "artifact_digest")
+        or _parse_timestamp(created_at) >= _parse_timestamp(derived_data_expires_at)
+    ):
+        raise ValueError("processing artifact binding or digest is invalid")
+    _validate_transcript_payload(
+        document["payload"], expected_source_segments=expected_source_segments
+    )
+    if len(canonical_json(document).encode("utf-8")) > MAX_PROCESSING_ARTIFACT_BYTES:
+        raise ValueError("processing artifact exceeds its byte limit")
+
+
+def _decode_processing_stage_artifact(raw: str | bytes) -> dict[str, Any]:
+    if isinstance(raw, str):
+        encoded = raw.encode("utf-8")
+    elif isinstance(raw, bytes):
+        encoded = raw
+    else:
+        raise ValueError("processing artifact body is not text")
+    if len(encoded) > MAX_PROCESSING_ARTIFACT_BYTES:
+        raise ValueError("processing artifact exceeds its byte limit")
+    return _strict_json_object(encoded)
 
 
 def _validate_completion_anchor(
@@ -390,8 +825,31 @@ def initialize_processing_job_schema(connection: sqlite3.Connection) -> None:
             ON jobs(session_id);
         """
     )
+    artifact_schema = ";\n".join(
+        (
+            _ARTIFACT_SCHEMA_TABLE_SQL,
+            """INSERT OR IGNORE INTO tacua_processing_artifact_schema
+               (schema_version) VALUES (1)""",
+            _ARTIFACT_TABLE_SQL,
+            _ARTIFACT_SESSION_INDEX_SQL,
+            _ARTIFACT_EXPIRY_INDEX_SQL,
+            _ARTIFACT_NO_UPDATE_TRIGGER_SQL,
+            _ARTIFACT_NO_REPLACE_TRIGGER_SQL,
+            _ARTIFACT_NO_DIRECT_DELETE_TRIGGER_SQL,
+        )
+    )
+    connection.executescript(artifact_schema + ";")
     try:
         connection.execute("BEGIN IMMEDIATE")
+        _validate_processing_artifact_schema_shape(connection)
+        artifact_schema_versions = connection.execute(
+            """SELECT schema_version FROM tacua_processing_artifact_schema
+                 ORDER BY schema_version"""
+        ).fetchall()
+        if [tuple(row) for row in artifact_schema_versions] != [
+            (PROCESSING_ARTIFACT_SCHEMA_VERSION,)
+        ]:
+            raise ValueError("processing artifact schema version is incompatible")
         orphan = connection.execute(
             """SELECT versions.job_id
                  FROM tacua_processing_job_versions AS versions
@@ -502,6 +960,8 @@ def _validate_initial(job: dict[str, Any]) -> None:
         or job["completed_at"] is not None
         or job["outputs"] is not None
         or job["failure"] is not None
+        or job["pipeline"]["pipeline_version"]
+        not in {LEGACY_PIPELINE_VERSION, ARTIFACT_PIPELINE_VERSION}
         or any(
             stage != {
                 "name": name,
@@ -842,6 +1302,130 @@ def _validate_transition(before: dict[str, Any], after: dict[str, Any]) -> None:
         raise ValueError("processing-job state transition is not allowed")
 
 
+def _validate_processing_artifact_population_for_job(
+    connection: sqlite3.Connection,
+    job_row: sqlite3.Row,
+    history: list[dict[str, Any]],
+) -> None:
+    """Bind every inline artifact to one exact durable stage transition."""
+
+    _validate_processing_artifact_schema_shape(connection)
+    schema_versions = connection.execute(
+        """SELECT schema_version FROM tacua_processing_artifact_schema
+             ORDER BY schema_version"""
+    ).fetchall()
+    if [tuple(row) for row in schema_versions] != [
+        (PROCESSING_ARTIFACT_SCHEMA_VERSION,)
+    ]:
+        raise ValueError("processing artifact schema version is incompatible")
+    rows = connection.execute(
+        """SELECT artifact_id,job_id,session_id,stage_name,artifact_kind,
+                  checkpoint_job_version,artifact_digest,created_at,
+                  derived_data_expires_at,canonical_json
+             FROM tacua_processing_artifacts
+            WHERE job_id = ? ORDER BY stage_name,artifact_kind,artifact_id""",
+        (job_row["job_id"],),
+    ).fetchall()
+    pipeline_version = history[0]["pipeline"]["pipeline_version"]
+    if pipeline_version == LEGACY_PIPELINE_VERSION:
+        if rows:
+            raise ValueError("legacy processing pipeline retained a stage artifact")
+        return
+    if pipeline_version != ARTIFACT_PIPELINE_VERSION:
+        raise ValueError("processing artifact pipeline version is unsupported")
+
+    transcribe = history[-1]["pipeline"]["stages"][0]
+    expected_artifact_count = 1 if transcribe["state"] == "succeeded" else 0
+    if len(rows) != expected_artifact_count:
+        raise ValueError("processing artifact population differs from stage history")
+    if not rows:
+        return
+    if (
+        history[-1]["status"] != "queued"
+        or _current_stage_index(history[-1]) != 1
+        or history[-1]["pipeline"]["stages"][1]["state"] != "pending"
+    ):
+        raise ValueError("artifact pipeline advanced before its reader was available")
+
+    session = connection.execute(
+        """SELECT session_id,derived_data_expires_at FROM sessions
+             WHERE session_id = ?""",
+        (job_row["session_id"],),
+    ).fetchone()
+    if session is None:
+        raise ValueError("processing artifact has no session retention anchor")
+    expected_sources = _expected_transcript_source_segments(
+        connection, job_row["session_id"]
+    )
+    row = rows[0]
+    document = _decode_processing_stage_artifact(row["canonical_json"])
+    version = document.get("checkpoint_job_version")
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or not 2 <= version <= len(history)
+    ):
+        raise ValueError("processing artifact checkpoint version is invalid")
+    checkpoint = history[version - 1]
+    previous = history[version - 2]
+    stage = checkpoint["pipeline"]["stages"][0]
+    previous_stage = previous["pipeline"]["stages"][0]
+    if (
+        stage["state"] != "succeeded"
+        or stage["completed_at"] is None
+        or previous_stage["state"] != "running"
+        or checkpoint["previous_job_digest"] != previous["job_digest"]
+    ):
+        raise ValueError("processing artifact does not name its checkpoint transition")
+    _validate_processing_stage_artifact(
+        document,
+        job=history[0],
+        stage_name=JOB_STAGES[0],
+        checkpoint_job_version=version,
+        created_at=stage["completed_at"],
+        derived_data_expires_at=session["derived_data_expires_at"],
+        expected_source_segments=expected_sources,
+    )
+    if (
+        row["artifact_id"] != document["artifact_id"]
+        or row["job_id"] != document["job_id"]
+        or row["session_id"] != document["session_id"]
+        or row["stage_name"] != document["stage_name"]
+        or row["artifact_kind"] != document["artifact_kind"]
+        or row["checkpoint_job_version"] != version
+        or row["artifact_digest"] != document["artifact_digest"]
+        or row["created_at"] != document["created_at"]
+        or row["derived_data_expires_at"] != document["derived_data_expires_at"]
+        or row["canonical_json"] != canonical_json(document)
+    ):
+        raise ValueError("processing artifact row differs from its canonical body")
+
+
+def _validate_processing_artifact_population(
+    connection: sqlite3.Connection, *, session_id: str | None = None
+) -> None:
+    _ = session_id
+    _validate_processing_artifact_schema_shape(connection)
+    schema_versions = connection.execute(
+        """SELECT schema_version FROM tacua_processing_artifact_schema
+             ORDER BY schema_version"""
+    ).fetchall()
+    if [tuple(row) for row in schema_versions] != [
+        (PROCESSING_ARTIFACT_SCHEMA_VERSION,)
+    ]:
+        raise ValueError("processing artifact schema version is incompatible")
+    orphan = connection.execute(
+        """SELECT artifacts.artifact_id
+             FROM tacua_processing_artifacts AS artifacts
+             LEFT JOIN jobs ON jobs.job_id = artifacts.job_id
+             LEFT JOIN sessions ON sessions.session_id = artifacts.session_id
+            WHERE jobs.job_id IS NULL OR sessions.session_id IS NULL
+            LIMIT 1"""
+    ).fetchone()
+    if orphan is not None:
+        raise ValueError("processing artifact population has an orphan row")
+
+
 class ProcessingJobStore:
     """Validated storage operations for a single deployment scope."""
 
@@ -998,6 +1582,9 @@ class ProcessingJobStore:
                     raise ValueError("running processing-job head has no exact lease")
             elif lease is not None:
                 raise ValueError("non-running processing-job retained a lease")
+            _validate_processing_artifact_population_for_job(
+                self.connection, row, snapshots
+            )
             return row, snapshots
         except ProcessingJobStoreError:
             raise
@@ -1193,6 +1780,17 @@ class ProcessingJobStore:
                 project_id=self.project_id,
                 session_id=session_id,
             )
+            _validate_processing_artifact_population(
+                self.connection, session_id=session_id
+            )
+            parameters: list[Any] = []
+            query = "SELECT job_id FROM jobs"
+            if session_id is not None:
+                query += " WHERE session_id = ?"
+                parameters.append(session_id)
+            query += " ORDER BY job_id"
+            for row in self.connection.execute(query, parameters):
+                self._load_chain(row["job_id"], enforce_scope=False)
         except (KeyError, TypeError, ValueError, sqlite3.Error) as error:
             raise self._storage_error(error) from error
 
@@ -1367,6 +1965,10 @@ class ProcessingJobStore:
             raise self._storage_error(
                 ValueError("processing-job head/lease population is inconsistent")
             )
+        # The first slice persists a transcript but deliberately has no
+        # lease-bound artifact reader yet.  Once an artifact exists the job is
+        # therefore durable but unclaimable; a later slice must add the reader
+        # before removing this predicate and activating pipeline 1.1.
         candidates = self.connection.execute(
             """SELECT jobs.job_id
                  FROM jobs
@@ -1380,6 +1982,10 @@ class ProcessingJobStore:
                   AND NOT EXISTS (
                       SELECT 1 FROM pending_deletions
                        WHERE pending_deletions.session_id = jobs.session_id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM tacua_processing_artifacts AS artifacts
+                       WHERE artifacts.job_id = jobs.job_id
                   )
                   AND (
                       (jobs.status = 'queued' AND leases.job_id IS NULL)
@@ -1564,6 +2170,7 @@ class ProcessingJobStore:
         lease_token: str,
         *,
         detail: str | None = None,
+        artifacts: tuple[dict[str, Any], ...] = (),
     ) -> dict[str, Any]:
         self._require_transaction()
         now = self._now()
@@ -1575,6 +2182,42 @@ class ProcessingJobStore:
                 "PROCESSING_PUBLICATION_REQUIRED",
                 "final processing completion requires an atomic processing result",
             )
+        if type(artifacts) is not tuple:
+            raise ProcessingJobStoreError(
+                422,
+                "PROCESSING_CHECKPOINT_INVALID",
+                "processing checkpoint is invalid",
+            )
+        pipeline_version = history[0]["pipeline"]["pipeline_version"]
+        expected_artifact_count = (
+            1
+            if pipeline_version == ARTIFACT_PIPELINE_VERSION
+            and stage_name == JOB_STAGES[0]
+            else 0
+        )
+        if (
+            pipeline_version not in {
+                LEGACY_PIPELINE_VERSION,
+                ARTIFACT_PIPELINE_VERSION,
+            }
+            or len(artifacts) != expected_artifact_count
+            or any(
+                type(artifact) is not dict
+                or set(artifact) != {"artifact_kind", "payload"}
+                or artifact["artifact_kind"] != "transcript"
+                or type(artifact["payload"]) is not dict
+                for artifact in artifacts
+            )
+        ):
+            raise ProcessingJobStoreError(
+                422,
+                "PROCESSING_CHECKPOINT_INVALID",
+                "processing checkpoint is invalid",
+            )
+        if artifacts:
+            # Artifact bodies must not acquire an alternate route into the
+            # reviewer-visible processing-job projection.
+            detail = ARTIFACT_CHECKPOINT_DETAIL
         if detail is not None and (
             not isinstance(detail, str)
             or not 1 <= len(detail) <= 4096
@@ -1584,15 +2227,88 @@ class ProcessingJobStore:
                 400, "PROCESSING_DETAIL_INVALID", "checkpoint detail is invalid"
             )
         event_time = self._event_time(history)
+        session = self.connection.execute(
+            """SELECT derived_data_expires_at FROM sessions
+                 WHERE session_id = ?""",
+            (history[-1]["session_id"],),
+        ).fetchone()
+        if session is None:
+            raise self._storage_error(
+                ValueError("processing checkpoint has no session retention anchor")
+            )
+        sealed_artifacts: list[dict[str, Any]] = []
+        if artifacts:
+            try:
+                expected_sources = _expected_transcript_source_segments(
+                    self.connection, history[-1]["session_id"]
+                )
+                sealed_artifacts = [
+                    _seal_processing_stage_artifact(
+                        job=history[0],
+                        stage_name=stage_name,
+                        checkpoint_job_version=history[-1]["job_version"] + 1,
+                        created_at=_timestamp(event_time),
+                        derived_data_expires_at=session[
+                            "derived_data_expires_at"
+                        ],
+                        artifact_kind=artifact["artifact_kind"],
+                        payload=artifact["payload"],
+                        expected_source_segments=expected_sources,
+                    )
+                    for artifact in artifacts
+                ]
+            except (KeyError, TypeError, ValueError):
+                raise ProcessingJobStoreError(
+                    422,
+                    "PROCESSING_CHECKPOINT_INVALID",
+                    "processing checkpoint is invalid",
+                ) from None
         queued = copy.deepcopy(history[-1])
         queued["status"] = "queued"
         queued["started_at"] = None
         stage = queued["pipeline"]["stages"][current]
         stage.update(state="succeeded", completed_at=_timestamp(event_time), detail=detail)
         result = self._append(history, queued, event_time)
-        self.connection.execute(
+        for document in sealed_artifacts:
+            self.connection.execute(
+                """INSERT INTO tacua_processing_artifacts
+                   (artifact_id,job_id,session_id,stage_name,artifact_kind,
+                    checkpoint_job_version,artifact_digest,created_at,
+                    derived_data_expires_at,canonical_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    document["artifact_id"],
+                    document["job_id"],
+                    document["session_id"],
+                    document["stage_name"],
+                    document["artifact_kind"],
+                    document["checkpoint_job_version"],
+                    document["artifact_digest"],
+                    document["created_at"],
+                    document["derived_data_expires_at"],
+                    canonical_json(document),
+                ),
+            )
+        removed = self.connection.execute(
             "DELETE FROM tacua_processing_job_leases WHERE job_id = ?", (job_id,)
         )
+        if removed.rowcount != 1:
+            raise ProcessingJobStoreError(
+                409, "PROCESSING_LEASE_STALE", "processing-job lease is stale"
+            )
+        row = self.connection.execute(
+            """SELECT job_id,session_id,organization_id,project_id,status,
+                      requested_at,job_json FROM jobs WHERE job_id = ?""",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            raise self._storage_error(ValueError("processing checkpoint lost its job"))
+        try:
+            _validate_processing_artifact_population_for_job(
+                self.connection, row, history
+            )
+        except (KeyError, TypeError, ValueError, sqlite3.Error) as error:
+            raise self._storage_error(error) from error
         return copy.deepcopy(result)
 
     @_map_sqlite_errors
