@@ -456,7 +456,7 @@ fi
 docker exec "$compose_reviewer_container" python -B - \
   < .github/scripts/smoke-reviewer-web-container.py
 docker exec "$compose_reviewer_container" python -B -c \
-  'from pathlib import Path; import stat; files=(Path("/licenses/tacua/LICENSE"),Path("/licenses/tacua/NOTICE"),Path("/licenses/reviewer/NOTICE"),Path("/licenses/reviewer/THIRD_PARTY_NOTICES.txt")); assert all(path.is_file() and stat.S_IMODE(path.stat().st_mode)==0o444 for path in files); assert files[0].read_text(encoding="utf-8").startswith("Apache License"); assert files[3].read_text(encoding="utf-8").startswith("Tacua reviewer web — third-party notices")'
+  'from pathlib import Path; import stat; files=(Path("/licenses/tacua/LICENSE"),Path("/licenses/tacua/NOTICE"),Path("/licenses/reviewer/NOTICE"),Path("/licenses/reviewer/THIRD_PARTY_NOTICES.txt")); assert all(path.is_file() and stat.S_IMODE(path.stat().st_mode)==0o444 for path in files); assert files[0].read_text(encoding="utf-8").lstrip().startswith("Apache License"); assert files[3].read_text(encoding="utf-8").startswith("Tacua reviewer web — third-party notices")'
 docker exec "$compose_reviewer_container" python -B -c \
   'from pathlib import Path; assert not any(Path(path).exists() for path in ("/run/secrets/tacua_admin","/run/tacua/config.json","/var/lib/tacua/tacua.sqlite3","/var/run/docker.sock","/run/docker.sock"))'
 docker exec "$compose_ingress_container" sh -c \
