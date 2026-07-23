@@ -323,13 +323,19 @@ only after applying equivalent secret/body redaction.
 
 The provider-neutral local adapter is disabled during ordinary service
 startup. To process queued sessions, follow
-[PROCESSING_ADAPTER.md](PROCESSING_ADAPTER.md): stop the backend, invoke the
-worker with an explicit canonical command document in `--run-once` or bounded
-`--drain` mode, and restart the backend. The worker deliberately acquires the
-same state-volume lock, so attempting to run it beside this service fails
-before SQLite or evidence is opened. Keep the checked-in `internal: true`
-network and do not add provider credentials or egress without a separate
-authorization design.
+[the Compose isolated-processing runbook](COMPOSE_PROCESSING_BRIDGE.md). Its
+trusted host gate preflights and stops the exact backend, verifies the named
+state volume offline, runs a one-shot network-none worker through the private
+descriptor bridge and existing isolated runner, verifies state again, and
+restarts plus smokes the same backend. The worker deliberately acquires the
+same state-volume lock, and neither it nor the selected processor receives the
+Docker socket. Keep the checked-in `internal: true` network and do not add
+provider credentials or egress without a separate authorization design.
+Before downtime, the gate refuses a combined SQLite database-plus-WAL size
+above the V1 512 MiB verifier-copy bound, leaving the previously healthy
+backend running. If recovery proves that the worker never started, it may
+restart that exact backend without a redundant offline database copy; if a
+worker may have started, post-worker offline verification is mandatory.
 
 ## 5. Crash-consistent backup
 
@@ -801,8 +807,11 @@ docker run --rm \
   --network none \
   --cap-drop ALL \
   --security-opt no-new-privileges:true \
+  --memory 4294967296 \
+  --memory-swap 4294967296 \
   --env TMPDIR=/tmp \
-  --tmpfs '/tmp:rw,nosuid,nodev,noexec,mode=0700,uid=10001,gid=10001' \
+  --tmpfs \
+    '/tmp:rw,nosuid,nodev,noexec,size=1073741824,mode=0700,uid=10001,gid=10001' \
   --mount "type=volume,src=$state_volume,dst=/var/lib/tacua" \
   --mount \
     "type=bind,src=$config_file,dst=/run/tacua/config.json,readonly" \
@@ -818,6 +827,9 @@ temporary complete recovery bundle, verifies every copied byte and SQLite pin,
 compares the prepared config and secret, and only then assigns state to UID/GID
 `10001`. `verify-compose-state` separately takes the service lock and checks
 ownership, modes, SQLite integrity, and the deployment pin as that UID.
+Its V1 database-copy profile accepts at most 512 MiB combined across the
+database and WAL and reserves the 1 GiB ephemeral tmpfs above; it never uses
+the image's ordinary state-local `TMPDIR`.
 
 During the deliberate cutover, continue in that same Bash shell with the
 owner-only resolved Compose file still present. First stop the old deployment
@@ -842,8 +854,11 @@ docker run --rm \
   --network none \
   --cap-drop ALL \
   --security-opt no-new-privileges:true \
+  --memory 4294967296 \
+  --memory-swap 4294967296 \
   --env TMPDIR=/tmp \
-  --tmpfs '/tmp:rw,nosuid,nodev,noexec,mode=0700,uid=10001,gid=10001' \
+  --tmpfs \
+    '/tmp:rw,nosuid,nodev,noexec,size=1073741824,mode=0700,uid=10001,gid=10001' \
   --mount "type=volume,src=$state_volume,dst=/var/lib/tacua" \
   --mount \
     "type=bind,src=$config_file,dst=/run/tacua/config.json,readonly" \

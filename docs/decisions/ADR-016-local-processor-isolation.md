@@ -57,8 +57,11 @@ must be exactly the unique `body_file` set referenced by the result;
 missing or unreferenced bodies are rejected. The runner reads attached
 stdout/stderr incrementally while the container is running, kills on the
 absolute deadline or stream cap, and validates exact exit/OOM state before
-accepting anything. Preview publication occurs atomically only after the whole
-envelope and all decoded bytes validate.
+accepting anything. Only after the whole envelope and all decoded bytes
+validate does the runner begin preview publication. Each preview is published
+with one atomic rename; the set is not a single filesystem transaction. If any
+rename fails, the runner removes every staged and already-published preview
+before it returns failure.
 
 The processor container is UID/GID `10002:10002`, distinct from backend
 `10001:10001`. It has network mode `none`, a read-only root, default seccomp,
@@ -74,10 +77,10 @@ PID controls, and builtin default seccomp. Limits are two
 CPUs, 4 GiB memory with no extra swap, 64 PIDs, 1,024 file descriptors, a
 150-second container limit, 256 MiB noexec scratch tmpfs, a 110 MiB attached
 transport cap, 64 MiB decoded result/preview aggregate, 16 MiB canonical result,
-and 512 evidence files / 4 GiB evidence bytes. The whole runner stops normal work by 180 seconds and finishes bounded
-kill/removal by 210 seconds. The ordinary adapter must enforce exactly 240
-seconds and exports that actual value to the runner, leaving a 30-second margin
-before its process-group kill.
+and 512 evidence files / 4 GiB evidence bytes. The whole runner stops normal
+work by 180 seconds and finishes bounded kill/removal by 210 seconds. The
+ordinary adapter must enforce exactly 240 seconds and exports that actual value
+to the runner, leaving a 30-second margin before its process-group kill.
 
 Every carrier, processor, and payload volume carries closed Tacua contract,
 instance, staging, role and deadline identity. At the start of the next
@@ -102,6 +105,13 @@ socket into either Tacua container. The Compose profile is a topology and
 preflight artifact; direct `docker compose up` is not an approved substitute
 for the runner's descriptor translation, model digest check, time kill, and
 bounded output retrieval.
+
+[ADR-020](ADR-020-compose-state-processing-bridge.md) supplies the checked
+Compose named-volume path without changing this isolation gate. A one-shot
+network-none worker retains the state-volume lock and passes only the adapter's
+already-open read-only descriptors over one private Unix socket to a trusted
+host broker, which invokes this runner. The state volume is not copied and no
+Tacua container receives the Docker socket.
 
 ## Consequences
 

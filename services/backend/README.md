@@ -74,6 +74,12 @@ must never be redirected.
   snapshot, exposes only read-only evidence descriptors and a canonical sealed
   input, and accepts an exact bounded result. It shares the state-volume lock,
   so the HTTP service must be stopped while `--run-once` or `--drain` executes.
+  The checked-in
+  [Compose processing bridge](COMPOSE_PROCESSING_BRIDGE.md) performs that
+  stop/verify/run/verify/restart lifecycle without copying the named state
+  volume or mounting the Docker socket into a Tacua container. A one-shot
+  network-none worker passes only its already-open descriptor capabilities
+  over one private Unix socket to the trusted host-side ADR-016 runner.
   There is no HTTP worker or result-publication route. A claim uses one
   SQLite `BEGIN IMMEDIATE` transaction to append the running snapshot and store
   one HMAC-verified opaque lease. The oldest eligible job wins; concurrent
@@ -230,7 +236,10 @@ published deletion, restart recovery, and preview-integrity failure. Local
 adapter tests cover exact argv, no inherited credentials/environment, verified
 read-only descriptors, zero- and multi-candidate results, canonical output,
 timeouts, stdout/stderr caps, symlink output, tampered evidence, crash cleanup,
-and state-lock exclusion. Artifact-pipeline tests additionally cover the
+and state-lock exclusion. Compose-bridge tests cover descriptor-only Unix
+socket transfer, exact FD-number recreation, response digest/staging, closed
+one-shot worker mounts and limits, and explicit Docker-socket denial.
+Artifact-pipeline tests additionally cover the
 lease-bound transcript reader, exact `1.0` compatibility, opt-in `1.1`
 transcribe-to-align handoff, receipt immutability and binding, retry and queue
 ordering, transactional rollback, retention/deletion, backup/restore, and the

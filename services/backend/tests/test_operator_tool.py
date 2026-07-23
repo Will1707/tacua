@@ -28,6 +28,7 @@ from tacua_backend.instance_lock import (  # noqa: E402
 )
 from tacua_backend.operator_tool import (  # noqa: E402
     OperatorError,
+    check_compose_state_copy_bound,
     create_admin_secret,
     create_backup,
     deployment_preflight,
@@ -620,6 +621,51 @@ class OperatorToolTests(unittest.TestCase):
                         require_immutable_image=True,
                     )
 
+    def test_compose_preflight_accepts_an_explicit_repository_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_file, secret_file, state = self.deployment(root)
+            config, _secret = load_config(config_file, secret_file)
+            verified_source = root / "verified-source"
+            document = self.compose_document(
+                immutable=False,
+                state_target=str(state),
+                config_source=str(config_file),
+                secret_source=str(secret_file),
+            )
+            document["services"]["backend"]["build"]["context"] = str(
+                verified_source
+            )
+
+            with self.assertRaisesRegex(
+                OperatorError,
+                "build authority differs",
+            ):
+                validate_compose_document(
+                    document,
+                    config,
+                    require_immutable_image=False,
+                )
+
+            validated = validate_compose_document(
+                document,
+                config,
+                require_immutable_image=False,
+                expected_repository_root=verified_source,
+            )
+            self.assertFalse(validated["immutable_image"])
+
+            preflight = deployment_preflight(
+                config_file,
+                secret_file,
+                document,
+                require_immutable_image=False,
+                check_state=False,
+                expected_repository_root=verified_source,
+            )
+            self.assertEqual("ok", preflight["status"])
+            self.assertFalse(preflight["state_checked_offline"])
+
     def test_state_preflight_handles_uri_metacharacters_in_the_state_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "deployment?pilot"
@@ -697,6 +743,79 @@ class OperatorToolTests(unittest.TestCase):
                 "state deployment pin differs from the supplied config",
             ):
                 verify_compose_state(config_file, state)
+
+    def test_stopped_state_verifier_uses_bounded_external_scratch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_file, _secret_file, state = self.deployment(root)
+            actual_temporary_directory = tempfile.TemporaryDirectory
+            scratch_directories: list[Path | None] = []
+
+            def capture_temporary_directory(*args, **kwargs):
+                value = kwargs.get("dir")
+                scratch_directories.append(
+                    Path(value) if value is not None else None
+                )
+                return actual_temporary_directory(*args, **kwargs)
+
+            with patch.object(
+                operator_tool.tempfile,
+                "TemporaryDirectory",
+                side_effect=capture_temporary_directory,
+            ):
+                result = verify_compose_state(config_file, state)
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(
+                scratch_directories,
+                [operator_tool.COMPOSE_STATE_VERIFICATION_SCRATCH],
+            )
+            self.assertEqual(list((state / "tmp").iterdir()), [])
+            database_bytes = (state / "tacua.sqlite3").stat().st_size
+            wal = state / "tacua.sqlite3-wal"
+            wal_bytes = wal.stat().st_size if wal.exists() else 0
+            with (
+                patch.object(
+                    operator_tool,
+                    "MAX_COMPOSE_STATE_DATABASE_COPY_BYTES",
+                    database_bytes + wal_bytes - 1,
+                ),
+                self.assertRaisesRegex(
+                    OperatorError,
+                    "exceeds the V1 verification byte bound",
+                ),
+            ):
+                verify_compose_state(config_file, state)
+            self.assertEqual(list((state / "tmp").iterdir()), [])
+
+    def test_running_state_copy_bound_preflight_is_content_free(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _config_file, _secret_file, state = self.deployment(root)
+            self.assertEqual(
+                check_compose_state_copy_bound(state),
+                {
+                    "maximum_bytes": (
+                        operator_tool.MAX_COMPOSE_STATE_DATABASE_COPY_BYTES
+                    ),
+                    "status": "ok",
+                },
+            )
+            database = state / "tacua.sqlite3"
+            original_size = database.stat().st_size
+            with (
+                patch.object(
+                    operator_tool,
+                    "MAX_COMPOSE_STATE_DATABASE_COPY_BYTES",
+                    original_size - 1,
+                ),
+                self.assertRaisesRegex(
+                    OperatorError,
+                    "exceeds the V1 verification byte bound",
+                ),
+            ):
+                check_compose_state_copy_bound(state)
 
     def test_preflight_rejects_every_non_compose_secret_mode(self) -> None:
         for mode in (0o400, 0o440, 0o600, 0o640):

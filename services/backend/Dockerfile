@@ -18,6 +18,7 @@ RUN groupadd --gid 10001 tacua \
 WORKDIR /app
 COPY --chown=root:root LICENSE NOTICE /app/
 COPY --chown=root:root services/backend/src/tacua_backend/*.py /app/services/backend/src/tacua_backend/
+COPY --chown=root:root --chmod=0555 services/backend/scripts/run_compose_isolated_processing.py services/backend/scripts/run_isolated_processor.py /app/services/backend/scripts/
 COPY --chown=root:root services/backend/config.example.json services/backend/config.template.example.json /app/services/backend/
 COPY --chown=root:root contracts/sdk-backend-protocol/src/*.py /app/contracts/sdk-backend-protocol/src/
 COPY --chown=root:root contracts/sdk-backend-protocol/schemas/*.schema.json /app/contracts/sdk-backend-protocol/schemas/
