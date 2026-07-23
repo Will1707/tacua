@@ -1129,7 +1129,10 @@ class Controller implements BackendManagedHostController {
         "More than one local queue matches the resume target",
       );
     }
-    return matches[0];
+    // The cardinality checks above prove this element exists. Keep the
+    // assertion at the array boundary so consumers enabling
+    // `noUncheckedIndexedAccess` do not inherit `undefined` in the SDK source.
+    return matches[0]!;
   }
 
   private async installStartedPlan(

@@ -283,12 +283,14 @@ export function admitFinalizedCapture(
 export function advancedAdmitFinalizedCapture(
   options: BackendAdmitFinalizedCaptureOptions,
 ): Promise<BackendCaptureAdmission> {
+  const buildIdentityJson = options.buildIdentity
+    ? JSON.stringify(options.buildIdentity)
+    : null;
+  const scopeJson = options.scope ? JSON.stringify(options.scope) : null;
   return TacuaCaptureSpikeModule.admitFinalizedCapture({
     localSessionId: options.localSessionId,
-    buildIdentityJson: options.buildIdentity
-      ? JSON.stringify(options.buildIdentity)
-      : undefined,
-    scopeJson: options.scope ? JSON.stringify(options.scope) : undefined,
+    ...(buildIdentityJson === null ? {} : { buildIdentityJson }),
+    ...(scopeJson === null ? {} : { scopeJson }),
   });
 }
 
