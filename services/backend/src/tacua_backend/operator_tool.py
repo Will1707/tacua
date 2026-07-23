@@ -58,6 +58,12 @@ BACKUP_ADMIN_SECRET = "admin-secret"
 BACKUP_STATE = "state"
 MAX_BACKUP_MANIFEST_BYTES = 16_777_216
 MAX_SMOKE_RESPONSE_BYTES = 2_097_152
+# The Compose verifier copies the stopped SQLite database and WAL into an
+# ephemeral container tmpfs before opening either file. Keep the accepted V1
+# state comfortably below that tmpfs ceiling so SQLite has bounded scratch
+# headroom for recovery and integrity inspection.
+MAX_COMPOSE_STATE_DATABASE_COPY_BYTES = 536_870_912
+COMPOSE_STATE_VERIFICATION_SCRATCH = Path("/tmp")
 _DIGEST = re.compile(r"^sha256:[a-f0-9]{64}$")
 _SEMANTIC_VERSION = re.compile(
     r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?$"
@@ -73,7 +79,7 @@ _INGRESS_IMAGE = (
     "sha256:66e25cc9a8332635f4e897f7f4b1e5622c25f09f0ee23cddc6ce9bdb3a24772a"
 )
 _INGRESS_CONFIG_DIGEST = (
-    "sha256:e2d2c264d05e4a1167d5593122793e5fce51c6e599312a4d98cfa512617a721b"
+    "sha256:11c31e6d3e163a22c0d688b8a0c7570d1a715e9c7e0b7785fed02968e08a0643"
 )
 _INGRESS_CONFIG_TARGET = "/usr/local/etc/haproxy/haproxy.cfg"
 _COMPOSE_HEALTHCHECK = [
@@ -93,7 +99,20 @@ _INGRESS_HEALTHCHECK = [
     "-ec",
     (
         "wget -qO- -T 2 http://127.0.0.1:8080/healthz "
-        "| grep -q '\"status\":\"ok\"'"
+        "| grep -q '\"status\":\"ok\"' "
+        "&& wget -qO- -T 2 http://127.0.0.1:8080/ "
+        "| grep -Fq '<div id=\"root\"></div>'"
+    ),
+]
+_REVIEWER_HEALTHCHECK = [
+    "CMD",
+    "python",
+    "-c",
+    (
+        "import urllib.request; "
+        "r=urllib.request.urlopen('http://127.0.0.1:8081/', timeout=2); "
+        "assert r.status==200 and r.headers['Cache-Control']=='no-store' and "
+        "r.headers['X-Content-Type-Options']=='nosniff'"
     ),
 ]
 
@@ -551,6 +570,7 @@ def _copy_file(
     mode: int,
     *,
     require_service_owner: bool = True,
+    maximum_bytes: int | None = None,
 ) -> tuple[int, str]:
     source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     destination_flags = (
@@ -578,6 +598,17 @@ def _copy_file(
         ):
             raise OperatorError(
                 "backup state files must be private, service-owned, non-linked regular files"
+            )
+        if (
+            maximum_bytes is not None
+            and (
+                isinstance(maximum_bytes, bool)
+                or maximum_bytes < 0
+                or before.st_size > maximum_bytes
+            )
+        ):
+            raise OperatorError(
+                "state database copy exceeds the V1 verification byte bound"
             )
         destination_descriptor = os.open(
             destination,
@@ -620,16 +651,31 @@ def _validate_state_database_copy(
     *,
     require_service_owner: bool,
     expected_deployment_pin_digest: str | None = None,
+    maximum_copy_bytes: int | None = None,
+    scratch_directory: Path | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Quick-check a disposable database/WAL copy, never the source state."""
 
-    with tempfile.TemporaryDirectory(prefix="tacua-database-check-") as temporary:
+    with tempfile.TemporaryDirectory(
+        prefix="tacua-database-check-",
+        dir=scratch_directory,
+    ) as temporary:
         destination = Path(temporary)
-        _copy_file(
+        database_copy_options: dict[str, Any] = {
+            "require_service_owner": require_service_owner,
+        }
+        if maximum_copy_bytes is not None:
+            database_copy_options["maximum_bytes"] = maximum_copy_bytes
+        database_size, _database_digest = _copy_file(
             state_directory / "tacua.sqlite3",
             destination / "tacua.sqlite3",
             0o600,
-            require_service_owner=require_service_owner,
+            **database_copy_options,
+        )
+        remaining = (
+            None
+            if maximum_copy_bytes is None
+            else maximum_copy_bytes - database_size
         )
         wal = state_directory / "tacua.sqlite3-wal"
         try:
@@ -637,11 +683,16 @@ def _validate_state_database_copy(
         except FileNotFoundError:
             pass
         else:
+            wal_copy_options: dict[str, Any] = {
+                "require_service_owner": require_service_owner,
+            }
+            if remaining is not None:
+                wal_copy_options["maximum_bytes"] = remaining
             _copy_file(
                 wal,
                 destination / "tacua.sqlite3-wal",
                 0o600,
-                require_service_owner=require_service_owner,
+                **wal_copy_options,
             )
         pin_digest = _validate_state_database(
             destination,
@@ -1285,6 +1336,8 @@ def validate_compose_document(
     config: PilotConfig,
     *,
     require_immutable_image: bool,
+    expected_repository_root: Path | None = None,
+    expected_published_port: int | None = None,
 ) -> dict[str, Any]:
     """Validate the resolved Compose model, not hand-written YAML text."""
 
@@ -1293,14 +1346,19 @@ def validate_compose_document(
         or set(document)
         != {"configs", "name", "networks", "secrets", "services", "volumes"}
         or not isinstance(document.get("services"), dict)
-        or set(document["services"]) != {"backend", "ingress"}
+        or set(document["services"]) != {"backend", "ingress", "reviewer"}
     ):
         raise OperatorError(
-            "resolved Compose must contain only the backend and ingress services"
+            "resolved Compose must contain only backend, reviewer, and ingress"
         )
     backend = document["services"].get("backend")
     ingress = document["services"].get("ingress")
-    if not isinstance(backend, dict) or not isinstance(ingress, dict):
+    reviewer = document["services"].get("reviewer")
+    if (
+        not isinstance(backend, dict)
+        or not isinstance(ingress, dict)
+        or not isinstance(reviewer, dict)
+    ):
         raise OperatorError("resolved Compose services are invalid")
     project_name = document.get("name")
     if (
@@ -1330,6 +1388,25 @@ def validate_compose_document(
     }
     if backend.get("build") is not None:
         backend_keys.add("build")
+    reviewer_keys = {
+        "cap_drop",
+        "command",
+        "deploy",
+        "entrypoint",
+        "healthcheck",
+        "image",
+        "init",
+        "logging",
+        "networks",
+        "pids_limit",
+        "read_only",
+        "restart",
+        "security_opt",
+        "stop_grace_period",
+        "user",
+    }
+    if reviewer.get("build") is not None:
+        reviewer_keys.add("build")
     ingress_keys = {
         "cap_drop",
         "command",
@@ -1350,14 +1427,29 @@ def validate_compose_document(
         "stop_grace_period",
         "user",
     }
-    if set(backend) != backend_keys or set(ingress) != ingress_keys:
+    if (
+        set(backend) != backend_keys
+        or set(ingress) != ingress_keys
+        or set(reviewer) != reviewer_keys
+    ):
         raise OperatorError("resolved Compose services contain unexpected authority")
     backend_build = backend.get("build")
+    repository_root = (
+        _REPOSITORY_ROOT
+        if expected_repository_root is None
+        else expected_repository_root
+    )
     if backend_build is not None and backend_build != {
-        "context": str(_REPOSITORY_ROOT),
+        "context": str(repository_root),
         "dockerfile": "services/backend/Dockerfile",
     }:
         raise OperatorError("backend build authority differs from the repository root")
+    reviewer_build = reviewer.get("build")
+    if reviewer_build is not None and reviewer_build != {
+        "context": str(repository_root),
+        "dockerfile": "services/reviewer-web/Dockerfile",
+    }:
+        raise OperatorError("reviewer build authority differs from the repository root")
 
     _validate_compose_service_common(
         backend,
@@ -1373,10 +1465,22 @@ def validate_compose_document(
         pids_limit=64,
         healthcheck_test=_INGRESS_HEALTHCHECK,
     )
+    _validate_compose_service_common(
+        reviewer,
+        label="reviewer",
+        user="10002:10002",
+        pids_limit=64,
+        healthcheck_test=_REVIEWER_HEALTHCHECK,
+    )
     if backend.get("ports") or backend.get("depends_on") or backend.get("configs"):
         raise OperatorError("backend must not publish or join the ingress authority")
     if ingress.get("volumes") or ingress.get("secrets") or ingress.get("build"):
         raise OperatorError("ingress must not receive state, config, or secret authority")
+    if any(
+        reviewer.get(field)
+        for field in ("configs", "depends_on", "ports", "secrets", "volumes")
+    ):
+        raise OperatorError("reviewer must not receive deployment authority")
 
     networks = document.get("networks")
     if not isinstance(networks, dict) or set(networks) != {
@@ -1408,6 +1512,8 @@ def validate_compose_document(
         raise OperatorError("Compose networks violate the closed bridge topology")
     if backend.get("networks") != {"tacua-default-deny": None}:
         raise OperatorError("backend must join only the egress-denied network")
+    if reviewer.get("networks") != {"tacua-default-deny": None}:
+        raise OperatorError("reviewer must join only the egress-denied network")
     if ingress.get("networks") != {
         "tacua-default-deny": None,
         "tacua-loopback-publish": None,
@@ -1419,21 +1525,37 @@ def validate_compose_document(
             "condition": "service_healthy",
             "required": True,
             "restart": True,
-        }
+        },
+        "reviewer": {
+            "condition": "service_healthy",
+            "required": True,
+            "restart": True,
+        },
     }:
-        raise OperatorError("ingress must wait for the one healthy backend")
+        raise OperatorError("ingress must wait for the healthy backend and reviewer")
     ports = ingress.get("ports")
     if not isinstance(ports, list) or len(ports) != 1:
         raise OperatorError("ingress must publish one loopback port")
     port = ports[0]
     published = port.get("published") if isinstance(port, dict) else None
+    selected_published_port = (
+        config.listen_port
+        if expected_published_port is None
+        else expected_published_port
+    )
     if (
-        not isinstance(port, dict)
+        type(selected_published_port) is not int
+        or not 1 <= selected_published_port <= 65_535
+        or (
+            require_immutable_image
+            and selected_published_port != config.listen_port
+        )
+        or not isinstance(port, dict)
         or port.get("host_ip") != "127.0.0.1"
         or port.get("protocol") != "tcp"
         or port.get("mode") != "ingress"
         or port.get("target") != config.listen_port
-        or published != str(config.listen_port)
+        or published != str(selected_published_port)
     ):
         raise OperatorError("ingress listener must be published only on host loopback")
 
@@ -1551,14 +1673,18 @@ def validate_compose_document(
         raise OperatorError("backend Compose secret definition is not one file")
 
     backend_image = backend.get("image")
+    reviewer_image = reviewer.get("image")
     if (
         not isinstance(backend_image, str)
+        or not isinstance(reviewer_image, str)
         or ingress.get("image") != _INGRESS_IMAGE
         or (
             require_immutable_image
             and (
                 _IMMUTABLE_IMAGE.fullmatch(backend_image) is None
                 or backend.get("build") is not None
+                or _IMMUTABLE_IMAGE.fullmatch(reviewer_image) is None
+                or reviewer.get("build") is not None
             )
         )
     ):
@@ -1571,8 +1697,12 @@ def validate_compose_document(
         "published_host": port["host_ip"],
         "published_port": published,
         "image": backend_image,
+        "reviewer_image": reviewer_image,
         "ingress_image": _INGRESS_IMAGE,
-        "immutable_image": _IMMUTABLE_IMAGE.fullmatch(backend_image) is not None,
+        "immutable_image": (
+            _IMMUTABLE_IMAGE.fullmatch(backend_image) is not None
+            and _IMMUTABLE_IMAGE.fullmatch(reviewer_image) is not None
+        ),
     }
 
 
@@ -1583,6 +1713,8 @@ def deployment_preflight(
     *,
     require_immutable_image: bool,
     check_state: bool,
+    expected_repository_root: Path | None = None,
+    expected_published_port: int | None = None,
 ) -> dict[str, Any]:
     _inspect_host_file(config_file, "public config", secret=False)
     _inspect_host_file(admin_secret_file, "admin secret", secret=True)
@@ -1607,6 +1739,8 @@ def deployment_preflight(
         compose_document,
         config,
         require_immutable_image=require_immutable_image,
+        expected_repository_root=expected_repository_root,
+        expected_published_port=expected_published_port,
     )
     ingress_definition = compose_document["configs"]["tacua_loopback_ingress"]
     ingress_config_file = Path(ingress_definition["file"])
@@ -1703,6 +1837,8 @@ def verify_compose_state(
             state_directory,
             require_service_owner=True,
             expected_deployment_pin_digest=_digest_json(config.deployment_pin),
+            maximum_copy_bytes=MAX_COMPOSE_STATE_DATABASE_COPY_BYTES,
+            scratch_directory=COMPOSE_STATE_VERIFICATION_SCRATCH,
         )
     return {
         "status": "ok",
@@ -1715,6 +1851,59 @@ def verify_compose_state(
         ),
         "deployment_pin_digest": state_pin,
         "state_directory": str(state_directory),
+    }
+
+
+def check_compose_state_copy_bound(
+    state_directory: Path,
+) -> dict[str, Any]:
+    """Reject a running Compose state that already exceeds verifier scratch."""
+
+    total = 0
+    for name, required in (
+        ("tacua.sqlite3", True),
+        ("tacua.sqlite3-wal", False),
+    ):
+        path = state_directory / name
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
+            os,
+            "O_NOFOLLOW",
+            0,
+        )
+        try:
+            descriptor = os.open(path, flags)
+        except FileNotFoundError:
+            if required:
+                raise OperatorError(
+                    "state database is unavailable for copy-bound preflight"
+                )
+            continue
+        except OSError as exc:
+            raise OperatorError(
+                "state database cannot be inspected for copy-bound preflight"
+            ) from exc
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) & 0o077
+                or metadata.st_size < 0
+            ):
+                raise OperatorError(
+                    "state database identity is invalid for copy-bound preflight"
+                )
+            total += metadata.st_size
+        finally:
+            os.close(descriptor)
+    if total > MAX_COMPOSE_STATE_DATABASE_COPY_BYTES:
+        raise OperatorError(
+            "state database exceeds the V1 verification byte bound"
+        )
+    return {
+        "status": "ok",
+        "maximum_bytes": MAX_COMPOSE_STATE_DATABASE_COPY_BYTES,
     }
 
 
@@ -1936,6 +2125,7 @@ def _parser() -> argparse.ArgumentParser:
     compose.add_argument("--config-file", required=True, type=Path)
     compose.add_argument("--compose-json", required=True, type=Path)
     compose.add_argument("--allow-mutable-image", action="store_true")
+    compose.add_argument("--expected-published-port", type=int)
 
     backup = subparsers.add_parser("backup")
     backup.add_argument("--config-file", required=True, type=Path)
@@ -1957,6 +2147,9 @@ def _parser() -> argparse.ArgumentParser:
     verify_state = subparsers.add_parser("verify-compose-state")
     verify_state.add_argument("--config-file", required=True, type=Path)
     verify_state.add_argument("--state-directory", required=True, type=Path)
+
+    copy_bound = subparsers.add_parser("check-compose-state-copy-bound")
+    copy_bound.add_argument("--state-directory", required=True, type=Path)
 
     smoke = subparsers.add_parser("smoke")
     smoke.add_argument("--config-file", required=True, type=Path)
@@ -1986,6 +2179,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _load_compose_json(args.compose_json),
                 config,
                 require_immutable_image=not args.allow_mutable_image,
+                expected_published_port=args.expected_published_port,
             )
         elif args.command == "backup":
             result = create_backup(
@@ -2009,6 +2203,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "verify-compose-state":
             result = verify_compose_state(
                 args.config_file,
+                args.state_directory,
+            )
+        elif args.command == "check-compose-state-copy-bound":
+            result = check_compose_state_copy_bound(
                 args.state_directory,
             )
         elif args.command == "smoke":

@@ -92,7 +92,18 @@ def compose_document(**backend_overrides):
         "image": "tacua-backend:local",
     }
     backend.update(backend_overrides)
-    return {"services": {"backend": backend}}
+    return {
+        "services": {
+            "backend": backend,
+            "reviewer": {
+                "build": {
+                    "context": str(ROOT),
+                    "dockerfile": "services/reviewer-web/Dockerfile",
+                },
+                "image": "tacua-reviewer-web:local",
+            },
+        }
+    }
 
 
 class TailnetPrivatePilotTests(unittest.TestCase):
@@ -114,6 +125,7 @@ class TailnetPrivatePilotTests(unittest.TestCase):
                 "publisher_service": "ingress",
                 "published_host": "127.0.0.1",
                 "published_port": "8080",
+                "reviewer_image": "tacua-reviewer-web:local",
             },
         ) as validator:
             result = PILOT.validate_tailnet_private_pilot(
@@ -190,24 +202,28 @@ class TailnetPrivatePilotTests(unittest.TestCase):
                 "publisher_service": "ingress",
                 "published_host": "0.0.0.0",
                 "published_port": "8080",
+                "reviewer_image": "tacua-reviewer-web:local",
             },
             {
                 "topology": "loopback-ingress",
                 "publisher_service": "ingress",
                 "published_host": "127.0.0.1",
                 "published_port": "8081",
+                "reviewer_image": "tacua-reviewer-web:local",
             },
             {
                 "topology": "loopback-ingress",
                 "publisher_service": "backend",
                 "published_host": "127.0.0.1",
                 "published_port": "8080",
+                "reviewer_image": "tacua-reviewer-web:local",
             },
             {
                 "topology": "direct",
                 "publisher_service": "ingress",
                 "published_host": "127.0.0.1",
                 "published_port": "8080",
+                "reviewer_image": "tacua-reviewer-web:local",
             },
         ]:
             with self.subTest(compose=compose_result):
@@ -233,6 +249,7 @@ class TailnetPrivatePilotTests(unittest.TestCase):
                 "publisher_service": "ingress",
                 "published_host": "127.0.0.1",
                 "published_port": "8080",
+                "reviewer_image": "tacua-reviewer-web:local",
             },
         ):
             self.assertEqual(

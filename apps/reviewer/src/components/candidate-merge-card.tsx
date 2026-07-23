@@ -2,7 +2,7 @@
 
 import * as Crypto from "expo-crypto";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Alert, Pressable, Text, View } from "react-native";
+import { Pressable, Text, View } from "react-native";
 
 import { createCandidateReplacementRequest, seedMergeDraft } from "@/api/candidate-replacement";
 import { CandidateSupersededApiError, TacuaApiError } from "@/api/client";
@@ -11,6 +11,7 @@ import type { CandidateReplacementDraft, TicketCandidate, TicketCandidateSummary
 import { ActionButton } from "@/components/action-button";
 import { CandidateReplacementDraftFields } from "@/components/candidate-replacement-draft-fields";
 import { SectionCard } from "@/components/section-card";
+import { useAppDialog } from "@/providers/app-dialog";
 import { colors } from "@/theme/colors";
 
 type Props = {
@@ -31,6 +32,7 @@ function candidateId(): string {
 }
 
 export function CandidateMergeCard({ candidates, client, disabled, reviewerId, onCompleted }: Props) {
+  const showDialog = useAppDialog();
   const eligible = useMemo(
     () => candidates.filter((candidate) => ["draft", "needs_clarification", "ready_for_review"].includes(candidate.state)),
     [candidates],
@@ -133,7 +135,7 @@ export function CandidateMergeCard({ candidates, client, disabled, reviewerId, o
       if (!isCurrent()) return;
       setPrepared(null);
       setSelected([]);
-      Alert.alert(
+      showDialog(
         "Combined draft created",
         `${response.operation.sources.length} source tickets remain in history and the new draft is now in the active queue. It is not approved.`,
       );
@@ -173,7 +175,7 @@ export function CandidateMergeCard({ candidates, client, disabled, reviewerId, o
       return;
     }
     const sourceList = prepared.sources.map((source) => `• ${source.content.title}`).join("\n");
-    Alert.alert(
+    showDialog(
       `Replace ${prepared.sources.length} active tickets with 1 draft?`,
       `These sources will leave the active queue:\n${sourceList}\n\nThey remain visible in history and link to the combined result. The result will be an unapproved draft.`,
       [

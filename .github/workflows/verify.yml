@@ -35,10 +35,13 @@ jobs:
           node --test .github/scripts/check-markdown-links.test.mjs
           node --test .github/scripts/package-mobile-sdk.test.mjs
           node --test .github/scripts/validate-backend-image-inputs.test.mjs
+          node --test .github/scripts/validate-processor-image-inputs.test.mjs
           node --test .github/scripts/validate-mobile-sdk-release-run.test.mjs
           node --test .github/scripts/verify-backend-container.test.mjs
+          node --test .github/scripts/verify-processor-container.test.mjs
           node .github/scripts/check-markdown-links.mjs
           node .github/scripts/validate-backend-image-inputs.mjs
+          node .github/scripts/validate-processor-image-inputs.mjs
 
       - name: Validate approved-handoff candidate
         working-directory: contracts/approved-handoff
@@ -81,6 +84,12 @@ jobs:
       - name: Validate the pilot backend boundary
         run: PYTHONWARNINGS=error python3 -B -m unittest discover -s services/backend/tests -v
 
+      - name: Validate and smoke-test the offline processor image
+        run: |
+          PYTHONWARNINGS=error python3 -B -m unittest discover \
+            -s services/processor/tests -v
+          bash .github/scripts/verify-processor-container.sh
+
       - name: Resolve and verify the isolated private-pilot processor profile
         env:
           TACUA_PROCESSOR_IMAGE: registry.invalid/tacua-processor@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -116,9 +125,19 @@ jobs:
         working-directory: apps/reviewer
         run: |
           npm ci --ignore-scripts --no-audit --no-fund
+          node ../../.github/scripts/generate-reviewer-third-party-notices.mjs
           npm test
           npm run typecheck
           ./node_modules/.bin/expo export --platform ios --output-dir /tmp/tacua-reviewer-export
+          ./node_modules/.bin/expo export --platform web --output-dir dist --clear
+
+      - name: Validate and smoke-test the self-hosted reviewer image
+        run: |
+          node --test .github/scripts/validate-reviewer-web-image-inputs.test.mjs
+          node .github/scripts/validate-reviewer-web-image-inputs.mjs
+          node .github/scripts/smoke-reviewer-web-browser.mjs
+          PYTHONWARNINGS=error python3 -B -m unittest discover -s services/reviewer-web/tests -v
+          bash .github/scripts/verify-reviewer-web-container.sh
 
       - name: Build and smoke-test the self-hosted backend image
         run: bash .github/scripts/verify-backend-container.sh

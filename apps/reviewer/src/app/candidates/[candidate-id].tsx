@@ -2,10 +2,8 @@
 
 import { Link, useLocalSearchParams } from "expo-router";
 import * as Crypto from "expo-crypto";
-import type { File } from "expo-file-system";
-import * as Sharing from "expo-sharing";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ActivityIndicator, Alert, Pressable, RefreshControl, ScrollView, Text, TextInput, View } from "react-native";
+import { ActivityIndicator, Pressable, RefreshControl, ScrollView, Text, TextInput, View } from "react-native";
 
 import { CandidateSupersededApiError, TacuaApiError } from "@/api/client";
 import type {
@@ -16,7 +14,10 @@ import type {
   ClarificationChoice,
   TicketCandidate,
 } from "@/api/types";
-import { cleanupApprovedHandoffShareCache, createApprovedHandoffShareFile } from "@/approved-handoff/share-cache";
+import {
+  exportApprovedHandoff,
+  prepareApprovedHandoffExport,
+} from "@/approved-handoff/handoff-export";
 import type { KeyframePreviewState, KeyframePreviewStates } from "@/candidates/keyframe-gallery-state";
 import { ActionButton } from "@/components/action-button";
 import { CandidateEvidencePanel } from "@/components/candidate-evidence-panel";
@@ -27,6 +28,7 @@ import { SectionCard } from "@/components/section-card";
 import { StatusPill } from "@/components/status-pill";
 import { useBackend } from "@/hooks/use-backend";
 import { useCandidateKeyframePreviews } from "@/hooks/use-candidate-keyframe-previews";
+import { useAppDialog } from "@/providers/app-dialog";
 import { colors } from "@/theme/colors";
 
 const handoffShareTypes = {
@@ -45,6 +47,7 @@ const handoffShareTypes = {
 export default function CandidateRoute() {
   const { "candidate-id": candidateId } = useLocalSearchParams<{ "candidate-id": string }>();
   const { client, config } = useBackend();
+  const showDialog = useAppDialog();
   const [candidate, setCandidate] = useState<TicketCandidate | null>(null);
   const [supersession, setSupersession] = useState<CandidateReplacementOperationProjection | null>(null);
   const [supersessionChecked, setSupersessionChecked] = useState(false);
@@ -164,7 +167,7 @@ export default function CandidateRoute() {
   useEffect(() => {
     mountedRef.current = true;
     try {
-      cleanupApprovedHandoffShareCache();
+      prepareApprovedHandoffExport();
     } catch {
       // A later share will retry cleanup and fail closed if the bound cannot be enforced.
     }
@@ -216,14 +219,14 @@ export default function CandidateRoute() {
       const refresh = await load();
       if (!shouldReport()) return;
       if (refresh.ok) {
-        Alert.alert(
+        showDialog(
           caught instanceof CandidateSupersededApiError ? "Ticket was replaced" : "Ticket refreshed",
           caught instanceof CandidateSupersededApiError
             ? "CANDIDATE_SUPERSEDED: this source left the active queue. Tacua loaded its immutable history and replacement links."
             : "This ticket changed while you were reviewing it. Tacua loaded the current version; please check it before trying again.",
         );
       } else {
-        Alert.alert("Refresh failed", `${refresh.message}\n\nActions remain locked until Tacua successfully refreshes this ticket.`);
+        showDialog("Refresh failed", `${refresh.message}\n\nActions remain locked until Tacua successfully refreshes this ticket.`);
       }
       return;
     }
@@ -231,7 +234,7 @@ export default function CandidateRoute() {
     const message = caught instanceof Error ? caught.message : "The backend rejected the transition.";
     setCandidateStale(true);
     setError("Tacua could not confirm the current ticket version. Refresh it before taking another action.");
-    Alert.alert(title, `${message}\n\nActions are locked until this ticket is refreshed.`);
+    showDialog(title, `${message}\n\nActions are locked until this ticket is refreshed.`);
   }
 
   async function transition(nextAction: "mark_ready" | "approve" | "reject", reason: string) {
@@ -402,7 +405,7 @@ export default function CandidateRoute() {
       setSupersessionChecked(true);
       setCandidateStale(false);
       setError(null);
-      Alert.alert(
+      showDialog(
         "Split drafts created",
         `${response.candidates.length} unapproved drafts are now active. This source remains available below as non-actionable history.`,
       );
@@ -480,7 +483,7 @@ export default function CandidateRoute() {
   }
 
   function confirmImmediateChoice(clarification: Clarification, choice: ClarificationChoice) {
-    Alert.alert(
+    showDialog(
       `Choose “${choice.label}”?`,
       `${choice.description}\n\nConsequence: ${choice.consequence}`,
       [
@@ -522,9 +525,6 @@ export default function CandidateRoute() {
     setHandoffAction(format);
     setHandoffError(null);
     try {
-      if (!await Sharing.isAvailableAsync()) {
-        throw new Error("File sharing is unavailable on this device.");
-      }
       const artifact = await client.getCandidateHandoff(candidateSnapshot, format, controller.signal);
       if (!isCurrentRequest()) return;
       setHandoffVerification({
@@ -533,23 +533,20 @@ export default function CandidateRoute() {
         bodyDigest: artifact.bodyDigest,
       });
       const shareType = handoffShareTypes[format];
-      const sharedFile: File = createApprovedHandoffShareFile({
+      await exportApprovedHandoff({
+        title: candidateSnapshot.content.title,
         candidateId: candidateSnapshot.candidate_id,
         candidateVersion: candidateSnapshot.candidate_version,
         extension: shareType.extension,
         bytes: artifact.bytes,
-      });
-      if (!isCurrentRequest()) return;
-      await Sharing.shareAsync(sharedFile.uri, {
-        dialogTitle: `${candidateSnapshot.content.title} · Tacua handoff`,
         mimeType: shareType.mimeType,
-        UTI: shareType.UTI,
+        uti: shareType.UTI,
       });
     } catch (caught) {
       if (!isCurrentRequest()) return;
-      const message = caught instanceof Error ? caught.message : "Tacua could not share the approved handoff.";
+      const message = caught instanceof Error ? caught.message : "Tacua could not export the approved handoff.";
       setHandoffError(message);
-      Alert.alert("Handoff unavailable", message);
+      showDialog("Handoff unavailable", message);
     } finally {
       if (handoffRequestRef.current?.requestId === requestId) {
         handoffRequestRef.current = null;
@@ -907,13 +904,13 @@ export default function CandidateRoute() {
           ) : null}
           {handoffError ? <Text selectable style={{ color: colors.red, fontSize: 13 }}>{handoffError}</Text> : null}
           <ActionButton
-            label="Share Markdown handoff"
+            label="Export Markdown handoff"
             loading={handoffAction === "markdown"}
             disabled={handoffAction !== null || candidateStale || loading}
             onPress={() => void shareHandoff("markdown")}
           />
           <ActionButton
-            label="Share JSON handoff"
+            label="Export JSON handoff"
             loading={handoffAction === "json"}
             disabled={handoffAction !== null || candidateStale || loading}
             onPress={() => void shareHandoff("json")}
@@ -924,8 +921,8 @@ export default function CandidateRoute() {
       {supersession === null ? (
         <View style={{ gap: 10, paddingTop: 4 }}>
           {candidate.state === "draft" || candidate.state === "needs_clarification" ? <ActionButton label="Mark ready for review" disabled={actionsDisabled || unresolved.some((item) => item.impact === "blocking")} loading={action === "mark_ready"} onPress={() => void transition("mark_ready", "Reviewer completed candidate preparation.")} /> : null}
-          {candidate.state === "ready_for_review" ? <ActionButton label="Approve exact version" disabled={actionsDisabled || !evidenceInspectionReady || evidenceLoading || evidenceError !== null} loading={action === "approve"} onPress={() => Alert.alert("Approve this ticket?", "Approval binds this exact candidate and evidence and atomically creates its immutable handoff. The handoff is not authenticated execution trust by itself.", [{ text: "Cancel", style: "cancel" }, { text: "Approve", onPress: () => void transition("approve", "Reviewer approved the exact candidate version.") }])} /> : null}
-          {candidate.state === "needs_clarification" || candidate.state === "ready_for_review" ? <ActionButton destructive label="Reject candidate" disabled={actionsDisabled} loading={action === "reject"} onPress={() => Alert.alert("Reject this candidate?", undefined, [{ text: "Cancel", style: "cancel" }, { text: "Reject", style: "destructive", onPress: () => void transition("reject", "Reviewer rejected the candidate.") }])} /> : null}
+          {candidate.state === "ready_for_review" ? <ActionButton label="Approve exact version" disabled={actionsDisabled || !evidenceInspectionReady || evidenceLoading || evidenceError !== null} loading={action === "approve"} onPress={() => showDialog("Approve this ticket?", "Approval binds this exact candidate and evidence and atomically creates its immutable handoff. The handoff is not authenticated execution trust by itself.", [{ text: "Cancel", style: "cancel" }, { text: "Approve", onPress: () => void transition("approve", "Reviewer approved the exact candidate version.") }])} /> : null}
+          {candidate.state === "needs_clarification" || candidate.state === "ready_for_review" ? <ActionButton destructive label="Reject candidate" disabled={actionsDisabled} loading={action === "reject"} onPress={() => showDialog("Reject this candidate?", undefined, [{ text: "Cancel", style: "cancel" }, { text: "Reject", style: "destructive", onPress: () => void transition("reject", "Reviewer rejected the candidate.") }])} /> : null}
         </View>
       ) : null}
     </ScrollView>

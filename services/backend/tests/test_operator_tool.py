@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from datetime import datetime, timedelta, timezone
 import json
 import os
@@ -28,6 +29,7 @@ from tacua_backend.instance_lock import (  # noqa: E402
 )
 from tacua_backend.operator_tool import (  # noqa: E402
     OperatorError,
+    check_compose_state_copy_bound,
     create_admin_secret,
     create_backup,
     deployment_preflight,
@@ -221,6 +223,41 @@ class OperatorToolTests(unittest.TestCase):
                 "context": str(REPOSITORY),
                 "dockerfile": "services/backend/Dockerfile",
             }
+        reviewer = {
+            "cap_drop": ["ALL"],
+            "command": None,
+            "deploy": {"replicas": 1},
+            "entrypoint": None,
+            "healthcheck": {
+                "interval": "30s",
+                "retries": 3,
+                "start_period": "5s",
+                "test": list(operator_tool._REVIEWER_HEALTHCHECK),
+                "timeout": "3s",
+            },
+            "image": (
+                "registry.example/tacua-reviewer@sha256:" + "b" * 64
+                if immutable
+                else "tacua-reviewer-web:local"
+            ),
+            "init": True,
+            "logging": {
+                "driver": "json-file",
+                "options": {"max-file": "3", "max-size": "10m"},
+            },
+            "networks": {"tacua-default-deny": None},
+            "pids_limit": 64,
+            "read_only": True,
+            "restart": "unless-stopped",
+            "security_opt": ["no-new-privileges:true"],
+            "stop_grace_period": "30s",
+            "user": "10002:10002",
+        }
+        if not immutable:
+            reviewer["build"] = {
+                "context": str(REPOSITORY),
+                "dockerfile": "services/reviewer-web/Dockerfile",
+            }
         ingress = {
             "cap_drop": ["ALL"],
             "command": None,
@@ -235,7 +272,12 @@ class OperatorToolTests(unittest.TestCase):
                     "condition": "service_healthy",
                     "required": True,
                     "restart": True,
-                }
+                },
+                "reviewer": {
+                    "condition": "service_healthy",
+                    "required": True,
+                    "restart": True,
+                },
             },
             "deploy": {"replicas": 1},
             "entrypoint": None,
@@ -280,7 +322,11 @@ class OperatorToolTests(unittest.TestCase):
                 }
             },
             "name": "test",
-            "services": {"backend": backend, "ingress": ingress},
+            "services": {
+                "backend": backend,
+                "ingress": ingress,
+                "reviewer": reviewer,
+            },
             "networks": {
                 "tacua-default-deny": {
                     "internal": True,
@@ -362,6 +408,53 @@ class OperatorToolTests(unittest.TestCase):
                     require_immutable_image=False,
                 )["immutable_image"]
             )
+
+            alternate_port = self.compose_document(
+                immutable=False,
+                state_target=str(state),
+                config_source=str(config_file),
+                secret_source=str(secret_file),
+            )
+            alternate_port["services"]["ingress"]["ports"][0][
+                "published"
+            ] = "18080"
+            with self.assertRaises(OperatorError):
+                validate_compose_document(
+                    alternate_port,
+                    config,
+                    require_immutable_image=False,
+                )
+            alternate_result = validate_compose_document(
+                alternate_port,
+                config,
+                require_immutable_image=False,
+                expected_published_port=18080,
+            )
+            self.assertEqual("18080", alternate_result["published_port"])
+            immutable_alternate_port = self.compose_document(
+                immutable=True,
+                state_target=str(state),
+                config_source=str(config_file),
+                secret_source=str(secret_file),
+            )
+            immutable_alternate_port["services"]["ingress"]["ports"][0][
+                "published"
+            ] = "18080"
+            with self.assertRaises(OperatorError):
+                validate_compose_document(
+                    immutable_alternate_port,
+                    config,
+                    require_immutable_image=True,
+                    expected_published_port=18080,
+                )
+            for invalid_port in (True, 0, 65_536):
+                with self.assertRaises(OperatorError):
+                    validate_compose_document(
+                        local,
+                        config,
+                        require_immutable_image=False,
+                        expected_published_port=invalid_port,
+                    )
 
             mutations = [
                 lambda service: service["deploy"].update(replicas=2),
@@ -463,6 +556,36 @@ class OperatorToolTests(unittest.TestCase):
                         require_immutable_image=True,
                     )
 
+            reviewer_mutations = [
+                lambda service: service.update(user="0:0"),
+                lambda service: service["cap_drop"].clear(),
+                lambda service: service.update(networks={
+                    "tacua-loopback-publish": None,
+                }),
+                lambda service: service.update(
+                    image="registry.example/reviewer:latest"
+                ),
+                lambda service: service.update(
+                    volumes=["/run/secrets/tacua_admin"]
+                ),
+                lambda service: service.update(ports=["0.0.0.0:8081:8081"]),
+                lambda service: service["healthcheck"].update(disable=True),
+            ]
+            for mutate in reviewer_mutations:
+                document = self.compose_document(
+                    immutable=True,
+                    state_target=str(state),
+                    config_source=str(config_file),
+                    secret_source=str(secret_file),
+                )
+                mutate(document["services"]["reviewer"])
+                with self.assertRaises(OperatorError):
+                    validate_compose_document(
+                        document,
+                        config,
+                        require_immutable_image=True,
+                    )
+
             document = self.compose_document(
                 immutable=True,
                 state_target=str(state),
@@ -505,7 +628,7 @@ class OperatorToolTests(unittest.TestCase):
             }
             with self.assertRaisesRegex(
                 OperatorError,
-                "only the backend and ingress services",
+                "only backend, reviewer, and ingress",
             ):
                 validate_compose_document(
                     document,
@@ -545,6 +668,69 @@ class OperatorToolTests(unittest.TestCase):
                         config,
                         require_immutable_image=True,
                     )
+
+    def test_compose_preflight_accepts_an_explicit_repository_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_file, secret_file, state = self.deployment(root)
+            config, _secret = load_config(config_file, secret_file)
+            verified_source = root / "verified-source"
+            document = self.compose_document(
+                immutable=False,
+                state_target=str(state),
+                config_source=str(config_file),
+                secret_source=str(secret_file),
+            )
+            document["services"]["backend"]["build"]["context"] = str(
+                verified_source
+            )
+            document["services"]["reviewer"]["build"]["context"] = str(
+                verified_source
+            )
+
+            with self.assertRaisesRegex(
+                OperatorError,
+                "build authority differs",
+            ):
+                validate_compose_document(
+                    document,
+                    config,
+                    require_immutable_image=False,
+                )
+
+            validated = validate_compose_document(
+                document,
+                config,
+                require_immutable_image=False,
+                expected_repository_root=verified_source,
+            )
+            self.assertFalse(validated["immutable_image"])
+
+            split_context = copy.deepcopy(document)
+            split_context["services"]["reviewer"]["build"]["context"] = str(
+                REPOSITORY
+            )
+            with self.assertRaisesRegex(
+                OperatorError,
+                "reviewer build authority differs",
+            ):
+                validate_compose_document(
+                    split_context,
+                    config,
+                    require_immutable_image=False,
+                    expected_repository_root=verified_source,
+                )
+
+            preflight = deployment_preflight(
+                config_file,
+                secret_file,
+                document,
+                require_immutable_image=False,
+                check_state=False,
+                expected_repository_root=verified_source,
+            )
+            self.assertEqual("ok", preflight["status"])
+            self.assertFalse(preflight["state_checked_offline"])
 
     def test_state_preflight_handles_uri_metacharacters_in_the_state_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -623,6 +809,79 @@ class OperatorToolTests(unittest.TestCase):
                 "state deployment pin differs from the supplied config",
             ):
                 verify_compose_state(config_file, state)
+
+    def test_stopped_state_verifier_uses_bounded_external_scratch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_file, _secret_file, state = self.deployment(root)
+            actual_temporary_directory = tempfile.TemporaryDirectory
+            scratch_directories: list[Path | None] = []
+
+            def capture_temporary_directory(*args, **kwargs):
+                value = kwargs.get("dir")
+                scratch_directories.append(
+                    Path(value) if value is not None else None
+                )
+                return actual_temporary_directory(*args, **kwargs)
+
+            with patch.object(
+                operator_tool.tempfile,
+                "TemporaryDirectory",
+                side_effect=capture_temporary_directory,
+            ):
+                result = verify_compose_state(config_file, state)
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(
+                scratch_directories,
+                [operator_tool.COMPOSE_STATE_VERIFICATION_SCRATCH],
+            )
+            self.assertEqual(list((state / "tmp").iterdir()), [])
+            database_bytes = (state / "tacua.sqlite3").stat().st_size
+            wal = state / "tacua.sqlite3-wal"
+            wal_bytes = wal.stat().st_size if wal.exists() else 0
+            with (
+                patch.object(
+                    operator_tool,
+                    "MAX_COMPOSE_STATE_DATABASE_COPY_BYTES",
+                    database_bytes + wal_bytes - 1,
+                ),
+                self.assertRaisesRegex(
+                    OperatorError,
+                    "exceeds the V1 verification byte bound",
+                ),
+            ):
+                verify_compose_state(config_file, state)
+            self.assertEqual(list((state / "tmp").iterdir()), [])
+
+    def test_running_state_copy_bound_preflight_is_content_free(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _config_file, _secret_file, state = self.deployment(root)
+            self.assertEqual(
+                check_compose_state_copy_bound(state),
+                {
+                    "maximum_bytes": (
+                        operator_tool.MAX_COMPOSE_STATE_DATABASE_COPY_BYTES
+                    ),
+                    "status": "ok",
+                },
+            )
+            database = state / "tacua.sqlite3"
+            original_size = database.stat().st_size
+            with (
+                patch.object(
+                    operator_tool,
+                    "MAX_COMPOSE_STATE_DATABASE_COPY_BYTES",
+                    original_size - 1,
+                ),
+                self.assertRaisesRegex(
+                    OperatorError,
+                    "exceeds the V1 verification byte bound",
+                ),
+            ):
+                check_compose_state_copy_bound(state)
 
     def test_preflight_rejects_every_non_compose_secret_mode(self) -> None:
         for mode in (0o400, 0o440, 0o600, 0o640):

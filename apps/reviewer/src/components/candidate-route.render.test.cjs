@@ -159,17 +159,13 @@ Module._load = function load(request, parent, isMain) {
   if (request === "expo-crypto") {
     return { randomUUID: () => `${String(++randomSequence).padStart(32, "0")}` };
   }
-  if (request === "expo-file-system") return {};
-  if (request === "expo-sharing") {
-    return { isAvailableAsync: async () => true, shareAsync: async () => undefined };
-  }
   if (request === "@/api/client") {
     return { TacuaApiError: class TacuaApiError extends Error {} };
   }
-  if (request === "@/approved-handoff/share-cache") {
+  if (request === "@/approved-handoff/handoff-export") {
     return {
-      cleanupApprovedHandoffShareCache() {},
-      createApprovedHandoffShareFile() { throw new Error("not exercised"); },
+      prepareApprovedHandoffExport() {},
+      exportApprovedHandoff() { throw new Error("not exercised"); },
     };
   }
   if (request === "@/hooks/use-backend") {

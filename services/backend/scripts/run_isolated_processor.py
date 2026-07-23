@@ -96,7 +96,8 @@ DIGEST_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
 LANGUAGE_TAG_RE = re.compile(
     r"^(?:und|[a-z]{2,3}(?:-[A-Z][a-z]{3})?(?:-(?:[A-Z]{2}|[0-9]{3}))?)$"
 )
-DESCRIPTOR_PATH_RE = re.compile(r"^/dev/fd/[0-9]+$")
+DESCRIPTOR_PATH_RE = re.compile(r"^/dev/fd/([0-9]+)$")
+MAX_SOURCE_DESCRIPTOR = 1_048_575
 MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SAFE_OUTPUT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 CONTAINER_ID_RE = re.compile(r"^[a-f0-9]{64}$")
@@ -268,6 +269,38 @@ def canonical_json(value: Any) -> bytes:
     ).encode("utf-8")
 
 
+def _duplicate_descriptor_capability(path: str, code: str) -> int:
+    match = DESCRIPTOR_PATH_RE.fullmatch(path)
+    if match is None:
+        raise IsolationError(code, "descriptor capability path is invalid")
+    source_text = match.group(1)
+    if len(source_text) > 7:
+        raise IsolationError(code, "descriptor capability is outside its bound")
+    source_number = int(source_text)
+    if not 3 <= source_number <= MAX_SOURCE_DESCRIPTOR:
+        raise IsolationError(code, "descriptor capability is outside its bound")
+    try:
+        descriptor = os.dup(source_number)
+    except OSError as error:
+        raise IsolationError(code, "descriptor capability is unavailable") from error
+    try:
+        metadata = os.fstat(descriptor)
+        status = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or status & os.O_ACCMODE != os.O_RDONLY
+            or status & getattr(os, "O_PATH", 0)
+        ):
+            raise IsolationError(
+                code,
+                "descriptor capability is not one read-only regular file",
+            )
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
 def _load_canonical_object(
     path: Path,
     maximum: int,
@@ -275,6 +308,7 @@ def _load_canonical_object(
     *,
     deadline: float | None = None,
     private_file: bool = False,
+    descriptor_capability: bool = False,
 ) -> dict[str, Any]:
     _check_deadline(deadline)
     if private_file:
@@ -315,6 +349,51 @@ def _load_canonical_object(
                 or after.st_ctime_ns != before.st_ctime_ns
             ):
                 raise IsolationError(code, "private artifact changed while it was read")
+            raw = b"".join(blocks)
+        finally:
+            os.close(descriptor)
+    elif (
+        descriptor_capability
+        and DESCRIPTOR_PATH_RE.fullmatch(str(path)) is not None
+    ):
+        descriptor = _duplicate_descriptor_capability(str(path), code)
+        try:
+            before = os.fstat(descriptor)
+            if before.st_size <= 0 or before.st_size > maximum:
+                raise IsolationError(code, "artifact violates its byte bound")
+            blocks: list[bytes] = []
+            offset = 0
+            while offset < before.st_size:
+                _check_deadline(deadline)
+                try:
+                    block = os.pread(
+                        descriptor,
+                        min(1_048_576, before.st_size - offset),
+                        offset,
+                    )
+                except OSError as error:
+                    raise IsolationError(
+                        code,
+                        "descriptor capability could not be read",
+                    ) from error
+                if not block:
+                    raise IsolationError(
+                        code,
+                        "descriptor capability ended early",
+                    )
+                blocks.append(block)
+                offset += len(block)
+            after = os.fstat(descriptor)
+            if (
+                (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+                or after.st_size != before.st_size
+                or after.st_mtime_ns != before.st_mtime_ns
+                or after.st_ctime_ns != before.st_ctime_ns
+            ):
+                raise IsolationError(
+                    code,
+                    "descriptor capability changed while it was read",
+                )
             raw = b"".join(blocks)
         finally:
             os.close(descriptor)
@@ -428,27 +507,43 @@ def _copy_evidence(
     deadline: float | None = None,
 ) -> int:
     _check_deadline(deadline)
-    try:
-        # /dev/fd/<n> is intentionally a descriptor symlink on Linux. The exact
-        # path grammar is checked before this call and fstat still requires a
-        # regular file, so O_NOFOLLOW would reject the safe capability itself.
-        source = os.open(source_path, os.O_RDONLY)
-    except OSError as error:
-        raise IsolationError("INVALID_EVIDENCE_INPUT", "one evidence descriptor could not be opened") from error
+    source = _duplicate_descriptor_capability(
+        source_path,
+        "INVALID_EVIDENCE_INPUT",
+    )
     try:
         metadata = os.fstat(source)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size < 0 or metadata.st_size > remaining:
+        if metadata.st_size < 0 or metadata.st_size > remaining:
             raise IsolationError("EVIDENCE_INPUT_LIMIT", "evidence violates the aggregate byte bound")
         destination_descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
         copied = 0
+        offset = 0
         digest = hashlib.sha256()
         try:
-            while True:
+            while offset < metadata.st_size:
                 _check_deadline(deadline)
-                block = os.read(source, min(1_048_576, remaining - copied + 1))
+                try:
+                    block = os.pread(
+                        source,
+                        min(
+                            1_048_576,
+                            metadata.st_size - offset,
+                            remaining - copied + 1,
+                        ),
+                        offset,
+                    )
+                except OSError as error:
+                    raise IsolationError(
+                        "INVALID_EVIDENCE_INPUT",
+                        "one evidence descriptor could not be read",
+                    ) from error
                 if not block:
-                    break
+                    raise IsolationError(
+                        "EVIDENCE_INPUT_CHANGED",
+                        "evidence descriptor ended early",
+                    )
                 copied += len(block)
+                offset += len(block)
                 if copied > remaining:
                     raise IsolationError("EVIDENCE_INPUT_LIMIT", "evidence violates the aggregate byte bound")
                 pending = memoryview(block)
@@ -462,7 +557,15 @@ def _copy_evidence(
             os.fsync(destination_descriptor)
         finally:
             os.close(destination_descriptor)
-        if copied != metadata.st_size:
+        final = os.fstat(source)
+        if (
+            copied != metadata.st_size
+            or (final.st_dev, final.st_ino)
+            != (metadata.st_dev, metadata.st_ino)
+            or final.st_size != metadata.st_size
+            or final.st_mtime_ns != metadata.st_mtime_ns
+            or final.st_ctime_ns != metadata.st_ctime_ns
+        ):
             raise IsolationError("EVIDENCE_INPUT_CHANGED", "evidence changed while it was copied")
         if "sha256:" + digest.hexdigest() != expected_digest:
             raise IsolationError(
@@ -885,6 +988,7 @@ def prepare_input(
         MAX_INPUT_BYTES,
         "INVALID_PROCESSING_INPUT",
         deadline=deadline,
+        descriptor_capability=True,
     )
     expected_result_contract = _validate_source_input_contract(source)
     source_input_digest = source.get("input_digest")

@@ -5,8 +5,9 @@ reaches it from the tested iPhone and reviewer app through Tailscale Serve:
 
 ```text
 iPhone -> tailnet HTTPS :443 -> Tailscale Serve
-       -> http://127.0.0.1:8080 -> pinned HAProxy TCP relay
-       -> internal Docker network -> Tacua backend container
+       -> http://127.0.0.1:8080 -> pinned HAProxy ingress
+       -> fixed API paths -> Tacua backend container
+       -> every other path -> authority-free reviewer container
 ```
 
 It needs no public Tacua DNS record, cloud VM, public firewall opening,
@@ -48,20 +49,22 @@ logging contract. Do not use this profile as production-promotion evidence.
 - Tailscale HTTPS certificates place the selected `*.ts.net` hostname in public
   Certificate Transparency logs. Do not put a person, customer, project, or
   other confidential identifier in the node name.
-- Compose must continue publishing only the relay at `127.0.0.1:8080`. The
-  backend itself stays on exactly one `internal: true` network, publishes no
-  host port, and retains zero egress. Never bind either service directly to
-  the LAN or a Tailscale address.
-- The pinned non-root relay receives no Tacua config, secret, state, or Docker
-  socket. It does see proxied plaintext HTTP and joins one ordinary bridge to
-  publish host loopback, so a compromised relay could egress captured traffic.
+- Compose must continue publishing only the ingress at `127.0.0.1:8080`. The
+  backend and reviewer each stay on exactly one `internal: true` network,
+  publish no host port, and retain zero egress. Never bind any service directly
+  to the LAN or a Tailscale address.
+- The pinned non-root ingress receives no Tacua config, secret, state, source,
+  or Docker socket. It does see proxied plaintext HTTP and joins one ordinary
+  bridge to publish host loopback, so a compromised ingress could egress
+  captured traffic.
   That accepted private-pilot risk is not a production network-policy claim.
 - [Tailscale Serve injects identity
   headers](https://tailscale.com/docs/features/tailscale-serve#identity-headers)
   containing the tailnet user's login, display name, and profile-picture URL.
   Tacua does not use those headers as authorization. Treat them as transient
-  PII visible to Serve, the relay, and backend request handling; never add them
-  to logs, tickets, or evidence.
+  PII visible to Serve, the ingress, and backend request handling; never add
+  them to logs, tickets, or evidence. The ingress removes these headers before
+  forwarding static reviewer requests.
 - The tested app's SDK profile pins the exact HTTPS origin at native build time.
   A TestFlight or preview build cannot switch origins through JavaScript or an
   OTA update. The reviewer app can change its HTTPS origin in Settings without
@@ -78,16 +81,41 @@ deliberately refuses to replace live deployment inputs:
 set -eu
 node --test .github/scripts/validate-backend-image-inputs.test.mjs
 node .github/scripts/validate-backend-image-inputs.mjs
-docker build -f services/backend/Dockerfile -t tacua-backend:local .
+cd apps/reviewer
+test ! -e node_modules
+test ! -e dist
+test ! -e generated
+npm ci --ignore-scripts --no-audit --no-fund
+node ../../.github/scripts/generate-reviewer-third-party-notices.mjs
+npm test
+npm run typecheck
+npm run export:web -- --output-dir dist --clear
+cd ../..
+node --test .github/scripts/validate-reviewer-web-image-inputs.test.mjs
+node .github/scripts/validate-reviewer-web-image-inputs.mjs
 
+if docker image inspect tacua-backend:local >/dev/null 2>&1 ||
+  docker image inspect tacua-reviewer-web:local >/dev/null 2>&1; then
+  echo 'refusing to replace an existing local Tacua image tag' >&2
+  exit 1
+fi
 TACUA_CONTAINER_TEST_ID=tailnet-pilot \
+TACUA_KEEP_VERIFIED_IMAGES=true \
   bash .github/scripts/verify-backend-container.sh
+docker tag tacua-backend:tailnet-pilot tacua-backend:local
+docker tag tacua-reviewer-web:tailnet-pilot tacua-reviewer-web:local
+test "$(docker image inspect --format '{{.Id}}' tacua-backend:local)" = \
+  "$(docker image inspect --format '{{.Id}}' tacua-backend:tailnet-pilot)"
+test "$(docker image inspect --format '{{.Id}}' tacua-reviewer-web:local)" = \
+  "$(docker image inspect --format '{{.Id}}' tacua-reviewer-web:tailnet-pilot)"
 ```
 
-The full check exercises the Compose topology, loopback relay, single-writer
-state, authenticated smoke, backup, restore, and restored startup. On a
-rootless daemon it is also the deployment-specific rootless test; the hosted
-CI job currently runs this boundary on its standard Docker daemon.
+The full check builds and retains the exact local candidates, then exercises
+the Compose topology, loopback same-origin routing,
+authority-free reviewer, single-writer state, authenticated smoke, backup,
+restore, and restored startup. On a rootless daemon it is also the
+deployment-specific rootless test; the hosted CI job currently runs this
+boundary on its standard Docker daemon.
 
 ## 2. Freeze the origin and prepare live inputs
 
@@ -326,8 +354,9 @@ agree exactly.
 
 The verifier fails closed on Funnel, extra ports or handlers, origin drift,
 offline/MagicDNS/certificate drift, a non-loopback target, direct backend
-publication, relay image/config drift, leaked relay authority, or weakened
-Docker network isolation. Its input loader requires stable, mode-`0600`,
+publication, ingress/reviewer image or config drift, leaked container
+authority, or weakened Docker network isolation. Its input loader requires
+stable, mode-`0600`,
 operator-owned regular files inside the mode-`0700` runtime directory and
 opens them without following symlinks.
 
@@ -418,8 +447,8 @@ Serve only after the loopback smoke passes.
 ## Deliberately deferred
 
 - Direct Serve is not the bounded production reverse proxy.
-- The pinned TCP relay is content-blind plumbing, not the production HTTP
-  concurrency, rate, header, or slow-client boundary.
+- The pinned ingress provides only fixed same-origin routing, not the
+  production HTTP concurrency, rate, header, or slow-client boundary.
 - No real transcription, repository research, or ticket-generation processor
   is selected by this profile.
 - Off-host backup, public availability, multi-user tailnet policy, and

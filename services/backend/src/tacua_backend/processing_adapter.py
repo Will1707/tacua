@@ -46,6 +46,7 @@ from .processing_jobs import (
     ProcessingResult,
     PublicationCandidate,
 )
+from .processing_bridge import BRIDGE_ERROR_CODE
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard for static tooling
     from .service import PilotBackend
@@ -356,6 +357,18 @@ def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
         process.wait()
 
 
+def _processor_failure_code(payload: bytes) -> str:
+    if len(payload) <= 128 and payload.endswith(b"\n"):
+        try:
+            code = payload[:-1].decode("ascii")
+        except UnicodeDecodeError:
+            pass
+        else:
+            if BRIDGE_ERROR_CODE.fullmatch(code) is not None:
+                return code
+    return "PROCESSOR_EXIT_FAILED"
+
+
 def _run_bounded_command(
     command: LocalProcessorCommand,
     argv: list[str],
@@ -390,9 +403,14 @@ def _run_bounded_command(
     assert process.stdout is not None
     assert process.stderr is not None
     stdout_descriptor = process.stdout.fileno()
+    stderr_descriptor = process.stderr.fileno()
     streams = {
         stdout_descriptor: (process.stdout, bytearray(), command.max_stdout_bytes),
-        process.stderr.fileno(): (process.stderr, bytearray(), command.max_stderr_bytes),
+        stderr_descriptor: (
+            process.stderr,
+            bytearray(),
+            command.max_stderr_bytes,
+        ),
     }
     selector = selectors.DefaultSelector()
     for descriptor in streams:
@@ -435,7 +453,10 @@ def _run_bounded_command(
         return_code = process.wait(timeout=max(0.1, deadline - time.monotonic()))
         if return_code != 0:
             raise ProcessingAdapterError(
-                "PROCESSOR_EXIT_FAILED", "processor exited unsuccessfully"
+                _processor_failure_code(
+                    bytes(streams[stderr_descriptor][1])
+                ),
+                "processor exited unsuccessfully",
             )
         return bytes(streams[stdout_descriptor][1])
     except subprocess.TimeoutExpired as error:

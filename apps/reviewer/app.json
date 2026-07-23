@@ -17,6 +17,9 @@
     },
     "android": {
       "package": "com.will1707.tacua"
+    },
+    "web": {
+      "output": "single"
     }
   }
 }

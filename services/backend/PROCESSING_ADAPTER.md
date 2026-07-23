@@ -34,8 +34,11 @@ there is no shell, interpolation, glob expansion, or command substitution.
 exactly once. The executable path must be absolute. Arguments containing any
 other brace are rejected. Timeout is 1–240 seconds, stdout is 1 KiB–16 MiB,
 and stderr is 1 KiB–1 MiB. Exceeding either pipe bound or the timeout kills the
-child process group. Stderr and invalid stdout are never copied into job state
-or an operator error.
+child process group. Raw stderr and invalid stdout are never copied into job
+state or an operator error. The provenance-verified Compose bridge may promote
+one exact, bounded `BRIDGE_*` failure code across each trusted internal
+boundary; every other stderr payload is discarded, and no stderr content is
+persisted or returned through the public API.
 
 The frozen document above selects adapter wire 1.0. An operator may explicitly
 select `tacua.local-processing-command@1.1.0` using the same exact five-field
@@ -246,11 +249,14 @@ one content-free canonical summary containing counts, queue state, and the last
 job ID. The worker refuses to start while the server, backup/restore, or another
 worker owns the state directory.
 
-For the checked-in Compose deployment, stop `backend`, run an ephemeral
-container with `--entrypoint python` and explicit read-only mounts for the
-command document and adapter implementation, then start `backend` again. Do
-not add either mount to the always-on service unless processing is intentionally
-enabled.
+For the checked-in Compose deployment, use the fail-closed
+[Compose isolated-processing runbook](COMPOSE_PROCESSING_BRIDGE.md). Its host
+gate binds the exact stopped backend and named state volume to a one-shot
+network-none worker, transfers only the adapter's already-open read-only
+descriptor capabilities over a private Unix socket, and invokes the existing
+host isolated runner. Neither the worker nor processor receives the Docker
+socket. Do not improvise an ephemeral worker with daemon authority or copy the
+state volume to a host directory.
 
 ## Egress and residual isolation boundary
 
@@ -272,10 +278,14 @@ only for trusted operator code and contract tests.
 
 [ADR-016](../../docs/decisions/ADR-016-local-processor-isolation.md) requires a
 mini-PC/private-pilot model or plugin to run through
-`scripts/run_isolated_processor.py`. Stop the backend, then launch the exclusive
-worker from the trusted host so the runner can use the host container runtime.
-Do not mount the Docker socket into the backend or processor container. The
-runner is trusted Tacua boundary code; the selected processor image is not.
+`scripts/run_isolated_processor.py`.
+[ADR-020](../../docs/decisions/ADR-020-compose-state-processing-bridge.md)
+connects that trusted host runner to the checked-in Compose state volume
+without giving Docker authority to a container: the stopped deployment's
+one-shot worker passes only already-open adapter descriptors over one private
+Unix socket to the host broker. Do not mount the Docker socket into the
+backend, worker, or processor container. The runner and bridge broker are
+trusted Tacua boundary code; the selected processor image is not.
 
 The worker's outer local-processing command must give the runner the parent's
 exact 240-second deadline. The adapter exports that actual value as
@@ -369,9 +379,11 @@ unique `body_file` set referenced by the result's candidate previews—missing
 and unreferenced bodies are rejected.
 The runner caps stdout incrementally at 110 MiB, caps and requires empty
 stderr, kills on cap/deadline, and exact-inspects exit/OOM state. It accepts at
-most 64 MiB of decoded result/preview bytes, publishes previews atomically only
-after complete validation, then emits the canonical result to the existing
-adapter.
+most 64 MiB of decoded result/preview bytes, then publishes each preview with
+one atomic rename only after complete validation. A failure removes every
+staged and already-published preview before the runner returns failure. The
+preview set is not a single filesystem transaction. The runner then emits the
+canonical result to the existing adapter.
 
 Before stale discovery or image inspection, the runner requires `docker info`
 to prove a rootless daemon, cgroup v2 with the systemd driver, effective CPU
@@ -454,4 +466,13 @@ real integration covers the final-running interruption; carrier-only,
 post-copy, malformed-output, and cleanup interruption phases remain deterministic
 unit regressions. The ordinary rootful GitHub-hosted job runs the unit/profile
 checks only; the real integration is the separate manually dispatched
-`verify-rootless-processor.yml` self-hosted gate.
+`verify-rootless-processor.yml` self-hosted gate. That gate also starts the
+complete backend/reviewer/ingress Compose topology, seeds one protocol-valid
+queued capture in a pristine test volume, and advances exactly one stage
+through the Compose bridge and the verified product processor image. The
+bridge's pipe-gated create and conservative recovery phases remain covered by
+the deterministic operation-journal unit matrix; no test-only barrier is
+exposed by the production bridge. Run the full gate only on an idle,
+non-production runner with a free unprivileged loopback port. The default is
+`8080`; set `TACUA_CONTAINER_TEST_PORT` when another local service owns it.
+The gate is not an in-place upgrade check for a host already serving Tacua.

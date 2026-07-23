@@ -47,6 +47,21 @@ omit cookies, reject redirects, and verify the response origin before parsing
 bounded JSON. Never commit a real endpoint, credential, recording, or private
 pilot identifier.
 
+The reviewer also has a browser export for a private, same-origin self-hosted
+deployment:
+
+```sh
+npm run export:web -- --output-dir dist
+```
+
+The web reviewer must be served from the backend's exact HTTPS origin. Its
+administrator configuration is kept only in that tab's `sessionStorage`, not
+in native secure storage or persistent `localStorage`, and approved handoffs
+download as verified files. The browser build deliberately rejects a different
+backend origin. The backend deliberately has no CORS surface, so do not add a
+wildcard origin or host the reviewer on a second origin. See
+[SELF_HOSTED_WEB.md](SELF_HOSTED_WEB.md) before packaging the export in Docker.
+
 The default bundle identifiers and QA target scheme are development
 placeholders for the repository owner and must remain configurable for other
 self-hosters.

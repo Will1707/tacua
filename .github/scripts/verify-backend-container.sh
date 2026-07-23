@@ -3,6 +3,24 @@
 
 set -euo pipefail
 
+keep_verified_images="${TACUA_KEEP_VERIFIED_IMAGES:-false}"
+case "$keep_verified_images" in
+  true|false) ;;
+  *)
+    echo "TACUA_KEEP_VERIFIED_IMAGES must be true or false" >&2
+    exit 2
+    ;;
+esac
+
+verify_compose_processing_bridge="${TACUA_VERIFY_COMPOSE_PROCESSING_BRIDGE:-false}"
+case "$verify_compose_processing_bridge" in
+  true|false) ;;
+  *)
+    echo "TACUA_VERIFY_COMPOSE_PROCESSING_BRIDGE must be true or false" >&2
+    exit 2
+    ;;
+esac
+
 test_id="${TACUA_CONTAINER_TEST_ID:-ci}"
 case "$test_id" in
   *[!a-z0-9-]*|''|-*)
@@ -15,12 +33,31 @@ if [ "${#test_id}" -gt 32 ]; then
   exit 2
 fi
 
+test_port="${TACUA_CONTAINER_TEST_PORT:-8080}"
+if [ "${#test_port}" -gt 5 ]; then
+  echo "TACUA_CONTAINER_TEST_PORT must be a canonical unprivileged TCP port" >&2
+  exit 2
+fi
+case "$test_port" in
+  *[!0-9]*|''|0*)
+    echo "TACUA_CONTAINER_TEST_PORT must be a canonical unprivileged TCP port" >&2
+    exit 2
+    ;;
+esac
+if [ "$test_port" -lt 1024 ] || [ "$test_port" -gt 65535 ]; then
+  echo "TACUA_CONTAINER_TEST_PORT must be a canonical unprivileged TCP port" >&2
+  exit 2
+fi
+test_origin="http://127.0.0.1:$test_port"
+
 if [ ! -f services/backend/Dockerfile ] || [ ! -f services/backend/config.example.json ]; then
   echo "run this script from the Tacua repository root" >&2
   exit 2
 fi
 
 image="tacua-backend:${test_id}"
+reviewer_image="tacua-reviewer-web:${test_id}"
+processor_image="tacua-offline-processor:${test_id}"
 container="tacua-backend-${test_id}"
 second_container="tacua-backend-${test_id}-second"
 restored_container="tacua-backend-${test_id}-restored"
@@ -28,6 +65,7 @@ compose_project="tacua-backend-${test_id}-compose"
 restore_compose_project="${compose_project}-restore"
 compose_container=""
 compose_ingress_container=""
+compose_reviewer_container=""
 restore_compose_container=""
 volume="tacua-backend-${test_id}-state"
 backup_volume="tacua-backend-${test_id}-backup"
@@ -39,7 +77,8 @@ secret="$runtime_directory/admin-secret"
 resolved_compose="$runtime_directory/compose.json"
 resolved_test_compose="$runtime_directory/compose-test.json"
 resolved_production_compose="$runtime_directory/compose-production.json"
-test_compose_override="$runtime_directory/compose-test-override.json"
+bridge_compose="$runtime_directory/compose-bridge.json"
+test_compose_override="$runtime_directory/compose-test-override.yaml"
 restore_volume_override="$runtime_directory/compose-restore-volume.json"
 verified_restored_backup="$runtime_directory/restored-backup.json"
 local_config="services/backend/local/config.json"
@@ -50,6 +89,8 @@ created_local_directory=false
 docker_cleanup=false
 compose_started=false
 restore_compose_created=false
+verification_succeeded=false
+processor_image_created=false
 
 cleanup() {
   if [ "$docker_cleanup" = true ]; then
@@ -74,7 +115,13 @@ cleanup() {
     docker volume rm "$volume" >/dev/null 2>&1 || true
     docker volume rm "$backup_volume" >/dev/null 2>&1 || true
     docker volume rm "$restored_volume" >/dev/null 2>&1 || true
-    docker image rm "$image" >/dev/null 2>&1 || true
+    if [ "$verification_succeeded" != true ] || [ "$keep_verified_images" != true ]; then
+      docker image rm "$image" >/dev/null 2>&1 || true
+      docker image rm "$reviewer_image" >/dev/null 2>&1 || true
+      if [ "$processor_image_created" = true ]; then
+        docker image rm "$processor_image" >/dev/null 2>&1 || true
+      fi
+    fi
   fi
   if [ "$cleanup_local_files" = true ]; then
     if [ -d "$local_directory" ] && [ ! -L "$local_directory" ]; then
@@ -133,6 +180,7 @@ for target in \
   "$restored_container" \
   "${compose_project}-backend-1" \
   "${compose_project}-ingress-1" \
+  "${compose_project}-reviewer-1" \
   "${restore_compose_project}-backend-1"; do
   if printf '%s\n' "$container_names" | grep -Fqx -- "$target"; then
     echo "refusing to replace existing Docker container: $target" >&2
@@ -241,10 +289,27 @@ if printf '%s\n' "$image_names" | grep -Fqx -- "$image"; then
   echo "refusing to replace existing Docker image: $image" >&2
   exit 1
 fi
+if printf '%s\n' "$image_names" | grep -Fqx -- "$reviewer_image"; then
+  echo "refusing to replace existing Docker image: $reviewer_image" >&2
+  exit 1
+fi
+if [ "$verify_compose_processing_bridge" = true ] \
+  && printf '%s\n' "$image_names" | grep -Fqx -- "$processor_image"; then
+  echo "refusing to replace existing Docker image: $processor_image" >&2
+  exit 1
+fi
 
 printf '%s' 'tacua-ci-admin-secret-0123456789abcdef' > "$secret"
 chmod 0444 "$secret"
-printf '{"services":{"backend":{"image":"%s"}}}\n' "$image" \
+printf '%s\n' \
+  'services:' \
+  '  backend:' \
+  "    image: $image" \
+  '  ingress:' \
+  '    ports: !override' \
+  "      - \"127.0.0.1:$test_port:8080\"" \
+  '  reviewer:' \
+  "    image: $reviewer_image" \
   > "$test_compose_override"
 printf '{"volumes":{"tacua-state":{"name":"%s"}}}\n' "$restored_volume" \
   > "$restore_volume_override"
@@ -277,8 +342,10 @@ PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool \
   validate-compose \
   --config-file services/backend/config.example.json \
   --compose-json "$resolved_test_compose" \
-  --allow-mutable-image
+  --allow-mutable-image \
+  --expected-published-port "$test_port"
 TACUA_BACKEND_IMAGE="registry.invalid/tacua@sha256:$(printf 'a%.0s' {1..64})" \
+TACUA_REVIEWER_IMAGE="registry.invalid/tacua-reviewer@sha256:$(printf 'b%.0s' {1..64})" \
   docker compose \
     -f services/backend/compose.yaml \
     -f services/backend/compose.production.yaml \
@@ -309,6 +376,17 @@ wait_for_healthy() {
 
 docker_cleanup=true
 docker build -f services/backend/Dockerfile -t "$image" .
+node .github/scripts/validate-reviewer-web-image-inputs.mjs >/dev/null
+docker build --pull=false \
+  -f services/reviewer-web/Dockerfile \
+  -t "$reviewer_image" \
+  .
+if [ "$verify_compose_processing_bridge" = true ]; then
+  TACUA_KEEP_VERIFIED_IMAGES=true \
+  TACUA_PROCESSOR_TEST_ID="$test_id" \
+    bash .github/scripts/verify-processor-container.sh
+  processor_image_created=true
+fi
 
 compose_started=true
 docker compose \
@@ -322,7 +400,7 @@ compose_container="$(
     -p "$compose_project" \
     -f services/backend/compose.yaml \
     -f "$test_compose_override" \
-    ps -q backend
+    ps --no-trunc -q backend
 )"
 if [ -z "$compose_container" ] || [ "$(printf '%s\n' "$compose_container" | wc -l)" -ne 1 ]; then
   echo "Compose did not resolve exactly one backend container" >&2
@@ -333,13 +411,25 @@ compose_ingress_container="$(
     -p "$compose_project" \
     -f services/backend/compose.yaml \
     -f "$test_compose_override" \
-    ps -q ingress
+    ps --no-trunc -q ingress
 )"
 if [ -z "$compose_ingress_container" ] || [ "$(printf '%s\n' "$compose_ingress_container" | wc -l)" -ne 1 ]; then
   echo "Compose did not resolve exactly one ingress container" >&2
   exit 1
 fi
+compose_reviewer_container="$(
+  docker compose \
+    -p "$compose_project" \
+    -f services/backend/compose.yaml \
+    -f "$test_compose_override" \
+    ps --no-trunc -q reviewer
+)"
+if [ -z "$compose_reviewer_container" ] || [ "$(printf '%s\n' "$compose_reviewer_container" | wc -l)" -ne 1 ]; then
+  echo "Compose did not resolve exactly one reviewer container" >&2
+  exit 1
+fi
 wait_for_healthy "$compose_container"
+wait_for_healthy "$compose_reviewer_container"
 wait_for_healthy "$compose_ingress_container"
 docker exec "$compose_container" sh -c \
   'test "$(stat -c %a /run/secrets/tacua_admin)" = 444 && ! test -w /run/secrets/tacua_admin'
@@ -355,6 +445,20 @@ if [ "$(docker inspect --format '{{len .NetworkSettings.Networks}}' "$compose_in
   echo "the ingress did not join exactly two networks" >&2
   exit 1
 fi
+if [ "$(docker inspect --format '{{len .NetworkSettings.Networks}}' "$compose_reviewer_container")" -ne 1 ]; then
+  echo "the reviewer did not remain on exactly one internal network" >&2
+  exit 1
+fi
+if docker port "$compose_reviewer_container" 8081/tcp >/dev/null 2>&1; then
+  echo "the reviewer unexpectedly published its internal listener" >&2
+  exit 1
+fi
+docker exec "$compose_reviewer_container" python -B - \
+  < .github/scripts/smoke-reviewer-web-container.py
+docker exec "$compose_reviewer_container" python -B -c \
+  'from pathlib import Path; import stat; files=(Path("/licenses/tacua/LICENSE"),Path("/licenses/tacua/NOTICE"),Path("/licenses/reviewer/NOTICE"),Path("/licenses/reviewer/THIRD_PARTY_NOTICES.txt")); assert all(path.is_file() and stat.S_IMODE(path.stat().st_mode)==0o444 for path in files); assert files[0].read_text(encoding="utf-8").lstrip().startswith("Apache License"); assert files[3].read_text(encoding="utf-8").startswith("Tacua reviewer web — third-party notices")'
+docker exec "$compose_reviewer_container" python -B -c \
+  'from pathlib import Path; assert not any(Path(path).exists() for path in ("/run/secrets/tacua_admin","/run/tacua/config.json","/var/lib/tacua/tacua.sqlite3","/var/run/docker.sock","/run/docker.sock"))'
 docker exec "$compose_ingress_container" sh -c \
   'test "$(id -u)" = 99 && test ! -e /run/secrets/tacua_admin && test ! -e /run/tacua/config.json && haproxy -c -q -f /usr/local/etc/haproxy/haproxy.cfg'
 docker exec "$compose_container" python -m tacua_backend.operator_tool smoke \
@@ -365,12 +469,16 @@ docker exec "$compose_container" python -m tacua_backend.operator_tool smoke \
 PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool smoke \
   --config-file "$local_config" \
   --admin-secret-file "$local_secret" \
-  --origin http://127.0.0.1:8080 \
+  --origin "$test_origin" \
   --allow-loopback-http
+python3 -B -c \
+  "import urllib.request; r=urllib.request.urlopen('$test_origin/', timeout=2); body=r.read(65537); assert r.status==200 and b'<div id=\"root\"></div>' in body and r.headers['Cache-Control']=='no-store' and r.headers['X-Content-Type-Options']=='nosniff'"
+python3 -B -c \
+  "import urllib.request; q=urllib.request.Request('$test_origin/', headers={'Authorization':'Bearer synthetic-never-log','Cookie':'synthetic=1','Idempotency-Key':'synthetic','If-Match':'\"synthetic\"','Proxy-Authorization':'Basic synthetic','Tacua-Content-Digest':'sha256:synthetic','Tacua-Credential-ID':'synthetic','Tacua-Evidence-Manifest-Digest':'sha256:synthetic','Tacua-Intent-Digest':'sha256:synthetic','Tacua-Page-Cursor':'synthetic','Tacua-Protocol-Version':'synthetic','Tacua-Requested-At':'2026-01-01T00:00:00Z','Tacua-Scope-Digest':'sha256:synthetic','Tacua-Sidecar-Digest':'sha256:synthetic','Tailscale-User-Login':'synthetic@example.invalid','Tailscale-User-Name':'Synthetic','Tailscale-User-Profile-Pic':'https://example.invalid/synthetic'}); r=urllib.request.urlopen(q, timeout=2); body=r.read(65537); assert r.status==200 and b'<div id=\"root\"></div>' in body"
 
 docker stop "$compose_ingress_container" >/dev/null
 if python3 -B -c \
-  "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=1)" \
+  "import urllib.request; urllib.request.urlopen('$test_origin/healthz', timeout=1)" \
   >/dev/null 2>&1; then
   echo "loopback remained reachable after the sole ingress stopped" >&2
   exit 1
@@ -384,8 +492,33 @@ wait_for_healthy "$compose_ingress_container"
 PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool smoke \
   --config-file "$local_config" \
   --admin-secret-file "$local_secret" \
-  --origin http://127.0.0.1:8080 \
+  --origin "$test_origin" \
   --allow-loopback-http
+
+if [ "$verify_compose_processing_bridge" = true ]; then
+  docker compose \
+    -p "$compose_project" \
+    -f services/backend/compose.yaml \
+    -f "$test_compose_override" \
+    config --format json > "$bridge_compose"
+  chmod 0600 "$bridge_compose"
+  processor_image_id="$(
+    docker image inspect --format '{{.Id}}' "$processor_image"
+  )"
+  backend_image_id="$(
+    docker inspect --format '{{.Image}}' "$compose_container"
+  )"
+  bash .github/scripts/verify-compose-processing-bridge.sh \
+    "$compose_project" \
+    "$bridge_compose" \
+    "$local_config" \
+    "$local_secret" \
+    "$compose_container" \
+    "$compose_state_volume" \
+    "$processor_image_id" \
+    "$backend_image_id" \
+    "$test_port"
+fi
 
 docker compose \
   -p "$compose_project" \
@@ -620,4 +753,14 @@ docker exec "$restored_container" python -m tacua_backend.operator_tool smoke \
   --origin http://127.0.0.1:8080 \
   --allow-loopback-http
 
+backend_image_id="$(docker image inspect --format '{{.Id}}' "$image")"
+reviewer_image_id="$(docker image inspect --format '{{.Id}}' "$reviewer_image")"
+if ! printf '%s\n' "$backend_image_id" | grep -Eq '^sha256:[a-f0-9]{64}$' \
+  || ! printf '%s\n' "$reviewer_image_id" | grep -Eq '^sha256:[a-f0-9]{64}$'; then
+  echo "verified image identifiers are invalid" >&2
+  exit 1
+fi
+verification_succeeded=true
 printf 'Backend container verification passed for %s.\n' "$test_id"
+printf 'Verified backend image: %s (%s)\n' "$image" "$backend_image_id"
+printf 'Verified reviewer image: %s (%s)\n' "$reviewer_image" "$reviewer_image_id"

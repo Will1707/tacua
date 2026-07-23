@@ -24,6 +24,8 @@ const exactPaths = [
   "NOTICE",
   "services/backend/config.example.json",
   "services/backend/config.template.example.json",
+  "services/backend/scripts/run_compose_isolated_processing.py",
+  "services/backend/scripts/run_isolated_processor.py",
 ];
 const sourceFamilies = [
   {
@@ -97,6 +99,7 @@ const expectedInputPaths = new Set([
   "services/backend/src/tacua_backend/instance_lock.py",
   "services/backend/src/tacua_backend/operator_tool.py",
   "services/backend/src/tacua_backend/processing_adapter.py",
+  "services/backend/src/tacua_backend/processing_bridge.py",
   "services/backend/src/tacua_backend/processing_jobs.py",
   "services/backend/src/tacua_backend/processing_worker.py",
   "services/backend/src/tacua_backend/service.py",
@@ -104,6 +107,7 @@ const expectedInputPaths = new Set([
 const expectedCopyBodies = [
   "--chown=root:root LICENSE NOTICE /app/",
   "--chown=root:root services/backend/src/tacua_backend/*.py /app/services/backend/src/tacua_backend/",
+  "--chown=root:root --chmod=0555 services/backend/scripts/run_compose_isolated_processing.py services/backend/scripts/run_isolated_processor.py /app/services/backend/scripts/",
   "--chown=root:root services/backend/config.example.json services/backend/config.template.example.json /app/services/backend/",
   "--chown=root:root contracts/sdk-backend-protocol/src/*.py /app/contracts/sdk-backend-protocol/src/",
   "--chown=root:root contracts/sdk-backend-protocol/schemas/*.schema.json /app/contracts/sdk-backend-protocol/schemas/",
@@ -152,6 +156,9 @@ const expectedIgnoreRules = new Set([
   "!services/backend/src/",
   "!services/backend/src/tacua_backend/",
   "!services/backend/src/tacua_backend/*.py",
+  "!services/backend/scripts/",
+  "!services/backend/scripts/run_compose_isolated_processing.py",
+  "!services/backend/scripts/run_isolated_processor.py",
   "!services/backend/config.example.json",
   "!services/backend/config.template.example.json",
   "!contracts/",
