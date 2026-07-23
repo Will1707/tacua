@@ -282,6 +282,42 @@ if ! "${bridge_arguments[@]}" > "$bridge_summary" 2> "$bridge_diagnostic"; then
   if [ -s "$bridge_diagnostic" ]; then
     cat "$bridge_diagnostic" >&2
   fi
+  failure_phase="pre_journal"
+  if [ -f "$operation/operation.json" ] \
+    && [ ! -L "$operation/operation.json" ]; then
+    failure_phase="$(
+      "$python_executable" -B - "$operation/operation.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+allowed = {
+    "prepared",
+    "backend_stopped",
+    "baseline_verifier_creating",
+    "baseline_verifier_created",
+    "baseline_verified",
+    "worker_creating",
+    "worker_created",
+    "worker_starting",
+    "worker_exited",
+    "post_worker_verifier_creating",
+    "post_worker_verifier_created",
+    "recovery_verifier_creating",
+    "recovery_verifier_created",
+    "state_verified",
+    "backend_healthy",
+}
+document = json.loads(Path(sys.argv[1]).read_bytes())
+phase = document.get("phase") if isinstance(document, dict) else None
+if phase not in allowed:
+    raise SystemExit(1)
+print(phase)
+PY
+    )" || failure_phase="invalid_journal"
+  fi
+  printf 'Compose processing bridge failure phase: %s\n' \
+    "$failure_phase" >&2
   echo "Compose processing bridge execution failed" >&2
   exit 1
 fi
