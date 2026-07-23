@@ -31,6 +31,14 @@ and stderr is 1 KiB–1 MiB. Exceeding either pipe bound or the timeout kills th
 child process group. Stderr and invalid stdout are never copied into job state
 or an operator error.
 
+The frozen document above selects adapter wire 1.0. An operator may explicitly
+select `tacua.local-processing-command@1.1.0` using the same exact five-field
+shape. Version 1.1 is accepted only for the dormant artifact pipeline's
+`transcribe` and `align` stages. A 1.1 command processing a legacy pipeline job
+still receives the exact 1.0 input and must return the exact 1.0 result. A 1.0
+command fails content-free before child execution if it is ever paired with a
+pipeline-1.1 job. No checked-in command or deployment default selects 1.1.
+
 The child receives a fixed minimal environment containing only `LANG`,
 `LC_ALL`, `PATH`, and the non-secret `TACUA_ADAPTER_TIMEOUT_SECONDS` value that
 the parent is actually enforcing. Tacua does not pass or inherit the admin
@@ -121,6 +129,25 @@ workspace under the backend temporary directory; the next ordinary backend or
 worker startup removes that bounded `processing-*` workspace before opening
 the service. No copy of raw media is created.
 
+For an explicitly selected pipeline-1.1 invocation the input contract is
+`tacua.local-processing-input@1.1.0` and adds exactly one top-level field:
+
+```json
+"stage_inputs": {
+  "artifacts": [
+    { "contract_version": "tacua.processing-stage-artifact@1.0.0", "...": "..." }
+  ]
+}
+```
+
+The array is empty for `transcribe` and contains exactly the full validated
+transcript artifact for `align`. The ordinary `input_digest` covers this field,
+so the body is bound to the current job version/digest, worker, and stage. The
+store resolves it only after revalidating the live lease, session, retention,
+job chain, canonical artifact and digest in the same transaction used for
+evidence admission. Transcript text remains in the private unlinked input file
+and is never projected through a job or public route.
+
 ## Processor result
 
 Stdout must contain exactly one canonical JSON object and no trailing newline.
@@ -164,8 +191,32 @@ Each preview is at most 2 MiB; one result may reference at most 512 files and
 64 MiB total. Use `no_issue_detected` with an empty `candidates` array for a
 successful zero-ticket result.
 
-The adapter only converts this closed document into the existing
-`ProcessingResult` and `PublicationCandidate` types. The backend then applies
+Adapter result 1.1 remains a checkpoint-only, two-stage contract in this
+slice. It has the same top-level binding fields as 1.0 and uses this exact
+non-final result shape:
+
+```json
+{
+  "artifacts": [
+    { "artifact_kind": "transcript", "payload": { "...": "..." } }
+  ],
+  "consumed_artifacts": [
+    { "artifact_id": "artifact_...", "artifact_digest": "sha256:..." }
+  ]
+}
+```
+
+`transcribe` produces exactly one transcript and consumes nothing. `align`
+produces no artifact in this narrow slice and must echo the exact transcript
+reference in its input. A successful align result atomically checkpoints the
+stage, removes its exact lease, and appends a body-free immutable consumption
+receipt. That receipt is the deliberate pause before `correlate`; it is not a
+generic future-stage scheduler. Failures, retries, stale leases, deletion and
+expiry never publish a receipt.
+
+Adapter 1.0 converts its closed document into the existing `ProcessingResult`
+and `PublicationCandidate` types; adapter 1.1 converts its two admitted stages
+into the private `ProcessingCheckpoint` type. The backend then applies
 the authoritative ticket/evidence validators and the atomic publication
 transaction from ADR-014. Invalid output records a bounded retryable processor
 failure and never exposes a partial candidate.

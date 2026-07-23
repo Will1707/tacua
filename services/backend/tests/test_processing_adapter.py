@@ -19,13 +19,14 @@ SOURCE = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SOURCE))
 
 from tacua_backend.candidate_domain import TICKET_CONTRACT  # noqa: E402
-from tacua_backend.contracts import canonical_json  # noqa: E402
+from tacua_backend.contracts import canonical_json, runtime_seal  # noqa: E402
 from tacua_backend.instance_lock import (  # noqa: E402
     InstanceLockError,
     acquire_state_instance_lock,
 )
 from tacua_backend.processing_adapter import (  # noqa: E402
     COMMAND_CONTRACT,
+    COMMAND_CONTRACT_V11,
     INPUT_PLACEHOLDER,
     OUTPUT_DIRECTORY_PLACEHOLDER,
     LocalProcessingAdapter,
@@ -34,9 +35,19 @@ from tacua_backend.processing_adapter import (  # noqa: E402
     _run_bounded_command,
     load_local_processor_command,
 )
+from tacua_backend.processing_jobs import ARTIFACT_PIPELINE_VERSION  # noqa: E402
 from tacua_backend.processing_worker import _run as run_worker  # noqa: E402
 from tacua_backend.service import ApiError, PilotBackend  # noqa: E402
 from test_backend import BackendHarness  # noqa: E402
+
+
+class AdapterArtifactPipelineBackend(PilotBackend):
+    """Test-only producer; production continues to create pipeline 1.0 jobs."""
+
+    def _queued_job_snapshot(self, *args, **kwargs):
+        job = super()._queued_job_snapshot(*args, **kwargs)
+        job["pipeline"]["pipeline_version"] = ARTIFACT_PIPELINE_VERSION
+        return runtime_seal(job)
 
 
 CHECKPOINT_PROCESSOR = r'''
@@ -53,6 +64,8 @@ arguments = dict(zip(sys.argv[1::2], sys.argv[2::2], strict=True))
 raw = Path(arguments["--input"]).read_bytes()
 document = json.loads(raw.decode("utf-8"))
 assert canonical(document).encode("utf-8") == raw
+assert set(document) == {"binding", "capture", "contract_version", "input_digest", "job"}
+assert document["contract_version"] == "tacua.local-processing-input@1.0.0"
 subject = dict(document)
 expected_digest = subject.pop("input_digest")
 actual_digest = "sha256:" + hashlib.sha256(canonical(subject).encode("utf-8")).hexdigest()
@@ -141,6 +154,85 @@ sys.stdout.buffer.write(canonical(result).encode("utf-8"))
 '''
 
 
+ARTIFACT_PIPELINE_PROCESSOR = r'''
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+def canonical(value):
+    return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True)
+
+arguments = dict(zip(sys.argv[1::2], sys.argv[2::2], strict=True))
+raw = Path(arguments["--input"]).read_bytes()
+document = json.loads(raw.decode("utf-8"))
+assert canonical(document).encode("utf-8") == raw
+assert document["contract_version"] == "tacua.local-processing-input@1.1.0"
+subject = dict(document)
+expected_digest = subject.pop("input_digest")
+assert expected_digest == "sha256:" + hashlib.sha256(canonical(subject).encode("utf-8")).hexdigest()
+binding = document["binding"]
+stage_inputs = document["stage_inputs"]["artifacts"]
+if binding["stage_name"] == "transcribe":
+    assert stage_inputs == []
+    sources = [
+        {
+            "segment_id": segment["segment_id"],
+            "sequence": segment["sequence"],
+            "content_digest": segment["content"]["content_digest"],
+            "start_ms": segment["time_range"]["start_ms"],
+            "end_ms": segment["time_range"]["end_ms"],
+        }
+        for segment in document["capture"]["manifest"]["segments"]
+        if segment["availability"] == "available"
+    ]
+    first = sources[0]
+    artifacts = [{
+        "artifact_kind": "transcript",
+        "payload": {
+            "contract_version": "tacua.transcript@1.0.0",
+            "language_tag": "en-GB",
+            "speech_status": "detected",
+            "source_segments": sources,
+            "spans": [{
+                "segment_id": first["segment_id"],
+                "start_ms": first["start_ms"],
+                "end_ms": first["end_ms"],
+                "text": "PRIVATE_ADAPTER_TRANSCRIPT_SENTINEL",
+            }],
+        },
+    }]
+    consumed = []
+elif binding["stage_name"] == "align":
+    assert len(stage_inputs) == 1
+    artifact = stage_inputs[0]
+    assert artifact["contract_version"] == "tacua.processing-stage-artifact@1.0.0"
+    assert artifact["artifact_kind"] == "transcript"
+    assert artifact["payload"]["spans"][0]["text"] == "PRIVATE_ADAPTER_TRANSCRIPT_SENTINEL"
+    artifacts = []
+    consumed = [{
+        "artifact_id": artifact["artifact_id"],
+        "artifact_digest": artifact["artifact_digest"],
+    }]
+else:
+    raise AssertionError("artifact pipeline advanced beyond its implemented boundary")
+result = {
+    "contract_version": "tacua.local-processing-result@1.1.0",
+    "input_digest": document["input_digest"],
+    "job_id": binding["job_id"],
+    "job_digest": binding["job_digest"],
+    "session_id": binding["session_id"],
+    "stage_name": binding["stage_name"],
+    "disposition": "checkpoint",
+    "result": {
+        "artifacts": artifacts,
+        "consumed_artifacts": consumed,
+    },
+}
+sys.stdout.buffer.write(canonical(result).encode("utf-8"))
+'''
+
+
 class LocalProcessingAdapterTests(BackendHarness):
     def processor_script(self, source: str) -> Path:
         directory = tempfile.TemporaryDirectory()
@@ -157,6 +249,7 @@ class LocalProcessingAdapterTests(BackendHarness):
         timeout_seconds: int = 30,
         stdout_bytes: int = 4_194_304,
         stderr_bytes: int = 65_536,
+        contract_version: str = COMMAND_CONTRACT,
     ) -> LocalProcessorCommand:
         return LocalProcessorCommand(
             argv=(
@@ -171,6 +264,7 @@ class LocalProcessingAdapterTests(BackendHarness):
             timeout_seconds=timeout_seconds,
             max_stdout_bytes=stdout_bytes,
             max_stderr_bytes=stderr_bytes,
+            contract_version=contract_version,
         )
 
     def install(self, command: LocalProcessorCommand) -> LocalProcessingAdapter:
@@ -202,7 +296,15 @@ class LocalProcessingAdapterTests(BackendHarness):
         command_path.chmod(0o600)
         loaded = load_local_processor_command(command_path)
         self.assertEqual(tuple(document["argv"]), loaded.argv)
+        self.assertEqual(COMMAND_CONTRACT, loaded.contract_version)
         self.assertIn("; touch /tmp/not-a-shell", loaded.argv)
+
+        document["contract_version"] = COMMAND_CONTRACT_V11
+        command_path.write_bytes(canonical_json(document).encode("utf-8"))
+        command_path.chmod(0o600)
+        loaded_v11 = load_local_processor_command(command_path)
+        self.assertEqual(COMMAND_CONTRACT_V11, loaded_v11.contract_version)
+        document["contract_version"] = COMMAND_CONTRACT
 
         command_path.write_text(json.dumps(document, indent=2), encoding="utf-8")
         command_path.chmod(0o600)
@@ -216,6 +318,108 @@ class LocalProcessingAdapterTests(BackendHarness):
         with self.assertRaises(ProcessingAdapterError) as captured:
             load_local_processor_command(command_path)
         self.assertEqual("PROCESSOR_ARGV_INVALID", captured.exception.code)
+
+    def test_opt_in_adapter_v11_passes_transcript_to_align_then_pauses(self) -> None:
+        self.backend = AdapterArtifactPipelineBackend(
+            self.config, self.admin_secret, clock=self.clock
+        )
+        lifecycle = self.full_completed_session()
+        job = lifecycle["completion_receipt"]["processing_job"]
+        script = self.processor_script(ARTIFACT_PIPELINE_PROCESSOR)
+        self.install(
+            self.command(script, contract_version=COMMAND_CONTRACT_V11)
+        )
+
+        transcribed = self.backend.run_processing_once("worker_adapter_v11")
+        assert transcribed is not None
+        self.assertEqual(
+            "succeeded", transcribed["pipeline"]["stages"][0]["state"]
+        )
+        aligned = self.backend.run_processing_once("worker_adapter_v11")
+        assert aligned is not None
+        self.assertEqual("succeeded", aligned["pipeline"]["stages"][1]["state"])
+        self.assertEqual("pending", aligned["pipeline"]["stages"][2]["state"])
+        self.assertIsNone(self.backend.run_processing_once("worker_adapter_v11"))
+        self.assertNotIn(
+            "PRIVATE_ADAPTER_TRANSCRIPT_SENTINEL", canonical_json(aligned)
+        )
+        self.assertNotIn(
+            "PRIVATE_ADAPTER_TRANSCRIPT_SENTINEL",
+            canonical_json(self.backend.list_jobs()),
+        )
+        with self.backend._connect() as connection:
+            artifact_body = connection.execute(
+                "SELECT canonical_json FROM tacua_processing_artifacts"
+            ).fetchone()[0]
+            receipt_body = connection.execute(
+                """SELECT canonical_json
+                     FROM tacua_processing_artifact_consumptions"""
+            ).fetchone()[0]
+        self.assertIn("PRIVATE_ADAPTER_TRANSCRIPT_SENTINEL", artifact_body)
+        self.assertNotIn("PRIVATE_ADAPTER_TRANSCRIPT_SENTINEL", receipt_body)
+        restarted = PilotBackend(self.config, self.admin_secret, clock=self.clock)
+        self.assertEqual(aligned, restarted.get_job(job["job_id"]))
+        self.assertEqual([], list(self.backend.temp_dir.iterdir()))
+
+    def test_adapter_v11_wrong_consumed_reference_fails_without_receipt(self) -> None:
+        self.backend = AdapterArtifactPipelineBackend(
+            self.config, self.admin_secret, clock=self.clock
+        )
+        lifecycle = self.full_completed_session()
+        job_id = lifecycle["completion_receipt"]["processing_job"]["job_id"]
+        source = ARTIFACT_PIPELINE_PROCESSOR.replace(
+            '"artifact_id": artifact["artifact_id"],',
+            '"artifact_id": "artifact_wrong_reference",',
+        )
+        self.install(
+            self.command(
+                self.processor_script(source),
+                contract_version=COMMAND_CONTRACT_V11,
+            )
+        )
+
+        transcribed = self.backend.run_processing_once("worker_adapter_v11_bad_ref")
+        assert transcribed is not None
+        with self.assertRaises(ApiError) as captured:
+            self.backend.run_processing_once("worker_adapter_v11_bad_ref")
+        self.assertEqual("PROCESSING_ENGINE_FAILED", captured.exception.code)
+        self.assertNotIn(
+            "PRIVATE_ADAPTER_TRANSCRIPT_SENTINEL", str(captured.exception)
+        )
+        job = self.backend.get_job(job_id)
+        self.assertEqual("queued", job["status"])
+        self.assertEqual("pending", job["pipeline"]["stages"][1]["state"])
+        self.assertEqual(1, job["pipeline"]["stages"][1]["attempt_count"])
+        with self.backend._connect() as connection:
+            self.assertEqual(
+                0,
+                connection.execute(
+                    "SELECT COUNT(*) FROM tacua_processing_artifact_consumptions"
+                ).fetchone()[0],
+            )
+        self.assertEqual([], list(self.backend.temp_dir.iterdir()))
+
+    def test_adapter_v10_refuses_artifact_pipeline_before_child_execution(self) -> None:
+        self.backend = AdapterArtifactPipelineBackend(
+            self.config, self.admin_secret, clock=self.clock
+        )
+        lifecycle = self.full_completed_session()
+        marker_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(marker_directory.cleanup)
+        marker = Path(marker_directory.name) / "child-ran"
+        script = self.processor_script(
+            f"from pathlib import Path; Path({str(marker)!r}).write_text('ran')"
+        )
+        self.install(self.command(script))
+        with self.assertRaises(ApiError) as captured:
+            self.backend.run_processing_once("worker_adapter_v10_guard")
+        self.assertEqual("PROCESSING_ENGINE_FAILED", captured.exception.code)
+        self.assertFalse(marker.exists())
+        job = self.backend.get_job(
+            lifecycle["completion_receipt"]["processing_job"]["job_id"]
+        )
+        self.assertEqual("queued", job["status"])
+        self.assertEqual(1, job["pipeline"]["stages"][0]["attempt_count"])
 
     def test_verified_descriptor_input_progresses_all_stages_to_zero_candidates(self) -> None:
         lifecycle = self.full_completed_session()

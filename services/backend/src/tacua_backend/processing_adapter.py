@@ -13,6 +13,7 @@ descriptors for evidence that was reverified under the backend deletion lock.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import copy
 from dataclasses import dataclass
 import hashlib
 import hmac
@@ -36,7 +37,10 @@ from .contracts import (
     validate_operation_pair,
 )
 from .processing_jobs import (
+    ARTIFACT_PIPELINE_VERSION,
     JOB_STAGES,
+    LEGACY_PIPELINE_VERSION,
+    ProcessingCheckpoint,
     ProcessingJobClaim,
     ProcessingJobStoreError,
     ProcessingResult,
@@ -50,6 +54,9 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle guard for static tooling
 COMMAND_CONTRACT = "tacua.local-processing-command@1.0.0"
 INPUT_CONTRACT = "tacua.local-processing-input@1.0.0"
 RESULT_CONTRACT = "tacua.local-processing-result@1.0.0"
+COMMAND_CONTRACT_V11 = "tacua.local-processing-command@1.1.0"
+INPUT_CONTRACT_V11 = "tacua.local-processing-input@1.1.0"
+RESULT_CONTRACT_V11 = "tacua.local-processing-result@1.1.0"
 INPUT_PLACEHOLDER = "{input}"
 OUTPUT_DIRECTORY_PLACEHOLDER = "{output_directory}"
 MAX_COMMAND_FILE_BYTES = 65_536
@@ -83,6 +90,7 @@ class LocalProcessorCommand:
     timeout_seconds: int
     max_stdout_bytes: int
     max_stderr_bytes: int
+    contract_version: str = COMMAND_CONTRACT
 
     def __post_init__(self) -> None:
         argv = self.argv
@@ -115,6 +123,8 @@ class LocalProcessorCommand:
             or isinstance(self.max_stderr_bytes, bool)
             or not isinstance(self.max_stderr_bytes, int)
             or not 1_024 <= self.max_stderr_bytes <= MAX_STDERR_BYTES
+            or self.contract_version
+            not in {COMMAND_CONTRACT, COMMAND_CONTRACT_V11}
         ):
             raise ProcessingAdapterError(
                 "PROCESSOR_COMMAND_INVALID", "processor command is invalid"
@@ -253,7 +263,10 @@ def load_local_processor_command(path: Path) -> LocalProcessorCommand:
         "timeout_seconds",
         "max_stdout_bytes",
         "max_stderr_bytes",
-    } or document["contract_version"] != COMMAND_CONTRACT:
+    } or document["contract_version"] not in {
+        COMMAND_CONTRACT,
+        COMMAND_CONTRACT_V11,
+    }:
         raise ProcessingAdapterError(
             "PROCESSOR_COMMAND_INVALID", "processor command fields are invalid"
         )
@@ -315,6 +328,7 @@ def load_local_processor_command(path: Path) -> LocalProcessorCommand:
         timeout_seconds=timeout,
         max_stdout_bytes=stdout_limit,
         max_stderr_bytes=stderr_limit,
+        contract_version=document["contract_version"],
     )
 
 
@@ -731,7 +745,10 @@ def _create_input_descriptor(work_directory: Path, payload: bytes) -> int:
 
 @contextmanager
 def _processing_input(
-    backend: PilotBackend, claim: ProcessingJobClaim
+    backend: PilotBackend,
+    claim: ProcessingJobClaim,
+    *,
+    command_contract_version: str,
 ) -> Iterator[_ProcessingInput]:
     """Hold deletion exclusion while verified read-only evidence is exposed."""
 
@@ -757,9 +774,9 @@ def _processing_input(
             with backend._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 try:
-                    job, worker_id = backend._processing_job_store(
+                    job, worker_id, stage_inputs = backend._processing_job_store(
                         connection
-                    ).validate_stage_lease(
+                    ).validate_stage_lease_inputs(
                         claim.job["job_id"], claim.stage_name, claim.lease_token
                     )
                 except ProcessingJobStoreError as error:
@@ -771,6 +788,20 @@ def _processing_input(
                     raise ProcessingAdapterError(
                         "PROCESSOR_CLAIM_CHANGED",
                         "processing claim changed before evidence admission",
+                    )
+                pipeline_version = job["pipeline"]["pipeline_version"]
+                if pipeline_version == LEGACY_PIPELINE_VERSION:
+                    input_contract = INPUT_CONTRACT
+                elif (
+                    pipeline_version == ARTIFACT_PIPELINE_VERSION
+                    and command_contract_version == COMMAND_CONTRACT_V11
+                    and claim.stage_name in {JOB_STAGES[0], JOB_STAGES[1]}
+                ):
+                    input_contract = INPUT_CONTRACT_V11
+                else:
+                    raise ProcessingAdapterError(
+                        "PROCESSOR_PIPELINE_UNSUPPORTED",
+                        "processor command does not support this pipeline",
                     )
                 session = connection.execute(
                     """SELECT state,build_identity_json,created_at,completed_at,
@@ -871,7 +902,7 @@ def _processing_input(
                 )
                 protocol_validate(build_identity)
                 processing_document = {
-                    "contract_version": INPUT_CONTRACT,
+                    "contract_version": input_contract,
                     "input_digest": "sha256:" + "0" * 64,
                     "binding": {
                         "organization_id": job["organization_id"],
@@ -899,6 +930,13 @@ def _processing_input(
                         "diagnostics": diagnostic_documents,
                     },
                 }
+                if input_contract == INPUT_CONTRACT_V11:
+                    processing_document["stage_inputs"] = {
+                        "artifacts": [
+                            copy.deepcopy(artifact)
+                            for artifact in stage_inputs.artifacts
+                        ]
+                    }
                 processing_document["input_digest"] = digest_without(
                     processing_document, "input_digest"
                 )
@@ -1077,7 +1115,9 @@ def _output_names(snapshot: _ProcessingInput) -> set[str]:
     return names
 
 
-def _parse_result(raw: bytes, snapshot: _ProcessingInput) -> ProcessingResult | None:
+def _parse_result(
+    raw: bytes, snapshot: _ProcessingInput
+) -> ProcessingCheckpoint | ProcessingResult | None:
     document = _strict_object(raw)
     if set(document) != {
         "contract_version",
@@ -1093,8 +1133,14 @@ def _parse_result(raw: bytes, snapshot: _ProcessingInput) -> ProcessingResult | 
             "PROCESSOR_RESULT_INVALID", "processor result fields are invalid"
         )
     binding = snapshot.document["binding"]
+    input_contract = snapshot.document["contract_version"]
+    expected_result_contract = {
+        INPUT_CONTRACT: RESULT_CONTRACT,
+        INPUT_CONTRACT_V11: RESULT_CONTRACT_V11,
+    }.get(input_contract)
     if (
-        document["contract_version"] != RESULT_CONTRACT
+        expected_result_contract is None
+        or document["contract_version"] != expected_result_contract
         or document["input_digest"] != snapshot.document["input_digest"]
         or document["job_id"] != binding["job_id"]
         or document["job_digest"] != binding["job_digest"]
@@ -1105,6 +1151,71 @@ def _parse_result(raw: bytes, snapshot: _ProcessingInput) -> ProcessingResult | 
             "PROCESSOR_RESULT_BINDING_MISMATCH",
             "processor result binding differs from its input",
         )
+    if input_contract == INPUT_CONTRACT_V11:
+        if (
+            binding["stage_name"] not in {JOB_STAGES[0], JOB_STAGES[1]}
+            or document["disposition"] != "checkpoint"
+            or type(document["result"]) is not dict
+            or set(document["result"])
+            != {"artifacts", "consumed_artifacts"}
+            or type(document["result"]["artifacts"]) is not list
+            or type(document["result"]["consumed_artifacts"]) is not list
+            or _output_names(snapshot)
+        ):
+            raise ProcessingAdapterError(
+                "PROCESSOR_RESULT_INVALID",
+                "artifact-pipeline processor result is invalid",
+            )
+        artifacts = document["result"]["artifacts"]
+        consumed = document["result"]["consumed_artifacts"]
+        if any(
+            type(artifact) is not dict
+            or set(artifact) != {"artifact_kind", "payload"}
+            or artifact["artifact_kind"] != "transcript"
+            or type(artifact["payload"]) is not dict
+            for artifact in artifacts
+        ) or any(
+            type(reference) is not dict
+            or set(reference) != {"artifact_id", "artifact_digest"}
+            or type(reference["artifact_id"]) is not str
+            or type(reference["artifact_digest"]) is not str
+            for reference in consumed
+        ):
+            raise ProcessingAdapterError(
+                "PROCESSOR_RESULT_INVALID",
+                "artifact-pipeline checkpoint fields are invalid",
+            )
+        stage_artifacts = snapshot.document["stage_inputs"]["artifacts"]
+        expected_consumed = [
+            {
+                "artifact_id": artifact["artifact_id"],
+                "artifact_digest": artifact["artifact_digest"],
+            }
+            for artifact in stage_artifacts
+        ]
+        if binding["stage_name"] == JOB_STAGES[0]:
+            valid_stage_result = (
+                len(artifacts) == 1
+                and not consumed
+                and artifacts[0]["artifact_kind"] == "transcript"
+                and not stage_artifacts
+            )
+        else:
+            valid_stage_result = (
+                not artifacts
+                and len(stage_artifacts) == 1
+                and consumed == expected_consumed
+            )
+        if not valid_stage_result:
+            raise ProcessingAdapterError(
+                "PROCESSOR_RESULT_INVALID",
+                "artifact-pipeline checkpoint differs from its stage inputs",
+            )
+        return ProcessingCheckpoint(
+            artifacts=tuple(copy.deepcopy(artifacts)),
+            consumed_artifacts=tuple(copy.deepcopy(consumed)),
+        )
+
     final_stage = binding["stage_name"] == JOB_STAGES[-1]
     if not final_stage:
         if document["disposition"] != "checkpoint" or document["result"] is not None:
@@ -1200,13 +1311,19 @@ class LocalProcessingAdapter:
             raise RuntimeError("local processing adapter is already bound")
         self._backend = backend
 
-    def process_stage(self, claim: ProcessingJobClaim) -> ProcessingResult | None:
+    def process_stage(
+        self, claim: ProcessingJobClaim
+    ) -> ProcessingCheckpoint | ProcessingResult | None:
         backend = self._backend
         if backend is None:
             raise ProcessingAdapterError(
                 "PROCESSOR_NOT_BOUND", "local processing adapter is not bound"
             )
-        with _processing_input(backend, claim) as snapshot:
+        with _processing_input(
+            backend,
+            claim,
+            command_contract_version=self.command.contract_version,
+        ) as snapshot:
             argv = self.command.expand(
                 input_path=snapshot.input_path,
                 output_directory=snapshot.output_directory,
