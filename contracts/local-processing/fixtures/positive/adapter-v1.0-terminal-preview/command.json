@@ -1,0 +1,1 @@
+{"argv":["/usr/bin/python3","/opt/tacua-processor/processor.py","--input","{input}","--output-directory","{output_directory}"],"contract_version":"tacua.local-processing-command@1.0.0","max_stderr_bytes":65536,"max_stdout_bytes":4194304,"timeout_seconds":240}

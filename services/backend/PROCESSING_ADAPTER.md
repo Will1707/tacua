@@ -6,6 +6,12 @@ completed session through `transcribe`, `align`, `correlate`, `research`, and
 repository connector, or SaaS integration. Normal backend startup does not
 load a command, claim a job, or spawn a child process.
 
+The canonical synthetic positive/negative wires and content-free conformance
+CLI live in [`contracts/local-processing`](../../contracts/local-processing/README.md).
+They freeze adapter 1.0/1.1 plus the isolated wrapper 1.0 without selecting a
+processor or activating the dormant artifact pipeline. Runtime lease,
+persistence, retention, and publication validation remains authoritative.
+
 The V1 worker is deliberately an **exclusive offline worker**. It acquires the
 same lifetime state-volume lock as the HTTP service and operator restore tools.
 Stop the HTTP container before running it, then restart the service afterward.

@@ -60,6 +60,12 @@ jobs:
           python3 -B scripts/validate.py bundle fixtures/positive
           python3 -B -m unittest discover -s tests -v
 
+      - name: Validate dormant local-processing contracts
+        run: |
+          python3 -B contracts/local-processing/scripts/regenerate_fixtures.py --check
+          python3 -B contracts/local-processing/scripts/validate.py fixtures contracts/local-processing/fixtures
+          PYTHONWARNINGS=error python3 -B -m unittest discover -s contracts/local-processing/tests -v
+
       - name: Validate production draft ticket-candidate contract
         working-directory: contracts/ticket-candidate
         run: |
