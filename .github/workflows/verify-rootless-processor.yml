@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-name: Verify rootless isolated processor
+name: Verify rootless processing
 
 on:
   workflow_dispatch:
@@ -12,13 +12,33 @@ jobs:
     # This is deliberately separate from ubuntu-latest: the acceptance gate
     # requires a rootless daemon with cgroup v2/systemd delegation and builtin
     # seccomp, which the ordinary rootful GitHub-hosted daemon does not prove.
+    # The runner must be idle and non-production because the complete gate
+    # temporarily owns the fixed loopback acceptance port 8080.
     runs-on: [self-hosted, linux, x64, tacua-rootless]
-    timeout-minutes: 15
+    timeout-minutes: 45
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '22.22.2'
+          package-manager-cache: false
+
       - name: Prove and run the rootless isolated-processor integration
         run: python3 -B services/backend/scripts/run_synthetic_isolated_processor_integration.py
+
+      - name: Build the self-hosted reviewer export
+        working-directory: apps/reviewer
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          node ../../.github/scripts/generate-reviewer-third-party-notices.mjs
+          ./node_modules/.bin/expo export --platform web --output-dir dist --clear
+
+      - name: Prove queued Compose processing
+        env:
+          TACUA_VERIFY_COMPOSE_PROCESSING_BRIDGE: 'true'
+        run: bash .github/scripts/verify-backend-container.sh

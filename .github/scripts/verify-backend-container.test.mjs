@@ -16,11 +16,25 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 const sourceScript = readFileSync(
   new URL("./verify-backend-container.sh", import.meta.url),
   "utf8",
 );
+const processingBridgeScript = fileURLToPath(
+  new URL("./verify-compose-processing-bridge.sh", import.meta.url),
+);
+
+test("the Compose processing bridge verifier has valid shell syntax", () => {
+  const result = spawnSync("bash", ["-n", processingBridgeScript], {
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "");
+  assert.equal(result.stderr, "");
+});
 
 function makeFixture(testContext) {
   const root = mkdtempSync(path.join(tmpdir(), "tacua-container-script-test-"));
@@ -78,6 +92,27 @@ test("a services/backend/local symlink is rejected before Docker or file mutatio
   assert.match(result.stderr, /must be absent or a real directory/u);
   assert.equal(existsSync(dockerMarker), false);
   assert.equal(readFileSync(path.join(outside, "sentinel"), "utf8"), "keep\n");
+});
+
+test("an invalid Compose processing bridge toggle is rejected before Docker", (t) => {
+  const { fakeBin, root } = makeFixture(t);
+  const dockerMarker = path.join(root, "docker-was-called");
+  writeExecutable(
+    path.join(fakeBin, "docker"),
+    "#!/bin/sh\nprintf called > \"$TACUA_DOCKER_MARKER\"\nexit 99\n",
+  );
+
+  const result = runFixture(root, fakeBin, {
+    TACUA_DOCKER_MARKER: dockerMarker,
+    TACUA_VERIFY_COMPOSE_PROCESSING_BRIDGE: "yes",
+  });
+
+  assert.equal(result.status, 2, result.stderr);
+  assert.match(
+    result.stderr,
+    /TACUA_VERIFY_COMPOSE_PROCESSING_BRIDGE must be true or false/u,
+  );
+  assert.equal(existsSync(dockerMarker), false);
 });
 
 for (const precreateLocalDirectory of [false, true]) {

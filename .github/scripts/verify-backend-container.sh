@@ -12,6 +12,15 @@ case "$keep_verified_images" in
     ;;
 esac
 
+verify_compose_processing_bridge="${TACUA_VERIFY_COMPOSE_PROCESSING_BRIDGE:-false}"
+case "$verify_compose_processing_bridge" in
+  true|false) ;;
+  *)
+    echo "TACUA_VERIFY_COMPOSE_PROCESSING_BRIDGE must be true or false" >&2
+    exit 2
+    ;;
+esac
+
 test_id="${TACUA_CONTAINER_TEST_ID:-ci}"
 case "$test_id" in
   *[!a-z0-9-]*|''|-*)
@@ -31,6 +40,7 @@ fi
 
 image="tacua-backend:${test_id}"
 reviewer_image="tacua-reviewer-web:${test_id}"
+processor_image="tacua-offline-processor:${test_id}"
 container="tacua-backend-${test_id}"
 second_container="tacua-backend-${test_id}-second"
 restored_container="tacua-backend-${test_id}-restored"
@@ -50,6 +60,7 @@ secret="$runtime_directory/admin-secret"
 resolved_compose="$runtime_directory/compose.json"
 resolved_test_compose="$runtime_directory/compose-test.json"
 resolved_production_compose="$runtime_directory/compose-production.json"
+bridge_compose="$runtime_directory/compose-bridge.json"
 test_compose_override="$runtime_directory/compose-test-override.json"
 restore_volume_override="$runtime_directory/compose-restore-volume.json"
 verified_restored_backup="$runtime_directory/restored-backup.json"
@@ -62,6 +73,7 @@ docker_cleanup=false
 compose_started=false
 restore_compose_created=false
 verification_succeeded=false
+processor_image_created=false
 
 cleanup() {
   if [ "$docker_cleanup" = true ]; then
@@ -89,6 +101,9 @@ cleanup() {
     if [ "$verification_succeeded" != true ] || [ "$keep_verified_images" != true ]; then
       docker image rm "$image" >/dev/null 2>&1 || true
       docker image rm "$reviewer_image" >/dev/null 2>&1 || true
+      if [ "$processor_image_created" = true ]; then
+        docker image rm "$processor_image" >/dev/null 2>&1 || true
+      fi
     fi
   fi
   if [ "$cleanup_local_files" = true ]; then
@@ -261,6 +276,11 @@ if printf '%s\n' "$image_names" | grep -Fqx -- "$reviewer_image"; then
   echo "refusing to replace existing Docker image: $reviewer_image" >&2
   exit 1
 fi
+if [ "$verify_compose_processing_bridge" = true ] \
+  && printf '%s\n' "$image_names" | grep -Fqx -- "$processor_image"; then
+  echo "refusing to replace existing Docker image: $processor_image" >&2
+  exit 1
+fi
 
 printf '%s' 'tacua-ci-admin-secret-0123456789abcdef' > "$secret"
 chmod 0444 "$secret"
@@ -336,6 +356,12 @@ docker build --pull=false \
   -f services/reviewer-web/Dockerfile \
   -t "$reviewer_image" \
   .
+if [ "$verify_compose_processing_bridge" = true ]; then
+  TACUA_KEEP_VERIFIED_IMAGES=true \
+  TACUA_PROCESSOR_TEST_ID="$test_id" \
+    bash .github/scripts/verify-processor-container.sh
+  processor_image_created=true
+fi
 
 compose_started=true
 docker compose \
@@ -349,7 +375,7 @@ compose_container="$(
     -p "$compose_project" \
     -f services/backend/compose.yaml \
     -f "$test_compose_override" \
-    ps -q backend
+    ps --no-trunc -q backend
 )"
 if [ -z "$compose_container" ] || [ "$(printf '%s\n' "$compose_container" | wc -l)" -ne 1 ]; then
   echo "Compose did not resolve exactly one backend container" >&2
@@ -360,7 +386,7 @@ compose_ingress_container="$(
     -p "$compose_project" \
     -f services/backend/compose.yaml \
     -f "$test_compose_override" \
-    ps -q ingress
+    ps --no-trunc -q ingress
 )"
 if [ -z "$compose_ingress_container" ] || [ "$(printf '%s\n' "$compose_ingress_container" | wc -l)" -ne 1 ]; then
   echo "Compose did not resolve exactly one ingress container" >&2
@@ -371,7 +397,7 @@ compose_reviewer_container="$(
     -p "$compose_project" \
     -f services/backend/compose.yaml \
     -f "$test_compose_override" \
-    ps -q reviewer
+    ps --no-trunc -q reviewer
 )"
 if [ -z "$compose_reviewer_container" ] || [ "$(printf '%s\n' "$compose_reviewer_container" | wc -l)" -ne 1 ]; then
   echo "Compose did not resolve exactly one reviewer container" >&2
@@ -443,6 +469,30 @@ PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool smoke 
   --admin-secret-file "$local_secret" \
   --origin http://127.0.0.1:8080 \
   --allow-loopback-http
+
+if [ "$verify_compose_processing_bridge" = true ]; then
+  docker compose \
+    -p "$compose_project" \
+    -f services/backend/compose.yaml \
+    -f "$test_compose_override" \
+    config --format json > "$bridge_compose"
+  chmod 0600 "$bridge_compose"
+  processor_image_id="$(
+    docker image inspect --format '{{.Id}}' "$processor_image"
+  )"
+  backend_image_id="$(
+    docker inspect --format '{{.Image}}' "$compose_container"
+  )"
+  bash .github/scripts/verify-compose-processing-bridge.sh \
+    "$compose_project" \
+    "$bridge_compose" \
+    "$local_config" \
+    "$local_secret" \
+    "$compose_container" \
+    "$compose_state_volume" \
+    "$processor_image_id" \
+    "$backend_image_id"
+fi
 
 docker compose \
   -p "$compose_project" \

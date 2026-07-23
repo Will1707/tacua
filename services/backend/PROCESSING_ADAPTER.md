@@ -463,4 +463,12 @@ real integration covers the final-running interruption; carrier-only,
 post-copy, malformed-output, and cleanup interruption phases remain deterministic
 unit regressions. The ordinary rootful GitHub-hosted job runs the unit/profile
 checks only; the real integration is the separate manually dispatched
-`verify-rootless-processor.yml` self-hosted gate.
+`verify-rootless-processor.yml` self-hosted gate. That gate also starts the
+complete backend/reviewer/ingress Compose topology, seeds one protocol-valid
+queued capture in a pristine test volume, and advances exactly one stage
+through the Compose bridge and the verified product processor image. The
+bridge's pipe-gated create and conservative recovery phases remain covered by
+the deterministic operation-journal unit matrix; no test-only barrier is
+exposed by the production bridge. Run the full gate only on an idle,
+non-production runner whose loopback port `8080` is free; it is not an
+in-place upgrade check for a host already serving Tacua.
