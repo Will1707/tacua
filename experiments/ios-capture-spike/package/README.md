@@ -157,6 +157,12 @@ The host QA target must pin these values in its built `Info.plist`:
 - `TacuaLaunchScheme`: a dedicated lowercase 2–64 character URL scheme registered
   by that target. Browser, OS-service, and Tacua reviewer schemes are rejected.
 
+A `development`/`local` QA profile may use a Release-configuration binary so
+the host can embed an immutable JavaScript bundle for evidence capture.
+`development` builds distributed beyond the local-device boundary still require
+Debug. Insecure loopback transport and the repository acceptance-harness
+retention bypass remain Debug-only.
+
 The accepted START launch URL is:
 
 ```text
