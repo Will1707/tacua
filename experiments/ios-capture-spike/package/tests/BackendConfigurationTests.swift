@@ -73,16 +73,18 @@ enum BackendConfigurationTests {
   }
 
   private static func qaBuildGateRejectsProductionAndMalformedConfiguration() throws {
-    let development = try TacuaQABuildConfiguration(
-      captureEnabled: true,
-      buildVariant: "development",
-      distribution: "local",
-      debugBuild: true
-    )
-    try require(
-      development.buildVariant == "development" && development.distribution == "local",
-      "Development QA build was not accepted"
-    )
+    for debugBuild in [false, true] {
+      let development = try TacuaQABuildConfiguration(
+        captureEnabled: true,
+        buildVariant: "development",
+        distribution: "local",
+        debugBuild: debugBuild
+      )
+      try require(
+        development.buildVariant == "development" && development.distribution == "local",
+        "Local QA build was not accepted"
+      )
+    }
     let preview = try TacuaQABuildConfiguration(
       captureEnabled: true,
       buildVariant: "preview",

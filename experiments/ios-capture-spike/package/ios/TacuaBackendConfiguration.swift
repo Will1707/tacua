@@ -40,7 +40,13 @@ struct TacuaQABuildConfiguration: Equatable {
     ) else {
       throw TacuaQABuildConfigurationError.unsupportedBuildPair
     }
-    if buildVariant == "development" && !debugBuild {
+    // A local QA host may deliberately use a Release configuration so its
+    // JavaScript bundle is embedded and immutable during evidence capture.
+    // The native profile, explicit capture flag, and `local` distribution
+    // remain required. Development builds distributed beyond the local device
+    // boundary still require Debug; loopback HTTP is gated independently
+    // below by TacuaBackendConfiguration.
+    if buildVariant == "development" && distribution != "local" && !debugBuild {
       throw TacuaQABuildConfigurationError.developmentBuildRequiresDebug
     }
     self.buildVariant = buildVariant
