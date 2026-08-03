@@ -20,6 +20,9 @@ class ReconcileSystemdContractTests(unittest.TestCase):
         cls.main_service = (
             SYSTEMD / "tacua-reconcile.service.in"
         ).read_text(encoding="utf-8")
+        cls.timer = (SYSTEMD / "tacua-reconcile.timer").read_text(
+            encoding="utf-8"
+        )
 
     def test_lock_prerequisite_keeps_the_host_ownership_view(self) -> None:
         self.assertIn("host-ownership anchor", self.lock_service)
@@ -90,6 +93,28 @@ class ReconcileSystemdContractTests(unittest.TestCase):
             self.main_service,
         )
         self.assertNotIn("ReadWritePaths=/tmp\n", self.main_service)
+
+    def test_timer_declares_activation_and_completion_relative_triggers(
+        self,
+    ) -> None:
+        directives = self.timer.splitlines()
+        self.assertEqual(directives.count("OnActiveSec=30s"), 1)
+        self.assertEqual(directives.count("OnUnitInactiveSec=30s"), 1)
+        self.assertFalse(
+            any(line.startswith("OnBootSec=") for line in directives)
+        )
+        self.assertFalse(
+            any(line.startswith("OnStartupSec=") for line in directives)
+        )
+        self.assertFalse(
+            any(line.startswith("OnUnitActiveSec=") for line in directives)
+        )
+        self.assertFalse(
+            any(line.startswith("Persistent=") for line in directives)
+        )
+        self.assertNotIn("RemainAfterElapse=no", directives)
+        self.assertEqual(directives.count("AccuracySec=5s"), 1)
+        self.assertEqual(directives.count("Unit=tacua-reconcile.service"), 1)
 
 
 if __name__ == "__main__":
