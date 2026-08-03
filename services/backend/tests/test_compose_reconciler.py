@@ -124,6 +124,109 @@ class ComposeReconcilerTests(unittest.TestCase):
         desired_path.chmod(0o600)
         return state
 
+    def _seal_candidate(
+        self,
+        root: Path,
+        *,
+        maintenance: bool,
+    ) -> tuple[SimpleNamespace, dict]:
+        from services.backend.tests.test_operator_tool import (
+            OperatorToolTests as OperatorFixture,
+        )
+
+        root = root.resolve()
+        root.chmod(0o700)
+        helper = OperatorFixture()
+        config, secret, backend_state = helper.deployment(root)
+        compose_document = helper.compose_document(
+            immutable=True,
+            state_target=str(backend_state),
+            config_source=str(config),
+            secret_source=str(secret),
+        )
+        compose = root / "resolved-compose.json"
+        compose.write_bytes(RECONCILER._canonical(compose_document))
+        compose.chmod(0o600)
+        operation = root / "operations"
+        operation.mkdir(mode=0o700)
+        deployment = {
+            "containers": {
+                service: {"sealed": service}
+                for service in RECONCILER.SERVICES
+            },
+            "resources": {
+                "networks": {"sealed-network": {"sealed": True}},
+                "volumes": {"sealed-volume": {"sealed": True}},
+            },
+        }
+        return (
+            SimpleNamespace(
+                admin_secret_file=secret,
+                allow_mutable_image=False,
+                compose_json=compose,
+                config_file=config,
+                docker_service="docker.service",
+                generation="generation-real-preflight",
+                maintenance=maintenance,
+                operation_directory=operation,
+                project="test",
+                state_directory=root / "reconciler",
+            ),
+            deployment,
+        )
+
+    @contextlib.contextmanager
+    def _seal_runtime(
+        self,
+        deployment: dict,
+        *,
+        healthy: bool = True,
+        tailnet_result: tuple[dict, bool] = ({}, False),
+        tailnet_side_effect: object | None = None,
+        smoke_error: Exception | None = None,
+    ):
+        smoke_side_effect = smoke_error
+        with mock.patch.object(
+            RECONCILER, "_runtime_binding", return_value=SYNTHETIC_RUNTIME
+        ), mock.patch.object(
+            RECONCILER,
+            "_binary",
+            side_effect=lambda name: f"/usr/bin/{name}",
+        ), mock.patch.object(
+            RECONCILER, "_host_lock", return_value=99
+        ), mock.patch.object(
+            RECONCILER, "_release_lock"
+        ) as release_lock, mock.patch.object(
+            RECONCILER, "_refuse_recovery_journal"
+        ), mock.patch.object(
+            RECONCILER,
+            "_daemon_projection",
+            return_value=SYNTHETIC_DAEMON,
+        ), mock.patch.object(
+            RECONCILER,
+            "_inspect_deployment",
+            return_value=(deployment, healthy),
+        ) as inspect_deployment, mock.patch.object(
+            RECONCILER,
+            "_smoke",
+            side_effect=smoke_side_effect,
+        ) as smoke, mock.patch.object(
+            RECONCILER,
+            "_tailnet_state",
+            return_value=tailnet_result,
+            side_effect=tailnet_side_effect,
+        ) as tailnet, mock.patch.object(
+            RECONCILER,
+            "_disable_serve",
+        ) as disable_serve:
+            yield SimpleNamespace(
+                disable_serve=disable_serve,
+                inspect_deployment=inspect_deployment,
+                release_lock=release_lock,
+                smoke=smoke,
+                tailnet=tailnet,
+            )
+
     def _anchor_fixture(self, home: Path) -> tuple[Path, Path, Path]:
         home.mkdir(mode=0o700, parents=True, exist_ok=True)
         home.chmod(0o700)
@@ -948,77 +1051,345 @@ class ComposeReconcilerTests(unittest.TestCase):
             self.assertIsNone(RECONCILER._load_activation(state, desired))
 
     def test_seal_accepts_real_preflight_config_and_read_only_secret_contract(self) -> None:
-        from services.backend.tests.test_operator_tool import (
-            OperatorToolTests as OperatorFixture,
-        )
-
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
-            root.chmod(0o700)
-            helper = OperatorFixture()
-            config, secret, backend_state = helper.deployment(root)
-            compose_document = helper.compose_document(
-                immutable=True,
-                state_target=str(backend_state),
-                config_source=str(config),
-                secret_source=str(secret),
+            args, deployment = self._seal_candidate(
+                root,
+                maintenance=False,
             )
-            compose = root / "resolved-compose.json"
-            compose.write_bytes(RECONCILER._canonical(compose_document))
-            compose.chmod(0o600)
-            operation = root / "operations"
-            operation.mkdir(mode=0o700)
-            state_directory = root / "reconciler"
-            args = SimpleNamespace(
-                admin_secret_file=secret,
-                allow_mutable_image=False,
-                compose_json=compose,
-                config_file=config,
-                docker_service="docker.service",
-                generation="generation-real-preflight",
-                operation_directory=operation,
-                project="test",
-                state_directory=state_directory,
-            )
-            deployment = {
-                "containers": {
-                    service: {} for service in RECONCILER.SERVICES
-                },
-                "resources": {"networks": {}, "volumes": {}},
-            }
-            with mock.patch.object(
-                RECONCILER, "_runtime_binding", return_value=SYNTHETIC_RUNTIME
-            ), mock.patch.object(
-                RECONCILER,
-                "_binary",
-                side_effect=lambda name: f"/usr/bin/{name}",
-            ), mock.patch.object(
-                RECONCILER, "_host_lock", return_value=99
-            ), mock.patch.object(
-                RECONCILER, "_release_lock"
-            ), mock.patch.object(
-                RECONCILER, "_refuse_recovery_journal"
-            ), mock.patch.object(
-                RECONCILER,
-                "_daemon_projection",
-                return_value=SYNTHETIC_DAEMON,
-            ), mock.patch.object(
-                RECONCILER,
-                "_inspect_deployment",
-                return_value=(deployment, True),
-            ), mock.patch.object(
-                RECONCILER, "_smoke"
-            ), mock.patch.object(
-                RECONCILER, "_tailnet_state", return_value=({}, True)
+            with self._seal_runtime(
+                deployment,
+                tailnet_result=({}, True),
             ):
                 result = RECONCILER.seal(args, runner=mock.Mock())
             self.assertEqual("healthy", result["status"])
             desired, manifest, _compose = RECONCILER._load_bound_state(
-                state_directory
+                args.state_directory
             )
             self.assertEqual("running", desired["desired"])
             self.assertEqual(0o444, manifest["secret"]["mode"])
             self.assertEqual(0o644, manifest["config"]["mode"])
+
+    def test_maintenance_seal_proves_empty_serve_and_publishes_exact_projection(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args, deployment = self._seal_candidate(
+                Path(directory),
+                maintenance=True,
+            )
+            with self._seal_runtime(deployment) as observed:
+                ordered = mock.Mock()
+                original_atomic_write = RECONCILER._atomic_private_write
+                atomic_write_patch = mock.patch.object(
+                    RECONCILER,
+                    "_atomic_private_write",
+                    wraps=original_atomic_write,
+                )
+                atomic_write = atomic_write_patch.start()
+                self.addCleanup(atomic_write_patch.stop)
+                ordered.attach_mock(atomic_write, "atomic_write")
+                ordered.attach_mock(observed.tailnet, "tailnet")
+                ordered.attach_mock(
+                    observed.inspect_deployment,
+                    "inspect_deployment",
+                )
+                ordered.attach_mock(observed.smoke, "smoke")
+                ordered.attach_mock(observed.release_lock, "release_lock")
+                result = RECONCILER.seal(args, runner=mock.Mock())
+                atomic_write_patch.stop()
+
+            self.assertEqual(
+                {"code": "RECONCILE_SEALED", "status": "maintenance"},
+                result,
+            )
+            observed.inspect_deployment.assert_called_once()
+            observed.smoke.assert_called_once()
+            self.assertFalse(observed.smoke.call_args.kwargs["public"])
+            self.assertEqual(2, observed.tailnet.call_count)
+            self.assertEqual(
+                [
+                    "atomic_write",
+                    "tailnet",
+                    "inspect_deployment",
+                    "smoke",
+                    "atomic_write",
+                    "tailnet",
+                    "atomic_write",
+                    "release_lock",
+                ],
+                [call[0] for call in ordered.mock_calls],
+            )
+            atomic_calls = [
+                call
+                for call in ordered.mock_calls
+                if call[0] == "atomic_write"
+            ]
+            self.assertEqual(0o400, atomic_calls[0].kwargs["mode"])
+            self.assertEqual(
+                RECONCILER.DESIRED_FILE,
+                atomic_calls[-1].args[0].name,
+            )
+            observed.disable_serve.assert_not_called()
+
+            desired, manifest, compose = RECONCILER._load_bound_state(
+                args.state_directory
+            )
+            self.assertEqual("maintenance", desired["desired"])
+            self.assertEqual(deployment["containers"], manifest["containers"])
+            self.assertEqual(deployment["resources"], manifest["resources"])
+            self.assertEqual(0o400, compose.stat().st_mode & 0o777)
+            self.assertIsNone(
+                RECONCILER._load_activation(args.state_directory, desired)
+            )
+
+            idle_runner = mock.Mock(
+                side_effect=AssertionError("maintenance invoked a command")
+            )
+            self.assertEqual(
+                {
+                    "code": "RECONCILE_MAINTENANCE",
+                    "status": "maintenance",
+                },
+                RECONCILER.reconcile(args.state_directory, runner=idle_runner),
+            )
+            idle_runner.assert_not_called()
+
+    def test_maintenance_seal_failures_never_publish_desired_state(self) -> None:
+        failures = (
+            (
+                "active-serve",
+                True,
+                ({}, True),
+                None,
+                None,
+                "RECONCILE_PUBLIC_PATH_ACTIVE",
+            ),
+            (
+                "unknown-serve",
+                True,
+                ({}, False),
+                RECONCILER.ReconcileError("RECONCILE_TAILNET_FAILED"),
+                None,
+                "RECONCILE_TAILNET_FAILED",
+            ),
+            (
+                "serve-occupied-after-smoke",
+                True,
+                ({}, False),
+                [({}, False), ({}, True)],
+                None,
+                "RECONCILE_PUBLIC_PATH_ACTIVE",
+            ),
+            (
+                "loopback-smoke",
+                True,
+                ({}, False),
+                None,
+                RECONCILER.ReconcileError("RECONCILE_SMOKE_FAILED"),
+                "RECONCILE_SMOKE_FAILED",
+            ),
+            (
+                "unhealthy",
+                False,
+                ({}, False),
+                None,
+                None,
+                "RECONCILE_HEALTH_FAILED",
+            ),
+        )
+        for (
+            name,
+            healthy,
+            tailnet_result,
+            tailnet_side_effect,
+            smoke_error,
+            code,
+        ) in failures:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                args, deployment = self._seal_candidate(
+                    Path(directory),
+                    maintenance=True,
+                )
+                with self._seal_runtime(
+                    deployment,
+                    healthy=healthy,
+                    tailnet_result=tailnet_result,
+                    tailnet_side_effect=tailnet_side_effect,
+                    smoke_error=smoke_error,
+                ) as observed, self.assertRaisesRegex(
+                    RECONCILER.ReconcileError,
+                    code,
+                ):
+                    RECONCILER.seal(args, runner=mock.Mock())
+                self.assertFalse(
+                    (args.state_directory / RECONCILER.DESIRED_FILE).exists()
+                )
+                self.assertEqual([], list(args.state_directory.iterdir()))
+                observed.disable_serve.assert_not_called()
+                if name in {"active-serve", "unknown-serve"}:
+                    observed.inspect_deployment.assert_not_called()
+                    observed.smoke.assert_not_called()
+                elif name == "unhealthy":
+                    observed.smoke.assert_not_called()
+                self.assertEqual(
+                    2 if name == "serve-occupied-after-smoke" else 1,
+                    observed.tailnet.call_count,
+                )
+                if name == "active-serve":
+                    with self._seal_runtime(deployment):
+                        retry = RECONCILER.seal(
+                            args,
+                            runner=mock.Mock(),
+                        )
+                    self.assertEqual("maintenance", retry["status"])
+
+    def test_staged_seal_running_crash_is_timer_recoverable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args, deployment = self._seal_candidate(
+                Path(directory),
+                maintenance=True,
+            )
+            with self._seal_runtime(deployment):
+                RECONCILER.seal(args, runner=mock.Mock())
+
+            with mock.patch.object(
+                RECONCILER,
+                "_recover_locked",
+                side_effect=SystemExit("synthetic crash after activation"),
+            ):
+                with self.assertRaises(SystemExit):
+                    RECONCILER.set_running(
+                        args.state_directory,
+                        runner=mock.Mock(),
+                    )
+            desired, _manifest, _compose = RECONCILER._load_bound_state(
+                args.state_directory
+            )
+            self.assertEqual("maintenance", desired["desired"])
+            activation = RECONCILER._load_activation(
+                args.state_directory,
+                desired,
+            )
+            self.assertIsNotNone(activation)
+            self.assertEqual("running", activation["intent"])
+
+            with mock.patch.object(
+                RECONCILER,
+                "_recover_locked",
+                return_value="healthy",
+            ):
+                result = RECONCILER.reconcile(
+                    args.state_directory,
+                    runner=mock.Mock(),
+                )
+            self.assertEqual(
+                {"code": "RECONCILE_RECOVERED", "status": "recovered"},
+                result,
+            )
+            desired, _manifest, _compose = RECONCILER._load_bound_state(
+                args.state_directory
+            )
+            self.assertEqual("running", desired["desired"])
+            self.assertIsNone(
+                RECONCILER._load_activation(args.state_directory, desired)
+            )
+
+    def test_desired_publication_failure_quarantines_complete_generation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args, deployment = self._seal_candidate(
+                Path(directory),
+                maintenance=True,
+            )
+            original_atomic_write = RECONCILER._atomic_private_write
+
+            def fail_desired_publication(path, payload, **kwargs):
+                if path.name == RECONCILER.DESIRED_FILE:
+                    raise RECONCILER.ReconcileError(
+                        "RECONCILE_STATE_INVALID"
+                    )
+                return original_atomic_write(path, payload, **kwargs)
+
+            with self._seal_runtime(deployment), mock.patch.object(
+                RECONCILER,
+                "_atomic_private_write",
+                side_effect=fail_desired_publication,
+            ), self.assertRaisesRegex(
+                RECONCILER.ReconcileError,
+                "RECONCILE_STATE_INVALID",
+            ):
+                RECONCILER.seal(args, runner=mock.Mock())
+
+            generation = (
+                args.state_directory
+                / "generations"
+                / args.generation
+            )
+            self.assertEqual(
+                {RECONCILER.COMPOSE_FILE, RECONCILER.MANIFEST_FILE},
+                {entry.name for entry in generation.iterdir()},
+            )
+            compose = generation / RECONCILER.COMPOSE_FILE
+            manifest_path = generation / RECONCILER.MANIFEST_FILE
+            self.assertEqual(0o400, compose.stat().st_mode & 0o777)
+            self.assertEqual(0o600, manifest_path.stat().st_mode & 0o777)
+            manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+            self.assertEqual(
+                manifest["manifest_digest"],
+                RECONCILER._document_digest(manifest, "manifest_digest"),
+            )
+            self.assertFalse(
+                (args.state_directory / RECONCILER.DESIRED_FILE).exists()
+            )
+
+            with mock.patch.object(
+                RECONCILER,
+                "_recover_locked",
+            ) as recover, self.assertRaisesRegex(
+                RECONCILER.ReconcileError,
+                "RECONCILE_STATE_INVALID",
+            ):
+                RECONCILER.reconcile(
+                    args.state_directory,
+                    runner=mock.Mock(),
+                )
+            recover.assert_not_called()
+
+            with mock.patch.object(
+                RECONCILER,
+                "_runtime_binding",
+                side_effect=AssertionError("partial state was adopted"),
+            ), self.assertRaisesRegex(
+                RECONCILER.ReconcileError,
+                "RECONCILE_STATE_EXISTS",
+            ):
+                RECONCILER.seal(args, runner=mock.Mock())
+            self.assertTrue(generation.is_dir())
+            self.assertFalse(
+                (args.state_directory / RECONCILER.DESIRED_FILE).exists()
+            )
+
+    def test_seal_requires_a_fresh_state_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args, _deployment = self._seal_candidate(
+                Path(directory),
+                maintenance=True,
+            )
+            args.state_directory.mkdir(mode=0o700)
+            foreign = args.state_directory / "foreign"
+            foreign.write_text("untrusted", encoding="ascii")
+            foreign.chmod(0o600)
+            with mock.patch.object(
+                RECONCILER,
+                "_runtime_binding",
+                side_effect=AssertionError("non-fresh state reached runtime"),
+            ), self.assertRaisesRegex(
+                RECONCILER.ReconcileError,
+                "RECONCILE_STATE_EXISTS",
+            ):
+                RECONCILER.seal(args, runner=mock.Mock())
 
     def test_cancel_crash_after_disable_is_resumed_as_cancel_not_activation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

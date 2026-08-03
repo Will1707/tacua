@@ -13,7 +13,7 @@ maintenance stop remain stopped while the user timer handles daemon loss.
 ## Safety model
 
 `seal` writes a private desired-state record and one immutable generation below
-an existing owner-only directory. The desired record is canonical JSON,
+a fresh owner-only directory. The desired record is canonical JSON,
 digest-sealed, mode `0600`, and atomically replaced with file and directory
 `fsync`. Its generation manifest binds:
 
@@ -94,31 +94,80 @@ again and proves it empty; failure to prove that emits only
 An unknown or additional Serve configuration is never mutated and blocks
 recovery.
 
-## Seal an existing healthy deployment
+For initial installation, `seal --maintenance` is the preferred staged path.
+It accepts only an exactly empty Serve configuration, proves that condition
+before any Docker inspection and again after exact live projection, health,
+and loopback smoke gates, and never invokes a Serve mutation. It then publishes
+desired `maintenance`. This lets the operator install and start the timer while
+the public capability remains absent. The later `running` transaction writes
+its durable activation marker before it may enable Serve, so an interruption
+is timer-recoverable rather than an unrecorded public-path change.
 
-Run this only after the normal deployment preflight and initial authenticated
-loopback and tailnet HTTPS smokes have passed. Use the exact resolved Compose
-JSON that created the live containers. The input must be a mode-`0600` regular
-file; the reconciler copies it into the sealed generation.
+## Stage-seal an existing healthy deployment
+
+For a first reconciler installation, run this only after normal deployment
+preflight and authenticated loopback backend/reviewer smokes have passed, while
+the three Compose services are healthy and Tailscale Serve is still exactly
+empty. Use the exact resolved Compose JSON that created the live containers.
+The input must be a mode-`0600` regular file; the reconciler copies it into the
+sealed generation.
+
+If an older reconciler already owns this deployment, first use that exact
+installed version to reach settled `maintenance` with no activation marker,
+prove Serve empty, and stop plus disable its timer. Do not stage a replacement
+while the old desired state is `running`, an activation is pending, or the old
+timer can still act. The healthy containers may remain running for projection
+and loopback smoke. Always use the new generation-scoped state path below,
+render the replacement units to that exact path, and retain the old sealed
+state for rollback and forensics. A symlink or in-place overwrite is not a
+generation promotion.
 
 ```sh
-install -d -m 0700 "$HOME/.local/state/tacua-reconcile"
+generation='generation-YYYYMMDDTHHMMSSZ'
+tacua_reconcile_state_directory="$HOME/.local/state/tacua-reconcile-$generation"
+test ! -e "$tacua_reconcile_state_directory"
+install -d -m 0700 "$tacua_reconcile_state_directory"
 install -d -m 0700 "$HOME/.local/state/tacua"
 
 python3 -B services/backend/scripts/reconcile_compose_deployment.py seal \
-  --state-directory "$HOME/.local/state/tacua-reconcile" \
-  --generation 'generation-YYYYMMDDTHHMMSSZ' \
+  --state-directory "$tacua_reconcile_state_directory" \
+  --generation "$generation" \
   --project tacua \
   --compose-json /absolute/private/resolved-compose.json \
   --config-file /absolute/private/config.json \
   --admin-secret-file /absolute/private/admin-secret \
-  --operation-directory "$HOME/.local/state/tacua"
+  --operation-directory "$HOME/.local/state/tacua" \
+  --maintenance
 ```
+
+The command first proves exact empty Serve plus the sealed tailnet identity. It
+then seals the exact healthy container/resource projections and daemon binding,
+runs authenticated backend and reviewer smoke through host loopback, and
+repeats the empty-Serve/tailnet proof immediately before publication. It does
+not call `tailscale serve off`, enable Serve, or run a public HTTPS smoke. An
+exact active Tacua listener is still rejected with
+`RECONCILE_PUBLIC_PATH_ACTIVE`; unknown Serve state fails closed without
+mutation. Success reports `maintenance`, and a timer reconcile in this settled
+state is a command-free no-op. The final proof, immutable generation rename,
+directory `fsync`, and desired-state linearization point all remain under the
+same processing/reconciler host lock.
 
 `--allow-mutable-image` exists only for the documented local private pilot. A
 production seal requires immutable backend and reviewer image references.
-`seal` refuses an existing desired-state record or generation; generation
-promotion is an explicit maintenance/deployment operation, not a timer action.
+`seal` requires an entirely fresh state directory and refuses every entry,
+including a partial earlier attempt. An ordinary pre-publication validation
+failure removes only the exact private generation draft it created, fsyncs the
+empty state directory, and permits a retry after the gate is fixed. If a host
+or process interruption leaves any partial entry, quarantine that directory
+and retry with a different fresh directory; never delete or edit its JSON to
+force adoption. Generation promotion is an explicit maintenance/deployment
+operation, not a timer action.
+
+For compatibility, omitting `--maintenance` retains the older adoption mode:
+it requires the exact active Tacua Serve listener plus loopback and public
+HTTPS smokes, then publishes desired `running`. Do not use that mode for a new
+installation where Serve can remain empty; it cannot make a listener enabled
+before the seal crash-consistent.
 
 ## Install the user timer
 
@@ -133,7 +182,9 @@ wrapper in `ExecStart`. They are the selected Python executable, this
 checked-out reconciler, the sealed state directory, the boot-scoped anchor, the
 exact shared lock, the sealed processing-operation directory, the public
 config, and the administrator secret. The operation, config, and secret paths
-must exactly match the selected sealed generation.
+must exactly match the selected sealed generation. Render `@STATE_DIRECTORY@`
+as the canonical absolute value of `$tacua_reconcile_state_directory`; never
+put a stable symlink in that placeholder.
 
 Render the four absolute placeholders in
 `systemd/tacua-reconcile-lock.service.in` beside it, and copy
@@ -171,6 +222,8 @@ directory from logind, validate it instead of guessing or creating
 `/run/user/<uid>`, and scope it only to the user-systemd commands:
 
 ```sh
+: "${tacua_reconcile_state_directory:?set the selected fresh sealed state path}"
+test -d "$tacua_reconcile_state_directory"
 tacua_user_runtime_directory="$(
   loginctl show-user "$(id -u)" --property=RuntimePath --value
 )"
@@ -182,7 +235,7 @@ tacua_anchor_file="$tacua_user_runtime_directory/tacua-reconcile.anchor.json"
 env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
   python3 -B services/backend/scripts/reconcile_compose_deployment.py \
   prepare-lock \
-  --state-directory "$HOME/.local/state/tacua-reconcile" \
+  --state-directory "$tacua_reconcile_state_directory" \
   --anchor-file "$tacua_anchor_file"
 env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
   systemd-analyze --user verify "$HOME/.config/systemd/user/tacua-reconcile-lock.service"
@@ -200,6 +253,12 @@ env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
   systemctl --user enable tacua-reconcile.timer
 env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
   systemctl --user restart tacua-reconcile.timer
+env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
+  systemctl --user is-enabled --quiet tacua-reconcile.timer
+env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
+  systemctl --user is-active --quiet tacua-reconcile.timer
+env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
+  systemctl --user list-timers --all tacua-reconcile.timer
 ```
 
 The explicit one-shot run must succeed before enabling the timer. Its
@@ -211,6 +270,31 @@ the main unit starts. Never render a durable path for `@ANCHOR_FILE@`, and do
 not enable the timer if the manual run fails. The explicit timer restart is
 upgrade-safe: it replaces an already loaded schedule as well as starting a
 fresh installation.
+
+For a `seal --maintenance` installation, never invoke `running` until the new
+anchored service reconcile has returned `maintenance`, the new timer is both
+enabled and active, and `list-timers` shows its next scheduled run. The checks
+above must all succeed before any Serve activation. Only then invoke the
+existing guarded transaction with the same validated runtime environment:
+
+```sh
+env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
+  python3 -B services/backend/scripts/reconcile_compose_deployment.py status \
+  --state-directory "$tacua_reconcile_state_directory"
+env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
+  python3 -B services/backend/scripts/reconcile_compose_deployment.py running \
+  --state-directory "$tacua_reconcile_state_directory"
+```
+
+Require the first command to report `maintenance` and the second to report
+`recovered`. Do not run `tailscale serve` manually between them. `running`
+durably publishes the activation marker before any recovery or Serve mutation;
+if the shell or host dies afterward, the already-active timer resumes that
+marker through the same fail-closed transaction. A failure leaves the marker
+intact for recovery or guarded cancellation. Unit tests prove the durable
+marker/state semantics; only the installed service/timer checks above and the
+later physical interruption tests establish that this host will schedule that
+recovery.
 
 The service intentionally has no `Wants=` or `Requires=` dependency on Docker:
 maintenance must not activate it. `PrivateTmp=no` is also intentional because
@@ -235,6 +319,10 @@ recovery from unit tests alone.
 
 ## Maintenance protocol
 
+The commands below use the same canonical, generation-scoped
+`$tacua_reconcile_state_directory` rendered into the active units. Set it
+explicitly in every new operator shell; do not infer it through a symlink.
+
 Every controlled processing, backup, restore, deployment, or shutdown workflow
 must enter maintenance before stopping a container. The command durably marks
 the transition, atomically publishes desired `maintenance`, disables and proves
@@ -242,7 +330,7 @@ the exact Serve listener empty, and only then retires the transition marker:
 
 ```sh
 python3 -B services/backend/scripts/reconcile_compose_deployment.py maintenance \
-  --state-directory "$HOME/.local/state/tacua-reconcile"
+  --state-directory "$tacua_reconcile_state_directory"
 ```
 
 In settled maintenance, timer reconciliation validates the sealed records and
@@ -265,7 +353,7 @@ maintenance no-op:
 
 ```sh
 python3 -B services/backend/scripts/reconcile_compose_deployment.py running \
-  --state-directory "$HOME/.local/state/tacua-reconcile"
+  --state-directory "$tacua_reconcile_state_directory"
 ```
 
 If this command fails, desired state remains maintenance but its durable
@@ -282,7 +370,7 @@ the canceling marker intact and requires inspection.
 ```sh
 python3 -B services/backend/scripts/reconcile_compose_deployment.py \
   cancel-activation \
-  --state-directory "$HOME/.local/state/tacua-reconcile"
+  --state-directory "$tacua_reconcile_state_directory"
 ```
 
 Never edit the JSON records by hand and never change to `running` merely

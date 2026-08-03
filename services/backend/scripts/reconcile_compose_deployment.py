@@ -6,9 +6,10 @@ The reconciler never creates, pulls, recreates, or removes a Docker object.  It
 may start one pinned user Docker service and may run ``docker compose start``
 against a sealed Compose snapshot, after proving that the same three
 containers and resources still exist.  Tailscale Serve is treated as an
-availability capability: recovery disables and proves the listener empty
-before any Docker mutation, and only restores it after local health and smoke
-checks succeed.
+availability capability: a deployment may be sealed directly into maintenance
+only while Serve is proven empty, and recovery disables and proves an active
+listener empty before any Docker mutation, then restores it only after local
+health and smoke checks succeed.
 """
 
 from __future__ import annotations
@@ -64,6 +65,9 @@ UNIT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]{0,119}\.service$")
 RESOURCE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$")
 STATE_STAGING = re.compile(
     r"^\.(?:activation|desired-state)\.json\.next-[0-9]+$"
+)
+GENERATION_STAGING = re.compile(
+    r"^\.[A-Za-z0-9][A-Za-z0-9._-]{0,95}\.next-[0-9]+-[a-f0-9]{12}$"
 )
 BOOT_ID = re.compile(
     r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
@@ -812,7 +816,15 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _atomic_private_write(path: Path, payload: bytes, *, replace: bool) -> None:
+def _atomic_private_write(
+    path: Path,
+    payload: bytes,
+    *,
+    replace: bool,
+    mode: int = 0o600,
+) -> None:
+    if mode not in {0o400, 0o600}:
+        raise ReconcileError("RECONCILE_STATE_INVALID")
     temporary = path.parent / f".{path.name}.next-{os.getpid()}"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -825,7 +837,9 @@ def _atomic_private_write(path: Path, payload: bytes, *, replace: bool) -> None:
                 if written <= 0:
                     raise OSError("atomic state write stopped")
                 offset += written
-            os.fchmod(descriptor, 0o600)
+            # Apply the final mode before fsync so the rename cannot publish a
+            # file whose durable metadata predates its sealed permissions.
+            os.fchmod(descriptor, mode)
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
@@ -842,6 +856,47 @@ def _atomic_private_write(path: Path, payload: bytes, *, replace: bool) -> None:
             temporary.unlink()
         except FileNotFoundError:
             pass
+
+
+def _remove_generation_draft(path: Path) -> None:
+    """Remove only one exact private generation draft created by ``seal``."""
+
+    if not path.exists() and not path.is_symlink():
+        return
+    if GENERATION_STAGING.fullmatch(path.name) is None:
+        raise ReconcileError("RECONCILE_STATE_INVALID")
+    draft = _safe_directory(path)
+    try:
+        entries = {entry.name: entry for entry in draft.iterdir()}
+    except OSError as error:
+        raise ReconcileError("RECONCILE_STATE_INVALID") from error
+    if not set(entries).issubset({COMPOSE_FILE, MANIFEST_FILE}):
+        raise ReconcileError("RECONCILE_STATE_INVALID")
+    expected_modes = {
+        COMPOSE_FILE: {0o400, 0o600},
+        MANIFEST_FILE: {0o600},
+    }
+    for name, entry in entries.items():
+        try:
+            metadata = entry.lstat()
+        except OSError as error:
+            raise ReconcileError("RECONCILE_STATE_INVALID") from error
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) not in expected_modes[name]
+            or metadata.st_size > MAX_DOCUMENT_BYTES
+        ):
+            raise ReconcileError("RECONCILE_STATE_INVALID")
+    try:
+        for entry in entries.values():
+            entry.unlink()
+        draft.rmdir()
+        _fsync_directory(path.parent)
+    except OSError as error:
+        raise ReconcileError("RECONCILE_STATE_INVALID") from error
 
 
 def _validate_directory_descriptor(
@@ -2119,6 +2174,20 @@ def _tailnet_state(manifest: Mapping[str, Any], compose: Path, runner: Callable[
         raise ReconcileError("RECONCILE_TAILNET_FAILED") from error
 
 
+def _require_empty_tailnet_preactivation(
+    manifest: Mapping[str, Any],
+    compose: Path,
+    runner: Callable[..., bytes],
+) -> None:
+    """Prove the exact tailnet identity and an unoccupied Serve capability."""
+
+    _status, active = _tailnet_state(manifest, compose, runner)
+    if active:
+        # Staged sealing has no authority to mutate even the exact Tacua
+        # listener.  The operator must enter with Serve already proven empty.
+        raise ReconcileError("RECONCILE_PUBLIC_PATH_ACTIVE")
+
+
 def _disable_serve(manifest: Mapping[str, Any], runner: Callable[..., bytes]) -> None:
     tailscale = manifest["commands"]["tailscale"]
     try:
@@ -2698,10 +2767,17 @@ def _reported_status(
 
 def seal(args: argparse.Namespace, runner: Callable[..., bytes] | None = None) -> dict[str, str]:
     state_directory = _safe_directory(args.state_directory, create=True)
-    if (state_directory / DESIRED_FILE).exists() or (state_directory / DESIRED_FILE).is_symlink():
+    try:
+        state_entries = tuple(state_directory.iterdir())
+    except OSError as error:
+        raise ReconcileError("RECONCILE_STATE_INVALID") from error
+    if state_entries:
         raise ReconcileError("RECONCILE_STATE_EXISTS")
     if PROJECT.fullmatch(args.project) is None or GENERATION.fullmatch(args.generation) is None or UNIT.fullmatch(args.docker_service) is None:
         raise ReconcileError("RECONCILE_INPUT_INVALID")
+    initial_state = (
+        "maintenance" if getattr(args, "maintenance", False) else "running"
+    )
     operation_directory = _safe_directory(args.operation_directory)
     compose_payload = _read_private(args.compose_json, mode=0o600, code="RECONCILE_INPUT_INVALID")
     compose_document = _parse_json(compose_payload, "RECONCILE_INPUT_INVALID")
@@ -2745,49 +2821,112 @@ def seal(args: argparse.Namespace, runner: Callable[..., bytes] | None = None) -
     generations = state_directory / "generations"
     try:
         generations.mkdir(mode=0o700)
-    except FileExistsError:
-        _safe_directory(generations)
+    except OSError as error:
+        raise ReconcileError("RECONCILE_STATE_EXISTS") from error
     temporary_parent = generations / (
         f".{args.generation}.next-{os.getpid()}-{os.urandom(6).hex()}"
     )
-    temporary_parent.mkdir(mode=0o700)
     temporary_compose = temporary_parent / COMPOSE_FILE
-    _atomic_private_write(temporary_compose, compose_payload, replace=False)
-    temporary_compose.chmod(0o400)
-    descriptor = _host_lock(args.project)
+    destination = generations / args.generation
+    descriptor: int | None = None
+    draft_created = False
+    promoted = False
     try:
+        temporary_parent.mkdir(mode=0o700)
+        draft_created = True
+        _atomic_private_write(
+            temporary_compose,
+            compose_payload,
+            replace=False,
+            mode=0o400,
+        )
+        descriptor = _host_lock(args.project)
         _refuse_recovery_journal(draft)
+        if initial_state == "maintenance":
+            # Prove the public capability empty before inspecting the daemon or
+            # deployment.  Staged sealing is read-only and never disables an
+            # active or unknown listener on the operator's behalf.
+            _require_empty_tailnet_preactivation(
+                draft,
+                temporary_compose,
+                selected_runner,
+            )
         draft["daemon"] = _daemon_projection(draft, selected_runner)
         deployment, healthy = _inspect_deployment(draft, temporary_compose, selected_runner)
         if not healthy:
             raise ReconcileError("RECONCILE_HEALTH_FAILED")
         draft.update(deployment)
         _smoke(draft, public=False)
-        _status, active = _tailnet_state(draft, temporary_compose, selected_runner)
-        if not active:
-            raise ReconcileError("RECONCILE_TAILNET_FAILED")
-        _smoke(draft, public=True)
+        if initial_state != "maintenance":
+            _status, active = _tailnet_state(
+                draft,
+                temporary_compose,
+                selected_runner,
+            )
+            if not active:
+                raise ReconcileError("RECONCILE_TAILNET_FAILED")
+            _smoke(draft, public=True)
+        draft["manifest_digest"] = _document_digest(
+            draft,
+            "manifest_digest",
+        )
+        _atomic_private_write(
+            temporary_parent / MANIFEST_FILE,
+            _canonical(draft),
+            replace=False,
+        )
+        if initial_state == "maintenance":
+            # Repeat the identity and exact-empty proof after every live gate
+            # and after the private draft is complete.  The generation and
+            # desired-state publications below remain under the same host lock.
+            _require_empty_tailnet_preactivation(
+                draft,
+                temporary_compose,
+                selected_runner,
+            )
+        if destination.exists() or destination.is_symlink():
+            raise ReconcileError("RECONCILE_STATE_EXISTS")
+        try:
+            os.replace(temporary_parent, destination)
+        except OSError as error:
+            raise ReconcileError("RECONCILE_STATE_INVALID") from error
+        promoted = True
+        _fsync_directory(generations)
+        desired = {
+            "compose_digest": draft["compose_digest"],
+            "contract_version": DESIRED_CONTRACT,
+            "desired": initial_state,
+            "generation": args.generation,
+            "manifest_digest": draft["manifest_digest"],
+            "project": args.project,
+            "state_digest": "",
+        }
+        desired["state_digest"] = _document_digest(
+            desired,
+            "state_digest",
+        )
+        _atomic_private_write(
+            state_directory / DESIRED_FILE,
+            _canonical(desired),
+            replace=False,
+        )
+    except Exception:
+        if not promoted:
+            try:
+                if draft_created:
+                    _remove_generation_draft(temporary_parent)
+                generations.rmdir()
+                _fsync_directory(state_directory)
+            except (OSError, ReconcileError) as cleanup_error:
+                raise ReconcileError("RECONCILE_STATE_INVALID") from cleanup_error
+        raise
     finally:
-        _release_lock(descriptor)
-    draft["manifest_digest"] = _document_digest(draft, "manifest_digest")
-    _atomic_private_write(temporary_parent / MANIFEST_FILE, _canonical(draft), replace=False)
-    destination = generations / args.generation
-    if destination.exists() or destination.is_symlink():
-        raise ReconcileError("RECONCILE_STATE_EXISTS")
-    os.replace(temporary_parent, destination)
-    _fsync_directory(generations)
-    desired = {
-        "compose_digest": draft["compose_digest"],
-        "contract_version": DESIRED_CONTRACT,
-        "desired": "running",
-        "generation": args.generation,
-        "manifest_digest": draft["manifest_digest"],
-        "project": args.project,
-        "state_digest": "",
+        if descriptor is not None:
+            _release_lock(descriptor)
+    return {
+        "code": "RECONCILE_SEALED",
+        "status": "maintenance" if initial_state == "maintenance" else "healthy",
     }
-    desired["state_digest"] = _document_digest(desired, "state_digest")
-    _atomic_private_write(state_directory / DESIRED_FILE, _canonical(desired), replace=False)
-    return {"code": "RECONCILE_SEALED", "status": "healthy"}
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -2817,6 +2956,14 @@ def _parser() -> argparse.ArgumentParser:
     create.add_argument("--operation-directory", required=True, type=Path)
     create.add_argument("--docker-service", default="docker.service")
     create.add_argument("--allow-mutable-image", action="store_true")
+    create.add_argument(
+        "--maintenance",
+        action="store_true",
+        help=(
+            "seal a healthy deployment with Serve proven empty and publish "
+            "desired maintenance"
+        ),
+    )
     return parser
 
 

@@ -280,6 +280,61 @@ runbook. Do not expose Serve until this host-side loopback smoke passes.
 
 ## 4. Configure private HTTPS
 
+### Reconciler-owned activation (recommended)
+
+For a first rootless reconciler installation, keep Serve empty after the
+loopback smoke in step 3 and stage-seal the healthy live deployment directly
+into maintenance. Continue in the same shell so `$project` and the exact
+mode-`0600` resolved Compose document are unchanged:
+
+```bash
+set -euo pipefail
+: "${project:?run steps 2 and 3 in this shell}"
+: "${runtime_directory:?run steps 2 and 3 in this shell}"
+test -d "$runtime_directory"
+generation="generation-$(date -u +%Y%m%dT%H%M%SZ)"
+tacua_reconcile_state_directory="$HOME/.local/state/tacua-reconcile-$generation"
+test ! -e "$tacua_reconcile_state_directory"
+install -d -m 0700 "$tacua_reconcile_state_directory"
+install -d -m 0700 "$HOME/.local/state/tacua"
+
+python3 -B services/backend/scripts/reconcile_compose_deployment.py seal \
+  --state-directory "$tacua_reconcile_state_directory" \
+  --generation "$generation" \
+  --project "$project" \
+  --compose-json "$runtime_directory/compose.json" \
+  --config-file services/backend/local/config.json \
+  --admin-secret-file services/backend/local/admin-secret \
+  --operation-directory "$HOME/.local/state/tacua" \
+  --allow-mutable-image \
+  --maintenance
+```
+
+This command proves the exact empty Serve/tailnet state before Docker
+inspection, seals the exact healthy live projections, repeats authenticated
+backend and reviewer loopback smoke, then proves exact empty Serve again before
+publishing desired `maintenance` under the shared host lock. It never changes
+Serve. If another reconciler already owns the deployment, do not run this block
+until its exact version has reached settled maintenance and its timer is
+stopped and disabled; follow the replacement prerequisites in
+[RECONCILIATION.md](RECONCILIATION.md). Keep the new generation-scoped state
+path for unit rendering and later operator commands; retain the old state
+directory separately and never replace it or use a symlink.
+
+Next install and start the lock service, hardened reconciler service, and timer
+exactly as documented in [RECONCILIATION.md](RECONCILIATION.md). Require the
+new anchored service reconcile to report `maintenance`, then require the new
+timer to be enabled, active, and visibly scheduled before running that guide's
+`running` command. `running`, not a direct
+`tailscale serve` command, writes the recoverable activation marker, performs
+the guarded Serve enable/validation and public smokes, and finally publishes
+desired `running`. Do not continue with the standalone activation block below.
+After the seal has copied the Compose bytes and the unit inputs are rendered,
+the owner-private discovery directory may be removed as in the standalone
+flow.
+
+### Standalone activation (without the reconciler)
+
 Require the runtime directory, capture the current Serve document, prove it is
 empty, and only then configure port 443. `set -e` makes the validation a real
 control-flow gate:
