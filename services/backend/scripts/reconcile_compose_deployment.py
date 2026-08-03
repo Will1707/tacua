@@ -2173,6 +2173,7 @@ def _recover_locked(
             # disable-and-prove-empty cleanup path.
             serve_active = True
             _enable_serve(manifest, compose, runner)
+            mutated = True
             public_disabled = False
         _tailnet_state(manifest, compose, runner)
         _smoke(manifest, public=True)
@@ -2456,6 +2457,7 @@ def reconcile(
             if current_activation is not None:
                 _write_desired(state_directory, current, "running")
                 _remove_activation(state_directory)
+                outcome = "recovered"
             return {
                 "code": f"RECONCILE_{outcome.upper()}",
                 "status": outcome,
@@ -2493,6 +2495,7 @@ def reconcile(
         if current_activation is not None:
             _write_desired(state_directory, current, "running")
             _remove_activation(state_directory)
+            outcome = "recovered"
         return {"code": f"RECONCILE_{outcome.upper()}", "status": outcome}
     finally:
         _release_lock(descriptor)
@@ -2539,6 +2542,7 @@ def set_running(state_directory: Path, runner: Callable[..., bytes] | None = Non
         outcome = _recover_locked(manifest, compose, selected_runner)
         _write_desired(state_directory, current, "running")
         _remove_activation(state_directory)
+        outcome = "recovered"
         return {"code": f"RECONCILE_{outcome.upper()}", "status": outcome}
     finally:
         _release_lock(descriptor)

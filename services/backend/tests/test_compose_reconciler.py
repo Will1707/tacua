@@ -295,6 +295,49 @@ class ComposeReconcilerTests(unittest.TestCase):
             events,
         )
 
+    def test_serve_enable_is_recovered_and_unchanged_serve_is_healthy(self) -> None:
+        cases = (
+            (
+                False,
+                {"code": "RECONCILE_RECOVERED", "status": "recovered"},
+            ),
+            (True, {"code": "RECONCILE_HEALTHY", "status": "healthy"}),
+        )
+        for active, expected in cases:
+            with self.subTest(
+                active=active
+            ), tempfile.TemporaryDirectory() as directory:
+                state = self._fixture(Path(directory), desired_state="running")
+                deployment = {"containers": {}, "resources": {}}
+                with mock.patch.object(
+                    RECONCILER, "_host_lock", return_value=99
+                ), mock.patch.object(
+                    RECONCILER, "_release_lock"
+                ), mock.patch.object(
+                    RECONCILER, "_refuse_recovery_journal"
+                ), mock.patch.object(
+                    RECONCILER,
+                    "_tailnet_state",
+                    side_effect=[({}, active), ({}, True)],
+                ), mock.patch.object(
+                    RECONCILER, "_docker_active", return_value=True
+                ), mock.patch.object(
+                    RECONCILER,
+                    "_daemon_projection",
+                    return_value=SYNTHETIC_DAEMON,
+                ), mock.patch.object(
+                    RECONCILER,
+                    "_inspect_deployment",
+                    return_value=(deployment, True),
+                ), mock.patch.object(
+                    RECONCILER, "_smoke"
+                ), mock.patch.object(
+                    RECONCILER, "_enable_serve"
+                ) as enable:
+                    result = RECONCILER.reconcile(state, runner=mock.Mock())
+                self.assertEqual(expected, result)
+                self.assertEqual(0 if active else 1, enable.call_count)
+
     def test_post_start_failure_leaves_serve_proven_empty(self) -> None:
         manifest = {
             "commands": {
@@ -419,10 +462,58 @@ class ComposeReconcilerTests(unittest.TestCase):
                 RECONCILER, "_recover_locked", return_value="healthy"
             ):
                 result = RECONCILER.reconcile(state, runner=mock.Mock())
-            self.assertEqual("healthy", result["status"])
+            self.assertEqual(
+                {"code": "RECONCILE_RECOVERED", "status": "recovered"},
+                result,
+            )
             desired, _manifest, _compose = RECONCILER._load_bound_state(state)
             self.assertEqual("running", desired["desired"])
             self.assertIsNone(RECONCILER._load_activation(state, desired))
+
+    def test_anchored_activation_completion_reports_recovered(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            state, runtime, anchor_path = self._anchor_fixture(home)
+            lock_path = RECONCILER._lock_path("reconcile-test")
+            lock_path.unlink(missing_ok=True)
+            try:
+                with self._anchor_environment(home, runtime):
+                    RECONCILER.prepare_lock(state, anchor_path)
+                    desired, _manifest, _compose = RECONCILER._load_bound_state(
+                        state
+                    )
+                    RECONCILER._write_activation(state, desired)
+                    with mock.patch.object(
+                        RECONCILER, "_recover_locked", return_value="healthy"
+                    ):
+                        result = RECONCILER.reconcile(
+                            state,
+                            runner=mock.Mock(),
+                            anchor_file=anchor_path,
+                        )
+                self.assertEqual(
+                    {"code": "RECONCILE_RECOVERED", "status": "recovered"},
+                    result,
+                )
+                desired, _manifest, _compose = RECONCILER._load_bound_state(
+                    state
+                )
+                self.assertEqual("running", desired["desired"])
+                self.assertIsNone(RECONCILER._load_activation(state, desired))
+            finally:
+                lock_path.unlink(missing_ok=True)
+
+    def test_set_running_state_publication_reports_recovered(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._fixture(Path(directory), desired_state="maintenance")
+            with mock.patch.object(
+                RECONCILER, "_recover_locked", return_value="healthy"
+            ):
+                result = RECONCILER.set_running(state, runner=mock.Mock())
+            self.assertEqual(
+                {"code": "RECONCILE_RECOVERED", "status": "recovered"},
+                result,
+            )
 
     def test_smoke_builds_only_explicit_no_proxy_openers(self) -> None:
         manifest = {
