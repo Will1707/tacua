@@ -112,15 +112,36 @@ empty. Use the exact resolved Compose JSON that created the live containers.
 The input must be a mode-`0600` regular file; the reconciler copies it into the
 sealed generation.
 
-If an older reconciler already owns this deployment, first use that exact
-installed version to reach settled `maintenance` with no activation marker,
-prove Serve empty, and stop plus disable its timer. Do not stage a replacement
-while the old desired state is `running`, an activation is pending, or the old
-timer can still act. The healthy containers may remain running for projection
-and loopback smoke. Always use the new generation-scoped state path below,
-render the replacement units to that exact path, and retain the old sealed
-state for rollback and forensics. A symlink or in-place overwrite is not a
-generation promotion.
+If an older reconciler already owns this deployment, first use its exact state
+path to run `maintenance --require-running`. When the installed reconciler
+already supports this option, use that exact installed executable. To
+bootstrap from a legacy installed version that predates the option, fully
+verify the clean replacement candidate first, retain its unchanged worktree,
+and invoke only the candidate's guarded `maintenance` command against the old
+sealed state. The candidate reads the old generation's sealed manifest,
+runner, config, secret, operation path, and project lock; do not replace the
+installed code or units before this guarded command succeeds.
+
+The opt-in guard checks settled `running` and the absence of an activation
+marker only after taking that shared processing/reconciler lock, at the
+maintenance transition's linearization point. It reports
+`RECONCILE_RUNNING_REQUIRED` without writing a transition if another operator
+or timer has already changed that state. After guarded success, confirm settled
+`maintenance` with no activation marker, prove Serve empty, and stop plus
+disable the old timer. Only then may the retained, already-verified candidate
+replace the installed code. Do not stage a replacement while the old desired
+state is `running`, an activation is pending, or the old timer can still act.
+The healthy containers may remain running for projection and loopback smoke.
+Always use the new generation-scoped state path below, render the replacement
+units to that exact path, and retain the old sealed state for rollback and
+forensics. A symlink or in-place overwrite is not a generation promotion.
+
+```sh
+python3 -B /absolute/path/to/verified/reconcile_compose_deployment.py \
+  maintenance \
+  --state-directory /absolute/path/to/installed-generation-state \
+  --require-running
+```
 
 ```sh
 generation='generation-YYYYMMDDTHHMMSSZ'
@@ -333,6 +354,13 @@ python3 -B services/backend/scripts/reconcile_compose_deployment.py maintenance 
   --state-directory "$tacua_reconcile_state_directory"
 ```
 
+The unguarded command remains idempotent for existing operational workflows:
+it may recheck Serve and settle maintenance when desired state is already
+`maintenance`. Use `--require-running` when the transition itself is an
+ownership or replacement precondition. That guarded form succeeds only when
+the lock-protected linearization point is settled `running` with no activation
+or transition marker; it never treats a stale pre-lock observation as proof.
+
 In settled maintenance, timer reconciliation validates the sealed records and
 exits successfully without invoking systemd, Docker, or Tailscale. If the
 maintenance command or host dies mid-transition, the timer resumes the durable
@@ -384,6 +412,8 @@ finishing a durable activation is reported as `RECONCILE_RECOVERED`. Failure is
 one stable code on stderr. In particular:
 
 - `RECONCILE_DEFERRED`: the processing bridge owns the project lock;
+- `RECONCILE_RUNNING_REQUIRED`: guarded maintenance did not observe settled
+  `running` with no activation at its lock-protected linearization point;
 - `RECONCILE_RECOVERY_REQUIRED`: a durable bridge operation must be recovered;
 - `RECONCILE_CONTAINER_DRIFT` or `RECONCILE_RESOURCE_DRIFT`: exact live state
   differs from the seal;

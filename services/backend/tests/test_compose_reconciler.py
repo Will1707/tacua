@@ -1490,6 +1490,205 @@ class ComposeReconcilerTests(unittest.TestCase):
             self.assertEqual("maintenance", result["status"])
             self.assertEqual([True], disabled)
 
+    def test_guarded_maintenance_linearizes_only_settled_running(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._fixture(Path(directory), desired_state="running")
+            desired, _manifest, _compose = RECONCILER._load_bound_state(state)
+            real_load_activation = RECONCILER._load_activation
+            checked_under_lock: list[bool] = []
+
+            def load_activation_under_lock(state_directory, current):
+                with self.assertRaisesRegex(
+                    RECONCILER.ReconcileError,
+                    "RECONCILE_DEFERRED",
+                ):
+                    RECONCILER._host_lock(desired["project"])
+                checked_under_lock.append(True)
+                return real_load_activation(state_directory, current)
+
+            with mock.patch.object(
+                RECONCILER,
+                "_load_activation",
+                side_effect=load_activation_under_lock,
+            ), mock.patch.object(
+                RECONCILER, "_tailnet_state", return_value=({}, False)
+            ):
+                result = RECONCILER.set_maintenance(
+                    state,
+                    runner=mock.Mock(),
+                    require_running=True,
+                )
+            self.assertEqual("maintenance", result["status"])
+            self.assertEqual([True], checked_under_lock)
+            current, _manifest, _compose = RECONCILER._load_bound_state(state)
+            self.assertEqual("maintenance", current["desired"])
+            self.assertIsNone(real_load_activation(state, current))
+
+    def test_guarded_maintenance_refuses_settled_maintenance_without_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._fixture(Path(directory), desired_state="maintenance")
+            before = (state / RECONCILER.DESIRED_FILE).read_bytes()
+            with mock.patch.object(
+                RECONCILER, "_write_maintenance_transition"
+            ) as transition, mock.patch.object(
+                RECONCILER, "_tailnet_state"
+            ) as tailnet, self.assertRaisesRegex(
+                RECONCILER.ReconcileError,
+                "RECONCILE_RUNNING_REQUIRED",
+            ):
+                RECONCILER.set_maintenance(
+                    state,
+                    runner=mock.Mock(),
+                    require_running=True,
+                )
+            self.assertEqual(before, (state / RECONCILER.DESIRED_FILE).read_bytes())
+            transition.assert_not_called()
+            tailnet.assert_not_called()
+
+    def test_guarded_maintenance_refuses_every_pending_transition(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._fixture(Path(directory), desired_state="running")
+            desired, _manifest, _compose = RECONCILER._load_bound_state(state)
+            transition = RECONCILER._write_maintenance_transition(state, desired)
+            with mock.patch.object(
+                RECONCILER, "_tailnet_state"
+            ) as tailnet, self.assertRaisesRegex(
+                RECONCILER.ReconcileError,
+                "RECONCILE_RUNNING_REQUIRED",
+            ):
+                RECONCILER.set_maintenance(
+                    state,
+                    runner=mock.Mock(),
+                    require_running=True,
+                )
+            current, _manifest, _compose = RECONCILER._load_bound_state(state)
+            self.assertEqual(desired, current)
+            self.assertEqual(
+                transition,
+                RECONCILER._load_activation(state, current),
+            )
+            tailnet.assert_not_called()
+
+    def test_guarded_maintenance_rechecks_a_stale_prelock_running_observation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._fixture(Path(directory), desired_state="running")
+            before, _manifest, _compose = RECONCILER._load_bound_state(state)
+
+            def competing_maintenance(_project):
+                RECONCILER._write_desired(state, before, "maintenance")
+                return 99
+
+            with mock.patch.object(
+                RECONCILER,
+                "_host_lock",
+                side_effect=competing_maintenance,
+            ), mock.patch.object(
+                RECONCILER, "_release_lock"
+            ), mock.patch.object(
+                RECONCILER, "_write_maintenance_transition"
+            ) as transition, self.assertRaisesRegex(
+                RECONCILER.ReconcileError,
+                "RECONCILE_RUNNING_REQUIRED",
+            ):
+                RECONCILER.set_maintenance(
+                    state,
+                    runner=mock.Mock(),
+                    require_running=True,
+                )
+            current, _manifest, _compose = RECONCILER._load_bound_state(state)
+            self.assertEqual("maintenance", current["desired"])
+            transition.assert_not_called()
+
+    def test_guarded_maintenance_uses_locked_running_not_stale_maintenance(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._fixture(Path(directory), desired_state="maintenance")
+            before, _manifest, _compose = RECONCILER._load_bound_state(state)
+
+            def competing_running(_project):
+                RECONCILER._write_desired(state, before, "running")
+                return 99
+
+            with mock.patch.object(
+                RECONCILER,
+                "_host_lock",
+                side_effect=competing_running,
+            ), mock.patch.object(
+                RECONCILER, "_release_lock"
+            ), mock.patch.object(
+                RECONCILER, "_tailnet_state", return_value=({}, False)
+            ):
+                result = RECONCILER.set_maintenance(
+                    state,
+                    runner=mock.Mock(),
+                    require_running=True,
+                )
+            self.assertEqual("maintenance", result["status"])
+            current, _manifest, _compose = RECONCILER._load_bound_state(state)
+            self.assertEqual("maintenance", current["desired"])
+            self.assertIsNone(RECONCILER._load_activation(state, current))
+
+    def test_guarded_candidate_bootstraps_from_preoption_sealed_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._fixture(Path(directory), desired_state="running")
+            before, sealed_manifest, sealed_compose = (
+                RECONCILER._load_bound_state(state)
+            )
+            selected_runner = mock.Mock()
+            with mock.patch.object(
+                RECONCILER,
+                "_runner_for_manifest",
+                return_value=selected_runner,
+            ) as runner_factory, mock.patch.object(
+                RECONCILER,
+                "_tailnet_state",
+                return_value=({}, False),
+            ) as tailnet:
+                result = RECONCILER.set_maintenance(
+                    state,
+                    require_running=True,
+                )
+            self.assertEqual("maintenance", result["status"])
+            runner_factory.assert_called_once_with(sealed_manifest)
+            tailnet.assert_called_once_with(
+                sealed_manifest,
+                sealed_compose,
+                selected_runner,
+            )
+            current, current_manifest, current_compose = (
+                RECONCILER._load_bound_state(state)
+            )
+            self.assertEqual(
+                {"desired", "state_digest"},
+                {
+                    key
+                    for key in current
+                    if current[key] != before[key]
+                },
+            )
+            self.assertEqual(sealed_manifest, current_manifest)
+            self.assertEqual(sealed_compose, current_compose)
+
+    def test_maintenance_cli_exposes_opt_in_running_guard(self) -> None:
+        guarded = RECONCILER._parser().parse_args(
+            [
+                "maintenance",
+                "--state-directory",
+                "/private/state",
+                "--require-running",
+            ]
+        )
+        compatible = RECONCILER._parser().parse_args(
+            ["maintenance", "--state-directory", "/private/state"]
+        )
+        self.assertTrue(guarded.require_running)
+        self.assertFalse(compatible.require_running)
+
     def test_existing_maintenance_crash_marker_remains_timer_recoverable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = self._fixture(Path(directory), desired_state="maintenance")
