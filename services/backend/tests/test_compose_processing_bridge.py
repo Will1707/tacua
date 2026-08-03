@@ -3697,6 +3697,15 @@ class ComposeProcessingBridgeTests(unittest.TestCase):
     def test_private_socket_bridge_round_trip_uses_existing_runner_boundary(
         self,
     ) -> None:
+        descriptor_limit = BRIDGE.resource.getrlimit(
+            BRIDGE.resource.RLIMIT_NOFILE
+        )
+        self.addCleanup(
+            BRIDGE.resource.setrlimit,
+            BRIDGE.resource.RLIMIT_NOFILE,
+            descriptor_limit,
+        )
+        BRIDGE._prepare_broker_descriptor_limit()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             child_output = root / "child-output"
