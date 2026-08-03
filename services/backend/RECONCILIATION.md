@@ -267,7 +267,9 @@ because `docker compose start` returned success.
 ## Stable outcomes
 
 Success is one canonical, content-free JSON object with `healthy`, `recovered`,
-or `maintenance`. Failure is one stable code on stderr. In particular:
+or `maintenance`. `RECONCILE_HEALTHY` is mutation-free: enabling Serve or
+finishing a durable activation is reported as `RECONCILE_RECOVERED`. Failure is
+one stable code on stderr. In particular:
 
 - `RECONCILE_DEFERRED`: the processing bridge owns the project lock;
 - `RECONCILE_RECOVERY_REQUIRED`: a durable bridge operation must be recovered;
