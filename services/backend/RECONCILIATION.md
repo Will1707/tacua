@@ -33,6 +33,38 @@ The manifest is private because it contains host paths. Neither command output
 nor systemd journal output includes those paths, IDs, origins, Docker/Tailscale
 stderr, HTTP bodies, or credentials.
 
+The user-systemd path adds a boot-scoped host-ownership attestation. Its small
+`tacua-reconcile-lock.service` prerequisite deliberately runs without a
+filesystem or user namespace so it can prove the host's real ownership and
+directory ancestry. While holding the exact, non-replaced processing lock, it
+publishes an owner-private anchor directly below logind's validated runtime
+directory. The anchor binds the current boot and effective user to the exact
+home, state, operation, generation, manifest, runtime, lock, public-config, and
+administrator-secret identities. After validating the runtime parent through
+a pinned directory descriptor, the prerequisite publishes a pending,
+deliberately invalid record before it creates or validates the lock and before
+it publishes the complete binding. An interrupted refresh therefore cannot
+leave an earlier trusted anchor at the validated runtime path.
+
+The main reconciler remains in its hardened filesystem namespace. It accepts
+only that exact boot's anchor, pins the anchor, operation directory, public
+config, administrator secret, and reconciler source read-only, and keeps only
+the sealed state directory and shared lock writable. This allows the main unit
+to verify host ownership even when a user service's mount namespace represents
+host ancestors with an overflow identity; it does not broaden accepted owners
+or make the prerequisite a deployment authority.
+
+For this user-unit path, the sealed state and processing-operation directories
+must be strict descendants of the effective user's passwd home, and every path
+component below that home must be effective-user-owned. The public config and
+administrator secret may be elsewhere, but every directory in each of their
+host paths must be root- or effective-user-owned and must not be group- or
+world-writable (apart from a root-owned sticky shared directory); each file's
+immediate parent must be effective-user-owned. The config and secret files
+themselves must be owned by the effective user and must retain the exact
+identities sealed in the selected generation. These user-unit requirements are
+stricter than the generic `seal` command's support for root-owned inputs.
+
 For `running`, the timer reads and validates state, takes the exact processing
 bridge lock, then re-reads state. It refuses any surviving durable processing
 operation directory. It starts only the sealed user Docker unit when inactive,
@@ -78,21 +110,40 @@ promotion is an explicit maintenance/deployment operation, not a timer action.
 
 ## Install the user timer
 
-Render the four absolute placeholders in
+First resolve the existing logind runtime directory as shown below. The anchor
+path is exactly its direct child `tacua-reconcile.anchor.json`; it is
+boot-scoped and must never be placed under persistent home state.
+
+Render the eight absolute placeholders in
 `systemd/tacua-reconcile.service.in` into
 `$HOME/.config/systemd/user/tacua-reconcile.service`; do not use a shell
-wrapper in `ExecStart`. Render the three paths in
+wrapper in `ExecStart`. They are the selected Python executable, this
+checked-out reconciler, the sealed state directory, the boot-scoped anchor, the
+exact shared lock, the sealed processing-operation directory, the public
+config, and the administrator secret. The operation, config, and secret paths
+must exactly match the selected sealed generation.
+
+Render the four absolute placeholders in
 `systemd/tacua-reconcile-lock.service.in` beside it, and copy
 `systemd/tacua-reconcile.timer` beside both services. The
-rendered paths must identify the selected Python executable, this checked-out
-reconciler, the sealed state directory, and the exact shared bridge lock
-`/tmp/tacua-compose-processing-<project>.lock`. The small prerequisite service
-creates or validates that one file after boot without replacing it. This is
-necessary because `/tmp` does not survive reboot. `ProtectSystem=strict` makes
-the rest of `/tmp` read-only to the main unit, while that narrow
-`ReadWritePaths` exception preserves the bridge/reconciler lock identity. Keep
-all units owner-controlled and inspect the rendered services before enabling
-them.
+lock service receives the same Python, reconciler, state, and anchor paths. The
+exact shared bridge lock remains
+`/tmp/tacua-compose-processing-<project>.lock`; it is derived from the sealed
+project rather than supplied to the prerequisite. The prerequisite creates or
+validates that one file after boot without replacing it. This is necessary
+because `/tmp` does not survive reboot.
+
+The prerequisite intentionally omits `PrivateDevices`, `ProtectHome`,
+`ProtectSystem`, and the other filesystem-namespace-generating directives so
+its ownership proof describes the host rather than a transformed mount view.
+It retains `UMask=0077`, `NoNewPrivileges`, `PrivateTmp=no`,
+`RestrictSUIDSGID`, `LockPersonality`, `MemoryDenyWriteExecute`, and a bounded
+oneshot lifetime. The main service retains the full sandbox.
+`ProtectSystem=strict` makes the rest of `/tmp` read-only to the main unit,
+while the exact state and lock `ReadWritePaths` exceptions preserve only the
+required mutable identities. Its `ReadOnlyPaths` pins the exact anchor,
+operation, config, secret, and reconciler paths. Keep all units
+owner-controlled and inspect the rendered services before enabling them.
 
 Noninteractive SSH sessions may omit `XDG_RUNTIME_DIR` even when logind has an
 existing runtime directory and the user manager is healthy. Resolve that
@@ -100,15 +151,19 @@ directory from logind, validate it instead of guessing or creating
 `/run/user/<uid>`, and scope it only to the user-systemd commands:
 
 ```sh
-python3 -B services/backend/scripts/reconcile_compose_deployment.py \
-  prepare-lock \
-  --state-directory "$HOME/.local/state/tacua-reconcile"
 tacua_user_runtime_directory="$(
   loginctl show-user "$(id -u)" --property=RuntimePath --value
 )"
 test -n "$tacua_user_runtime_directory"
 test -d "$tacua_user_runtime_directory"
 test "$(stat -c '%u' -- "$tacua_user_runtime_directory")" = "$(id -u)"
+tacua_anchor_file="$tacua_user_runtime_directory/tacua-reconcile.anchor.json"
+
+env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
+  python3 -B services/backend/scripts/reconcile_compose_deployment.py \
+  prepare-lock \
+  --state-directory "$HOME/.local/state/tacua-reconcile" \
+  --anchor-file "$tacua_anchor_file"
 env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
   systemd-analyze --user verify "$HOME/.config/systemd/user/tacua-reconcile-lock.service"
 env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
@@ -118,12 +173,20 @@ env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
 env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
   systemctl --user daemon-reload
 env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
-  systemctl --user enable --now tacua-reconcile.timer
-env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
   systemctl --user start tacua-reconcile.service
 env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
   systemctl --user status tacua-reconcile.service
+env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
+  systemctl --user enable --now tacua-reconcile.timer
 ```
+
+The explicit one-shot run must succeed before enabling the timer. Its
+`Requires=`/`After=` dependency ensures the host-view prerequisite has
+succeeded and proves that the rendered main unit can consume the freshly
+published anchor.
+On later boots, the same dependency recreates the missing runtime anchor before
+the main unit starts. Never render a durable path for `@ANCHOR_FILE@`, and do
+not enable the timer if the manual run fails.
 
 The service intentionally has no `Wants=` or `Requires=` dependency on Docker:
 maintenance must not activate it. `PrivateTmp=no` is also intentional because

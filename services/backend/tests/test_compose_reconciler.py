@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import importlib.util
+import contextlib
+import io
 import json
+import os
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -120,6 +123,59 @@ class ComposeReconcilerTests(unittest.TestCase):
         desired_path.write_bytes(RECONCILER._canonical(desired))
         desired_path.chmod(0o600)
         return state
+
+    def _anchor_fixture(self, home: Path) -> tuple[Path, Path, Path]:
+        home.mkdir(mode=0o700, parents=True, exist_ok=True)
+        home.chmod(0o700)
+        state = self._fixture(home)
+        runtime = home / "runtime"
+        runtime.mkdir(mode=0o700)
+        generation = state / "generations" / "generation-1"
+        manifest_path = generation / RECONCILER.MANIFEST_FILE
+        manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+        manifest["runtime"] = {
+            "docker_host": f"unix://{runtime}/docker.sock",
+            "home": str(home),
+            "xdg_runtime_directory": str(runtime),
+        }
+        manifest["manifest_digest"] = RECONCILER._document_digest(
+            manifest, "manifest_digest"
+        )
+        manifest_path.write_bytes(RECONCILER._canonical(manifest))
+        desired_path = state / RECONCILER.DESIRED_FILE
+        desired = json.loads(desired_path.read_text(encoding="ascii"))
+        desired["manifest_digest"] = manifest["manifest_digest"]
+        desired["state_digest"] = RECONCILER._document_digest(
+            desired, "state_digest"
+        )
+        desired_path.write_bytes(RECONCILER._canonical(desired))
+        anchor = runtime / "tacua-reconcile.anchor.json"
+        return state, runtime, anchor
+
+    @contextlib.contextmanager
+    def _anchor_environment(self, home: Path, runtime: Path):
+        with mock.patch.object(
+            RECONCILER, "_passwd_home", return_value=home
+        ), mock.patch.object(
+            RECONCILER,
+            "_boot_id",
+            return_value="12345678-1234-1234-1234-123456789abc",
+        ), mock.patch.object(
+            RECONCILER, "_overflow_uid", return_value=60001
+        ), mock.patch.dict(
+            os.environ, {"XDG_RUNTIME_DIR": str(runtime)}
+        ):
+            yield
+
+    def _rewrite_anchor(self, anchor_path: Path, **changes) -> dict:
+        anchor = json.loads(anchor_path.read_text(encoding="ascii"))
+        anchor.update(changes)
+        anchor["anchor_digest"] = RECONCILER._document_digest(
+            anchor, "anchor_digest"
+        )
+        anchor_path.write_bytes(RECONCILER._canonical(anchor))
+        anchor_path.chmod(0o600)
+        return anchor
 
     def test_maintenance_reconcile_has_no_subprocess_or_lock_side_effect(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -821,6 +877,555 @@ class ComposeReconcilerTests(unittest.TestCase):
                 result = RECONCILER.reconcile(state, runner=mock.Mock())
             self.assertEqual("maintenance", result["status"])
             self.assertIsNone(RECONCILER._load_activation(state, desired))
+
+    def test_prepare_lock_publishes_bound_anchor_and_preserves_lock_inode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            state, runtime, anchor_path = self._anchor_fixture(home)
+            lock_path = RECONCILER._lock_path("reconcile-test")
+            lock_path.unlink(missing_ok=True)
+            try:
+                with self._anchor_environment(home, runtime):
+                    RECONCILER.prepare_lock(state, anchor_path)
+                    first_inode = lock_path.stat().st_ino
+                    anchor = RECONCILER._load_anchor(anchor_path, state)
+                    self.assertEqual(first_inode, anchor["lock"]["inode"])
+                    self.assertEqual(60001, anchor["overflow_uid"])
+                    result = RECONCILER.reconcile(
+                        state,
+                        runner=mock.Mock(),
+                        anchor_file=anchor_path,
+                    )
+                    self.assertEqual("maintenance", result["status"])
+                    RECONCILER.prepare_lock(state, anchor_path)
+                    self.assertEqual(first_inode, lock_path.stat().st_ino)
+            finally:
+                lock_path.unlink(missing_ok=True)
+
+    def test_prepare_failure_leaves_only_nontrusted_pending_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            state, runtime, anchor_path = self._anchor_fixture(home)
+            lock_path = RECONCILER._lock_path("reconcile-test")
+            lock_path.unlink(missing_ok=True)
+            try:
+                with self._anchor_environment(home, runtime):
+                    RECONCILER.prepare_lock(state, anchor_path)
+                    with mock.patch.object(
+                        RECONCILER,
+                        "_open_host_lock",
+                        side_effect=RECONCILER.ReconcileError(
+                            "RECONCILE_LOCK_INVALID"
+                        ),
+                    ):
+                        with self.assertRaisesRegex(
+                            RECONCILER.ReconcileError,
+                            "RECONCILE_LOCK_INVALID",
+                        ):
+                            RECONCILER.prepare_lock(state, anchor_path)
+                    pending = json.loads(anchor_path.read_text(encoding="ascii"))
+                    self.assertEqual(
+                        RECONCILER.ANCHOR_PENDING_CONTRACT,
+                        pending["contract_version"],
+                    )
+                    with self.assertRaisesRegex(
+                        RECONCILER.ReconcileError,
+                        "RECONCILE_ANCHOR_INVALID",
+                    ):
+                        RECONCILER._load_anchor(anchor_path, state)
+            finally:
+                lock_path.unlink(missing_ok=True)
+
+    def test_anchor_rejects_noncanonical_mode_owner_link_and_symlink(self) -> None:
+        cases = ("noncanonical", "mode", "owner", "hardlink", "symlink")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory).resolve()
+                state, runtime, anchor_path = self._anchor_fixture(home)
+                lock_path = RECONCILER._lock_path("reconcile-test")
+                lock_path.unlink(missing_ok=True)
+                try:
+                    with self._anchor_environment(home, runtime):
+                        RECONCILER.prepare_lock(state, anchor_path)
+                        owner_patch = contextlib.nullcontext()
+                        if case == "noncanonical":
+                            document = json.loads(
+                                anchor_path.read_text(encoding="ascii")
+                            )
+                            anchor_path.write_text(
+                                json.dumps(document, indent=2), encoding="ascii"
+                            )
+                        elif case == "mode":
+                            anchor_path.chmod(0o640)
+                        elif case == "owner":
+                            owner_patch = mock.patch.object(
+                                RECONCILER.os,
+                                "geteuid",
+                                return_value=os.geteuid() + 1,
+                            )
+                        elif case == "hardlink":
+                            os.link(anchor_path, runtime / "second-link")
+                        else:
+                            target = runtime / "anchor-target"
+                            anchor_path.replace(target)
+                            anchor_path.symlink_to(target)
+                        with owner_patch, self.assertRaisesRegex(
+                            RECONCILER.ReconcileError,
+                            "RECONCILE_ANCHOR_INVALID",
+                        ):
+                            RECONCILER._load_anchor(anchor_path, state)
+                finally:
+                    lock_path.unlink(missing_ok=True)
+
+    def test_anchor_rejects_path_project_identity_and_boot_mismatches(self) -> None:
+        mutations = (
+            ("state-device", lambda value: value["state_directory"].__setitem__("device", value["state_directory"]["device"] + 1)),
+            ("operation-inode", lambda value: value["operation_directory"].__setitem__("inode", value["operation_directory"]["inode"] + 1)),
+            ("lock-inode", lambda value: value["lock"].__setitem__("inode", value["lock"]["inode"] + 1)),
+            ("project", lambda value: value.__setitem__("project", "different-project")),
+            ("boot", lambda value: value.__setitem__("boot_id", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")),
+            ("overflow", lambda value: value.__setitem__("overflow_uid", 60002)),
+            ("dot-path", lambda value: value["state_directory"].__setitem__("path", value["home"]["path"] + "/state/../state")),
+        )
+        for name, mutate in mutations:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory).resolve()
+                state, runtime, anchor_path = self._anchor_fixture(home)
+                lock_path = RECONCILER._lock_path("reconcile-test")
+                lock_path.unlink(missing_ok=True)
+                try:
+                    with self._anchor_environment(home, runtime):
+                        RECONCILER.prepare_lock(state, anchor_path)
+                        anchor = json.loads(anchor_path.read_text(encoding="ascii"))
+                        mutate(anchor)
+                        anchor["anchor_digest"] = RECONCILER._document_digest(
+                            anchor, "anchor_digest"
+                        )
+                        anchor_path.write_bytes(RECONCILER._canonical(anchor))
+                        with self.assertRaisesRegex(
+                            RECONCILER.ReconcileError,
+                            "RECONCILE_ANCHOR_INVALID",
+                        ):
+                            RECONCILER.reconcile(
+                                state,
+                                runner=mock.Mock(),
+                                anchor_file=anchor_path,
+                            )
+                finally:
+                    lock_path.unlink(missing_ok=True)
+
+    def test_manifest_binding_mismatch_is_rejected_after_lock_before_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            state, runtime, anchor_path = self._anchor_fixture(home)
+            lock_path = RECONCILER._lock_path("reconcile-test")
+            lock_path.unlink(missing_ok=True)
+            try:
+                with self._anchor_environment(home, runtime):
+                    RECONCILER.prepare_lock(state, anchor_path)
+                    self._rewrite_anchor(
+                        anchor_path,
+                        manifest_digest="sha256:" + "a" * 64,
+                    )
+                    with mock.patch.object(
+                        RECONCILER, "_recover_locked"
+                    ) as recover, self.assertRaisesRegex(
+                        RECONCILER.ReconcileError,
+                        "RECONCILE_ANCHOR_INVALID",
+                    ):
+                        RECONCILER.reconcile(
+                            state,
+                            runner=mock.Mock(),
+                            anchor_file=anchor_path,
+                        )
+                    recover.assert_not_called()
+            finally:
+                lock_path.unlink(missing_ok=True)
+
+    def test_host_prerequisite_rejects_unsafe_ancestor_and_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            state, runtime, anchor_path = self._anchor_fixture(home)
+            lock_path = RECONCILER._lock_path("reconcile-test")
+            lock_path.unlink(missing_ok=True)
+            try:
+                home.chmod(0o770)
+                with self._anchor_environment(home, runtime), self.assertRaisesRegex(
+                    RECONCILER.ReconcileError, "RECONCILE_STATE_INVALID"
+                ):
+                    RECONCILER.prepare_lock(state, anchor_path)
+                home.chmod(0o700)
+                target = home / "target"
+                target.mkdir(mode=0o700)
+                link = home / "link"
+                link.symlink_to(target, target_is_directory=True)
+                with self.assertRaisesRegex(
+                    RECONCILER.ReconcileError, "RECONCILE_STATE_INVALID"
+                ):
+                    RECONCILER._prove_host_directory(link)
+            finally:
+                home.chmod(0o700)
+                lock_path.unlink(missing_ok=True)
+
+    def test_prepare_proves_runtime_parent_before_any_anchor_write(self) -> None:
+        for case in ("unsafe", "symlink", "replaced"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory).resolve()
+                state, runtime, anchor_path = self._anchor_fixture(home)
+                lock_path = RECONCILER._lock_path("reconcile-test")
+                lock_path.unlink(missing_ok=True)
+                old_runtime = home / "runtime-old"
+                pending_patch = contextlib.nullcontext()
+                try:
+                    if case == "unsafe":
+                        runtime.chmod(0o770)
+                    elif case == "symlink":
+                        runtime.rename(old_runtime)
+                        runtime.symlink_to(old_runtime, target_is_directory=True)
+                    else:
+                        real_pending = RECONCILER._pending_anchor
+
+                        def replace_runtime(project):
+                            pending = real_pending(project)
+                            runtime.rename(old_runtime)
+                            runtime.mkdir(mode=0o700)
+                            return pending
+
+                        pending_patch = mock.patch.object(
+                            RECONCILER,
+                            "_pending_anchor",
+                            side_effect=replace_runtime,
+                        )
+                    with self._anchor_environment(home, runtime), pending_patch, self.assertRaisesRegex(
+                        RECONCILER.ReconcileError,
+                        "RECONCILE_(?:STATE|ANCHOR)_INVALID",
+                    ):
+                        RECONCILER.prepare_lock(state, anchor_path)
+                    self.assertFalse(anchor_path.exists())
+                    self.assertFalse(
+                        (old_runtime / "tacua-reconcile.anchor.json").exists()
+                    )
+                finally:
+                    lock_path.unlink(missing_ok=True)
+
+    def test_config_inode_substitution_is_rejected_before_state_load(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            state, runtime, anchor_path = self._anchor_fixture(home)
+            lock_path = RECONCILER._lock_path("reconcile-test")
+            lock_path.unlink(missing_ok=True)
+            try:
+                with self._anchor_environment(home, runtime):
+                    RECONCILER.prepare_lock(state, anchor_path)
+                    config = home / "config.json"
+                    replacement = home / "replacement-config.json"
+                    replacement.write_bytes(config.read_bytes())
+                    replacement.chmod(0o644)
+                    replacement.replace(config)
+                    with mock.patch.object(
+                        RECONCILER,
+                        "_load_bound_state",
+                        side_effect=AssertionError(
+                            "state was read before config binding rejection"
+                        ),
+                    ), self.assertRaisesRegex(
+                        RECONCILER.ReconcileError,
+                        "RECONCILE_ANCHOR_INVALID",
+                    ):
+                        RECONCILER._attested_lock(anchor_path, state)
+            finally:
+                lock_path.unlink(missing_ok=True)
+
+    def test_safe_directory_overflow_requires_exact_attested_stop(self) -> None:
+        euid = os.geteuid()
+        state_binding = {
+            "device": 10,
+            "inode": 40,
+            "mode": 0o700,
+            "path": "/synthetic/home/state",
+            "uid": euid,
+        }
+        records = [
+            {"device": 1, "inode": 1, "mode": 0o755, "path": "/", "uid": 60001},
+            {"device": 2, "inode": 2, "mode": 0o755, "path": "/synthetic", "uid": 60001},
+            {"device": 3, "inode": 3, "mode": 0o700, "path": "/synthetic/home", "uid": euid},
+            dict(state_binding),
+            {"device": 10, "inode": 41, "mode": 0o700, "path": "/synthetic/home/state/child", "uid": euid},
+        ]
+        with mock.patch.object(
+            RECONCILER, "_descriptor_directory_chain", return_value=records
+        ):
+            self.assertEqual(
+                Path("/synthetic/home/state/child"),
+                RECONCILER._safe_directory(
+                    Path("/synthetic/home/state/child"),
+                    attested_directories=(state_binding,),
+                ),
+            )
+            mismatched = dict(state_binding, inode=99)
+            with self.assertRaisesRegex(
+                RECONCILER.ReconcileError, "RECONCILE_STATE_INVALID"
+            ):
+                RECONCILER._safe_directory(
+                    Path("/synthetic/home/state/child"),
+                    attested_directories=(mismatched,),
+                )
+            with self.assertRaisesRegex(
+                RECONCILER.ReconcileError, "RECONCILE_STATE_INVALID"
+            ):
+                RECONCILER._safe_directory(
+                    Path("/outside/anchor"),
+                    attested_directories=(state_binding,),
+                )
+
+    def test_overflow_uid_matches_only_attested_root_owned_component(self) -> None:
+        observed = {
+            "device": 1,
+            "inode": 2,
+            "mode": 0o755,
+            "path": "/synthetic",
+            "uid": 60001,
+        }
+        root_owned = dict(observed, uid=0)
+        unrelated_owner = dict(observed, uid=1234)
+        current_owner = dict(observed, uid=os.geteuid())
+        self.assertTrue(
+            RECONCILER._record_matches_binding(
+                observed,
+                root_owned,
+                overflow_uid=60001,
+            )
+        )
+        self.assertFalse(
+            RECONCILER._record_matches_binding(
+                observed,
+                unrelated_owner,
+                overflow_uid=60001,
+            )
+        )
+        self.assertFalse(
+            RECONCILER._record_matches_binding(
+                observed,
+                current_owner,
+                overflow_uid=60001,
+            )
+        )
+
+    def test_anchor_shape_rejects_dot_and_dotdot_paths(self) -> None:
+        self.assertIsNone(RECONCILER._canonical_absolute_path("/safe/./state"))
+        self.assertIsNone(RECONCILER._canonical_absolute_path("/safe/../state"))
+        self.assertIsNone(RECONCILER._canonical_absolute_path("/safe/\x00state"))
+        binding = {
+            "device": 1,
+            "inode": 2,
+            "mode": 0o700,
+            "path": "/safe/../state",
+            "uid": os.geteuid(),
+        }
+        self.assertFalse(
+            RECONCILER._binding_valid(
+                binding,
+                mode=0o700,
+                uid=os.geteuid(),
+            )
+        )
+
+    def test_anchor_builder_rejects_namespace_incompatible_config_and_secret(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            state, runtime, _anchor_path = self._anchor_fixture(home)
+            desired, manifest, _compose = RECONCILER._load_bound_state(state)
+            lock = {
+                "device": 1,
+                "inode": 2,
+                "mode": 0o600,
+                "path": str(RECONCILER._lock_path(desired["project"])),
+                "uid": os.geteuid(),
+            }
+            for key in ("config", "secret"):
+                with self.subTest(key=key), self._anchor_environment(home, runtime):
+                    incompatible = dict(manifest)
+                    incompatible[key] = dict(incompatible[key], uid=os.geteuid() + 1)
+                    with mock.patch.object(
+                        RECONCILER,
+                        "_prove_host_directory",
+                        side_effect=AssertionError(
+                            "incompatible identity was not rejected early"
+                        ),
+                    ), self.assertRaisesRegex(
+                        RECONCILER.ReconcileError,
+                        "RECONCILE_ANCHOR_INVALID",
+                    ):
+                        RECONCILER._anchor_from_state(
+                            desired,
+                            incompatible,
+                            state_directory=state,
+                            lock=lock,
+                        )
+
+    def test_prepare_rejects_incompatible_inputs_before_pending_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            state, runtime, anchor_path = self._anchor_fixture(home)
+            desired, manifest, compose = RECONCILER._load_bound_state(state)
+            incompatible = dict(manifest)
+            incompatible["secret"] = dict(
+                incompatible["secret"],
+                uid=os.geteuid() + 1,
+            )
+            with self._anchor_environment(home, runtime), mock.patch.object(
+                RECONCILER,
+                "_load_bound_state",
+                return_value=(desired, incompatible, compose),
+            ), self.assertRaisesRegex(
+                RECONCILER.ReconcileError,
+                "RECONCILE_ANCHOR_INVALID",
+            ):
+                RECONCILER.prepare_lock(state, anchor_path)
+            self.assertFalse(anchor_path.exists())
+
+    def test_user_descendant_ancestry_rejects_root_below_home(self) -> None:
+        euid = os.geteuid()
+        if euid == 0:
+            self.skipTest("the rootless user-unit contract requires a non-root EUID")
+        home_ancestry = [
+            {"device": 1, "inode": 1, "mode": 0o755, "path": "/", "uid": 0},
+            {
+                "device": 1,
+                "inode": 2,
+                "mode": 0o700,
+                "path": "/home/user",
+                "uid": euid,
+            },
+        ]
+        root_owned_child = [
+            *home_ancestry,
+            {
+                "device": 1,
+                "inode": 3,
+                "mode": 0o755,
+                "path": "/home/user/root-owned",
+                "uid": 0,
+            },
+            {
+                "device": 1,
+                "inode": 4,
+                "mode": 0o700,
+                "path": "/home/user/root-owned/state",
+                "uid": euid,
+            },
+        ]
+        with self.assertRaisesRegex(
+            RECONCILER.ReconcileError,
+            "RECONCILE_ANCHOR_INVALID",
+        ):
+            RECONCILER._require_user_descendant_ancestry(
+                root_owned_child,
+                home_ancestry=home_ancestry,
+            )
+        compatible = [
+            dict(record, uid=euid) if index >= len(home_ancestry) else record
+            for index, record in enumerate(root_owned_child)
+        ]
+        RECONCILER._require_user_descendant_ancestry(
+            compatible,
+            home_ancestry=home_ancestry,
+        )
+
+    def test_anchor_swap_is_rejected_and_releases_same_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            state, runtime, anchor_path = self._anchor_fixture(home)
+            lock_path = RECONCILER._lock_path("reconcile-test")
+            lock_path.unlink(missing_ok=True)
+            try:
+                with self._anchor_environment(home, runtime):
+                    RECONCILER.prepare_lock(state, anchor_path)
+                    real_open = RECONCILER._open_host_lock
+
+                    def swap_after_lock(path, *, create):
+                        descriptor = real_open(path, create=create)
+                        anchor_path.write_bytes(anchor_path.read_bytes() + b"\n")
+                        return descriptor
+
+                    with mock.patch.object(
+                        RECONCILER,
+                        "_open_host_lock",
+                        side_effect=swap_after_lock,
+                    ), self.assertRaisesRegex(
+                        RECONCILER.ReconcileError,
+                        "RECONCILE_ANCHOR_INVALID",
+                    ):
+                        RECONCILER._attested_lock(anchor_path, state)
+                    descriptor = real_open(lock_path, create=False)
+                    RECONCILER._release_lock(descriptor)
+            finally:
+                lock_path.unlink(missing_ok=True)
+
+    def test_attested_main_never_recreates_missing_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            state, runtime, anchor_path = self._anchor_fixture(home)
+            lock_path = RECONCILER._lock_path("reconcile-test")
+            lock_path.unlink(missing_ok=True)
+            with self._anchor_environment(home, runtime):
+                RECONCILER.prepare_lock(state, anchor_path)
+                lock_path.unlink()
+                with self.assertRaisesRegex(
+                    RECONCILER.ReconcileError,
+                    "RECONCILE_LOCK_INVALID",
+                ):
+                    RECONCILER._attested_lock(anchor_path, state)
+                self.assertFalse(lock_path.exists())
+
+    def test_prepare_and_reconcile_cli_accept_exact_anchor_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            state, runtime, anchor_path = self._anchor_fixture(home)
+            lock_path = RECONCILER._lock_path("reconcile-test")
+            lock_path.unlink(missing_ok=True)
+            previous_umask = os.umask(0o077)
+            try:
+                output = io.StringIO()
+                with self._anchor_environment(home, runtime), contextlib.redirect_stdout(
+                    output
+                ):
+                    self.assertEqual(
+                        0,
+                        RECONCILER.main(
+                            [
+                                "prepare-lock",
+                                "--state-directory",
+                                str(state),
+                                "--anchor-file",
+                                str(anchor_path),
+                            ]
+                        ),
+                    )
+                    with mock.patch.object(
+                        RECONCILER,
+                        "_runner_for_manifest",
+                        return_value=mock.Mock(),
+                    ):
+                        self.assertEqual(
+                            0,
+                            RECONCILER.main(
+                                [
+                                    "reconcile",
+                                    "--state-directory",
+                                    str(state),
+                                    "--anchor-file",
+                                    str(anchor_path),
+                                ]
+                            ),
+                        )
+                lines = output.getvalue().splitlines()
+                self.assertEqual(2, len(lines))
+                self.assertEqual("healthy", json.loads(lines[0])["status"])
+                self.assertEqual("maintenance", json.loads(lines[1])["status"])
+            finally:
+                os.umask(previous_umask)
+                lock_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
