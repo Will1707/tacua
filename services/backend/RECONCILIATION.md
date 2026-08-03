@@ -71,6 +71,18 @@ operation directory. It starts only the sealed user Docker unit when inactive,
 attests the existing deployment, and uses only `docker compose start` against
 the sealed snapshot. Container IDs must remain identical.
 
+One daemon-restart artifact has a deliberately narrow pre-start exception.
+Docker may temporarily omit stopped containers from a network's live consumer
+map even though every sealed container and resource still exists. When at
+least one service is not healthy, recovery may proceed only if every container
+projection, volume, network, and non-consumer resource field remains exact and
+each live network consumer set is a subset of its sealed expected set. An
+unexpected consumer is never accepted. After `docker compose start`, every
+inspection is strict again: all network consumer sets and all other container
+and resource projections must exactly match the sealed generation before
+health, smoke, or Serve gates can succeed. A subset on an already healthy
+deployment, any extra consumer, or any other drift remains a hard failure.
+
 Tailscale Serve is part of that transaction. The current Serve state must be
 either the exact Tacua listener or empty. Before Docker or container recovery,
 the reconciler disables an active listener and proves Serve is exactly `{}`.

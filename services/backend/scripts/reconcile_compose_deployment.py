@@ -1456,6 +1456,80 @@ def _resource_projection(document: Any, *, network: bool) -> dict[str, Any]:
     return result
 
 
+def _validate_resources_against_sealed(
+    resources: Mapping[str, Any],
+    expected: Mapping[str, Any],
+    *,
+    allow_missing_network_consumers: bool,
+    all_healthy: bool,
+) -> bool:
+    """Allow only stopped-service network reattachment as recovery drift.
+
+    Docker may omit stopped containers from a network's ``Containers`` map
+    after a rootless daemon restart.  Compose can reattach those exact sealed
+    containers on ``start``.  No other resource difference is recoverable, and
+    even this subset-only difference is forbidden when every service is
+    already healthy (where recovery would not execute ``start``).
+    """
+    if resources == expected:
+        return False
+    if not allow_missing_network_consumers or all_healthy:
+        raise ReconcileError("RECONCILE_RESOURCE_DRIFT")
+    if (
+        set(resources) != {"networks", "volumes"}
+        or set(expected) != {"networks", "volumes"}
+        or resources["volumes"] != expected["volumes"]
+        or not isinstance(resources["networks"], dict)
+        or not isinstance(expected["networks"], dict)
+        or set(resources["networks"]) != set(expected["networks"])
+    ):
+        raise ReconcileError("RECONCILE_RESOURCE_DRIFT")
+    missing = False
+    for name, actual in resources["networks"].items():
+        sealed = expected["networks"][name]
+        if (
+            not isinstance(actual, dict)
+            or not isinstance(sealed, dict)
+            or set(actual) != set(sealed)
+            or "ContainerIDs" not in actual
+        ):
+            raise ReconcileError("RECONCILE_RESOURCE_DRIFT")
+        actual_ids = actual["ContainerIDs"]
+        sealed_ids = sealed["ContainerIDs"]
+        if (
+            not isinstance(actual_ids, list)
+            or not isinstance(sealed_ids, list)
+            or actual_ids != sorted(actual_ids)
+            or sealed_ids != sorted(sealed_ids)
+            or len(actual_ids) != len(set(actual_ids))
+            or len(sealed_ids) != len(set(sealed_ids))
+            or any(
+                CONTAINER_ID.fullmatch(str(value)) is None
+                for value in actual_ids
+            )
+            or any(
+                CONTAINER_ID.fullmatch(str(value)) is None
+                for value in sealed_ids
+            )
+            or not set(actual_ids).issubset(sealed_ids)
+            or {
+                key: value
+                for key, value in actual.items()
+                if key != "ContainerIDs"
+            }
+            != {
+                key: value
+                for key, value in sealed.items()
+                if key != "ContainerIDs"
+            }
+        ):
+            raise ReconcileError("RECONCILE_RESOURCE_DRIFT")
+        missing = missing or actual_ids != sealed_ids
+    if not missing:
+        raise ReconcileError("RECONCILE_RESOURCE_DRIFT")
+    return True
+
+
 def _compose_prefix(manifest: Mapping[str, Any], compose: Path) -> list[str]:
     return [
         *_docker_prefix(manifest),
@@ -1468,7 +1542,11 @@ def _compose_prefix(manifest: Mapping[str, Any], compose: Path) -> list[str]:
 
 
 def _inspect_deployment(
-    manifest: Mapping[str, Any], compose: Path, runner: Callable[..., bytes]
+    manifest: Mapping[str, Any],
+    compose: Path,
+    runner: Callable[..., bytes],
+    *,
+    allow_missing_network_consumers: bool = False,
 ) -> tuple[dict[str, Any], bool]:
     docker = _docker_prefix(manifest)
     project = manifest["project"]
@@ -1534,8 +1612,14 @@ def _inspect_deployment(
         if listed != set(resources[kind]):
             raise ReconcileError("RECONCILE_RESOURCE_DRIFT")
     expected_resources = manifest.get("resources")
-    if expected_resources is not None and resources != expected_resources:
-        raise ReconcileError("RECONCILE_RESOURCE_DRIFT")
+    subset_recovery = False
+    if expected_resources is not None:
+        subset_recovery = _validate_resources_against_sealed(
+            resources,
+            expected_resources,
+            allow_missing_network_consumers=allow_missing_network_consumers,
+            all_healthy=all_healthy,
+        )
     expected_network_consumers: dict[str, set[str]] = {
         name: set() for name in resources["networks"]
     }
@@ -1544,12 +1628,24 @@ def _inspect_deployment(
             if network_name not in expected_network_consumers:
                 raise ReconcileError("RECONCILE_RESOURCE_DRIFT")
             expected_network_consumers[network_name].add(projection["id"])
-    if any(
-        resources["networks"][name].get("ContainerIDs")
-        != sorted(expected_network_consumers[name])
-        for name in expected_network_consumers
-    ):
-        raise ReconcileError("RECONCILE_RESOURCE_DRIFT")
+    for name, consumers in expected_network_consumers.items():
+        sealed_ids = sorted(consumers)
+        if (
+            expected_resources is not None
+            and expected_resources["networks"][name].get("ContainerIDs")
+            != sealed_ids
+        ):
+            raise ReconcileError("RECONCILE_RESOURCE_DRIFT")
+        actual_ids = resources["networks"][name].get("ContainerIDs")
+        if (
+            not isinstance(actual_ids, list)
+            or (
+                not set(actual_ids).issubset(consumers)
+                if subset_recovery
+                else actual_ids != sealed_ids
+            )
+        ):
+            raise ReconcileError("RECONCILE_RESOURCE_DRIFT")
     state_volume = compose_document["volumes"]["tacua-state"]["name"]
     consumers = _listed_container_ids(
         runner,
@@ -2148,7 +2244,12 @@ def _recover_locked(
             mutated = True
         if _daemon_projection(manifest, runner) != manifest["daemon"]:
             raise ReconcileError("RECONCILE_RUNTIME_DRIFT")
-        deployment, healthy = _inspect_deployment(manifest, compose, runner)
+        _deployment, healthy = _inspect_deployment(
+            manifest,
+            compose,
+            runner,
+            allow_missing_network_consumers=True,
+        )
         if not healthy:
             if serve_active:
                 _disable_serve(manifest, runner)
@@ -2158,9 +2259,11 @@ def _recover_locked(
             mutated = True
             deadline = time.monotonic() + 90
             while True:
-                after, healthy = _inspect_deployment(manifest, compose, runner)
-                if after != deployment:
-                    raise ReconcileError("RECONCILE_CONTAINER_DRIFT")
+                _after, healthy = _inspect_deployment(manifest, compose, runner)
+                # The strict inspection above must match every sealed
+                # projection.  Do not compare it to the intentionally relaxed
+                # pre-start network consumer map: successful start restores
+                # those missing attachments.
                 if healthy:
                     break
                 if time.monotonic() >= deadline:
