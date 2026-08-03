@@ -57,6 +57,12 @@ jobs:
           python3 -B experiments/ios-capture-spike/scripts/validate_app_audio_acceptance.py experiments/ios-capture-spike/fixtures/app-audio-acceptance/synthetic-passing.json --conformance
           python3 -B -m unittest discover -s experiments/ios-capture-spike/tests -p 'test_app_audio_acceptance*.py' -v
 
+      - name: Validate physical-pilot diagnostics retention
+        run: >-
+          PYTHONWARNINGS=error python3 -B -m unittest discover
+          -s experiments/ios-capture-spike/tests
+          -p 'test_pilot_diagnostics*.py' -v
+
       - name: Validate runtime contract candidates
         working-directory: contracts/runtime
         run: |

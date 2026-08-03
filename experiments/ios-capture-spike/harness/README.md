@@ -94,6 +94,18 @@ Sanitized experiment observations live in
 [`../PHYSICAL-DEVICE-RESULTS.md`](../PHYSICAL-DEVICE-RESULTS.md). Raw media and
 stable device identifiers must never be added to that file or committed.
 
+### Host-side diagnostics retention
+
+Xcode, device tooling, and automation wrappers can produce private host-side
+diagnostics even when the app under test retains no media. Store those outputs
+only in an owner-private managed operation and enforce their independent
+seven-day deadline with the repository-owned
+[`manage_pilot_diagnostics.py`](../PILOT-DIAGNOSTICS-RETENTION.md) workflow.
+Its daily scoped scavenger replaces cleanup that runs only when another pilot
+starts, and its explicit migration mode can harden legacy diagnostics without
+silently deleting them. This host policy does not replace SDK or backend
+retention and does not authorize committing raw evidence.
+
 The deterministic low-storage, writer-finalization, and ReplayKit-stop campaign
 uses a separate compile-time QA variant. Follow
 [`../FAULT-INJECTION-RUNBOOK.md`](../FAULT-INJECTION-RUNBOOK.md); never simulate
