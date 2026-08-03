@@ -133,6 +133,14 @@ project rather than supplied to the prerequisite. The prerequisite creates or
 validates that one file after boot without replacing it. This is necessary
 because `/tmp` does not survive reboot.
 
+The timer's `OnActiveSec=30s` arms the first automatic reconciliation relative
+to every actual timer activation, including a restart or a disable/enable cycle
+that uses `--now`. `OnUnitInactiveSec=30s` then rearms only after the bounded
+oneshot has finished. Do not replace the activation-relative trigger with
+`OnBootSec`: with the default elapsed-state retention, restarting a timer whose
+boot trigger already fired can leave it active with no future deadline.
+`Persistent=` is not used because it only affects `OnCalendar=` timers.
+
 The prerequisite intentionally omits `PrivateDevices`, `ProtectHome`,
 `ProtectSystem`, and the other filesystem-namespace-generating directives so
 its ownership proof describes the host rather than a transformed mount view.
@@ -177,7 +185,9 @@ env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
 env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
   systemctl --user status tacua-reconcile.service
 env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
-  systemctl --user enable --now tacua-reconcile.timer
+  systemctl --user enable tacua-reconcile.timer
+env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
+  systemctl --user restart tacua-reconcile.timer
 ```
 
 The explicit one-shot run must succeed before enabling the timer. Its
@@ -186,7 +196,9 @@ succeeded and proves that the rendered main unit can consume the freshly
 published anchor.
 On later boots, the same dependency recreates the missing runtime anchor before
 the main unit starts. Never render a durable path for `@ANCHOR_FILE@`, and do
-not enable the timer if the manual run fails.
+not enable the timer if the manual run fails. The explicit timer restart is
+upgrade-safe: it replaces an already loaded schedule as well as starting a
+fresh installation.
 
 The service intentionally has no `Wants=` or `Requires=` dependency on Docker:
 maintenance must not activate it. `PrivateTmp=no` is also intentional because
