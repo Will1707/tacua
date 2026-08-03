@@ -257,6 +257,11 @@ preflight, digest-pinned images, TLS/no-redirect and firewall invariants,
 single-replica enforcement, retention monitoring, atomic offline recovery
 bundles, restore, upgrade, and rollback.
 
+For a rootless single-node deployment that must restore the same existing
+containers after daemon loss, install the fail-closed user-systemd reconciler
+described in [RECONCILIATION.md](RECONCILIATION.md). Enter its durable
+maintenance state before every controlled stop.
+
 ```sh
 chmod go-w . services services/backend
 test ! -L services/backend/local

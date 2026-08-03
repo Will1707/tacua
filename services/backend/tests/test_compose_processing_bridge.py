@@ -53,6 +53,99 @@ BRIDGE = _load_script()
 
 
 class ComposeProcessingBridgeTests(unittest.TestCase):
+    def _backend_inspection(
+        self,
+        restart_policy: object,
+    ) -> dict[str, object]:
+        container_id = "a" * 64
+        image_id = "sha256:" + "b" * 64
+        project = "tacua-test"
+        state_volume = "tacua-test_tacua-state"
+        return {
+            "Config": {
+                "Image": "tacua-backend:test",
+                "Labels": {
+                    "com.docker.compose.oneoff": "False",
+                    "com.docker.compose.project": project,
+                    "com.docker.compose.service": "backend",
+                },
+            },
+            "HostConfig": {"RestartPolicy": restart_policy},
+            "Id": container_id,
+            "Image": image_id,
+            "Mounts": [
+                {
+                    "Destination": BRIDGE.STATE_IN_CONTAINER,
+                    "Name": state_volume,
+                    "Type": "volume",
+                }
+            ],
+            "State": {
+                "Health": {"Status": "healthy"},
+                "Status": "running",
+            },
+        }
+
+    def test_backend_inspection_requires_runtime_unless_stopped_policy(
+        self,
+    ) -> None:
+        container_id = "a" * 64
+        image_id = "sha256:" + "b" * 64
+        accepted = (
+            {"Name": "unless-stopped"},
+            {"MaximumRetryCount": 0, "Name": "unless-stopped"},
+        )
+        for restart_policy in accepted:
+            with self.subTest(restart_policy=restart_policy):
+                with mock.patch.object(
+                    BRIDGE,
+                    "_inspect_container",
+                    return_value=self._backend_inspection(restart_policy),
+                ):
+                    self.assertEqual(
+                        BRIDGE._inspect_backend(
+                            container_id=container_id,
+                            project="tacua-test",
+                            state_volume="tacua-test_tacua-state",
+                            expected_status="running",
+                            expected_image_id=image_id,
+                            expected_config_image="tacua-backend:test",
+                            require_healthy=True,
+                        ),
+                        image_id,
+                    )
+
+        rejected = (
+            None,
+            {},
+            {"MaximumRetryCount": 0, "Name": "no"},
+            {"MaximumRetryCount": 1, "Name": "unless-stopped"},
+            {"MaximumRetryCount": False, "Name": "unless-stopped"},
+        )
+        for restart_policy in rejected:
+            with self.subTest(restart_policy=restart_policy):
+                with mock.patch.object(
+                    BRIDGE,
+                    "_inspect_container",
+                    return_value=self._backend_inspection(restart_policy),
+                ):
+                    with self.assertRaises(
+                        BRIDGE.ComposeProcessingError
+                    ) as caught:
+                        BRIDGE._inspect_backend(
+                            container_id=container_id,
+                            project="tacua-test",
+                            state_volume="tacua-test_tacua-state",
+                            expected_status="running",
+                            expected_image_id=image_id,
+                            expected_config_image="tacua-backend:test",
+                            require_healthy=True,
+                        )
+                self.assertEqual(
+                    caught.exception.code,
+                    "BRIDGE_DEPLOYMENT_CHANGED",
+                )
+
     def _write_create_receipt(
         self,
         operation: Path,

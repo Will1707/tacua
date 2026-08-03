@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+# Render @PYTHON@, @RECONCILER@, @STATE_DIRECTORY@, and @LOCK_FILE@ to
+# absolute paths. The exact lock file must already exist as mode 0600.
+
+[Unit]
+Description=Tacua rootless desired-state reconciler
+Documentation=https://github.com/Will1707/tacua/blob/main/services/backend/RECONCILIATION.md
+After=network-online.target
+Wants=network-online.target
+Requires=tacua-reconcile-lock.service
+After=tacua-reconcile-lock.service
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=@PYTHON@ -B "@RECONCILER@" reconcile --state-directory "@STATE_DIRECTORY@"
+TimeoutStartSec=180
+RuntimeMaxSec=180
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=no
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths="@STATE_DIRECTORY@" "@LOCK_FILE@"
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
