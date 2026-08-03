@@ -9,9 +9,10 @@ export { normalizeBaseUrl } from "./base-url.ts";
 export { validateBackendConfig } from "./backend-config-validation.ts";
 export type { BackendConfig } from "./backend-config-validation.ts";
 
-const configurationKey = "tacua.backend.configuration.web-session.v1";
+const configurationKey = "tacua.backend.configuration.web-session.v2";
+const supersededConfigurationKey = "tacua.backend.configuration.web-session.v1";
 
-type PersistedBackendConfig = BackendConfig & { readonly storageVersion: 1 };
+type PersistedBackendConfig = BackendConfig & { readonly storageVersion: 2 };
 
 function browserSessionStorage(): Storage {
   if (typeof globalThis.sessionStorage === "undefined") {
@@ -26,7 +27,7 @@ function parsePersistedConfig(value: string): BackendConfig | null {
     if (
       !parsed
       || typeof parsed !== "object"
-      || parsed.storageVersion !== 1
+      || parsed.storageVersion !== 2
       || typeof parsed.baseUrl !== "string"
       || typeof parsed.adminToken !== "string"
       || typeof parsed.reviewerId !== "string"
@@ -54,10 +55,12 @@ export async function loadBackendConfig(): Promise<BackendConfig | null> {
 
 export async function saveBackendConfig(config: BackendConfig): Promise<void> {
   const validated = validateBackendConfig(config);
-  const persisted: PersistedBackendConfig = { storageVersion: 1, ...validated };
+  const persisted: PersistedBackendConfig = { storageVersion: 2, ...validated };
   browserSessionStorage().setItem(configurationKey, JSON.stringify(persisted));
+  browserSessionStorage().removeItem(supersededConfigurationKey);
 }
 
 export async function clearBackendConfig(): Promise<void> {
   browserSessionStorage().removeItem(configurationKey);
+  browserSessionStorage().removeItem(supersededConfigurationKey);
 }

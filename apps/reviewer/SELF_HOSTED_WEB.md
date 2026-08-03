@@ -80,6 +80,12 @@ generic value: the browser cannot derive or verify scheme ownership from a
 bundle identifier. Correcting this setting clears any retained one-time grant;
 create a new launch after saving the correction.
 
+The release that introduced this requirement also increments the browser and
+native configuration storage contracts without migrating earlier values. Every
+existing reviewer must reconnect once and explicitly enter the exact scheme;
+Tacua does not special-case the old placeholder because another self-hoster may
+legitimately own that scheme.
+
 Ticket inspection, editing, approval, and handoff download work from a desktop
 browser. When starting a review from a desktop, the reviewer renders the QA
 app's custom-scheme launch link as a QR code for the test iPhone. The QR is
