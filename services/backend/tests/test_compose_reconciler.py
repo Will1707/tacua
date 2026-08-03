@@ -458,6 +458,41 @@ class ComposeReconcilerTests(unittest.TestCase):
         self.assertEqual([first, second], actual["ContainerIDs"])
         self.assertNotEqual(expected, actual)
 
+    def test_exact_container_listings_request_untruncated_ids(self) -> None:
+        calls: list[list[str]] = []
+
+        def runner(argv, *, timeout):
+            calls.append(argv)
+            width = 64 if "--no-trunc" in argv else 12
+            return (("a" * width) + "\n").encode("ascii")
+
+        docker = ["/usr/bin/docker", "--host", "unix:///private/docker.sock"]
+        for filter_value, code in (
+            (
+                "label=com.docker.compose.project=reconcile-test",
+                "RECONCILE_CONTAINER_DRIFT",
+            ),
+            ("volume=reconcile-test_state", "RECONCILE_RESOURCE_DRIFT"),
+        ):
+            self.assertEqual(
+                {"a" * 64},
+                RECONCILER._listed_container_ids(
+                    runner,
+                    docker,
+                    filter_value,
+                    code,
+                ),
+            )
+        self.assertEqual(2, len(calls))
+        self.assertTrue(all("--no-trunc" in call for call in calls))
+        self.assertEqual(
+            {
+                "label=com.docker.compose.project=reconcile-test",
+                "volume=reconcile-test_state",
+            },
+            {call[-1] for call in calls},
+        )
+
     def test_container_projection_rejects_mutated_resource_limits(self) -> None:
         container_id = "a" * 64
         document = [{
