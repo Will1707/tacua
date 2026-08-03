@@ -94,17 +94,35 @@ the rest of `/tmp` read-only to the main unit, while that narrow
 all units owner-controlled and inspect the rendered services before enabling
 them.
 
+Noninteractive SSH sessions may omit `XDG_RUNTIME_DIR` even when logind has an
+existing runtime directory and the user manager is healthy. Resolve that
+directory from logind, validate it instead of guessing or creating
+`/run/user/<uid>`, and scope it only to the user-systemd commands:
+
 ```sh
 python3 -B services/backend/scripts/reconcile_compose_deployment.py \
   prepare-lock \
   --state-directory "$HOME/.local/state/tacua-reconcile"
-systemd-analyze --user verify "$HOME/.config/systemd/user/tacua-reconcile-lock.service"
-systemd-analyze --user verify "$HOME/.config/systemd/user/tacua-reconcile.service"
-systemd-analyze --user verify "$HOME/.config/systemd/user/tacua-reconcile.timer"
-systemctl --user daemon-reload
-systemctl --user enable --now tacua-reconcile.timer
-systemctl --user start tacua-reconcile.service
-systemctl --user status tacua-reconcile.service
+tacua_user_runtime_directory="$(
+  loginctl show-user "$(id -u)" --property=RuntimePath --value
+)"
+test -n "$tacua_user_runtime_directory"
+test -d "$tacua_user_runtime_directory"
+test "$(stat -c '%u' -- "$tacua_user_runtime_directory")" = "$(id -u)"
+env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
+  systemd-analyze --user verify "$HOME/.config/systemd/user/tacua-reconcile-lock.service"
+env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
+  systemd-analyze --user verify "$HOME/.config/systemd/user/tacua-reconcile.service"
+env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
+  systemd-analyze --user verify "$HOME/.config/systemd/user/tacua-reconcile.timer"
+env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
+  systemctl --user daemon-reload
+env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
+  systemctl --user enable --now tacua-reconcile.timer
+env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
+  systemctl --user start tacua-reconcile.service
+env XDG_RUNTIME_DIR="$tacua_user_runtime_directory" \
+  systemctl --user status tacua-reconcile.service
 ```
 
 The service intentionally has no `Wants=` or `Requires=` dependency on Docker:
