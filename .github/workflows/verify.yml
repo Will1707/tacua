@@ -63,6 +63,12 @@ jobs:
           -s experiments/ios-capture-spike/tests
           -p 'test_pilot_diagnostics*.py' -v
 
+      - name: Validate the physical-pilot terminal receipt
+        run: >-
+          PYTHONWARNINGS=error python3 -B -m unittest discover
+          -s experiments/ios-capture-spike/tests
+          -p 'test_finalize_pilot_operation.py' -v
+
       - name: Validate runtime contract candidates
         working-directory: contracts/runtime
         run: |

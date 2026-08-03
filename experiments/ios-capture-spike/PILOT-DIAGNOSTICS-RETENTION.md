@@ -132,8 +132,8 @@ non-quiet dry sweep manually to obtain content-free counts.
 Loading the plist is an operator action; rendering it does not modify the
 current `launchd` state. Before moving or replacing the checkout, boot out the
 old job, archive its plist, render a new one, validate it, and bootstrap it
-again. Monitor the error log and investigate any ignored operations rather
-than broadening deletion rules.
+again. Monitor the launchd job's last exit status and run a non-quiet dry sweep
+to investigate ignored operations rather than broadening deletion rules.
 
 ## Verification
 
