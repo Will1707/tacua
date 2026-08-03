@@ -1263,6 +1263,75 @@ class ComposeReconcilerTests(unittest.TestCase):
                             lock=lock,
                         )
 
+    def test_prepare_rejects_incompatible_inputs_before_pending_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            state, runtime, anchor_path = self._anchor_fixture(home)
+            desired, manifest, compose = RECONCILER._load_bound_state(state)
+            incompatible = dict(manifest)
+            incompatible["secret"] = dict(
+                incompatible["secret"],
+                uid=os.geteuid() + 1,
+            )
+            with self._anchor_environment(home, runtime), mock.patch.object(
+                RECONCILER,
+                "_load_bound_state",
+                return_value=(desired, incompatible, compose),
+            ), self.assertRaisesRegex(
+                RECONCILER.ReconcileError,
+                "RECONCILE_ANCHOR_INVALID",
+            ):
+                RECONCILER.prepare_lock(state, anchor_path)
+            self.assertFalse(anchor_path.exists())
+
+    def test_user_descendant_ancestry_rejects_root_below_home(self) -> None:
+        euid = os.geteuid()
+        if euid == 0:
+            self.skipTest("the rootless user-unit contract requires a non-root EUID")
+        home_ancestry = [
+            {"device": 1, "inode": 1, "mode": 0o755, "path": "/", "uid": 0},
+            {
+                "device": 1,
+                "inode": 2,
+                "mode": 0o700,
+                "path": "/home/user",
+                "uid": euid,
+            },
+        ]
+        root_owned_child = [
+            *home_ancestry,
+            {
+                "device": 1,
+                "inode": 3,
+                "mode": 0o755,
+                "path": "/home/user/root-owned",
+                "uid": 0,
+            },
+            {
+                "device": 1,
+                "inode": 4,
+                "mode": 0o700,
+                "path": "/home/user/root-owned/state",
+                "uid": euid,
+            },
+        ]
+        with self.assertRaisesRegex(
+            RECONCILER.ReconcileError,
+            "RECONCILE_ANCHOR_INVALID",
+        ):
+            RECONCILER._require_user_descendant_ancestry(
+                root_owned_child,
+                home_ancestry=home_ancestry,
+            )
+        compatible = [
+            dict(record, uid=euid) if index >= len(home_ancestry) else record
+            for index, record in enumerate(root_owned_child)
+        ]
+        RECONCILER._require_user_descendant_ancestry(
+            compatible,
+            home_ancestry=home_ancestry,
+        )
+
     def test_anchor_swap_is_rejected_and_releases_same_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory).resolve()

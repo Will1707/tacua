@@ -54,6 +54,17 @@ to verify host ownership even when a user service's mount namespace represents
 host ancestors with an overflow identity; it does not broaden accepted owners
 or make the prerequisite a deployment authority.
 
+For this user-unit path, the sealed state and processing-operation directories
+must be strict descendants of the effective user's passwd home, and every path
+component below that home must be effective-user-owned. The public config and
+administrator secret may be elsewhere, but every directory in each of their
+host paths must be root- or effective-user-owned and must not be group- or
+world-writable (apart from a root-owned sticky shared directory); each file's
+immediate parent must be effective-user-owned. The config and secret files
+themselves must be owned by the effective user and must retain the exact
+identities sealed in the selected generation. These user-unit requirements are
+stricter than the generic `seal` command's support for root-owned inputs.
+
 For `running`, the timer reads and validates state, takes the exact processing
 bridge lock, then re-reads state. It refuses any surviving durable processing
 operation directory. It starts only the sealed user Docker unit when inactive,

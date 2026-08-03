@@ -220,6 +220,25 @@ def _directory_is_beneath(path: Path, parent: Path) -> bool:
     return relative != Path(".") and ".." not in relative.parts
 
 
+def _require_user_descendant_ancestry(
+    ancestry: Sequence[Mapping[str, Any]],
+    *,
+    home_ancestry: Sequence[Mapping[str, Any]],
+) -> None:
+    """Require every component below the attested home to stay EUID-owned."""
+
+    if (
+        len(ancestry) <= len(home_ancestry)
+        or list(ancestry[: len(home_ancestry)]) != list(home_ancestry)
+        or any(
+            record.get("uid") != os.geteuid()
+            or int(record.get("mode", 0)) & 0o022
+            for record in ancestry[len(home_ancestry) :]
+        )
+    ):
+        raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+
+
 def _read_kernel_scalar(path: Path, *, maximum_bytes: int) -> tuple[str, os.stat_result]:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
         os, "O_NOFOLLOW", 0
@@ -1769,18 +1788,20 @@ def _anchor_file_path(anchor_file: Path, runtime: Path) -> None:
         raise ReconcileError("RECONCILE_ANCHOR_INVALID")
 
 
-def _anchor_from_state(
-    desired: Mapping[str, Any],
+def _prove_anchor_sources(
     manifest: Mapping[str, Any],
     *,
     state_directory: Path,
-    lock: Mapping[str, Any],
 ) -> dict[str, Any]:
     home = _passwd_home()
-    runtime = Path(manifest["runtime"]["xdg_runtime_directory"])
-    operation = Path(manifest["operation_directory"])
+    runtime = _canonical_absolute_path(
+        manifest["runtime"]["xdg_runtime_directory"]
+    )
+    operation = _canonical_absolute_path(manifest["operation_directory"])
     if (
-        manifest["runtime"]["home"] != str(home)
+        runtime is None
+        or operation is None
+        or manifest["runtime"]["home"] != str(home)
         or manifest["config"].get("uid") != os.geteuid()
         or manifest["secret"].get("uid") != os.geteuid()
         or not _directory_is_beneath(state_directory, home)
@@ -1791,26 +1812,56 @@ def _anchor_from_state(
     runtime_ancestry = _prove_host_directory(runtime, leaf_mode=0o700)
     state_ancestry = _prove_host_directory(state_directory, leaf_mode=0o700)
     operation_ancestry = _prove_host_directory(operation, leaf_mode=0o700)
-    config_binding = _prove_host_file(manifest["config"], secret=False)
-    secret_binding = _prove_host_file(manifest["secret"], secret=True)
+    _require_user_descendant_ancestry(
+        state_ancestry,
+        home_ancestry=home_ancestry,
+    )
+    _require_user_descendant_ancestry(
+        operation_ancestry,
+        home_ancestry=home_ancestry,
+    )
+    return {
+        "config": _prove_host_file(manifest["config"], secret=False),
+        "home": home,
+        "home_ancestry": home_ancestry,
+        "operation": operation,
+        "operation_ancestry": operation_ancestry,
+        "runtime": runtime,
+        "runtime_ancestry": runtime_ancestry,
+        "secret": _prove_host_file(manifest["secret"], secret=True),
+        "state_ancestry": state_ancestry,
+    }
+
+
+def _anchor_from_state(
+    desired: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    *,
+    state_directory: Path,
+    lock: Mapping[str, Any],
+) -> dict[str, Any]:
+    sources = _prove_anchor_sources(
+        manifest,
+        state_directory=state_directory,
+    )
     anchor = {
         "anchor_digest": "",
         "boot_id": _boot_id(),
-        "config": config_binding,
+        "config": sources["config"],
         "contract_version": ANCHOR_CONTRACT,
         "euid": os.geteuid(),
         "generation": desired["generation"],
-        "home": home_ancestry[-1],
-        "home_ancestry": home_ancestry,
+        "home": sources["home_ancestry"][-1],
+        "home_ancestry": sources["home_ancestry"],
         "lock": dict(lock),
         "manifest_digest": desired["manifest_digest"],
-        "operation_directory": operation_ancestry[-1],
+        "operation_directory": sources["operation_ancestry"][-1],
         "overflow_uid": _overflow_uid(),
         "project": desired["project"],
-        "runtime_directory": runtime_ancestry[-1],
-        "runtime_ancestry": runtime_ancestry,
-        "state_directory": state_ancestry[-1],
-        "secret": secret_binding,
+        "runtime_directory": sources["runtime_ancestry"][-1],
+        "runtime_ancestry": sources["runtime_ancestry"],
+        "state_directory": sources["state_ancestry"][-1],
+        "secret": sources["secret"],
     }
     anchor["anchor_digest"] = _document_digest(anchor, "anchor_digest")
     return anchor
@@ -1818,14 +1869,20 @@ def _anchor_from_state(
 
 def prepare_lock(state_directory: Path, anchor_file: Path) -> None:
     desired, manifest, _compose = _load_bound_state(state_directory)
-    runtime = Path(manifest["runtime"]["xdg_runtime_directory"])
+    # Reject layouts that the hardened user namespace cannot consume before
+    # replacing a previously valid anchor with the fail-closed pending record.
+    sources = _prove_anchor_sources(
+        manifest,
+        state_directory=state_directory,
+    )
+    runtime = sources["runtime"]
     _anchor_file_path(anchor_file, runtime)
     runtime_environment = _canonical_absolute_path(
         os.environ.get("XDG_RUNTIME_DIR")
     )
     if runtime_environment != runtime:
         raise ReconcileError("RECONCILE_ANCHOR_INVALID")
-    runtime_ancestry = _prove_host_directory(runtime, leaf_mode=0o700)
+    runtime_ancestry = sources["runtime_ancestry"]
     current_runtime, runtime_descriptor = _open_descriptor_directory_chain(
         runtime
     )
