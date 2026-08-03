@@ -479,6 +479,33 @@ def _lines(payload: bytes, pattern: re.Pattern[str], code: str) -> tuple[str, ..
     return values
 
 
+def _listed_container_ids(
+    runner: Callable[..., bytes],
+    docker: Sequence[str],
+    filter_value: str,
+    code: str,
+) -> set[str]:
+    return set(
+        _lines(
+            runner(
+                [
+                    *docker,
+                    "container",
+                    "ls",
+                    "--all",
+                    "--no-trunc",
+                    "--quiet",
+                    "--filter",
+                    filter_value,
+                ],
+                timeout=30,
+            ),
+            CONTAINER_ID,
+            code,
+        )
+    )
+
+
 def _json_command(runner: Callable[..., bytes], argv: Sequence[str], code: str) -> Any:
     try:
         return _parse_json(runner(argv, timeout=30), code)
@@ -659,11 +686,12 @@ def _inspect_deployment(
     docker = _docker_prefix(manifest)
     project = manifest["project"]
     prefix = _compose_prefix(manifest, compose)
-    project_ids = set(_lines(
-        runner([*docker, "container", "ls", "--all", "--quiet", "--filter", f"label=com.docker.compose.project={project}"], timeout=30),
-        CONTAINER_ID,
+    project_ids = _listed_container_ids(
+        runner,
+        docker,
+        f"label=com.docker.compose.project={project}",
         "RECONCILE_CONTAINER_DRIFT",
-    ))
+    )
     projections: dict[str, Any] = {}
     all_healthy = True
     for service in SERVICES:
@@ -736,11 +764,12 @@ def _inspect_deployment(
     ):
         raise ReconcileError("RECONCILE_RESOURCE_DRIFT")
     state_volume = compose_document["volumes"]["tacua-state"]["name"]
-    consumers = set(_lines(
-        runner([*docker, "container", "ls", "--all", "--quiet", "--filter", f"volume={state_volume}"], timeout=30),
-        CONTAINER_ID,
+    consumers = _listed_container_ids(
+        runner,
+        docker,
+        f"volume={state_volume}",
         "RECONCILE_RESOURCE_DRIFT",
-    ))
+    )
     if consumers != {projections["backend"]["id"]}:
         raise ReconcileError("RECONCILE_RESOURCE_DRIFT")
     return {"containers": projections, "resources": resources}, all_healthy
