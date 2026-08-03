@@ -1219,9 +1219,13 @@ class Controller implements BackendManagedHostController {
       const start = await this.primitives.getBackendStartRecoveryStatus(
         localSessionId,
       );
-      const resume = await this.primitives.getBackendResumeRecoveryStatus(
-        localSessionId,
-      );
+      // START and RESUME recovery are mutually exclusive. Native deliberately rejects a RESUME
+      // inspection while an active START journal owns this session, so preserve that START
+      // recovery action instead of turning discovery into a generic refresh failure.
+      const resume =
+        start.state === "none" || start.state === "queue_committed"
+          ? await this.primitives.getBackendResumeRecoveryStatus(localSessionId)
+          : emptyResumeRecovery(localSessionId);
       const recoveryBlocksQueue =
         !["none", "queue_committed"].includes(start.state) ||
         !["none", "queue_committed"].includes(resume.state);
@@ -1751,6 +1755,20 @@ function admittedOperationCount(queue: BackendQueueStatus): number {
 
 function emptyQueue(localSessionId: string): BackendQueueStatus {
   return { exists: false, localSessionId };
+}
+
+function emptyResumeRecovery(
+  localSessionId: string,
+): BackendResumeRecoveryStatus {
+  return {
+    localSessionId,
+    state: "none",
+    remoteCredentialMayExist: false,
+    queueUsable: false,
+    canRecoverWithoutLaunch: false,
+    canResetPreparedCredential: false,
+    requiresReconciliation: false,
+  };
 }
 
 function projectRecorder(status: CaptureStatus): BackendManagedRecorderSnapshot {

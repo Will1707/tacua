@@ -1096,14 +1096,26 @@ test("authenticated reset requires an explicit second confirmation", async () =>
 });
 
 test("recovery actions distinguish recoverable receipts from unknown outcomes", async () => {
-  const harness = createHarness();
-  harness.queues.set(LOCAL_SESSION_ID, readyQueue());
-  harness.startRecovery.set(LOCAL_SESSION_ID, {
+  const startHarness = createHarness();
+  startHarness.queues.set(LOCAL_SESSION_ID, readyQueue());
+  startHarness.startRecovery.set(LOCAL_SESSION_ID, {
     ...noStartRecovery(),
     state: "receipt_validated_queue_commit_pending",
     canRecoverWithoutLaunch: true,
   });
-  harness.resumeRecovery.set(LOCAL_SESSION_ID, {
+  const startController = createBackendManagedHostControllerForPrimitives(
+    startHarness.sdk,
+  );
+
+  await startController.refresh();
+  const startActionKinds = startController
+    .getSnapshot()
+    .sessions[0]?.actions.map((action) => action.kind);
+  assert.equal(startActionKinds?.includes("recover_start_plan"), true);
+
+  const resumeHarness = createHarness();
+  resumeHarness.queues.set(LOCAL_SESSION_ID, readyQueue());
+  resumeHarness.resumeRecovery.set(LOCAL_SESSION_ID, {
     localSessionId: LOCAL_SESSION_ID,
     state: "exchange_outcome_unknown",
     remoteCredentialMayExist: true,
@@ -1112,26 +1124,191 @@ test("recovery actions distinguish recoverable receipts from unknown outcomes", 
     canResetPreparedCredential: false,
     requiresReconciliation: true,
   });
-  const controller = createBackendManagedHostControllerForPrimitives(
-    harness.sdk,
+  const resumeController = createBackendManagedHostControllerForPrimitives(
+    resumeHarness.sdk,
   );
 
-  await controller.refresh();
-  const actionKinds = controller
+  await resumeController.refresh();
+  const resumeActionKinds = resumeController
     .getSnapshot()
     .sessions[0]?.actions.map((action) => action.kind);
-  assert.equal(actionKinds?.includes("recover_start_plan"), true);
   assert.equal(
-    actionKinds?.includes("operator_reconciliation_required"),
+    resumeActionKinds?.includes("operator_reconciliation_required"),
     true,
   );
   await assert.rejects(
-    controller.resetPreparedResume(LOCAL_SESSION_ID),
+    resumeController.resetPreparedResume(LOCAL_SESSION_ID),
     (error: unknown) =>
       error instanceof BackendManagedHostControllerError &&
       error.category === "reconciliation_required",
   );
 });
+
+for (const recoveryCase of [
+  {
+    state: "credential_prepared",
+    remoteSessionMayExist: false,
+    canRecoverWithoutLaunch: false,
+    canAbandonLocally: true,
+    expectedAction: "abandon_start",
+  },
+  {
+    state: "exchange_outcome_unknown",
+    remoteSessionMayExist: true,
+    canRecoverWithoutLaunch: false,
+    canAbandonLocally: true,
+    expectedAction: "abandon_start",
+  },
+  {
+    state: "credential_prepared_reset_pending",
+    remoteSessionMayExist: false,
+    canRecoverWithoutLaunch: false,
+    canAbandonLocally: true,
+    expectedAction: "abandon_start",
+  },
+  {
+    state: "exchange_outcome_unknown_reset_pending",
+    remoteSessionMayExist: true,
+    canRecoverWithoutLaunch: false,
+    canAbandonLocally: true,
+    expectedAction: "abandon_start",
+  },
+  {
+    state: "receipt_validated_queue_commit_pending",
+    remoteSessionMayExist: true,
+    canRecoverWithoutLaunch: true,
+    canAbandonLocally: false,
+    expectedAction: "recover_start_plan",
+  },
+] as const) {
+  test(`active START ${recoveryCase.state} projects its action without inspecting RESUME`, async () => {
+    const harness = createHarness();
+    harness.startRecovery.set(LOCAL_SESSION_ID, {
+      localSessionId: LOCAL_SESSION_ID,
+      state: recoveryCase.state,
+      requiresFreshReviewerLaunch:
+        recoveryCase.state !== "receipt_validated_queue_commit_pending",
+      remoteSessionMayExist: recoveryCase.remoteSessionMayExist,
+      canRecoverWithoutLaunch: recoveryCase.canRecoverWithoutLaunch,
+      canAbandonLocally: recoveryCase.canAbandonLocally,
+      resumeRequired:
+        recoveryCase.state === "receipt_validated_queue_commit_pending"
+          ? false
+          : null,
+      transportConfigurationMatchesBuild: true,
+      credentialCapability:
+        recoveryCase.state === "receipt_validated_queue_commit_pending"
+          ? "active"
+          : null,
+      credentialAvailability:
+        recoveryCase.state === "receipt_validated_queue_commit_pending"
+          ? "available"
+          : null,
+    });
+    const sdk: BackendManagedHostPrimitives = {
+      ...harness.sdk,
+      listBackendSessions: async () => {
+        harness.calls.push("list-backend");
+        return [
+          {
+            localSessionId: LOCAL_SESSION_ID,
+            hasCommittedQueue: false,
+            hasStartRecovery: true,
+          },
+        ];
+      },
+      getBackendResumeRecoveryStatus: async (localSessionId) => {
+        harness.calls.push(`resume-recovery-should-not-run:${localSessionId}`);
+        throw new Error("START recovery must exclude RESUME recovery inspection");
+      },
+    };
+    const controller = createBackendManagedHostControllerForPrimitives(sdk);
+
+    await controller.refresh();
+
+    const session = controller.getSnapshot().sessions[0];
+    assert.equal(session?.startRecoveryState, recoveryCase.state);
+    assert.equal(session?.resumeRecoveryState, "none");
+    assert.equal(
+      session?.actions.some(
+        (action) => action.kind === recoveryCase.expectedAction,
+      ),
+      true,
+    );
+    assert.equal(
+      harness.calls.includes(
+        `resume-recovery-should-not-run:${LOCAL_SESSION_ID}`,
+      ),
+      false,
+    );
+    assert.equal(harness.calls.includes(`queue:${LOCAL_SESSION_ID}`), false);
+  });
+}
+
+for (const state of ["none", "queue_committed"] as const) {
+  test(`START ${state} still inspects and projects active RESUME recovery`, async () => {
+    const harness = createHarness();
+    harness.startRecovery.set(LOCAL_SESSION_ID, {
+      localSessionId: LOCAL_SESSION_ID,
+      state,
+      requiresFreshReviewerLaunch: false,
+      remoteSessionMayExist: state === "queue_committed",
+      canRecoverWithoutLaunch: false,
+      canAbandonLocally: false,
+      resumeRequired: state === "queue_committed" ? false : null,
+      transportConfigurationMatchesBuild:
+        state === "queue_committed" ? true : null,
+      credentialCapability: state === "queue_committed" ? "active" : null,
+      credentialAvailability:
+        state === "queue_committed" ? "available" : null,
+    });
+    const sdk: BackendManagedHostPrimitives = {
+      ...harness.sdk,
+      listBackendSessions: async () => {
+        harness.calls.push("list-backend");
+        return [
+          {
+            localSessionId: LOCAL_SESSION_ID,
+            hasCommittedQueue: state === "queue_committed",
+            hasStartRecovery: false,
+          },
+        ];
+      },
+      getBackendResumeRecoveryStatus: async (localSessionId) => {
+        harness.calls.push(`resume-recovery-preserved:${localSessionId}`);
+        return {
+          localSessionId,
+          state: "credential_prepared",
+          remoteCredentialMayExist: false,
+          queueUsable: false,
+          canRecoverWithoutLaunch: false,
+          canResetPreparedCredential: true,
+          requiresReconciliation: false,
+        };
+      },
+    };
+    const controller = createBackendManagedHostControllerForPrimitives(sdk);
+
+    await controller.refresh();
+
+    const session = controller.getSnapshot().sessions[0];
+    assert.equal(session?.startRecoveryState, state);
+    assert.equal(session?.resumeRecoveryState, "credential_prepared");
+    assert.equal(
+      session?.actions.some(
+        (action) => action.kind === "reset_prepared_resume",
+      ),
+      true,
+    );
+    assert.equal(
+      harness.calls.filter(
+        (call) => call === `resume-recovery-preserved:${LOCAL_SESSION_ID}`,
+      ).length,
+      1,
+    );
+    assert.equal(harness.calls.includes(`queue:${LOCAL_SESSION_ID}`), false);
+  });
+}
 
 test("validated START and RESUME receipt journals restore native capture plans", async () => {
   const startHarness = createHarness();
