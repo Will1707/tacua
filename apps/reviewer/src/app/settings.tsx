@@ -27,7 +27,7 @@ export default function SettingsRoute() {
   const [baseUrl, setBaseUrl] = useState(initialBaseUrl);
   const [adminToken, setAdminToken] = useState("");
   const [reviewerId, setReviewerId] = useState("reviewer_owner");
-  const [targetScheme, setTargetScheme] = useState("tacua-qa-app");
+  const [targetScheme, setTargetScheme] = useState("");
   const [loadingConfig, setLoadingConfig] = useState(true);
   const [saving, setSaving] = useState(false);
   const [clearing, setClearing] = useState(false);
@@ -91,7 +91,7 @@ export default function SettingsRoute() {
       setAdminToken("");
       setBaseUrl(initialBaseUrl());
       setReviewerId("reviewer_owner");
-      setTargetScheme("tacua-qa-app");
+      setTargetScheme("");
       await reload();
       router.back();
     } catch (caught) {
@@ -119,7 +119,10 @@ export default function SettingsRoute() {
       <Field editable={!formDisabled} label="Backend URL" value={baseUrl} onChangeText={setBaseUrl} placeholder="https://tacua.example.com" autoCapitalize="none" keyboardType="url" />
       <Field editable={!formDisabled} label="Administrator token" value={adminToken} onChangeText={setAdminToken} placeholder="Mounted backend secret" autoCapitalize="none" secureTextEntry />
       <Field editable={!formDisabled} label="Reviewer ID" value={reviewerId} onChangeText={setReviewerId} placeholder="reviewer_owner" autoCapitalize="none" />
-      <Field editable={!formDisabled} label="QA app URL scheme" value={targetScheme} onChangeText={setTargetScheme} placeholder="tacua-qa-app" autoCapitalize="none" />
+      <Field editable={!formDisabled} label="QA app URL scheme" value={targetScheme} onChangeText={setTargetScheme} placeholder="your-app-qa" autoCapitalize="none" />
+      <Text selectable style={{ color: colors.secondaryLabel, fontSize: 13, lineHeight: 18 }}>
+        Enter the exact dedicated launchScheme configured in the SDK-enabled QA build. Tacua cannot infer a custom URL scheme from the app bundle identifier.
+      </Text>
       <ActionButton disabled={loadingConfig || clearing} label="Save and connect" loading={saving} onPress={() => void save()} />
       <ActionButton
         destructive

@@ -62,9 +62,11 @@ backend origin. The backend deliberately has no CORS surface, so do not add a
 wildcard origin or host the reviewer on a second origin. See
 [SELF_HOSTED_WEB.md](SELF_HOSTED_WEB.md) before packaging the export in Docker.
 
-The default bundle identifiers and QA target scheme are development
-placeholders for the repository owner and must remain configurable for other
-self-hosters.
+Bundle identifiers and the QA target scheme remain configurable for each
+self-hoster. The reviewer deliberately leaves the scheme blank on first setup:
+enter the exact dedicated `launchScheme` configured in the SDK-enabled QA
+build. A syntactically valid but different scheme belongs to another URL
+handler and cannot launch the intended app.
 
 The app uses the adaptive palette and accessibility rules in the
 [visual-direction guide](../../docs/design/visual-direction.md).

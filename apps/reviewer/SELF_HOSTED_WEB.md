@@ -73,12 +73,34 @@ browser storage.
 
 ## Device-launch limitation
 
+The first-run `QA app URL scheme` setting must exactly match the dedicated
+`launchScheme` installed by the Tacua config plugin in the SDK-enabled QA
+build. It is intentionally blank rather than prefilled with a plausible
+generic value: the browser cannot derive or verify scheme ownership from a
+bundle identifier. Correcting this setting clears any retained one-time grant;
+create a new launch after saving the correction.
+
 Ticket inspection, editing, approval, and handoff download work from a desktop
-browser. The start and recovery controls open the QA app's custom URL scheme on
-the same device as the reviewer. Use the web reviewer on the test iPhone for
-those controls. A desktop browser cannot launch a different physical iPhone;
-an authenticated QR/device-handoff flow is not implemented and would need its
-own launch-code disclosure and expiry review.
+browser. When starting a review from a desktop, the reviewer renders the QA
+app's custom-scheme launch link as a QR code for the test iPhone. The QR is
+generated locally in the tab without a third-party service and contains only
+the fixed custom-scheme route plus the one-use, short-lived launch code: never
+the backend origin, administrator credential, or recording data. It is still a
+bearer until use or expiry, and custom URL schemes are not exclusive to one
+installed handler, so do not screenshot, copy, or share it. While a grant is
+live, the reviewer disables creation of another one rather than leave multiple
+valid QRs in circulation. Changing
+reviewer configuration or reaching the stated expiry or five-minute local
+retention cap removes the retained grant and QR from the UI.
+
+On an iPhone, creating a grant and opening the custom scheme are deliberately
+two taps. The authenticated request is asynchronous, and browsers commonly
+block a custom-scheme popup after the first tap's transient user activation has
+ended; the ready state's second tap performs the open synchronously. Browser
+device detection is only a convenience: the ready state always exposes an
+explicit same-device action as an accessible alternative to scanning. The
+recovery control still opens the QA app on the same device as the reviewer; use
+the web reviewer on the test iPhone for interrupted-session recovery.
 
 ## Build validation
 
