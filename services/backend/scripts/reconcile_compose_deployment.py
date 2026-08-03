@@ -2676,6 +2676,8 @@ def reconcile(
 def set_maintenance(
     state_directory: Path,
     runner: Callable[..., bytes] | None = None,
+    *,
+    require_running: bool = False,
 ) -> dict[str, str]:
     desired, initial_manifest, _compose = _load_bound_state(state_directory)
     selected_runner = runner or _runner_for_manifest(initial_manifest)
@@ -2683,8 +2685,24 @@ def set_maintenance(
     try:
         current, manifest, compose = _load_bound_state(state_directory)
         if current != desired:
-            raise ReconcileError("RECONCILE_STATE_CHANGED")
-        if _load_activation(state_directory, current) is not None:
+            initial_binding = {
+                key: value
+                for key, value in desired.items()
+                if key not in {"desired", "state_digest"}
+            }
+            current_binding = {
+                key: value
+                for key, value in current.items()
+                if key not in {"desired", "state_digest"}
+            }
+            if not require_running or current_binding != initial_binding:
+                raise ReconcileError("RECONCILE_STATE_CHANGED")
+        activation = _load_activation(state_directory, current)
+        if require_running and (
+            current["desired"] != "running" or activation is not None
+        ):
+            raise ReconcileError("RECONCILE_RUNNING_REQUIRED")
+        if activation is not None:
             raise ReconcileError("RECONCILE_ACTIVATION_PENDING")
         _write_maintenance_transition(state_directory, current)
         _write_desired(state_directory, current, "maintenance")
@@ -2938,8 +2956,17 @@ def _parser() -> argparse.ArgumentParser:
     prepare = commands.add_parser("prepare-lock")
     prepare.add_argument("--state-directory", required=True, type=Path)
     prepare.add_argument("--anchor-file", required=True, type=Path)
+    maintenance = commands.add_parser("maintenance")
+    maintenance.add_argument("--state-directory", required=True, type=Path)
+    maintenance.add_argument(
+        "--require-running",
+        action="store_true",
+        help=(
+            "atomically refuse the maintenance transition unless the locked "
+            "state is settled running"
+        ),
+    )
     for name in (
-        "maintenance",
         "running",
         "status",
         "cancel-activation",
@@ -2979,7 +3006,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 anchor_file=args.anchor_file,
             )
         elif args.command == "maintenance":
-            result = set_maintenance(args.state_directory)
+            result = set_maintenance(
+                args.state_directory,
+                require_running=args.require_running,
+            )
         elif args.command == "running":
             result = set_running(args.state_directory)
         elif args.command == "prepare-lock":
