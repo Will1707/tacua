@@ -23,7 +23,7 @@ const handoffPath = path.join(
   repositoryRoot,
   "contracts/approved-handoff/fixtures/positive/approved-handoff.json",
 );
-const configurationKey = "tacua.backend.configuration.web-session.v1";
+const configurationKey = "tacua.backend.configuration.web-session.v2";
 const adminToken =
   "tacua-browser-smoke-admin-token-0123456789abcdef0123456789";
 const reviewerId = "reviewer_browser";
@@ -784,7 +784,7 @@ async function runBrowserSmoke(browser, fixture, temporaryDirectory) {
       );
       if (typeof value !== "string") return false;
       const parsed = JSON.parse(value);
-      return parsed.storageVersion === 1
+      return parsed.storageVersion === 2
         && parsed.baseUrl === fixture.origin
         && parsed.adminToken === adminToken
         && parsed.reviewerId === reviewerId
@@ -841,7 +841,7 @@ async function runBrowserSmoke(browser, fixture, temporaryDirectory) {
       `sessionStorage.setItem(
         ${JSON.stringify(configurationKey)},
         ${JSON.stringify(JSON.stringify({
-          storageVersion: 1,
+          storageVersion: 2,
           baseUrl: fixture.origin,
           adminToken,
           reviewerId,
