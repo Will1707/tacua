@@ -47,6 +47,8 @@ import verify_tailnet_private_pilot as tailnet_gate  # noqa: E402
 DESIRED_CONTRACT = "tacua.compose-desired-state@1.0.0"
 GENERATION_CONTRACT = "tacua.compose-reconcile-generation@1.0.0"
 ACTIVATION_CONTRACT = "tacua.compose-reconcile-activation@1.0.0"
+ANCHOR_CONTRACT = "tacua.compose-reconcile-anchor@1.0.0"
+ANCHOR_PENDING_CONTRACT = "tacua.compose-reconcile-anchor-pending@1.0.0"
 DESIRED_FILE = "desired-state.json"
 ACTIVATION_FILE = "activation.json"
 MANIFEST_FILE = "manifest.json"
@@ -62,6 +64,9 @@ UNIT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]{0,119}\.service$")
 RESOURCE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$")
 STATE_STAGING = re.compile(
     r"^\.(?:activation|desired-state)\.json\.next-[0-9]+$"
+)
+BOOT_ID = re.compile(
+    r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
 )
 
 
@@ -117,7 +122,231 @@ def _parse_json(payload: bytes, code: str) -> Any:
         raise ReconcileError(code) from error
 
 
-def _safe_directory(path: Path, *, create: bool = False) -> Path:
+def _directory_record(path: Path, metadata: os.stat_result) -> dict[str, Any]:
+    return {
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "path": str(path),
+        "uid": metadata.st_uid,
+    }
+
+
+def _open_descriptor_directory_chain(
+    path: Path,
+) -> tuple[list[dict[str, Any]], int]:
+    """Open every path component from ``/`` without following a symlink."""
+
+    if not path.is_absolute() or any(part in {".", ".."} for part in path.parts):
+        raise ReconcileError("RECONCILE_STATE_INVALID")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor: int | None = None
+    records: list[dict[str, Any]] = []
+    current = Path("/")
+    try:
+        descriptor = os.open("/", flags)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ReconcileError("RECONCILE_STATE_INVALID")
+        records.append(_directory_record(current, metadata))
+        for component in path.parts[1:]:
+            try:
+                child = os.open(component, flags, dir_fd=descriptor)
+            except OSError as error:
+                raise ReconcileError("RECONCILE_STATE_INVALID") from error
+            os.close(descriptor)
+            descriptor = child
+            current /= component
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise ReconcileError("RECONCILE_STATE_INVALID")
+            records.append(_directory_record(current, metadata))
+        result = descriptor
+        descriptor = None
+        return records, result
+    except OSError as error:
+        raise ReconcileError("RECONCILE_STATE_INVALID") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _descriptor_directory_chain(path: Path) -> list[dict[str, Any]]:
+    records, descriptor = _open_descriptor_directory_chain(path)
+    os.close(descriptor)
+    return records
+
+
+def _prove_host_directory(
+    path: Path,
+    *,
+    leaf_mode: int | None = None,
+) -> list[dict[str, Any]]:
+    """Prove a host path with descriptor-relative, no-symlink traversal."""
+
+    records = _descriptor_directory_chain(path)
+    euid = os.geteuid()
+    for record in records:
+        permissions = int(record["mode"])
+        sticky_shared = (
+            record["uid"] == 0
+            and permissions & stat.S_ISVTX
+            and permissions & 0o022
+        )
+        if (
+            record["uid"] not in {0, euid}
+            or (permissions & 0o022 and not sticky_shared)
+        ):
+            raise ReconcileError("RECONCILE_STATE_INVALID")
+    leaf = records[-1]
+    if (
+        leaf["uid"] != euid
+        or (leaf_mode is not None and leaf["mode"] != leaf_mode)
+    ):
+        raise ReconcileError("RECONCILE_STATE_INVALID")
+    return records
+
+
+def _directory_is_beneath(path: Path, parent: Path) -> bool:
+    try:
+        relative = path.relative_to(parent)
+    except ValueError:
+        return False
+    return relative != Path(".") and ".." not in relative.parts
+
+
+def _read_kernel_scalar(path: Path, *, maximum_bytes: int) -> tuple[str, os.stat_result]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
+        os, "O_NOFOLLOW", 0
+    )
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            metadata = os.fstat(descriptor)
+            payload = os.read(descriptor, maximum_bytes + 1)
+            if os.read(descriptor, 1):
+                raise OSError()
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        raise ReconcileError("RECONCILE_ANCHOR_INVALID") from error
+    try:
+        value = payload.decode("ascii").strip().lower()
+    except UnicodeError as error:
+        raise ReconcileError("RECONCILE_ANCHOR_INVALID") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or not value
+        or len(payload) > maximum_bytes
+    ):
+        raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+    return value, metadata
+
+
+def _overflow_uid() -> int:
+    value, _metadata = _read_kernel_scalar(
+        Path("/proc/sys/kernel/overflowuid"), maximum_bytes=32
+    )
+    try:
+        overflow = int(value, 10)
+    except ValueError as error:
+        raise ReconcileError("RECONCILE_ANCHOR_INVALID") from error
+    if not 0 <= overflow <= 2**32 - 1 or overflow == os.geteuid():
+        raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+    return overflow
+
+
+def _boot_id() -> str:
+    value, metadata = _read_kernel_scalar(
+        Path("/proc/sys/kernel/random/boot_id"), maximum_bytes=128
+    )
+    if (
+        metadata.st_uid not in {0, _overflow_uid()}
+        or BOOT_ID.fullmatch(value) is None
+    ):
+        raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+    return value
+
+
+def _binding_valid(
+    value: Any,
+    *,
+    mode: int | None,
+    uid: int | None,
+) -> bool:
+    canonical_path = (
+        isinstance(value, dict)
+        and isinstance(value.get("path"), str)
+        and str(Path(value["path"])) == value["path"]
+        and not value["path"].startswith("//")
+        and "\x00" not in value["path"]
+        and not any(part in {".", ".."} for part in Path(value["path"]).parts)
+    )
+    return (
+        isinstance(value, dict)
+        and set(value) == {"device", "inode", "mode", "path", "uid"}
+        and type(value.get("device")) is int
+        and value["device"] >= 0
+        and type(value.get("inode")) is int
+        and value["inode"] > 0
+        and type(value.get("mode")) is int
+        and (mode is None or value["mode"] == mode)
+        and 0 <= value["mode"] <= 0o7777
+        and canonical_path
+        and Path(value["path"]).is_absolute()
+        and type(value.get("uid")) is int
+        and (uid is None or value["uid"] == uid)
+    )
+
+
+def _identity_document_valid(value: Any, *, secret: bool, uid: int) -> bool:
+    expected_mode = 0o444 if secret else 0o644
+    return (
+        isinstance(value, dict)
+        and set(value) == {"digest", "mode", "path", "size", "uid"}
+        and DIGEST.fullmatch(str(value.get("digest"))) is not None
+        and value.get("mode") == expected_mode
+        and _canonical_absolute_path(value.get("path")) is not None
+        and type(value.get("size")) is int
+        and 0 < value["size"] <= MAX_DOCUMENT_BYTES
+        and value.get("uid") == uid
+    )
+
+
+def _record_matches_binding(
+    observed: Mapping[str, Any],
+    expected: Mapping[str, Any],
+    *,
+    overflow_uid: int | None = None,
+) -> bool:
+    observed_uid = observed.get("uid")
+    expected_uid = expected.get("uid")
+    uid_matches = observed_uid == expected_uid
+    if (
+        not uid_matches
+        and overflow_uid is not None
+        and observed_uid == overflow_uid
+        and expected_uid == 0
+    ):
+        uid_matches = True
+    return uid_matches and all(
+        observed.get(key) == expected.get(key)
+        for key in ("device", "inode", "mode", "path")
+    )
+
+
+def _safe_directory(
+    path: Path,
+    *,
+    create: bool = False,
+    attested_directories: Sequence[Mapping[str, Any]] | None = None,
+) -> Path:
     if not path.is_absolute():
         raise ReconcileError("RECONCILE_STATE_INVALID")
     if create:
@@ -127,6 +356,38 @@ def _safe_directory(path: Path, *, create: bool = False) -> Path:
             pass
         except OSError as error:
             raise ReconcileError("RECONCILE_STATE_INVALID") from error
+    if attested_directories is not None:
+        if create:
+            raise ReconcileError("RECONCILE_STATE_INVALID")
+        records = _descriptor_directory_chain(path)
+        leaf = records[-1]
+        if (
+            leaf["path"] != str(path)
+            or leaf["uid"] != os.geteuid()
+            or leaf["mode"] != 0o700
+        ):
+            raise ReconcileError("RECONCILE_STATE_INVALID")
+        bindings = {
+            str(binding.get("path")): binding
+            for binding in attested_directories
+            if isinstance(binding, Mapping)
+        }
+        for record in reversed(records):
+            binding = bindings.get(str(record["path"]))
+            if binding is not None and _record_matches_binding(record, binding):
+                return path
+            permissions = int(record["mode"])
+            sticky_shared = (
+                record["uid"] == 0
+                and permissions & stat.S_ISVTX
+                and permissions & 0o022
+            )
+            if (
+                record["uid"] not in {0, os.geteuid()}
+                or (permissions & 0o022 and not sticky_shared)
+            ):
+                raise ReconcileError("RECONCILE_STATE_INVALID")
+        raise ReconcileError("RECONCILE_STATE_INVALID")
     try:
         resolved = path.resolve(strict=True)
         metadata = path.lstat()
@@ -213,6 +474,314 @@ def _read_private(path: Path, *, mode: int, code: str) -> bytes:
         os.close(descriptor)
 
 
+def _canonical_absolute_path(value: Any) -> Path | None:
+    if (
+        not isinstance(value, str)
+        or value.startswith("//")
+        or "\x00" in value
+    ):
+        return None
+    path = Path(value)
+    if (
+        not path.is_absolute()
+        or str(path) != value
+        or any(part in {".", ".."} for part in path.parts)
+    ):
+        return None
+    return path
+
+
+def _passwd_home() -> Path:
+    try:
+        value = pwd.getpwuid(os.geteuid()).pw_dir
+    except KeyError as error:
+        raise ReconcileError("RECONCILE_ANCHOR_INVALID") from error
+    path = _canonical_absolute_path(value)
+    if path is None:
+        raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+    return path
+
+
+def _ancestry_document_valid(
+    ancestry: Any,
+    *,
+    leaf: Mapping[str, Any],
+    euid: int,
+) -> bool:
+    if not isinstance(ancestry, list) or not ancestry:
+        return False
+    previous: Path | None = None
+    for record in ancestry:
+        if not _binding_valid(record, mode=None, uid=None):
+            return False
+        path = Path(record["path"])
+        if record["uid"] not in {0, euid}:
+            return False
+        permissions = int(record["mode"])
+        sticky_shared = (
+            record["uid"] == 0
+            and permissions & stat.S_ISVTX
+            and permissions & 0o022
+        )
+        if permissions & 0o022 and not sticky_shared:
+            return False
+        if previous is None:
+            if path != Path("/"):
+                return False
+        elif path.parent != previous:
+            return False
+        previous = path
+    return ancestry[-1] == leaf
+
+
+def _file_binding_valid(value: Any, *, secret: bool, euid: int) -> bool:
+    expected_mode = 0o444 if secret else 0o644
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {
+            "ancestry",
+            "device",
+            "digest",
+            "inode",
+            "mode",
+            "path",
+            "size",
+            "uid",
+        }
+    ):
+        return False
+    leaf = {
+        key: value[key]
+        for key in ("device", "inode", "mode", "path", "uid")
+    }
+    identity = _identity_from_file_binding(value)
+    ancestry = value["ancestry"]
+    return (
+        _binding_valid(leaf, mode=expected_mode, uid=euid)
+        and _identity_document_valid(identity, secret=secret, uid=euid)
+        and isinstance(ancestry, list)
+        and bool(ancestry)
+        and _ancestry_document_valid(
+            ancestry,
+            leaf=ancestry[-1],
+            euid=euid,
+        )
+        and Path(value["path"]).parent == Path(ancestry[-1]["path"])
+    )
+
+
+def _load_anchor(
+    anchor_file: Path,
+    state_directory: Path,
+    *,
+    payload: bytes | None = None,
+) -> dict[str, Any]:
+    if payload is None:
+        payload = _read_private(
+            anchor_file,
+            mode=0o600,
+            code="RECONCILE_ANCHOR_INVALID",
+        )
+    anchor = _parse_json(payload, "RECONCILE_ANCHOR_INVALID")
+    required = {
+        "anchor_digest",
+        "boot_id",
+        "config",
+        "contract_version",
+        "euid",
+        "generation",
+        "home",
+        "home_ancestry",
+        "lock",
+        "manifest_digest",
+        "operation_directory",
+        "overflow_uid",
+        "project",
+        "runtime_directory",
+        "runtime_ancestry",
+        "state_directory",
+        "secret",
+    }
+    euid = os.geteuid()
+    if (
+        not isinstance(anchor, dict)
+        or set(anchor) != required
+        or anchor.get("contract_version") != ANCHOR_CONTRACT
+        or anchor.get("euid") != euid
+        or type(anchor.get("overflow_uid")) is not int
+        or anchor.get("overflow_uid") == euid
+        or not 0 <= anchor["overflow_uid"] <= 2**32 - 1
+        or BOOT_ID.fullmatch(str(anchor.get("boot_id"))) is None
+        or PROJECT.fullmatch(str(anchor.get("project"))) is None
+        or GENERATION.fullmatch(str(anchor.get("generation"))) is None
+        or DIGEST.fullmatch(str(anchor.get("manifest_digest"))) is None
+        or not _file_binding_valid(anchor.get("config"), secret=False, euid=euid)
+        or not _file_binding_valid(anchor.get("secret"), secret=True, euid=euid)
+        or not _binding_valid(anchor.get("home"), mode=None, uid=euid)
+        or int(anchor["home"]["mode"]) & 0o022
+        or not _binding_valid(
+            anchor.get("runtime_directory"), mode=0o700, uid=euid
+        )
+        or not _binding_valid(
+            anchor.get("state_directory"), mode=0o700, uid=euid
+        )
+        or not _binding_valid(
+            anchor.get("operation_directory"), mode=0o700, uid=euid
+        )
+        or not _binding_valid(anchor.get("lock"), mode=0o600, uid=euid)
+        or not _ancestry_document_valid(
+            anchor.get("home_ancestry"), leaf=anchor.get("home", {}), euid=euid
+        )
+        or not _ancestry_document_valid(
+            anchor.get("runtime_ancestry"),
+            leaf=anchor.get("runtime_directory", {}),
+            euid=euid,
+        )
+        or anchor.get("anchor_digest")
+        != _document_digest(anchor, "anchor_digest")
+        or payload != _canonical(anchor)
+    ):
+        raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+    home = Path(anchor["home"]["path"])
+    runtime = Path(anchor["runtime_directory"]["path"])
+    state = Path(anchor["state_directory"]["path"])
+    operation = Path(anchor["operation_directory"]["path"])
+    expected_anchor = runtime / "tacua-reconcile.anchor.json"
+    runtime_environment = _canonical_absolute_path(
+        os.environ.get("XDG_RUNTIME_DIR")
+    )
+    if (
+        home != _passwd_home()
+        or state != state_directory
+        or not _directory_is_beneath(state, home)
+        or not _directory_is_beneath(operation, home)
+        or anchor_file != expected_anchor
+        or runtime_environment != runtime
+        or Path(anchor["lock"]["path"])
+        != Path(f"/tmp/tacua-compose-processing-{anchor['project']}.lock")
+    ):
+        raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+    return anchor
+
+
+def _compare_current_ancestry(
+    expected: Sequence[Mapping[str, Any]],
+    *,
+    overflow_uid: int,
+) -> None:
+    current = _descriptor_directory_chain(Path(expected[-1]["path"]))
+    if len(current) != len(expected) or any(
+        not _record_matches_binding(
+            observed,
+            binding,
+            overflow_uid=overflow_uid,
+        )
+        for observed, binding in zip(current, expected, strict=True)
+    ):
+        raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+
+
+def _compare_anchored_descendant(
+    binding: Mapping[str, Any],
+    *,
+    home_ancestry: Sequence[Mapping[str, Any]],
+    overflow_uid: int,
+) -> None:
+    current = _descriptor_directory_chain(Path(binding["path"]))
+    if len(current) <= len(home_ancestry):
+        raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+    for observed, expected in zip(
+        current[: len(home_ancestry)], home_ancestry, strict=True
+    ):
+        if not _record_matches_binding(
+            observed,
+            expected,
+            overflow_uid=overflow_uid,
+        ):
+            raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+    for record in current[len(home_ancestry) :]:
+        if record["uid"] != os.geteuid() or int(record["mode"]) & 0o022:
+            raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+    if not _record_matches_binding(current[-1], binding):
+        raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+
+
+def _validate_file_binding_current(
+    binding: Mapping[str, Any],
+    *,
+    secret: bool,
+    overflow_uid: int,
+) -> None:
+    ancestry = binding["ancestry"]
+    _compare_current_ancestry(ancestry, overflow_uid=overflow_uid)
+    current, parent_descriptor = _open_descriptor_directory_chain(
+        Path(ancestry[-1]["path"])
+    )
+    try:
+        if len(current) != len(ancestry) or any(
+            not _record_matches_binding(
+                observed,
+                expected,
+                overflow_uid=overflow_uid,
+            )
+            for observed, expected in zip(current, ancestry, strict=True)
+        ):
+            raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+        observed_file = _file_record_from_parent(
+            parent_descriptor,
+            Path(binding["path"]),
+            secret=secret,
+        )
+    finally:
+        os.close(parent_descriptor)
+    expected_file = {
+        key: value for key, value in binding.items() if key != "ancestry"
+    }
+    if observed_file != expected_file:
+        raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+
+
+def _validate_anchor_current(anchor: Mapping[str, Any]) -> None:
+    if (
+        anchor.get("euid") != os.geteuid()
+        or anchor.get("overflow_uid") != _overflow_uid()
+        or anchor.get("boot_id") != _boot_id()
+        or Path(anchor["home"]["path"]) != _passwd_home()
+    ):
+        raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+    overflow_uid = int(anchor["overflow_uid"])
+    _compare_current_ancestry(
+        anchor["home_ancestry"], overflow_uid=overflow_uid
+    )
+    _compare_current_ancestry(
+        anchor["runtime_ancestry"], overflow_uid=overflow_uid
+    )
+    _compare_anchored_descendant(
+        anchor["state_directory"],
+        home_ancestry=anchor["home_ancestry"],
+        overflow_uid=overflow_uid,
+    )
+    _compare_anchored_descendant(
+        anchor["operation_directory"],
+        home_ancestry=anchor["home_ancestry"],
+        overflow_uid=overflow_uid,
+    )
+    for key, secret in (("config", False), ("secret", True)):
+        _validate_file_binding_current(
+            anchor[key],
+            secret=secret,
+            overflow_uid=overflow_uid,
+        )
+    for key in ("home", "runtime_directory", "state_directory", "operation_directory"):
+        path = Path(anchor[key]["path"])
+        try:
+            if path.resolve(strict=True) != path:
+                raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+        except OSError as error:
+            raise ReconcileError("RECONCILE_ANCHOR_INVALID") from error
+
+
 def _fsync_directory(path: Path) -> None:
     descriptor = os.open(
         path,
@@ -252,6 +821,83 @@ def _atomic_private_write(path: Path, payload: bytes, *, replace: bool) -> None:
     finally:
         try:
             temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _validate_directory_descriptor(
+    descriptor: int,
+    path: Path,
+    expected: Mapping[str, Any],
+) -> None:
+    metadata = os.fstat(descriptor)
+    record = _directory_record(path, metadata)
+    current, current_descriptor = _open_descriptor_directory_chain(path)
+    try:
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or not _record_matches_binding(record, expected)
+            or not _record_matches_binding(current[-1], expected)
+        ):
+            raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+    finally:
+        os.close(current_descriptor)
+
+
+def _atomic_private_write_in_directory(
+    directory_descriptor: int,
+    directory_path: Path,
+    directory_binding: Mapping[str, Any],
+    name: str,
+    payload: bytes,
+) -> None:
+    if name != "tacua-reconcile.anchor.json":
+        raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+    _validate_directory_descriptor(
+        directory_descriptor,
+        directory_path,
+        directory_binding,
+    )
+    temporary = f".{name}.next-{os.getpid()}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(
+            temporary,
+            flags,
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+        try:
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise OSError()
+                offset += written
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        _validate_directory_descriptor(
+            directory_descriptor,
+            directory_path,
+            directory_binding,
+        )
+        os.replace(
+            temporary,
+            name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
+        os.fsync(directory_descriptor)
+    except ReconcileError:
+        raise
+    except OSError as error:
+        raise ReconcileError("RECONCILE_ANCHOR_INVALID") from error
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=directory_descriptor)
         except FileNotFoundError:
             pass
 
@@ -309,6 +955,128 @@ def _identity(path: Path, *, secret: bool) -> dict[str, Any]:
         "size": metadata.st_size,
         "uid": metadata.st_uid,
     }
+
+
+def _file_record_from_parent(
+    parent_descriptor: int,
+    path: Path,
+    *,
+    secret: bool,
+) -> dict[str, Any]:
+    expected_mode = 0o444 if secret else 0o644
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
+        os, "O_NOFOLLOW", 0
+    )
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+        before = os.fstat(descriptor)
+        path_metadata = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(path_metadata.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != expected_mode
+            or before.st_size <= 0
+            or before.st_size > MAX_DOCUMENT_BYTES
+            or (before.st_dev, before.st_ino)
+            != (path_metadata.st_dev, path_metadata.st_ino)
+        ):
+            raise OSError()
+        payload = bytearray()
+        while len(payload) <= MAX_DOCUMENT_BYTES:
+            block = os.read(
+                descriptor,
+                min(65_536, MAX_DOCUMENT_BYTES + 1 - len(payload)),
+            )
+            if not block:
+                break
+            payload.extend(block)
+        after = os.fstat(descriptor)
+        current_path = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            len(payload) != before.st_size
+            or len(payload) > MAX_DOCUMENT_BYTES
+            or (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+                after.st_nlink,
+                stat.S_IMODE(after.st_mode),
+                after.st_uid,
+            )
+            != (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+                before.st_nlink,
+                stat.S_IMODE(before.st_mode),
+                before.st_uid,
+            )
+            or (current_path.st_dev, current_path.st_ino)
+            != (after.st_dev, after.st_ino)
+        ):
+            raise OSError()
+        return {
+            "device": before.st_dev,
+            "digest": _digest(bytes(payload)),
+            "inode": before.st_ino,
+            "mode": expected_mode,
+            "path": str(path),
+            "size": before.st_size,
+            "uid": before.st_uid,
+        }
+    except OSError as error:
+        raise ReconcileError("RECONCILE_ANCHOR_INVALID") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _identity_from_file_binding(binding: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: binding[key]
+        for key in ("digest", "mode", "path", "size", "uid")
+    }
+
+
+def _prove_host_file(
+    identity: Mapping[str, Any],
+    *,
+    secret: bool,
+) -> dict[str, Any]:
+    path = _canonical_absolute_path(identity.get("path"))
+    if path is None or path.name in {"", ".", ".."}:
+        raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+    ancestry = _prove_host_directory(path.parent)
+    current, parent_descriptor = _open_descriptor_directory_chain(path.parent)
+    try:
+        if current != ancestry:
+            raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+        binding = _file_record_from_parent(
+            parent_descriptor,
+            path,
+            secret=secret,
+        )
+    finally:
+        os.close(parent_descriptor)
+    if _identity_from_file_binding(binding) != identity:
+        raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+    binding["ancestry"] = ancestry
+    return binding
 
 
 class CommandRunner:
@@ -775,8 +1543,15 @@ def _inspect_deployment(
     return {"containers": projections, "resources": resources}, all_healthy
 
 
-def _load_bound_state(state_directory: Path) -> tuple[dict[str, Any], dict[str, Any], Path]:
-    root = _safe_directory(state_directory)
+def _load_bound_state(
+    state_directory: Path,
+    *,
+    attested_directories: Sequence[Mapping[str, Any]] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], Path]:
+    root = _safe_directory(
+        state_directory,
+        attested_directories=attested_directories,
+    )
     try:
         root_entries = {entry.name for entry in root.iterdir()}
     except OSError as error:
@@ -823,7 +1598,10 @@ def _load_bound_state(state_directory: Path) -> tuple[dict[str, Any], dict[str, 
     ):
         raise ReconcileError("RECONCILE_STATE_INVALID")
     generation = root / "generations" / desired["generation"]
-    _safe_directory(generation)
+    _safe_directory(
+        generation,
+        attested_directories=attested_directories,
+    )
     try:
         if {entry.name for entry in generation.iterdir()} != {
             COMPOSE_FILE,
@@ -904,41 +1682,238 @@ def _load_bound_state(state_directory: Path) -> tuple[dict[str, Any], dict[str, 
     return desired, manifest, compose
 
 
-def _host_lock(project: str) -> int:
-    path = Path(f"/tmp/tacua-compose-processing-{project}.lock")
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+def _lock_path(project: str) -> Path:
+    if PROJECT.fullmatch(project) is None:
+        raise ReconcileError("RECONCILE_LOCK_INVALID")
+    return Path(f"/tmp/tacua-compose-processing-{project}.lock")
+
+
+def _validate_lock_descriptor(
+    descriptor: int,
+    path: Path,
+    expected: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     try:
-        descriptor = os.open(path, flags, 0o600)
-        os.fchmod(descriptor, 0o600)
         metadata = os.fstat(descriptor)
         path_metadata = path.lstat()
+        record = _directory_record(path, metadata)
         if (
             not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(path_metadata.st_mode)
             or metadata.st_uid != os.geteuid()
             or metadata.st_nlink != 1
             or stat.S_IMODE(metadata.st_mode) != 0o600
-            or (metadata.st_dev, metadata.st_ino) != (path_metadata.st_dev, path_metadata.st_ino)
+            or (metadata.st_dev, metadata.st_ino)
+            != (path_metadata.st_dev, path_metadata.st_ino)
         ):
             raise OSError()
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return descriptor
-    except BlockingIOError as error:
-        try:
-            os.close(descriptor)
-        except (OSError, UnboundLocalError):
-            pass
-        raise ReconcileError("RECONCILE_DEFERRED") from error
+        if expected is not None and not _record_matches_binding(record, expected):
+            raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+        return record
     except OSError as error:
-        try:
-            os.close(descriptor)
-        except (OSError, UnboundLocalError):
-            pass
         raise ReconcileError("RECONCILE_LOCK_INVALID") from error
 
 
-def _prepare_lock_file(project: str) -> None:
-    descriptor = _host_lock(project)
-    _release_lock(descriptor)
+def _open_host_lock(path: Path, *, create: bool) -> int:
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(
+        os, "O_NOFOLLOW", 0
+    )
+    descriptor: int | None = None
+    try:
+        if create:
+            try:
+                descriptor = os.open(
+                    path,
+                    flags | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except FileExistsError:
+                descriptor = os.open(path, flags)
+        else:
+            descriptor = os.open(path, flags)
+        _validate_lock_descriptor(descriptor, path)
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _validate_lock_descriptor(descriptor, path)
+        return descriptor
+    except BlockingIOError as error:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise ReconcileError("RECONCILE_DEFERRED") from error
+    except (OSError, ReconcileError) as error:
+        if descriptor is not None:
+            os.close(descriptor)
+        if isinstance(error, ReconcileError):
+            raise
+        raise ReconcileError("RECONCILE_LOCK_INVALID") from error
+
+
+def _host_lock(project: str) -> int:
+    return _open_host_lock(_lock_path(project), create=True)
+
+
+def _pending_anchor(project: str) -> dict[str, Any]:
+    return {
+        "boot_id": _boot_id(),
+        "contract_version": ANCHOR_PENDING_CONTRACT,
+        "euid": os.geteuid(),
+        "overflow_uid": _overflow_uid(),
+        "project": project,
+    }
+
+
+def _anchor_file_path(anchor_file: Path, runtime: Path) -> None:
+    if (
+        anchor_file != runtime / "tacua-reconcile.anchor.json"
+        or _canonical_absolute_path(str(anchor_file)) != anchor_file
+    ):
+        raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+
+
+def _anchor_from_state(
+    desired: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    *,
+    state_directory: Path,
+    lock: Mapping[str, Any],
+) -> dict[str, Any]:
+    home = _passwd_home()
+    runtime = Path(manifest["runtime"]["xdg_runtime_directory"])
+    operation = Path(manifest["operation_directory"])
+    if (
+        manifest["runtime"]["home"] != str(home)
+        or manifest["config"].get("uid") != os.geteuid()
+        or manifest["secret"].get("uid") != os.geteuid()
+        or not _directory_is_beneath(state_directory, home)
+        or not _directory_is_beneath(operation, home)
+    ):
+        raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+    home_ancestry = _prove_host_directory(home)
+    runtime_ancestry = _prove_host_directory(runtime, leaf_mode=0o700)
+    state_ancestry = _prove_host_directory(state_directory, leaf_mode=0o700)
+    operation_ancestry = _prove_host_directory(operation, leaf_mode=0o700)
+    config_binding = _prove_host_file(manifest["config"], secret=False)
+    secret_binding = _prove_host_file(manifest["secret"], secret=True)
+    anchor = {
+        "anchor_digest": "",
+        "boot_id": _boot_id(),
+        "config": config_binding,
+        "contract_version": ANCHOR_CONTRACT,
+        "euid": os.geteuid(),
+        "generation": desired["generation"],
+        "home": home_ancestry[-1],
+        "home_ancestry": home_ancestry,
+        "lock": dict(lock),
+        "manifest_digest": desired["manifest_digest"],
+        "operation_directory": operation_ancestry[-1],
+        "overflow_uid": _overflow_uid(),
+        "project": desired["project"],
+        "runtime_directory": runtime_ancestry[-1],
+        "runtime_ancestry": runtime_ancestry,
+        "state_directory": state_ancestry[-1],
+        "secret": secret_binding,
+    }
+    anchor["anchor_digest"] = _document_digest(anchor, "anchor_digest")
+    return anchor
+
+
+def prepare_lock(state_directory: Path, anchor_file: Path) -> None:
+    desired, manifest, _compose = _load_bound_state(state_directory)
+    runtime = Path(manifest["runtime"]["xdg_runtime_directory"])
+    _anchor_file_path(anchor_file, runtime)
+    runtime_environment = _canonical_absolute_path(
+        os.environ.get("XDG_RUNTIME_DIR")
+    )
+    if runtime_environment != runtime:
+        raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+    runtime_ancestry = _prove_host_directory(runtime, leaf_mode=0o700)
+    current_runtime, runtime_descriptor = _open_descriptor_directory_chain(
+        runtime
+    )
+    try:
+        if current_runtime != runtime_ancestry:
+            raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+        # Invalidate any previous trusted anchor before touching the per-boot
+        # lock, using the already-proved runtime directory descriptor.
+        _atomic_private_write_in_directory(
+            runtime_descriptor,
+            runtime,
+            runtime_ancestry[-1],
+            anchor_file.name,
+            _canonical(_pending_anchor(desired["project"])),
+        )
+        descriptor = _open_host_lock(
+            _lock_path(desired["project"]), create=True
+        )
+        try:
+            current, current_manifest, _compose = _load_bound_state(
+                state_directory
+            )
+            if current != desired or current_manifest != manifest:
+                raise ReconcileError("RECONCILE_STATE_CHANGED")
+            lock = _validate_lock_descriptor(
+                descriptor,
+                _lock_path(desired["project"]),
+            )
+            anchor = _anchor_from_state(
+                current,
+                current_manifest,
+                state_directory=state_directory,
+                lock=lock,
+            )
+            if anchor["runtime_ancestry"] != runtime_ancestry:
+                raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+            _atomic_private_write_in_directory(
+                runtime_descriptor,
+                runtime,
+                runtime_ancestry[-1],
+                anchor_file.name,
+                _canonical(anchor),
+            )
+        finally:
+            _release_lock(descriptor)
+    finally:
+        os.close(runtime_descriptor)
+
+
+def _attested_lock(
+    anchor_file: Path,
+    state_directory: Path,
+) -> tuple[int, dict[str, Any]]:
+    initial_payload = _read_private(
+        anchor_file,
+        mode=0o600,
+        code="RECONCILE_ANCHOR_INVALID",
+    )
+    anchor = _load_anchor(
+        anchor_file,
+        state_directory,
+        payload=initial_payload,
+    )
+    _validate_anchor_current(anchor)
+    path = _lock_path(anchor["project"])
+    descriptor = _open_host_lock(path, create=False)
+    try:
+        _validate_lock_descriptor(descriptor, path, anchor["lock"])
+        current_payload = _read_private(
+            anchor_file,
+            mode=0o600,
+            code="RECONCILE_ANCHOR_INVALID",
+        )
+        if current_payload != initial_payload:
+            raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+        current_anchor = _load_anchor(
+            anchor_file,
+            state_directory,
+            payload=current_payload,
+        )
+        if current_anchor != anchor:
+            raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+        _validate_anchor_current(current_anchor)
+        _validate_lock_descriptor(descriptor, path, current_anchor["lock"])
+        return descriptor, current_anchor
+    except Exception:
+        _release_lock(descriptor)
+        raise
 
 
 def _release_lock(descriptor: int) -> None:
@@ -948,8 +1923,15 @@ def _release_lock(descriptor: int) -> None:
         os.close(descriptor)
 
 
-def _refuse_recovery_journal(manifest: Mapping[str, Any]) -> None:
-    parent = _safe_directory(Path(manifest["operation_directory"]))
+def _refuse_recovery_journal(
+    manifest: Mapping[str, Any],
+    *,
+    attested_directories: Sequence[Mapping[str, Any]] | None = None,
+) -> None:
+    parent = _safe_directory(
+        Path(manifest["operation_directory"]),
+        attested_directories=attested_directories,
+    )
     operation = parent / f"tacua-compose-processing-{manifest['project']}"
     if operation.exists() or operation.is_symlink():
         raise ReconcileError("RECONCILE_RECOVERY_REQUIRED")
@@ -1081,8 +2063,17 @@ def _start_docker(manifest: Mapping[str, Any], runner: Callable[..., bytes]) -> 
     raise ReconcileError("RECONCILE_DOCKER_START_FAILED")
 
 
-def _recover_locked(manifest: Mapping[str, Any], compose: Path, runner: Callable[..., bytes]) -> str:
-    _refuse_recovery_journal(manifest)
+def _recover_locked(
+    manifest: Mapping[str, Any],
+    compose: Path,
+    runner: Callable[..., bytes],
+    *,
+    attested_directories: Sequence[Mapping[str, Any]] | None = None,
+) -> str:
+    _refuse_recovery_journal(
+        manifest,
+        attested_directories=attested_directories,
+    )
     serve_known = False
     serve_active = False
     public_disabled = False
@@ -1320,7 +2311,100 @@ def _remove_activation(state_directory: Path) -> None:
         raise ReconcileError("RECONCILE_STATE_INVALID") from error
 
 
-def reconcile(state_directory: Path, runner: Callable[..., bytes] | None = None) -> dict[str, str]:
+def _anchor_directories(
+    anchor: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    return anchor["state_directory"], anchor["operation_directory"]
+
+
+def _validate_anchor_state_binding(
+    anchor: Mapping[str, Any],
+    desired: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+) -> None:
+    if (
+        anchor["project"] != desired["project"]
+        or anchor["generation"] != desired["generation"]
+        or anchor["manifest_digest"] != desired["manifest_digest"]
+        or anchor["operation_directory"]["path"]
+        != manifest["operation_directory"]
+        or anchor["runtime_directory"]["path"]
+        != manifest["runtime"]["xdg_runtime_directory"]
+        or anchor["home"]["path"] != manifest["runtime"]["home"]
+        or _identity_from_file_binding(anchor["config"]) != manifest["config"]
+        or _identity_from_file_binding(anchor["secret"]) != manifest["secret"]
+    ):
+        raise ReconcileError("RECONCILE_ANCHOR_INVALID")
+
+
+def reconcile(
+    state_directory: Path,
+    runner: Callable[..., bytes] | None = None,
+    *,
+    anchor_file: Path | None = None,
+) -> dict[str, str]:
+    if anchor_file is not None:
+        descriptor, anchor = _attested_lock(anchor_file, state_directory)
+        attested = _anchor_directories(anchor)
+        try:
+            desired, manifest, compose = _load_bound_state(
+                state_directory,
+                attested_directories=attested,
+            )
+            _validate_anchor_state_binding(anchor, desired, manifest)
+            selected_runner = runner or _runner_for_manifest(manifest)
+            activation = _load_activation(state_directory, desired)
+            if desired["desired"] == "maintenance" and activation is None:
+                return {
+                    "code": "RECONCILE_MAINTENANCE",
+                    "status": "maintenance",
+                }
+            current, current_manifest, current_compose = _load_bound_state(
+                state_directory,
+                attested_directories=attested,
+            )
+            _validate_anchor_state_binding(anchor, current, current_manifest)
+            if current != desired:
+                raise ReconcileError("RECONCILE_STATE_CHANGED")
+            current_activation = _load_activation(state_directory, current)
+            if current_activation != activation:
+                raise ReconcileError("RECONCILE_STATE_CHANGED")
+            if current_activation is not None and current_activation["intent"] in {
+                "canceling",
+                "maintenance",
+            }:
+                if (
+                    current_activation["intent"] == "maintenance"
+                    and current["desired"] == "running"
+                ):
+                    _write_desired(state_directory, current, "maintenance")
+                _status, active = _tailnet_state(
+                    current_manifest,
+                    current_compose,
+                    selected_runner,
+                )
+                if active:
+                    _disable_serve(current_manifest, selected_runner)
+                _remove_activation(state_directory)
+                return {
+                    "code": "RECONCILE_MAINTENANCE",
+                    "status": "maintenance",
+                }
+            outcome = _recover_locked(
+                current_manifest,
+                current_compose,
+                selected_runner,
+                attested_directories=attested,
+            )
+            if current_activation is not None:
+                _write_desired(state_directory, current, "running")
+                _remove_activation(state_directory)
+            return {
+                "code": f"RECONCILE_{outcome.upper()}",
+                "status": outcome,
+            }
+        finally:
+            _release_lock(descriptor)
     desired, initial_manifest, _compose = _load_bound_state(state_directory)
     selected_runner = runner or _runner_for_manifest(initial_manifest)
     activation = _load_activation(state_directory, desired)
@@ -1545,12 +2629,16 @@ def seal(args: argparse.Namespace, runner: Callable[..., bytes] | None = None) -
 def _parser() -> argparse.ArgumentParser:
     parser = _Parser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    reconcile_command = commands.add_parser("reconcile")
+    reconcile_command.add_argument("--state-directory", required=True, type=Path)
+    reconcile_command.add_argument("--anchor-file", type=Path)
+    prepare = commands.add_parser("prepare-lock")
+    prepare.add_argument("--state-directory", required=True, type=Path)
+    prepare.add_argument("--anchor-file", required=True, type=Path)
     for name in (
-        "reconcile",
         "maintenance",
         "running",
         "status",
-        "prepare-lock",
         "cancel-activation",
     ):
         child = commands.add_parser(name)
@@ -1575,16 +2663,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "seal":
             result = seal(args)
         elif args.command == "reconcile":
-            result = reconcile(args.state_directory)
+            result = reconcile(
+                args.state_directory,
+                anchor_file=args.anchor_file,
+            )
         elif args.command == "maintenance":
             result = set_maintenance(args.state_directory)
         elif args.command == "running":
             result = set_running(args.state_directory)
         elif args.command == "prepare-lock":
-            desired, _manifest, _compose = _load_bound_state(
-                args.state_directory
-            )
-            _prepare_lock_file(desired["project"])
+            prepare_lock(args.state_directory, args.anchor_file)
             result = {"code": "RECONCILE_LOCK_READY", "status": "healthy"}
         elif args.command == "cancel-activation":
             result = cancel_activation(args.state_directory)
