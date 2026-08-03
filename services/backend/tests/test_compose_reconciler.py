@@ -605,6 +605,176 @@ class ComposeReconcilerTests(unittest.TestCase):
         self.assertEqual([first, second], actual["ContainerIDs"])
         self.assertNotEqual(expected, actual)
 
+    def test_recovery_accepts_only_unhealthy_sealed_network_consumer_subsets(
+        self,
+    ) -> None:
+        first = "a" * 64
+        second = "b" * 64
+        unexpected = "c" * 64
+        expected = {
+            "networks": {
+                "reconcile-test_private": {
+                    "Attachable": False,
+                    "ContainerIDs": [first, second],
+                    "Driver": "bridge",
+                    "Id": "private-network-id",
+                    "Ingress": False,
+                    "Internal": True,
+                    "Labels": {
+                        "com.docker.compose.project": "reconcile-test"
+                    },
+                    "Name": "reconcile-test_private",
+                    "Options": {},
+                }
+            },
+            "volumes": {
+                "reconcile-test_tacua-state": {
+                    "Driver": "local",
+                    "Labels": {
+                        "com.docker.compose.project": "reconcile-test"
+                    },
+                    "Name": "reconcile-test_tacua-state",
+                    "Options": {},
+                    "Scope": "local",
+                }
+            },
+        }
+        missing = json.loads(json.dumps(expected))
+        missing["networks"]["reconcile-test_private"]["ContainerIDs"] = [
+            first
+        ]
+        self.assertTrue(
+            RECONCILER._validate_resources_against_sealed(
+                missing,
+                expected,
+                allow_missing_network_consumers=True,
+                all_healthy=False,
+            )
+        )
+        for actual, allow, healthy in (
+            (missing, False, False),
+            (missing, True, True),
+        ):
+            with self.subTest(allow=allow, healthy=healthy), self.assertRaisesRegex(
+                RECONCILER.ReconcileError,
+                "RECONCILE_RESOURCE_DRIFT",
+            ):
+                RECONCILER._validate_resources_against_sealed(
+                    actual,
+                    expected,
+                    allow_missing_network_consumers=allow,
+                    all_healthy=healthy,
+                )
+
+        rogue = json.loads(json.dumps(missing))
+        rogue["networks"]["reconcile-test_private"]["ContainerIDs"].append(
+            unexpected
+        )
+        network_drift = json.loads(json.dumps(missing))
+        network_drift["networks"]["reconcile-test_private"]["Internal"] = False
+        volume_drift = json.loads(json.dumps(missing))
+        volume_drift["volumes"]["reconcile-test_tacua-state"]["Options"] = {
+            "unexpected": "value"
+        }
+        for label, actual in (
+            ("unexpected consumer", rogue),
+            ("network field", network_drift),
+            ("volume field", volume_drift),
+        ):
+            with self.subTest(label=label), self.assertRaisesRegex(
+                RECONCILER.ReconcileError,
+                "RECONCILE_RESOURCE_DRIFT",
+            ):
+                RECONCILER._validate_resources_against_sealed(
+                    actual,
+                    expected,
+                    allow_missing_network_consumers=True,
+                    all_healthy=False,
+                )
+
+    def test_network_reattachment_recovery_reinspects_strictly_after_start(
+        self,
+    ) -> None:
+        manifest = {
+            "commands": {
+                "docker": "/usr/bin/docker",
+                "docker_service": "docker.service",
+                "systemctl": "/usr/bin/systemctl",
+                "tailscale": "/usr/bin/tailscale",
+            },
+            "daemon": SYNTHETIC_DAEMON,
+            "project": "reconcile-test",
+            "runtime": SYNTHETIC_RUNTIME,
+        }
+        inspected_modes: list[bool] = []
+        deployments = iter(
+            [
+                (
+                    {
+                        "containers": {"sealed": True},
+                        "resources": {"subset": True},
+                    },
+                    False,
+                ),
+                (
+                    {
+                        "containers": {"sealed": True},
+                        "resources": {"exact": True},
+                    },
+                    True,
+                ),
+            ]
+        )
+
+        def inspect(*_args, **kwargs):
+            inspected_modes.append(
+                kwargs.get("allow_missing_network_consumers", False)
+            )
+            return next(deployments)
+
+        runner = mock.Mock(return_value=b"")
+        with mock.patch.object(
+            RECONCILER, "_refuse_recovery_journal"
+        ), mock.patch.object(
+            RECONCILER,
+            "_tailnet_state",
+            side_effect=[({}, False), ({}, True)],
+        ), mock.patch.object(
+            RECONCILER, "_docker_active", return_value=True
+        ), mock.patch.object(
+            RECONCILER,
+            "_daemon_projection",
+            return_value=SYNTHETIC_DAEMON,
+        ), mock.patch.object(
+            RECONCILER, "_inspect_deployment", side_effect=inspect
+        ), mock.patch.object(
+            RECONCILER, "_smoke"
+        ), mock.patch.object(
+            RECONCILER, "_enable_serve"
+        ):
+            result = RECONCILER._recover_locked(
+                manifest,
+                Path("/sealed/compose"),
+                runner,
+            )
+        self.assertEqual("recovered", result)
+        self.assertEqual([True, False], inspected_modes)
+        runner.assert_called_once_with(
+            [
+                "/usr/bin/docker",
+                "--host",
+                SYNTHETIC_RUNTIME["docker_host"],
+                "compose",
+                "-p",
+                "reconcile-test",
+                "-f",
+                "/sealed/compose",
+                "start",
+                *RECONCILER.SERVICES,
+            ],
+            timeout=60,
+        )
+
     def test_exact_container_listings_request_untruncated_ids(self) -> None:
         calls: list[list[str]] = []
 

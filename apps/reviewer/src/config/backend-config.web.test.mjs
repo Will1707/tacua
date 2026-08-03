@@ -77,3 +77,34 @@ test("web configuration rejects a cross-origin backend before storage", async (c
   );
   assert.equal(storage.length, 0);
 });
+
+test("web configuration requires explicit scheme reconfirmation after V1", async (context) => {
+  const storage = createSessionStorage();
+  Object.defineProperty(globalThis, "sessionStorage", {
+    configurable: true,
+    value: storage,
+  });
+  Object.defineProperty(globalThis, "location", {
+    configurable: true,
+    value: { origin: "https://reviewer.example" },
+  });
+  context.after(() => {
+    delete globalThis.sessionStorage;
+    delete globalThis.location;
+  });
+
+  const config = {
+    baseUrl: "https://reviewer.example",
+    adminToken: "a".repeat(32),
+    reviewerId: "reviewer_owner",
+    targetScheme: "legitimate-existing-scheme",
+  };
+  const oldKey = "tacua.backend.configuration.web-session.v1";
+  storage.setItem(oldKey, JSON.stringify({ storageVersion: 1, ...config }));
+
+  assert.equal(await loadBackendConfig(), null);
+  await saveBackendConfig(config);
+  assert.equal(storage.getItem(oldKey), null);
+  assert.equal(storage.length, 1);
+  assert.deepEqual(await loadBackendConfig(), config);
+});
