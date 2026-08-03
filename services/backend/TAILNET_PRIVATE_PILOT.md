@@ -391,6 +391,14 @@ normal device tests use the launch and SDK credentials issued by the backend.
 
 ## Stop and recover
 
+If the rootless desired-state reconciler is installed, publish its
+`maintenance` state before this section's first Docker mutation; follow
+[RECONCILIATION.md](RECONCILIATION.md). The guarded command already validates
+and disables the exact listener and proves Serve empty, so do not rerun the
+exact-active/off portion of the standalone block below. Recapture Serve and
+use `--expect-empty-serve` immediately before the Compose stop. Return to
+`running` only through that reconciler's verified transition.
+
 Disable only the exact validated Tacua listener **before** stopping ingress.
 This prevents Serve from forwarding trusted HTTPS traffic to an unowned
 loopback port. Recapture the live documents, prove the exact binding, turn it

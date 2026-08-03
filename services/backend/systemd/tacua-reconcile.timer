@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[Unit]
+Description=Periodically reconcile the Tacua rootless deployment
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=30s
+AccuracySec=5s
+Persistent=true
+Unit=tacua-reconcile.service
+
+[Install]
+WantedBy=timers.target

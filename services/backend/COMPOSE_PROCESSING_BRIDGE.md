@@ -34,11 +34,14 @@ that format until every V1 operation has been recovered or explicitly
 migrated; changing the live inventory constants alone must not strand an older
 operation before its stored launcher can execute.
 
-The running backend must be healthy and the only container that references its
-named state volume. Create and verify a current recovery bundle before every
-maintenance window. The host must satisfy the rootless Docker, cgroup v2,
-systemd cgroup-driver, resource-controller, and default-seccomp checks in [the
-processing adapter runbook](PROCESSING_ADAPTER.md).
+The running backend must be healthy, have an actual inspected Docker restart
+policy of `unless-stopped` (and a zero `MaximumRetryCount` when that field is
+reported), and be the only container that references its named state volume.
+This runtime check is separate from validating `restart: unless-stopped` in the
+resolved Compose model. Create and verify a current recovery bundle before
+every maintenance window. The host must satisfy the rootless Docker, cgroup
+v2, systemd cgroup-driver, resource-controller, and default-seccomp checks in
+[the processing adapter runbook](PROCESSING_ADAPTER.md).
 Its hard `RLIMIT_NOFILE` must exceed `2562`; the gate raises the inherited soft
 limit to at most `4096` and fails with `BRIDGE_DESCRIPTOR_LIMIT` before
 downtime when the hard limit cannot carry the closed 513-file request bound.

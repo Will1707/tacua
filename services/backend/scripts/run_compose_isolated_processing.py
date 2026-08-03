@@ -1734,6 +1734,15 @@ def _inspect_container(container_id: str) -> dict[str, Any]:
     return document[0]
 
 
+def _has_unless_stopped_restart_policy(value: Any) -> bool:
+    if not isinstance(value, dict) or value.get("Name") != "unless-stopped":
+        return False
+    if "MaximumRetryCount" not in value:
+        return True
+    maximum_retries = value["MaximumRetryCount"]
+    return type(maximum_retries) is int and maximum_retries == 0
+
+
 def _inspect_backend(
     *,
     container_id: str,
@@ -1746,6 +1755,7 @@ def _inspect_backend(
 ) -> str:
     inspected = _inspect_container(container_id)
     config = inspected.get("Config")
+    host_config = inspected.get("HostConfig")
     state = inspected.get("State")
     mounts = inspected.get("Mounts")
     labels = config.get("Labels") if isinstance(config, dict) else None
@@ -1762,6 +1772,10 @@ def _inspect_backend(
         or (
             expected_config_image is not None
             and config.get("Image") != expected_config_image
+        )
+        or not isinstance(host_config, dict)
+        or not _has_unless_stopped_restart_policy(
+            host_config.get("RestartPolicy")
         )
         or not isinstance(state, dict)
         or state.get("Status") != expected_status
@@ -1793,7 +1807,8 @@ def _inspect_backend(
     ):
         raise ComposeProcessingError(
             "BRIDGE_DEPLOYMENT_CHANGED",
-            "backend identity, state, image, or state-volume binding differs",
+            "backend identity, state, image, restart policy, or "
+            "state-volume binding differs",
         )
     return image_id
 

@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+# Render @PYTHON@, @RECONCILER@, and @STATE_DIRECTORY@ to absolute paths.
+
+[Unit]
+Description=Prepare the exact shared Tacua processing/reconcile lock
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+UMask=0077
+ExecStart=@PYTHON@ -B "@RECONCILER@" prepare-lock --state-directory "@STATE_DIRECTORY@"
+TimeoutStartSec=30
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=no
+ProtectControlGroups=yes
+ProtectHome=read-only
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=full
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes

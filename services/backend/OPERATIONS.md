@@ -339,6 +339,15 @@ worker may have started, post-worker offline verification is mandatory.
 
 ## 5. Crash-consistent backup
 
+When the rootless desired-state reconciler is installed, invoke its guarded
+`maintenance` command before the first Compose stop below. That command
+durably publishes maintenance, disables the exact Tailscale Serve listener,
+and proves Serve empty as one recoverable transaction. After backup
+verification and recovery, use its
+gate-bearing `running` transition instead of directly publishing desired
+`running`; see [RECONCILIATION.md](RECONCILIATION.md). A failed transition must
+remain maintenance with Serve empty.
+
 Recovery bundles contain the database, WAL and state objects, the exact sealed
 public config, and the exact administrator secret. They are deliberately
 mode `0700` with mode-`0600` files, but they are not encrypted. The selected
