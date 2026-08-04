@@ -97,7 +97,7 @@ _ALLOWED_PREFIXES = (
 # carries a bounded set of already-reviewed pilot diagnostics, CI, and bridge
 # files.  Keep this exception commit-bound and path-exact: later installations
 # must continue to satisfy the reviewer-only policy above.
-_PILOT_BASELINE_COMMIT = "1735e1ee25629e2f218225f3560ba75d5d43f068"
+_PILOT_BASELINE_COMMIT = candidate._PILOT_BASELINE_COMMIT
 _PILOT_BASELINE_ALLOWED_EXACT = frozenset(
     {
         ".github/workflows/verify.yml",
