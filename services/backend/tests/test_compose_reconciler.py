@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import contextlib
+import errno
 import io
 import json
 import os
@@ -198,7 +199,7 @@ class ComposeReconcilerTests(unittest.TestCase):
             RECONCILER, "_release_lock"
         ) as release_lock, mock.patch.object(
             RECONCILER, "_refuse_recovery_journal"
-        ), mock.patch.object(
+        ) as refuse_recovery, mock.patch.object(
             RECONCILER,
             "_daemon_projection",
             return_value=SYNTHETIC_DAEMON,
@@ -222,10 +223,61 @@ class ComposeReconcilerTests(unittest.TestCase):
             yield SimpleNamespace(
                 disable_serve=disable_serve,
                 inspect_deployment=inspect_deployment,
+                refuse_recovery=refuse_recovery,
                 release_lock=release_lock,
                 smoke=smoke,
                 tailnet=tailnet,
             )
+
+    @contextlib.contextmanager
+    def _borrowed_host_lock(self, suffix: str):
+        project = f"borrowed-{os.getpid()}-{suffix}"
+        self.assertIsNotNone(RECONCILER.PROJECT.fullmatch(project))
+        path = RECONCILER._lock_path(project)
+        path.unlink(missing_ok=True)
+        descriptor = RECONCILER._host_lock(project)
+        try:
+            yield project, path, descriptor
+        finally:
+            try:
+                os.fstat(descriptor)
+            except OSError:
+                pass
+            else:
+                RECONCILER._release_lock(descriptor)
+            path.unlink(missing_ok=True)
+
+    def _open_existing_lock(self, path: Path) -> int:
+        return os.open(
+            path,
+            os.O_RDWR
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+
+    def _upgrade_inhibitor(
+        self,
+        state: Path,
+    ) -> tuple[dict, dict[str, str], Path]:
+        _desired, manifest, _compose = RECONCILER._load_bound_state(state)
+        operation = Path(manifest["operation_directory"]) / (
+            "tacua-compose-processing-" + manifest["project"]
+        )
+        operation.mkdir(mode=0o700)
+        document = {
+            "contract_version": RECONCILER.UPGRADE_INHIBITOR_CONTRACT,
+            "inhibitor_digest": "",
+            "plan_digest": "sha256:" + "a" * 64,
+            "project": manifest["project"],
+        }
+        document["inhibitor_digest"] = RECONCILER._document_digest(
+            document,
+            "inhibitor_digest",
+        )
+        path = operation / RECONCILER.UPGRADE_INHIBITOR_FILE
+        path.write_bytes(RECONCILER._canonical(document))
+        path.chmod(0o600)
+        return manifest, document, operation
 
     def _anchor_fixture(self, home: Path) -> tuple[Path, Path, Path]:
         home.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -616,6 +668,445 @@ class ComposeReconcilerTests(unittest.TestCase):
             self.assertEqual(
                 {"code": "RECONCILE_RECOVERED", "status": "recovered"},
                 result,
+            )
+
+    def test_set_running_retains_caller_owned_host_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._fixture(Path(directory), desired_state="maintenance")
+            with mock.patch.object(
+                RECONCILER,
+                "_adopt_host_lock",
+                return_value=77,
+            ) as adopt, mock.patch.object(
+                RECONCILER,
+                "_release_lock",
+            ) as release, mock.patch.object(
+                RECONCILER,
+                "_recover_locked",
+                return_value="healthy",
+            ):
+                result = RECONCILER.set_running(
+                    state,
+                    runner=mock.Mock(),
+                    lock_descriptor=77,
+                )
+
+            self.assertEqual("recovered", result["status"])
+            adopt.assert_called_once_with("reconcile-test", 77)
+            release.assert_not_called()
+
+    def test_set_running_accepts_only_a_revalidated_upgrade_inhibitor(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._fixture(Path(directory), desired_state="maintenance")
+            _manifest, inhibitor, _operation = self._upgrade_inhibitor(state)
+            with mock.patch.object(
+                RECONCILER,
+                "_adopt_host_lock",
+                return_value=77,
+            ), mock.patch.object(
+                RECONCILER,
+                "_recover_locked",
+                return_value="healthy",
+            ) as recover:
+                result = RECONCILER.set_running(
+                    state,
+                    runner=mock.Mock(),
+                    lock_descriptor=77,
+                    upgrade_inhibitor=inhibitor,
+                )
+
+            self.assertEqual("recovered", result["status"])
+            recover.assert_called_once_with(
+                mock.ANY,
+                mock.ANY,
+                mock.ANY,
+                upgrade_inhibitor=inhibitor,
+            )
+
+    def test_upgrade_set_running_resumes_maintenance_activation_marker(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._fixture(Path(directory), desired_state="maintenance")
+            desired, _manifest, _compose = RECONCILER._load_bound_state(state)
+            RECONCILER._write_activation(state, desired)
+            _manifest, inhibitor, _operation = self._upgrade_inhibitor(state)
+            with mock.patch.object(
+                RECONCILER,
+                "_adopt_host_lock",
+                return_value=77,
+            ), mock.patch.object(
+                RECONCILER,
+                "_release_lock",
+            ) as release, mock.patch.object(
+                RECONCILER,
+                "_recover_locked",
+                return_value="healthy",
+            ) as recover:
+                result = RECONCILER.set_running(
+                    state,
+                    runner=mock.Mock(),
+                    lock_descriptor=77,
+                    upgrade_inhibitor=inhibitor,
+                )
+
+            current, _manifest, _compose = RECONCILER._load_bound_state(state)
+            self.assertEqual(result["status"], "recovered")
+            self.assertEqual(current["desired"], "running")
+            self.assertIsNone(RECONCILER._load_activation(state, current))
+            recover.assert_called_once_with(
+                mock.ANY,
+                mock.ANY,
+                mock.ANY,
+                upgrade_inhibitor=inhibitor,
+            )
+            release.assert_not_called()
+
+    def test_upgrade_set_running_resumes_running_state_with_same_marker(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._fixture(Path(directory), desired_state="maintenance")
+            desired, _manifest, _compose = RECONCILER._load_bound_state(state)
+            RECONCILER._write_activation(state, desired)
+            RECONCILER._write_desired(state, desired, "running")
+            _manifest, inhibitor, _operation = self._upgrade_inhibitor(state)
+            with mock.patch.object(
+                RECONCILER,
+                "_adopt_host_lock",
+                return_value=78,
+            ), mock.patch.object(
+                RECONCILER,
+                "_release_lock",
+            ) as release, mock.patch.object(
+                RECONCILER,
+                "_recover_locked",
+                return_value="healthy",
+            ) as recover, mock.patch.object(
+                RECONCILER,
+                "_write_desired",
+                wraps=RECONCILER._write_desired,
+            ) as write_desired:
+                result = RECONCILER.set_running(
+                    state,
+                    runner=mock.Mock(),
+                    lock_descriptor=78,
+                    upgrade_inhibitor=inhibitor,
+                )
+
+            current, _manifest, _compose = RECONCILER._load_bound_state(state)
+            self.assertEqual(result["status"], "recovered")
+            self.assertEqual(current["desired"], "running")
+            self.assertIsNone(RECONCILER._load_activation(state, current))
+            write_desired.assert_not_called()
+            recover.assert_called_once_with(
+                mock.ANY,
+                mock.ANY,
+                mock.ANY,
+                upgrade_inhibitor=inhibitor,
+            )
+            release.assert_not_called()
+
+    def test_upgrade_set_running_reproves_settled_running_only_with_gate(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._fixture(Path(directory), desired_state="running")
+            _manifest, inhibitor, _operation = self._upgrade_inhibitor(state)
+            with mock.patch.object(
+                RECONCILER,
+                "_adopt_host_lock",
+                return_value=79,
+            ), mock.patch.object(
+                RECONCILER,
+                "_release_lock",
+            ) as release, mock.patch.object(
+                RECONCILER,
+                "_recover_locked",
+                return_value="healthy",
+            ) as recover:
+                result = RECONCILER.set_running(
+                    state,
+                    runner=mock.Mock(),
+                    lock_descriptor=79,
+                    upgrade_inhibitor=inhibitor,
+                )
+
+            self.assertEqual(result["status"], "recovered")
+            recover.assert_called_once()
+            release.assert_not_called()
+
+            with mock.patch.object(
+                RECONCILER,
+                "_adopt_host_lock",
+                return_value=79,
+            ), mock.patch.object(
+                RECONCILER,
+                "_release_lock",
+            ) as release, self.assertRaisesRegex(
+                RECONCILER.ReconcileError,
+                "RECONCILE_STATE_CHANGED",
+            ):
+                RECONCILER.set_running(
+                    state,
+                    runner=mock.Mock(),
+                    lock_descriptor=79,
+                )
+            release.assert_not_called()
+
+    def test_set_running_rejects_pending_marker_without_upgrade_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._fixture(Path(directory), desired_state="maintenance")
+            desired, _manifest, _compose = RECONCILER._load_bound_state(state)
+            RECONCILER._write_activation(state, desired)
+            with mock.patch.object(
+                RECONCILER,
+                "_adopt_host_lock",
+                return_value=80,
+            ), mock.patch.object(
+                RECONCILER,
+                "_release_lock",
+            ) as release, self.assertRaisesRegex(
+                RECONCILER.ReconcileError,
+                "RECONCILE_ACTIVATION_PENDING",
+            ):
+                RECONCILER.set_running(
+                    state,
+                    runner=mock.Mock(),
+                    lock_descriptor=80,
+                )
+            release.assert_not_called()
+
+    def test_upgrade_set_running_rejects_wrong_intent_and_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._fixture(Path(directory), desired_state="running")
+            desired, _manifest, _compose = RECONCILER._load_bound_state(state)
+            RECONCILER._write_maintenance_transition(state, desired)
+            _manifest, inhibitor, _operation = self._upgrade_inhibitor(state)
+            with mock.patch.object(
+                RECONCILER,
+                "_adopt_host_lock",
+                return_value=81,
+            ), mock.patch.object(
+                RECONCILER,
+                "_release_lock",
+            ) as release, self.assertRaisesRegex(
+                RECONCILER.ReconcileError,
+                "RECONCILE_ACTIVATION_PENDING",
+            ):
+                RECONCILER.set_running(
+                    state,
+                    runner=mock.Mock(),
+                    lock_descriptor=81,
+                    upgrade_inhibitor=inhibitor,
+                )
+            release.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._fixture(Path(directory), desired_state="maintenance")
+            desired, _manifest, _compose = RECONCILER._load_bound_state(state)
+            activation = RECONCILER._write_activation(state, desired)
+            activation["generation"] = "generation-rebound"
+            activation["activation_digest"] = RECONCILER._document_digest(
+                activation,
+                "activation_digest",
+            )
+            RECONCILER._atomic_private_write(
+                state / RECONCILER.ACTIVATION_FILE,
+                RECONCILER._canonical(activation),
+                replace=True,
+            )
+            _manifest, inhibitor, _operation = self._upgrade_inhibitor(state)
+            with mock.patch.object(
+                RECONCILER,
+                "_adopt_host_lock",
+                return_value=82,
+            ), mock.patch.object(
+                RECONCILER,
+                "_release_lock",
+            ) as release, self.assertRaisesRegex(
+                RECONCILER.ReconcileError,
+                "RECONCILE_STATE_INVALID",
+            ):
+                RECONCILER.set_running(
+                    state,
+                    runner=mock.Mock(),
+                    lock_descriptor=82,
+                    upgrade_inhibitor=inhibitor,
+                )
+            release.assert_not_called()
+
+    def test_upgrade_activation_revalidates_inhibitor_before_serve(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._fixture(Path(directory), desired_state="maintenance")
+            _desired, manifest, compose = RECONCILER._load_bound_state(state)
+            _sealed_manifest, inhibitor, _operation = self._upgrade_inhibitor(
+                state
+            )
+            with mock.patch.object(
+                RECONCILER,
+                "_require_upgrade_inhibitor",
+            ) as require, mock.patch.object(
+                RECONCILER,
+                "_tailnet_state",
+                return_value=({}, False),
+            ), mock.patch.object(
+                RECONCILER,
+                "_docker_active",
+                return_value=True,
+            ), mock.patch.object(
+                RECONCILER,
+                "_daemon_projection",
+                return_value=manifest["daemon"],
+            ), mock.patch.object(
+                RECONCILER,
+                "_inspect_deployment",
+                return_value=({}, True),
+            ), mock.patch.object(
+                RECONCILER,
+                "_smoke",
+            ), mock.patch.object(
+                RECONCILER,
+                "_enable_serve",
+            ):
+                result = RECONCILER._recover_locked(
+                    manifest,
+                    compose,
+                    mock.Mock(),
+                    upgrade_inhibitor=inhibitor,
+                )
+
+            self.assertEqual("recovered", result)
+            self.assertEqual(require.call_count, 3)
+            require.assert_has_calls(
+                [
+                    mock.call(manifest, inhibitor),
+                    mock.call(manifest, inhibitor),
+                    mock.call(manifest, inhibitor),
+                ]
+            )
+
+    def test_upgrade_activation_disables_serve_if_inhibitor_disappears(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._fixture(Path(directory), desired_state="maintenance")
+            _desired, manifest, compose = RECONCILER._load_bound_state(state)
+            _sealed_manifest, inhibitor, _operation = self._upgrade_inhibitor(
+                state
+            )
+            with mock.patch.object(
+                RECONCILER,
+                "_require_upgrade_inhibitor",
+                side_effect=[
+                    None,
+                    None,
+                    RECONCILER.ReconcileError(
+                        "RECONCILE_UPGRADE_INHIBITOR_INVALID"
+                    ),
+                ],
+            ), mock.patch.object(
+                RECONCILER,
+                "_tailnet_state",
+                return_value=({}, False),
+            ), mock.patch.object(
+                RECONCILER,
+                "_docker_active",
+                return_value=True,
+            ), mock.patch.object(
+                RECONCILER,
+                "_daemon_projection",
+                return_value=manifest["daemon"],
+            ), mock.patch.object(
+                RECONCILER,
+                "_inspect_deployment",
+                return_value=({}, True),
+            ), mock.patch.object(
+                RECONCILER,
+                "_smoke",
+            ), mock.patch.object(
+                RECONCILER,
+                "_enable_serve",
+            ), mock.patch.object(
+                RECONCILER,
+                "_disable_serve",
+            ) as disable, self.assertRaisesRegex(
+                RECONCILER.ReconcileError,
+                "RECONCILE_UPGRADE_INHIBITOR_INVALID",
+            ):
+                RECONCILER._recover_locked(
+                    manifest,
+                    compose,
+                    mock.Mock(),
+                    upgrade_inhibitor=inhibitor,
+                )
+
+            disable.assert_called_once_with(manifest, mock.ANY)
+
+    def test_reconcile_retains_borrowed_lock_for_settled_maintenance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._fixture(Path(directory), desired_state="maintenance")
+            with mock.patch.object(
+                RECONCILER,
+                "_adopt_host_lock",
+                return_value=77,
+            ) as adopt, mock.patch.object(
+                RECONCILER,
+                "_release_lock",
+            ) as release:
+                result = RECONCILER.reconcile(
+                    state,
+                    runner=mock.Mock(),
+                    lock_descriptor=77,
+                )
+
+            self.assertEqual("maintenance", result["status"])
+            adopt.assert_called_once_with("reconcile-test", 77)
+            release.assert_not_called()
+
+    def test_reconcile_retains_borrowed_lock_while_settling_maintenance(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._fixture(Path(directory), desired_state="running")
+            desired, _manifest, _compose = RECONCILER._load_bound_state(state)
+            RECONCILER._write_maintenance_transition(state, desired)
+            with mock.patch.object(
+                RECONCILER,
+                "_adopt_host_lock",
+                return_value=77,
+            ) as adopt, mock.patch.object(
+                RECONCILER,
+                "_release_lock",
+            ) as release, mock.patch.object(
+                RECONCILER,
+                "_tailnet_state",
+                return_value=({}, False),
+            ):
+                result = RECONCILER.reconcile(
+                    state,
+                    runner=mock.Mock(),
+                    lock_descriptor=77,
+                )
+
+            self.assertEqual("maintenance", result["status"])
+            current, _manifest, _compose = RECONCILER._load_bound_state(state)
+            self.assertEqual("maintenance", current["desired"])
+            self.assertIsNone(RECONCILER._load_activation(state, current))
+            adopt.assert_called_once_with("reconcile-test", 77)
+            release.assert_not_called()
+
+    def test_anchored_reconcile_rejects_a_borrowed_lock(self) -> None:
+        with self.assertRaisesRegex(
+            RECONCILER.ReconcileError,
+            "RECONCILE_INPUT_INVALID",
+        ):
+            RECONCILER.reconcile(
+                Path("/sealed/state"),
+                anchor_file=Path("/sealed/anchor"),
+                lock_descriptor=77,
             )
 
     def test_smoke_builds_only_explicit_no_proxy_openers(self) -> None:
@@ -1155,6 +1646,233 @@ class ComposeReconcilerTests(unittest.TestCase):
             )
             idle_runner.assert_not_called()
 
+    def test_borrowed_host_lock_accepts_and_retains_held_descriptor(self) -> None:
+        with self._borrowed_host_lock("accept") as (
+            project,
+            path,
+            descriptor,
+        ):
+            self.assertEqual(
+                descriptor,
+                RECONCILER._adopt_host_lock(project, descriptor),
+            )
+            os.fstat(descriptor)
+            competitor = self._open_existing_lock(path)
+            try:
+                with self.assertRaisesRegex(
+                    RECONCILER.ReconcileError,
+                    "RECONCILE_DEFERRED",
+                ):
+                    RECONCILER._adopt_host_lock(project, competitor)
+            finally:
+                os.close(competitor)
+
+    def test_borrowed_host_lock_rejects_wrong_path_and_replacement(self) -> None:
+        with self._borrowed_host_lock("expected") as (
+            project,
+            path,
+            _descriptor,
+        ), self._borrowed_host_lock("wrong") as (
+            _other_project,
+            _other_path,
+            other_descriptor,
+        ):
+            with self.assertRaisesRegex(
+                RECONCILER.ReconcileError,
+                "RECONCILE_LOCK_INVALID",
+            ):
+                RECONCILER._adopt_host_lock(project, other_descriptor)
+
+            moved = path.with_name(path.name + ".moved")
+            moved.unlink(missing_ok=True)
+            path.rename(moved)
+            replacement = os.open(
+                path,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            os.close(replacement)
+            try:
+                with self.assertRaisesRegex(
+                    RECONCILER.ReconcileError,
+                    "RECONCILE_LOCK_INVALID",
+                ):
+                    RECONCILER._adopt_host_lock(project, _descriptor)
+            finally:
+                path.unlink(missing_ok=True)
+                moved.unlink(missing_ok=True)
+
+    def test_borrowed_host_lock_rejects_hardlink_and_non_cloexec(self) -> None:
+        with self._borrowed_host_lock("hardlink") as (
+            project,
+            path,
+            descriptor,
+        ):
+            hardlink = path.with_name(path.name + ".hardlink")
+            hardlink.unlink(missing_ok=True)
+            os.link(path, hardlink)
+            try:
+                with self.assertRaisesRegex(
+                    RECONCILER.ReconcileError,
+                    "RECONCILE_LOCK_INVALID",
+                ):
+                    RECONCILER._adopt_host_lock(project, descriptor)
+            finally:
+                hardlink.unlink(missing_ok=True)
+
+        with self._borrowed_host_lock("cloexec") as (
+            project,
+            _path,
+            descriptor,
+        ):
+            os.set_inheritable(descriptor, True)
+            self.assertTrue(os.get_inheritable(descriptor))
+            with self.assertRaisesRegex(
+                RECONCILER.ReconcileError,
+                "RECONCILE_LOCK_INVALID",
+            ):
+                RECONCILER._adopt_host_lock(project, descriptor)
+
+    def test_borrowed_host_lock_distinguishes_contention_from_invalid(self) -> None:
+        with self._borrowed_host_lock("errors") as (
+            project,
+            _path,
+            descriptor,
+        ):
+            for error, code in (
+                (BlockingIOError(errno.EAGAIN, "busy"), "RECONCILE_DEFERRED"),
+                (OSError(errno.EINVAL, "invalid"), "RECONCILE_LOCK_INVALID"),
+            ):
+                with self.subTest(code=code), mock.patch.object(
+                    RECONCILER.fcntl,
+                    "flock",
+                    side_effect=error,
+                ), self.assertRaisesRegex(RECONCILER.ReconcileError, code):
+                    RECONCILER._adopt_host_lock(project, descriptor)
+
+    def test_maintenance_seal_can_reuse_caller_owned_host_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args, deployment = self._seal_candidate(
+                Path(directory),
+                maintenance=True,
+            )
+            with self._borrowed_host_lock("seal-success") as (
+                project,
+                path,
+                descriptor,
+            ):
+                args.project = project
+                with self._seal_runtime(deployment) as observed:
+                    result = RECONCILER.seal(
+                        args,
+                        runner=mock.Mock(),
+                        lock_descriptor=descriptor,
+                    )
+
+                os.fstat(descriptor)
+                competitor = self._open_existing_lock(path)
+                try:
+                    with self.assertRaisesRegex(
+                        RECONCILER.ReconcileError,
+                        "RECONCILE_DEFERRED",
+                    ):
+                        RECONCILER._adopt_host_lock(project, competitor)
+                finally:
+                    os.close(competitor)
+
+            self.assertEqual("maintenance", result["status"])
+            observed.release_lock.assert_not_called()
+
+    def test_maintenance_seal_requires_exact_upgrade_inhibitor_twice(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args, deployment = self._seal_candidate(
+                Path(directory),
+                maintenance=True,
+            )
+            inhibitor = {
+                "contract_version": RECONCILER.UPGRADE_INHIBITOR_CONTRACT,
+                "inhibitor_digest": "",
+                "plan_digest": "sha256:" + "a" * 64,
+                "project": args.project,
+            }
+            inhibitor["inhibitor_digest"] = RECONCILER._document_digest(
+                inhibitor,
+                "inhibitor_digest",
+            )
+            with self._seal_runtime(deployment) as observed, mock.patch.object(
+                RECONCILER,
+                "_require_upgrade_inhibitor",
+            ) as require_inhibitor:
+                result = RECONCILER.seal(
+                    args,
+                    runner=mock.Mock(),
+                    upgrade_inhibitor=inhibitor,
+                )
+
+            self.assertEqual("maintenance", result["status"])
+            self.assertEqual(require_inhibitor.call_count, 2)
+            require_inhibitor.assert_has_calls(
+                [mock.call(mock.ANY, inhibitor), mock.call(mock.ANY, inhibitor)]
+            )
+            observed.refuse_recovery.assert_not_called()
+
+    def test_running_seal_never_accepts_an_upgrade_inhibitor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args, _deployment = self._seal_candidate(
+                Path(directory),
+                maintenance=False,
+            )
+            with self.assertRaisesRegex(
+                RECONCILER.ReconcileError,
+                "RECONCILE_UPGRADE_INHIBITOR_INVALID",
+            ):
+                RECONCILER.seal(
+                    args,
+                    runner=mock.Mock(),
+                    upgrade_inhibitor={},
+                )
+            self.assertFalse(args.state_directory.exists())
+
+    def test_maintenance_seal_failure_retains_caller_owned_host_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args, deployment = self._seal_candidate(
+                Path(directory),
+                maintenance=True,
+            )
+            with self._borrowed_host_lock("seal-failure") as (
+                project,
+                path,
+                descriptor,
+            ):
+                args.project = project
+                failure = RECONCILER.ReconcileError(
+                    "RECONCILE_SMOKE_FAILED"
+                )
+                with self._seal_runtime(
+                    deployment,
+                    smoke_error=failure,
+                ) as observed, self.assertRaisesRegex(
+                    RECONCILER.ReconcileError,
+                    "RECONCILE_SMOKE_FAILED",
+                ):
+                    RECONCILER.seal(
+                        args,
+                        runner=mock.Mock(),
+                        lock_descriptor=descriptor,
+                    )
+
+                os.fstat(descriptor)
+                competitor = self._open_existing_lock(path)
+                try:
+                    with self.assertRaisesRegex(
+                        RECONCILER.ReconcileError,
+                        "RECONCILE_DEFERRED",
+                    ):
+                        RECONCILER._adopt_host_lock(project, competitor)
+                finally:
+                    os.close(competitor)
+                observed.release_lock.assert_not_called()
+
     def test_maintenance_seal_failures_never_publish_desired_state(self) -> None:
         failures = (
             (
@@ -1490,6 +2208,54 @@ class ComposeReconcilerTests(unittest.TestCase):
             self.assertEqual("maintenance", result["status"])
             self.assertEqual([True], disabled)
 
+    def test_exact_plan_bound_upgrade_inhibitor_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._fixture(Path(directory), desired_state="maintenance")
+            manifest, document, _operation = self._upgrade_inhibitor(state)
+
+            RECONCILER._require_upgrade_inhibitor(manifest, document)
+
+    def test_upgrade_inhibitor_rejects_tamper_extra_entries_and_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._fixture(Path(directory), desired_state="maintenance")
+            manifest, document, operation = self._upgrade_inhibitor(state)
+            path = operation / RECONCILER.UPGRADE_INHIBITOR_FILE
+
+            cases = ("tamper", "extra", "mode", "wrong-project")
+            for case in cases:
+                with self.subTest(case=case):
+                    path.write_bytes(RECONCILER._canonical(document))
+                    path.chmod(0o600)
+                    extra = operation / "unexpected"
+                    extra.unlink(missing_ok=True)
+                    expected = dict(document)
+                    if case == "tamper":
+                        changed = dict(document)
+                        changed["plan_digest"] = "sha256:" + "b" * 64
+                        path.write_bytes(RECONCILER._canonical(changed))
+                    elif case == "extra":
+                        extra.write_text("unexpected", encoding="ascii")
+                        extra.chmod(0o600)
+                    elif case == "mode":
+                        path.chmod(0o640)
+                    else:
+                        expected["project"] = "another-project"
+                        expected["inhibitor_digest"] = (
+                            RECONCILER._document_digest(
+                                expected,
+                                "inhibitor_digest",
+                            )
+                        )
+                    with self.assertRaisesRegex(
+                        RECONCILER.ReconcileError,
+                        "RECONCILE_UPGRADE_INHIBITOR_INVALID",
+                    ):
+                        RECONCILER._require_upgrade_inhibitor(
+                            manifest,
+                            expected,
+                        )
+                    extra.unlink(missing_ok=True)
+
     def test_guarded_maintenance_linearizes_only_settled_running(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = self._fixture(Path(directory), desired_state="running")
@@ -1523,6 +2289,32 @@ class ComposeReconcilerTests(unittest.TestCase):
             current, _manifest, _compose = RECONCILER._load_bound_state(state)
             self.assertEqual("maintenance", current["desired"])
             self.assertIsNone(real_load_activation(state, current))
+
+    def test_guarded_maintenance_retains_caller_owned_host_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._fixture(Path(directory), desired_state="running")
+            with mock.patch.object(
+                RECONCILER,
+                "_adopt_host_lock",
+                return_value=77,
+            ) as adopt, mock.patch.object(
+                RECONCILER,
+                "_release_lock",
+            ) as release, mock.patch.object(
+                RECONCILER,
+                "_tailnet_state",
+                return_value=({}, False),
+            ):
+                result = RECONCILER.set_maintenance(
+                    state,
+                    runner=mock.Mock(),
+                    require_running=True,
+                    lock_descriptor=77,
+                )
+
+            self.assertEqual("maintenance", result["status"])
+            adopt.assert_called_once_with("reconcile-test", 77)
+            release.assert_not_called()
 
     def test_guarded_maintenance_refuses_settled_maintenance_without_mutation(
         self,

@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+# Render @PYTHON@, @UPGRADER@, @STATE_PARENT@, @SERIAL_LOCK_FILE@,
+# @UNIT_DIRECTORY@, @LOCK_FILE@, @OPERATION_DIRECTORY@, @REPOSITORY@,
+# @CONFIG_FILE@, and @ADMIN_SECRET_FILE@ to canonical absolute paths.
+
+[Unit]
+Description=Resume a durable Tacua reviewer upgrade transaction
+Documentation=https://github.com/Will1707/tacua/blob/main/services/backend/RECONCILIATION.md
+After=network-online.target
+Wants=network-online.target
+Wants=tacua-reviewer-upgrade-lock.service
+After=tacua-reviewer-upgrade-lock.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=@PYTHON@ -B "@UPGRADER@" resume --state-parent "@STATE_PARENT@" --serial-lock-file "@SERIAL_LOCK_FILE@" --unit-directory "@UNIT_DIRECTORY@" --lock-file "@LOCK_FILE@" --operation-directory "@OPERATION_DIRECTORY@"
+TimeoutStartSec=45min
+RuntimeMaxSec=45min
+Restart=on-failure
+RestartSec=5s
+RestartPreventExitStatus=78
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=no
+ProtectControlGroups=yes
+ProtectHome=read-only
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths="@STATE_PARENT@" "@SERIAL_LOCK_FILE@" "@UNIT_DIRECTORY@" "@LOCK_FILE@" "@OPERATION_DIRECTORY@"
+ReadOnlyPaths="@UPGRADER@" "@REPOSITORY@" "@CONFIG_FILE@" "@ADMIN_SECRET_FILE@"
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes

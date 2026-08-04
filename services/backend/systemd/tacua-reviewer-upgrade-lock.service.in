@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+# Render @PYTHON@, @UPGRADER@, @SERIAL_LOCK_FILE@, @LOCK_FILE@, and @PROJECT@
+# before installation.
+
+[Unit]
+Description=Prepare the stable Tacua reviewer-upgrade lock prerequisite
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+UMask=0077
+ExecStart=@PYTHON@ -B "@UPGRADER@" prepare-lock --serial-lock-file "@SERIAL_LOCK_FILE@" --lock-file "@LOCK_FILE@" --project "@PROJECT@"
+TimeoutStartSec=30s
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=no
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes

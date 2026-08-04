@@ -3617,6 +3617,38 @@ class ComposeProcessingBridgeTests(unittest.TestCase):
             )
             self.assertFalse(operation.exists())
 
+    def test_journal_free_recovery_never_removes_upgrade_inhibitor(self) -> None:
+        with tempfile.TemporaryDirectory(dir=SHORT_TEMP_ROOT) as temporary:
+            parent = Path(temporary).resolve()
+            operation = BRIDGE._create_operation_directory(
+                parent,
+                "tacua-test",
+            )
+            inhibitor = operation / "reviewer-upgrade-inhibitor.json"
+            inhibitor.write_text("{}", encoding="ascii")
+            inhibitor.chmod(0o600)
+            args = argparse.Namespace(
+                admin_secret_file=parent / "unused-secret",
+                allow_mutable_image=True,
+                config_file=parent / "unused-config",
+                operation_directory=parent,
+                project="tacua-test",
+            )
+            with mock.patch.multiple(
+                BRIDGE,
+                _acquire_host_lock=mock.Mock(return_value=99),
+                _bridge_verifier_containers=mock.Mock(return_value=()),
+                _bridge_worker_containers=mock.Mock(return_value=()),
+                _release_host_lock=mock.Mock(),
+            ), self.assertRaisesRegex(
+                BRIDGE.ComposeProcessingError,
+                "operation directory contains an unexpected entry",
+            ):
+                BRIDGE.recover_compose_processing(args)
+
+            self.assertTrue(operation.is_dir())
+            self.assertEqual(inhibitor.read_text(encoding="ascii"), "{}")
+
     def test_automatic_recovery_discards_incomplete_journal_update(
         self,
     ) -> None:
