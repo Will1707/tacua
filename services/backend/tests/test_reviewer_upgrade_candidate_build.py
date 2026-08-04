@@ -234,7 +234,15 @@ class CandidateBuildContractTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(len(BUILD._validate_restricted_diff(payload)), 6)
+        self.assertEqual(
+            len(
+                BUILD._validate_restricted_diff(
+                    payload,
+                    installed_commit="b" * 40,
+                )
+            ),
+            6,
+        )
 
     def test_restricted_diff_rejects_sensitive_and_non_reviewer_changes(self) -> None:
         forbidden = (
@@ -252,15 +260,61 @@ class CandidateBuildContractTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(
                 BUILD.CandidateBuildError
             ):
-                BUILD._validate_restricted_diff(payload)
+                BUILD._validate_restricted_diff(
+                    payload,
+                    installed_commit="b" * 40,
+                )
 
     def test_restricted_diff_allows_host_upgrade_only_candidate(self) -> None:
         self.assertEqual(
             BUILD._validate_restricted_diff(
-                b"services/backend/scripts/reviewer_upgrade_candidate.py\0"
+                b"services/backend/scripts/reviewer_upgrade_candidate.py\0",
+                installed_commit="b" * 40,
             ),
             ("services/backend/scripts/reviewer_upgrade_candidate.py",),
         )
+
+    def test_restricted_diff_pilot_baseline_exception_is_commit_and_path_exact(
+        self,
+    ) -> None:
+        self.assertEqual(len(BUILD._PILOT_BASELINE_ALLOWED_EXACT), 15)
+        for path in sorted(BUILD._PILOT_BASELINE_ALLOWED_EXACT):
+            payload = f"{path}\0".encode("utf-8")
+            with self.subTest(path=path, policy="pilot-baseline"):
+                self.assertEqual(
+                    BUILD._validate_restricted_diff(
+                        payload,
+                        installed_commit=BUILD._PILOT_BASELINE_COMMIT,
+                    ),
+                    (path,),
+                )
+            with (
+                self.subTest(path=path, policy="future-installation"),
+                self.assertRaises(BUILD.CandidateBuildError),
+            ):
+                BUILD._validate_restricted_diff(
+                    payload,
+                    installed_commit="b" * 40,
+                )
+
+        for path in (
+            "experiments/ios-capture-spike/scripts/unreviewed.py",
+            ".github/workflows/unreviewed.yml",
+            "packages/mobile-sdk/src/index.ts",
+        ):
+            with self.subTest(path=path), self.assertRaises(
+                BUILD.CandidateBuildError
+            ):
+                BUILD._validate_restricted_diff(
+                    f"{path}\0".encode("utf-8"),
+                    installed_commit=BUILD._PILOT_BASELINE_COMMIT,
+                )
+
+        with self.assertRaises(BUILD.CandidateBuildError):
+            BUILD._validate_restricted_diff(
+                b"services/backend/scripts/reviewer_upgrade_candidate.py\0",
+                installed_commit="invalid",
+            )
 
     def test_restricted_diff_rejects_malformed_duplicate_and_traversal(self) -> None:
         for payload in (
@@ -273,7 +327,10 @@ class CandidateBuildContractTests(unittest.TestCase):
             with self.subTest(payload=payload), self.assertRaises(
                 BUILD.CandidateBuildError
             ):
-                BUILD._validate_restricted_diff(payload)
+                BUILD._validate_restricted_diff(
+                    payload,
+                    installed_commit="b" * 40,
+                )
 
     def test_subprocess_runner_has_no_shell_no_stdin_and_private_logs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
