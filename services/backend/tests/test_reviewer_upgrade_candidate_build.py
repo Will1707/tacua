@@ -310,11 +310,75 @@ class CandidateBuildContractTests(unittest.TestCase):
             self.assertIs(kwargs["stdout"], BUILD.subprocess.PIPE)
             self.assertIs(kwargs["stderr"], BUILD.subprocess.PIPE)
             self.assertEqual(kwargs["bufsize"], 0)
+            self.assertEqual(kwargs["umask"], BUILD.VERIFICATION_CHILD_UMASK)
+            self.assertNotIn("preexec_fn", kwargs)
             modes = {
                 stat.S_IMODE(path.stat().st_mode)
                 for path in logs.iterdir()
             }
             self.assertEqual(modes, {0o600})
+
+    def test_subprocess_runner_scopes_container_readable_umask_to_child(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            base.chmod(0o700)
+            logs = base / "logs"
+            logs.mkdir(mode=0o700)
+            output = base / "export"
+            executable = base / "export-tool"
+            executable.write_bytes(
+                b"#!/bin/sh\n"
+                b"mkdir \"$1\"\n"
+                b"printf artifact > \"$1/index.html\"\n"
+            )
+            executable.chmod(0o700)
+
+            previous_umask = os.umask(BUILD.PRIVATE_PROCESS_UMASK)
+            try:
+                result = BUILD.SubprocessRunner(logs)(
+                    [str(executable), str(output)],
+                    cwd=base,
+                    env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+                    timeout=1,
+                    label="readable-export",
+                    umask=BUILD.VERIFICATION_CHILD_UMASK,
+                )
+                observed_parent_umask = os.umask(BUILD.PRIVATE_PROCESS_UMASK)
+            finally:
+                os.umask(previous_umask)
+
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(observed_parent_umask, BUILD.PRIVATE_PROCESS_UMASK)
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o755)
+            self.assertEqual(
+                stat.S_IMODE((output / "index.html").stat().st_mode),
+                0o644,
+            )
+            self.assertEqual(
+                {stat.S_IMODE(path.stat().st_mode) for path in logs.iterdir()},
+                {0o600},
+            )
+
+    def test_subprocess_runner_rejects_unapproved_child_umask(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            base.chmod(0o700)
+            logs = base / "logs"
+            logs.mkdir(mode=0o700)
+            with self.assertRaises(BUILD.CandidateBuildError) as raised:
+                BUILD.SubprocessRunner(logs)(
+                    ["/bin/true"],
+                    cwd=base,
+                    env={"LC_ALL": "C"},
+                    timeout=1,
+                    label="invalid-umask",
+                    umask=0,
+                )
+
+            self.assertEqual(
+                raised.exception.code,
+                "REVIEWER_UPGRADE_CANDIDATE_BUILD_COMMAND_INVALID",
+            )
 
     def test_subprocess_runner_kills_noisy_process_before_logs_exceed_cap(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -727,6 +791,18 @@ class CandidateBuildContractTests(unittest.TestCase):
             self.assertEqual(
                 verifier[0],
                 [str(inputs.bash), ".github/scripts/verify-backend-container.sh"],
+            )
+            self.assertTrue(
+                all(
+                    kwargs["umask"] == BUILD.VERIFICATION_CHILD_UMASK
+                    for _argv, kwargs in runner.calls
+                )
+            )
+            self.assertTrue(
+                all(
+                    command["umask"] == BUILD.VERIFICATION_CHILD_UMASK
+                    for command in commands
+                )
             )
             self.assertEqual(verifier[1]["env"]["TACUA_KEEP_VERIFIED_IMAGES"], "true")
             self.assertEqual(verifier[1]["env"]["TACUA_CONTAINER_TEST_PORT"], "49152")
