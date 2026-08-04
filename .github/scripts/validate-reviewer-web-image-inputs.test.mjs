@@ -2,6 +2,7 @@
 
 import assert from "node:assert/strict";
 import {
+  chmodSync,
   cpSync,
   mkdtempSync,
   readFileSync,
@@ -105,11 +106,45 @@ test("rejects links, source maps, mutated bundles, localStorage, and inline scri
   const temporary = mkdtempSync(path.join(tmpdir(), "tacua-reviewer-export-"));
   context.after(() => rmSync(temporary, { recursive: true, force: true }));
   cpSync(exportRoot, temporary, { recursive: true });
+  chmodSync(temporary, 0o755);
 
   const entryDirectory = path.join(temporary, "_expo/static/js/web");
   const entryName = readdirSync(entryDirectory)[0];
   const entryPath = path.join(entryDirectory, entryName);
   const originalBundle = readFileSync(entryPath, "utf8");
+  chmodSync(temporary, 0o700);
+  assert.throws(
+    () => validateReviewerExport(temporary),
+    /root must be one real directory/u,
+  );
+  chmodSync(temporary, 0o755);
+
+  chmodSync(entryPath, 0o600);
+  assert.throws(
+    () => validateReviewerExport(temporary),
+    /unsafe file/u,
+  );
+  chmodSync(entryPath, 0o644);
+  chmodSync(entryPath, 0o1644);
+  assert.throws(
+    () => validateReviewerExport(temporary),
+    /unsafe file/u,
+  );
+  chmodSync(entryPath, 0o644);
+
+  chmodSync(entryDirectory, 0o700);
+  assert.throws(
+    () => validateReviewerExport(temporary),
+    /non-container-readable directory/u,
+  );
+  chmodSync(entryDirectory, 0o755);
+  chmodSync(entryDirectory, 0o1755);
+  assert.throws(
+    () => validateReviewerExport(temporary),
+    /non-container-readable directory/u,
+  );
+  chmodSync(entryDirectory, 0o755);
+
   writeFileSync(entryPath, `${originalBundle}\n`, "utf8");
   assert.throws(
     () => validateReviewerExport(temporary),
