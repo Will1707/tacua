@@ -64,6 +64,8 @@ MAX_JOURNAL_RECORD_BYTES = 1 * 1024 * 1024
 MAX_TOOL_BYTES = 128 * 1024 * 1024
 REQUIRED_NODE_VERSION = "v22.22.2"
 REQUIRED_NPM_VERSION = "10.9.4"
+PRIVATE_PROCESS_UMASK = 0o077
+VERIFICATION_CHILD_UMASK = 0o022
 _CLEANUP_TARGETS = frozenset(
     {BUILD_SOURCE_DIRECTORY, STAGED_RELEASE_DIRECTORY, "ios-export", "runtime"}
 )
@@ -139,6 +141,12 @@ class CommandResult:
 Runner = Callable[..., CommandResult]
 
 
+def _validated_child_umask(value: int) -> int:
+    if type(value) is not int or value != VERIFICATION_CHILD_UMASK:
+        _fail("REVIEWER_UPGRADE_CANDIDATE_BUILD_COMMAND_INVALID")
+    return value
+
+
 @dataclass(frozen=True)
 class BuildInputs:
     installed_repository: Path
@@ -208,8 +216,10 @@ class SubprocessRunner:
         env: Mapping[str, str],
         timeout: float,
         label: str,
+        umask: int = VERIFICATION_CHILD_UMASK,
     ) -> CommandResult:
         command = _validate_command(argv, cwd=cwd, env=env, timeout=timeout, label=label)
+        child_umask = _validated_child_umask(umask)
         self._sequence += 1
         stem = f"{self._sequence:04d}-{label}"
         stdout_path = self._log_directory / f"{stem}.stdout.log"
@@ -229,6 +239,7 @@ class SubprocessRunner:
                     shell=False,
                     start_new_session=True,
                     bufsize=0,
+                    umask=child_umask,
                 )
                 returncode = _drain_bounded_process(
                     process,
@@ -1020,14 +1031,17 @@ def _invoke(
     timeout: float,
     label: str,
     expected: frozenset[int] = frozenset({0}),
+    umask: int = VERIFICATION_CHILD_UMASK,
 ) -> CommandResult:
     command = _validate_command(argv, cwd=cwd, env=env, timeout=timeout, label=label)
+    child_umask = _validated_child_umask(umask)
     result = runner(
         command,
         cwd=cwd,
         env=dict(env),
         timeout=float(timeout),
         label=label,
+        umask=child_umask,
     )
     if (
         not isinstance(result, CommandResult)
@@ -1049,6 +1063,7 @@ def _invoke(
             "stderr_digest": _digest(result.stderr),
             "stdout_digest": _digest(result.stdout),
             "timeout": float(timeout),
+            "umask": child_umask,
         }
     )
     return result
@@ -1847,10 +1862,25 @@ def _run_verification(
         label="backend-tests",
     )
     for argv, timeout, label in (
-        ((*npm, "ci", "--ignore-scripts", "--no-audit", "--no-fund"), 1_200, "reviewer-npm-ci"),
-        ((str(inputs.node), ".github/scripts/generate-reviewer-third-party-notices.mjs"), 300, "reviewer-notices"),
+        (
+            (*npm, "ci", "--ignore-scripts", "--no-audit", "--no-fund"),
+            1_200,
+            "reviewer-npm-ci",
+        ),
+        (
+            (
+                str(inputs.node),
+                ".github/scripts/generate-reviewer-third-party-notices.mjs",
+            ),
+            300,
+            "reviewer-notices",
+        ),
         ((*npm, "test"), 900, "reviewer-tests"),
-        ((*npm, "run", "typecheck"), 900, "reviewer-typecheck"),
+        (
+            (*npm, "run", "typecheck"),
+            900,
+            "reviewer-typecheck",
+        ),
         (
             (
                 *npm,
@@ -2375,7 +2405,7 @@ def build_prepared_release(
 ) -> candidate.PreparedRelease:
     """Produce and revalidate one content-addressed prepared release."""
 
-    os.umask(0o077)
+    os.umask(PRIVATE_PROCESS_UMASK)
     inputs.validate()
     initial_desired, manifest, source_compose_path, source_compose_payload, source_compose = (
         _read_source_compose(inputs.source_state_directory)
@@ -2600,7 +2630,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    os.umask(0o077)
+    os.umask(PRIVATE_PROCESS_UMASK)
     try:
         args = _parser().parse_args(argv)
         prepared = build_prepared_release(

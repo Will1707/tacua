@@ -36,6 +36,16 @@ live stage. Preparation therefore must use the same rootless Docker image
 store that the live stage will inspect, but it does not replace a live
 container or change Serve.
 
+The producer keeps its own evidence, logs, and scratch roots under an
+owner-private `0077` creation mask and explicit private modes. Every bounded
+child process receives a deterministic `0022` mask so the isolated Git
+checkout and generated exports have the `0755` directory and `0644` file modes
+required after root-owned files are copied into non-root container images.
+Those child-created files remain below the attempt's `0700` ancestor, logs are
+created explicitly as `0600`, and each command's child mask is recorded in the
+verification evidence. The child mask does not change the producer's process
+mask.
+
 The candidate diff is intentionally narrow. Reviewer application and web code,
 the checked-in reviewer-upgrade boundary, its tests and systemd templates, and
 documentation are allowed. Backend package code, protocol contracts, mobile
