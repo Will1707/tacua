@@ -157,7 +157,7 @@ function safeFile(relative, absolute) {
     !metadata.isFile()
     || metadata.isSymbolicLink()
     || metadata.nlink !== 1
-    || (metadata.mode & 0o022) !== 0
+    || (metadata.mode & 0o7777) !== 0o0644
     || metadata.size < 1
     || metadata.size > maximumReviewerFileBytes
   ) {
@@ -171,7 +171,7 @@ function collectFiles(root) {
   if (
     !rootMetadata.isDirectory()
     || rootMetadata.isSymbolicLink()
-    || (rootMetadata.mode & 0o022) !== 0
+    || (rootMetadata.mode & 0o7777) !== 0o0755
   ) {
     fail("reviewer export root must be one real directory");
   }
@@ -193,8 +193,8 @@ function collectFiles(root) {
       }
       if (entry.isSymbolicLink()) fail("reviewer export must not contain links");
       if (entry.isDirectory()) {
-        if ((lstatSync(absolute).mode & 0o022) !== 0) {
-          fail("reviewer export contains a writable directory");
+        if ((lstatSync(absolute).mode & 0o7777) !== 0o0755) {
+          fail("reviewer export contains a non-container-readable directory");
         }
         pending.push(absolute);
       } else if (entry.isFile()) {
