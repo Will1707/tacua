@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# Render @STATE_PARENT@ to one canonical absolute state path.
+
+[Unit]
+Description=Resume a published Tacua reviewer upgrade transaction
+Documentation=https://github.com/Will1707/tacua/blob/main/services/backend/RECONCILIATION.md
+
+[Path]
+PathExists=@STATE_PARENT@/upgrades/active.json
+Unit=tacua-reviewer-upgrade-resume.service
+TriggerLimitIntervalSec=infinity
+TriggerLimitBurst=1
+
+[Install]
+WantedBy=default.target

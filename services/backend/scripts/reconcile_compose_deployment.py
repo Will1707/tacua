@@ -15,6 +15,7 @@ health and smoke checks succeed.
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import hashlib
 import json
@@ -50,10 +51,12 @@ GENERATION_CONTRACT = "tacua.compose-reconcile-generation@1.0.0"
 ACTIVATION_CONTRACT = "tacua.compose-reconcile-activation@1.0.0"
 ANCHOR_CONTRACT = "tacua.compose-reconcile-anchor@1.0.0"
 ANCHOR_PENDING_CONTRACT = "tacua.compose-reconcile-anchor-pending@1.0.0"
+UPGRADE_INHIBITOR_CONTRACT = "tacua.reviewer-upgrade-inhibitor@1.0.0"
 DESIRED_FILE = "desired-state.json"
 ACTIVATION_FILE = "activation.json"
 MANIFEST_FILE = "manifest.json"
 COMPOSE_FILE = "compose.json"
+UPGRADE_INHIBITOR_FILE = "reviewer-upgrade-inhibitor.json"
 SERVICES = ("backend", "reviewer", "ingress")
 MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
 MAX_COMMAND_BYTES = 2 * 1024 * 1024
@@ -482,14 +485,50 @@ def _read_private(path: Path, *, mode: int, code: str) -> bytes:
         if (
             len(payload) != before.st_size
             or len(payload) > MAX_DOCUMENT_BYTES
-            or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
-                after.st_ctime_ns, after.st_nlink, stat.S_IMODE(after.st_mode),
-                after.st_uid)
-            != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
-                before.st_ctime_ns, before.st_nlink, stat.S_IMODE(before.st_mode),
-                before.st_uid)
-            or (path_after.st_dev, path_after.st_ino)
-            != (after.st_dev, after.st_ino)
+            or (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_uid,
+                after.st_gid,
+                after.st_nlink,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            != (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_uid,
+                before.st_gid,
+                before.st_nlink,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            or (
+                path_after.st_dev,
+                path_after.st_ino,
+                path_after.st_mode,
+                path_after.st_uid,
+                path_after.st_gid,
+                path_after.st_nlink,
+                path_after.st_size,
+                path_after.st_mtime_ns,
+                path_after.st_ctime_ns,
+            )
+            != (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_uid,
+                after.st_gid,
+                after.st_nlink,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
         ):
             raise ReconcileError(code)
         return bytes(payload)
@@ -1921,6 +1960,40 @@ def _host_lock(project: str) -> int:
     return _open_host_lock(_lock_path(project), create=True)
 
 
+def _adopt_host_lock(project: str, descriptor: int) -> int:
+    """Acquire the exact host lock through a caller-owned descriptor.
+
+    The descriptor must be close-on-exec and remains open and exclusively
+    locked for the caller on both success and any later ``seal`` failure.  This
+    function never closes or unlocks it.
+    """
+
+    if type(descriptor) is not int or descriptor < 0:
+        raise ReconcileError("RECONCILE_LOCK_INVALID")
+    path = _lock_path(project)
+    _validate_lock_descriptor(descriptor, path)
+    try:
+        descriptor_flags = fcntl.fcntl(descriptor, fcntl.F_GETFD)
+    except (OSError, TypeError, ValueError) as error:
+        raise ReconcileError("RECONCILE_LOCK_INVALID") from error
+    if not descriptor_flags & fcntl.FD_CLOEXEC:
+        raise ReconcileError("RECONCILE_LOCK_INVALID")
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        if error.errno in {errno.EACCES, errno.EAGAIN, errno.EINTR}:
+            raise ReconcileError("RECONCILE_DEFERRED") from error
+        raise ReconcileError("RECONCILE_LOCK_INVALID") from error
+    _validate_lock_descriptor(descriptor, path)
+    try:
+        descriptor_flags = fcntl.fcntl(descriptor, fcntl.F_GETFD)
+    except (OSError, TypeError, ValueError) as error:
+        raise ReconcileError("RECONCILE_LOCK_INVALID") from error
+    if not descriptor_flags & fcntl.FD_CLOEXEC:
+        raise ReconcileError("RECONCILE_LOCK_INVALID")
+    return descriptor
+
+
 def _pending_anchor(project: str) -> dict[str, Any]:
     return {
         "boot_id": _boot_id(),
@@ -2145,6 +2218,70 @@ def _refuse_recovery_journal(
         raise ReconcileError("RECONCILE_RECOVERY_REQUIRED")
 
 
+def _validate_upgrade_inhibitor(
+    value: Any,
+    *,
+    project: str,
+) -> dict[str, str]:
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {
+            "contract_version",
+            "inhibitor_digest",
+            "plan_digest",
+            "project",
+        }
+        or value.get("contract_version") != UPGRADE_INHIBITOR_CONTRACT
+        or value.get("project") != project
+        or DIGEST.fullmatch(str(value.get("plan_digest"))) is None
+        or DIGEST.fullmatch(str(value.get("inhibitor_digest"))) is None
+        or value.get("inhibitor_digest")
+        != _document_digest(value, "inhibitor_digest")
+    ):
+        raise ReconcileError("RECONCILE_UPGRADE_INHIBITOR_INVALID")
+    return dict(value)
+
+
+def _require_upgrade_inhibitor(
+    manifest: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> None:
+    document = _validate_upgrade_inhibitor(
+        expected,
+        project=str(manifest["project"]),
+    )
+    parent = _safe_directory(Path(manifest["operation_directory"]))
+    operation = _safe_directory(
+        parent / f"tacua-compose-processing-{manifest['project']}"
+    )
+    try:
+        entries = tuple(operation.iterdir())
+    except OSError as error:
+        raise ReconcileError("RECONCILE_UPGRADE_INHIBITOR_INVALID") from error
+    if len(entries) != 1 or entries[0].name != UPGRADE_INHIBITOR_FILE:
+        raise ReconcileError("RECONCILE_UPGRADE_INHIBITOR_INVALID")
+    path = operation / UPGRADE_INHIBITOR_FILE
+    payload = _read_private(
+        path,
+        mode=0o600,
+        code="RECONCILE_UPGRADE_INHIBITOR_INVALID",
+    )
+    observed = _parse_json(
+        payload,
+        "RECONCILE_UPGRADE_INHIBITOR_INVALID",
+    )
+    if (
+        _validate_upgrade_inhibitor(
+            observed,
+            project=str(manifest["project"]),
+        )
+        != document
+        or payload != _canonical(document)
+    ):
+        raise ReconcileError("RECONCILE_UPGRADE_INHIBITOR_INVALID")
+
+
 def _tailnet_state(manifest: Mapping[str, Any], compose: Path, runner: Callable[..., bytes]) -> tuple[dict[str, Any], bool]:
     tailscale = manifest["commands"]["tailscale"]
     # Read Serve first. Failure to inspect the public capability is critical;
@@ -2291,11 +2428,17 @@ def _recover_locked(
     runner: Callable[..., bytes],
     *,
     attested_directories: Sequence[Mapping[str, Any]] | None = None,
+    upgrade_inhibitor: Mapping[str, Any] | None = None,
 ) -> str:
-    _refuse_recovery_journal(
-        manifest,
-        attested_directories=attested_directories,
-    )
+    if upgrade_inhibitor is None:
+        _refuse_recovery_journal(
+            manifest,
+            attested_directories=attested_directories,
+        )
+    else:
+        if attested_directories is not None:
+            raise ReconcileError("RECONCILE_UPGRADE_INHIBITOR_INVALID")
+        _require_upgrade_inhibitor(manifest, upgrade_inhibitor)
     serve_known = False
     serve_active = False
     public_disabled = False
@@ -2340,6 +2483,13 @@ def _recover_locked(
                 time.sleep(1)
         _smoke(manifest, public=False)
         if not serve_active:
+            if upgrade_inhibitor is not None:
+                # A reviewer-upgrade activation intentionally keeps its
+                # persistent processing gate until the new state is public.
+                # Revalidate the exact plan-bound marker immediately before
+                # that public-path mutation while the caller retains the
+                # shared host lock.
+                _require_upgrade_inhibitor(manifest, upgrade_inhibitor)
             # The enable command can mutate Serve before a later validation
             # fails.  Mark it active first so every such failure takes the
             # disable-and-prove-empty cleanup path.
@@ -2349,6 +2499,8 @@ def _recover_locked(
             public_disabled = False
         _tailnet_state(manifest, compose, runner)
         _smoke(manifest, public=True)
+        if upgrade_inhibitor is not None:
+            _require_upgrade_inhibitor(manifest, upgrade_inhibitor)
         return "recovered" if mutated else "healthy"
     except Exception as original:
         if serve_known and serve_active:
@@ -2572,8 +2724,19 @@ def reconcile(
     runner: Callable[..., bytes] | None = None,
     *,
     anchor_file: Path | None = None,
+    lock_descriptor: int | None = None,
 ) -> dict[str, str]:
+    """Reconcile a sealed state under an optional caller-retained host lock.
+
+    The attested systemd path continues to acquire the lock described by its
+    anchor.  Transactional callers may instead supply the already-held host
+    lock to the unanchored path; that descriptor is validated and retained on
+    both success and failure.
+    """
+
     if anchor_file is not None:
+        if lock_descriptor is not None:
+            raise ReconcileError("RECONCILE_INPUT_INVALID")
         descriptor, anchor = _attested_lock(anchor_file, state_directory)
         attested = _anchor_directories(anchor)
         try:
@@ -2639,9 +2802,12 @@ def reconcile(
     desired, initial_manifest, _compose = _load_bound_state(state_directory)
     selected_runner = runner or _runner_for_manifest(initial_manifest)
     activation = _load_activation(state_directory, desired)
-    if desired["desired"] == "maintenance" and activation is None:
-        return {"code": "RECONCILE_MAINTENANCE", "status": "maintenance"}
-    descriptor = _host_lock(desired["project"])
+    descriptor_owned = lock_descriptor is None
+    descriptor = (
+        _host_lock(desired["project"])
+        if descriptor_owned
+        else _adopt_host_lock(desired["project"], lock_descriptor)
+    )
     try:
         current, manifest, compose = _load_bound_state(state_directory)
         if current != desired:
@@ -2649,6 +2815,11 @@ def reconcile(
         current_activation = _load_activation(state_directory, current)
         if current_activation != activation:
             raise ReconcileError("RECONCILE_STATE_CHANGED")
+        if current["desired"] == "maintenance" and current_activation is None:
+            return {
+                "code": "RECONCILE_MAINTENANCE",
+                "status": "maintenance",
+            }
         if current_activation is not None and current_activation["intent"] in {
             "canceling",
             "maintenance",
@@ -2670,7 +2841,8 @@ def reconcile(
             outcome = "recovered"
         return {"code": f"RECONCILE_{outcome.upper()}", "status": outcome}
     finally:
-        _release_lock(descriptor)
+        if descriptor_owned:
+            _release_lock(descriptor)
 
 
 def set_maintenance(
@@ -2678,10 +2850,16 @@ def set_maintenance(
     runner: Callable[..., bytes] | None = None,
     *,
     require_running: bool = False,
+    lock_descriptor: int | None = None,
 ) -> dict[str, str]:
     desired, initial_manifest, _compose = _load_bound_state(state_directory)
     selected_runner = runner or _runner_for_manifest(initial_manifest)
-    descriptor = _host_lock(desired["project"])
+    descriptor_owned = lock_descriptor is None
+    descriptor = (
+        _host_lock(desired["project"])
+        if descriptor_owned
+        else _adopt_host_lock(desired["project"], lock_descriptor)
+    )
     try:
         current, manifest, compose = _load_bound_state(state_directory)
         if current != desired:
@@ -2712,30 +2890,69 @@ def set_maintenance(
         _remove_activation(state_directory)
         return {"code": "RECONCILE_MAINTENANCE", "status": "maintenance"}
     finally:
-        _release_lock(descriptor)
+        if descriptor_owned:
+            _release_lock(descriptor)
 
 
-def set_running(state_directory: Path, runner: Callable[..., bytes] | None = None) -> dict[str, str]:
+def set_running(
+    state_directory: Path,
+    runner: Callable[..., bytes] | None = None,
+    *,
+    lock_descriptor: int | None = None,
+    upgrade_inhibitor: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    """Activate a sealed maintenance state under an optional retained lock.
+
+    ``upgrade_inhibitor`` is accepted only as the exact plan-bound persistent
+    processing gate.  It lets the crash-safe reviewer transaction make the
+    new deployment public before removing that gate, avoiding an unrecorded
+    window in which another processor could win after a power loss.
+    """
+
     desired, initial_manifest, _compose = _load_bound_state(state_directory)
     selected_runner = runner or _runner_for_manifest(initial_manifest)
-    descriptor = _host_lock(desired["project"])
+    descriptor_owned = lock_descriptor is None
+    descriptor = (
+        _host_lock(desired["project"])
+        if descriptor_owned
+        else _adopt_host_lock(desired["project"], lock_descriptor)
+    )
     try:
         current, manifest, compose = _load_bound_state(state_directory)
-        if current != desired or current["desired"] != "maintenance":
+        if current != desired:
             raise ReconcileError("RECONCILE_STATE_CHANGED")
-        if _load_activation(state_directory, current) is not None:
-            raise ReconcileError("RECONCILE_ACTIVATION_PENDING")
-        # The durable marker makes activation recoverable while desired state
-        # is still maintenance.  A timer that observes the marker must finish
-        # the guarded transaction instead of taking the maintenance no-op.
-        _write_activation(state_directory, current)
-        outcome = _recover_locked(manifest, compose, selected_runner)
-        _write_desired(state_directory, current, "running")
-        _remove_activation(state_directory)
+        activation = _load_activation(state_directory, current)
+        if upgrade_inhibitor is None:
+            if current["desired"] != "maintenance":
+                raise ReconcileError("RECONCILE_STATE_CHANGED")
+            if activation is not None:
+                raise ReconcileError("RECONCILE_ACTIVATION_PENDING")
+        else:
+            _require_upgrade_inhibitor(manifest, upgrade_inhibitor)
+            if current["desired"] not in {"maintenance", "running"}:
+                raise ReconcileError("RECONCILE_STATE_CHANGED")
+            if activation is not None and activation["intent"] != "running":
+                raise ReconcileError("RECONCILE_ACTIVATION_PENDING")
+        if current["desired"] == "maintenance" and activation is None:
+            # The durable marker makes activation recoverable while desired
+            # state is still maintenance.  Upgrade retries below accept only
+            # this exact plan-bound running marker.
+            activation = _write_activation(state_directory, current)
+        outcome = _recover_locked(
+            manifest,
+            compose,
+            selected_runner,
+            upgrade_inhibitor=upgrade_inhibitor,
+        )
+        if current["desired"] == "maintenance":
+            _write_desired(state_directory, current, "running")
+        if activation is not None:
+            _remove_activation(state_directory)
         outcome = "recovered"
         return {"code": f"RECONCILE_{outcome.upper()}", "status": outcome}
     finally:
-        _release_lock(descriptor)
+        if descriptor_owned:
+            _release_lock(descriptor)
 
 
 def cancel_activation(
@@ -2783,7 +3000,28 @@ def _reported_status(
     }[str(activation["intent"])]
 
 
-def seal(args: argparse.Namespace, runner: Callable[..., bytes] | None = None) -> dict[str, str]:
+def seal(
+    args: argparse.Namespace,
+    runner: Callable[..., bytes] | None = None,
+    *,
+    lock_descriptor: int | None = None,
+    upgrade_inhibitor: Mapping[str, Any] | None = None,
+    expected_repository_root: Path | None = None,
+) -> dict[str, str]:
+    """Seal the live deployment, optionally retaining a caller-owned lock.
+
+    When ``lock_descriptor`` is supplied, it is acquired and validated by
+    :func:`_adopt_host_lock` but is never unlocked or closed here, including on
+    failure.  The caller owns its complete lifetime.  ``upgrade_inhibitor``
+    permits only the exact plan-bound processing inhibitor used by a durable
+    reviewer upgrade; every other processing operation remains a hard stop.
+    """
+
+    initial_state = (
+        "maintenance" if getattr(args, "maintenance", False) else "running"
+    )
+    if upgrade_inhibitor is not None and initial_state != "maintenance":
+        raise ReconcileError("RECONCILE_UPGRADE_INHIBITOR_INVALID")
     state_directory = _safe_directory(args.state_directory, create=True)
     try:
         state_entries = tuple(state_directory.iterdir())
@@ -2793,9 +3031,6 @@ def seal(args: argparse.Namespace, runner: Callable[..., bytes] | None = None) -
         raise ReconcileError("RECONCILE_STATE_EXISTS")
     if PROJECT.fullmatch(args.project) is None or GENERATION.fullmatch(args.generation) is None or UNIT.fullmatch(args.docker_service) is None:
         raise ReconcileError("RECONCILE_INPUT_INVALID")
-    initial_state = (
-        "maintenance" if getattr(args, "maintenance", False) else "running"
-    )
     operation_directory = _safe_directory(args.operation_directory)
     compose_payload = _read_private(args.compose_json, mode=0o600, code="RECONCILE_INPUT_INVALID")
     compose_document = _parse_json(compose_payload, "RECONCILE_INPUT_INVALID")
@@ -2806,6 +3041,7 @@ def seal(args: argparse.Namespace, runner: Callable[..., bytes] | None = None) -
             compose_document,
             require_immutable_image=not args.allow_mutable_image,
             check_state=False,
+            expected_repository_root=expected_repository_root,
         )
     except (ConfigError, OperatorError, OSError) as error:
         raise ReconcileError("RECONCILE_INPUT_INVALID") from error
@@ -2847,6 +3083,7 @@ def seal(args: argparse.Namespace, runner: Callable[..., bytes] | None = None) -
     temporary_compose = temporary_parent / COMPOSE_FILE
     destination = generations / args.generation
     descriptor: int | None = None
+    descriptor_owned = False
     draft_created = False
     promoted = False
     try:
@@ -2858,8 +3095,15 @@ def seal(args: argparse.Namespace, runner: Callable[..., bytes] | None = None) -
             replace=False,
             mode=0o400,
         )
-        descriptor = _host_lock(args.project)
-        _refuse_recovery_journal(draft)
+        if lock_descriptor is None:
+            descriptor = _host_lock(args.project)
+            descriptor_owned = True
+        else:
+            descriptor = _adopt_host_lock(args.project, lock_descriptor)
+        if upgrade_inhibitor is None:
+            _refuse_recovery_journal(draft)
+        else:
+            _require_upgrade_inhibitor(draft, upgrade_inhibitor)
         if initial_state == "maintenance":
             # Prove the public capability empty before inspecting the daemon or
             # deployment.  Staged sealing is read-only and never disables an
@@ -2902,6 +3146,11 @@ def seal(args: argparse.Namespace, runner: Callable[..., bytes] | None = None) -
                 temporary_compose,
                 selected_runner,
             )
+        if upgrade_inhibitor is not None:
+            # Keep the crash-persistent processing gate bound until the
+            # complete generation is ready for publication.  The caller still
+            # holds the shared lock, so no processor can race this recheck.
+            _require_upgrade_inhibitor(draft, upgrade_inhibitor)
         if destination.exists() or destination.is_symlink():
             raise ReconcileError("RECONCILE_STATE_EXISTS")
         try:
@@ -2939,7 +3188,7 @@ def seal(args: argparse.Namespace, runner: Callable[..., bytes] | None = None) -
                 raise ReconcileError("RECONCILE_STATE_INVALID") from cleanup_error
         raise
     finally:
-        if descriptor is not None:
+        if descriptor is not None and descriptor_owned:
             _release_lock(descriptor)
     return {
         "code": "RECONCILE_SEALED",

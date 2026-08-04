@@ -10,6 +10,12 @@ that requires an operator-controlled restore or deployment.
 The V1 deployment keeps `restart: unless-stopped`. This lets a deliberate
 maintenance stop remain stopped while the user timer handles daemon loss.
 
+Reviewer-only releases use the reconciler's guarded maintenance, sealing, and
+activation boundaries but add a verified backup, content-addressed retained
+source, stable asynchronous resumer, and reviewer-only replacement. Follow
+[Reviewer-only upgrades](./REVIEWER_UPGRADES.md); do not replace the installed
+reconciler or adapt the legacy handoff paragraph below into an upgrade script.
+
 ## Safety model
 
 `seal` writes a private desired-state record and one immutable generation below
