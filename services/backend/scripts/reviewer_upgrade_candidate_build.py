@@ -92,6 +92,31 @@ _ALLOWED_PREFIXES = (
     "services/backend/tests/test_reviewer_upgrade_",
     "services/backend/systemd/",
 )
+# The first self-hosted pilot was sealed before the reconciliation and guarded
+# reviewer-upgrade boundary landed.  Crossing that exact public baseline also
+# carries a bounded set of already-reviewed pilot diagnostics, CI, and bridge
+# files.  Keep this exception commit-bound and path-exact: later installations
+# must continue to satisfy the reviewer-only policy above.
+_PILOT_BASELINE_COMMIT = "1735e1ee25629e2f218225f3560ba75d5d43f068"
+_PILOT_BASELINE_ALLOWED_EXACT = frozenset(
+    {
+        ".github/workflows/verify.yml",
+        "experiments/ios-capture-spike/PILOT-DIAGNOSTICS-RETENTION.md",
+        "experiments/ios-capture-spike/PILOT-OPERATION-RECEIPT.md",
+        "experiments/ios-capture-spike/harness/README.md",
+        "experiments/ios-capture-spike/package/README.md",
+        "experiments/ios-capture-spike/package/ios/TacuaBackendConfiguration.swift",
+        "experiments/ios-capture-spike/package/src/BackendManagedHostController.ts",
+        "experiments/ios-capture-spike/package/tests/BackendConfigurationTests.swift",
+        "experiments/ios-capture-spike/package/tests/backend-managed-host-controller.test.ts",
+        "experiments/ios-capture-spike/scripts/finalize_pilot_operation.py",
+        "experiments/ios-capture-spike/scripts/manage_pilot_diagnostics.py",
+        "experiments/ios-capture-spike/tests/test_finalize_pilot_operation.py",
+        "experiments/ios-capture-spike/tests/test_pilot_diagnostics_retention.py",
+        "services/backend/scripts/run_compose_isolated_processing.py",
+        "services/backend/tests/test_reconcile_systemd_contract.py",
+    }
+)
 _FORBIDDEN_PREFIXES = (
     "apps/mobile-sdk/",
     "contracts/",
@@ -677,7 +702,7 @@ def _read_log(path: Path) -> bytes:
         ) from error
 
 
-def _allowed_change(path: str) -> bool:
+def _allowed_change(path: str, *, installed_commit: str) -> bool:
     if (
         not path
         or path.startswith("/")
@@ -691,6 +716,11 @@ def _allowed_change(path: str) -> bool:
         return False
     if path in _ALLOWED_EXACT:
         return True
+    if (
+        installed_commit == _PILOT_BASELINE_COMMIT
+        and path in _PILOT_BASELINE_ALLOWED_EXACT
+    ):
+        return True
     if path.startswith("services/backend/") and path.endswith(".md"):
         return True
     if path.startswith("docs/") and path.endswith(".md"):
@@ -698,14 +728,26 @@ def _allowed_change(path: str) -> bool:
     return path.startswith(_ALLOWED_PREFIXES)
 
 
-def _validate_restricted_diff(payload: bytes) -> tuple[str, ...]:
-    if not isinstance(payload, bytes) or not payload or payload[-1:] != b"\0":
+def _validate_restricted_diff(
+    payload: bytes,
+    *,
+    installed_commit: str,
+) -> tuple[str, ...]:
+    if (
+        not isinstance(payload, bytes)
+        or not payload
+        or payload[-1:] != b"\0"
+        or COMMIT_RE.fullmatch(installed_commit) is None
+    ):
         _fail("REVIEWER_UPGRADE_CANDIDATE_BUILD_DIFF_INVALID")
     values: list[str] = []
     try:
         for raw in payload[:-1].split(b"\0"):
             value = raw.decode("utf-8", "strict")
-            if not _allowed_change(value) or value in values:
+            if (
+                not _allowed_change(value, installed_commit=installed_commit)
+                or value in values
+            ):
                 _fail("REVIEWER_UPGRADE_CANDIDATE_BUILD_DIFF_INVALID")
             values.append(value)
     except UnicodeError as error:
@@ -1753,7 +1795,10 @@ def _git_preflight_and_checkout(
         timeout=120,
         label="candidate-restricted-diff",
     )
-    changes = _validate_restricted_diff(result.stdout)
+    changes = _validate_restricted_diff(
+        result.stdout,
+        installed_commit=inputs.installed_commit,
+    )
     result = _invoke(
         runner,
         commands,

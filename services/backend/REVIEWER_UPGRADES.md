@@ -59,6 +59,14 @@ exact, fully revalidated `source/` tree of the previous retained release. The
 Git lineage worktree and current Compose source authority are deliberately
 separate after the first upgrade.
 
+The original self-hosted pilot baseline at commit
+`1735e1ee25629e2f218225f3560ba75d5d43f068` predates this boundary. Its first
+managed upgrade has a commit-bound, path-exact exception for the already
+reviewed pilot diagnostics, CI verification, and processing-bridge files that
+landed with the reconciliation machinery. No prefix is opened by that bridge:
+an unlisted sibling path, the same path from any other installed commit, and
+all normally forbidden runtime surfaces still fail closed.
+
 The asynchronous transaction advances monotonically through:
 
 ```text
