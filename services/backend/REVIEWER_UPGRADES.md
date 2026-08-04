@@ -119,7 +119,12 @@ commits, repository identity, reviewer image reference and ID, verification
 command digest, and the exact Git, Python, Node, npm, Docker, and Bash binaries.
 
 The pure candidate loader re-reads all of that evidence, the receipt-bound
-source Compose file, and the receipt-bound tools. Extra files, symlinks,
+source Compose file, and the receipt-bound tools. Prepared-release JSON stays
+canonical. Only the exact original pilot baseline's pre-existing sealed source
+Compose document may use a noncanonical ASCII JSON serialization. It remains
+byte-for-byte digest-bound and is parsed with the same duplicate-key, numeric,
+depth, collection, string, and size limits. Every later baseline requires a
+canonical source Compose document. Extra files, symlinks,
 special files, changed modes, changed inodes where bound, changed bytes, a
 rebound tool, a missing old sealed source Compose document, or any Compose
 delta outside the reviewer transition invalidates the release. The stable

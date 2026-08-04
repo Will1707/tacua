@@ -58,6 +58,7 @@ MAX_JSON_STRING_BYTES = 2 * 1024 * 1024
 MAX_SAFE_INTEGER = (1 << 63) - 1
 
 _ERROR = "REVIEWER_UPGRADE_CANDIDATE_INVALID"
+_PILOT_BASELINE_COMMIT = "1735e1ee25629e2f218225f3560ba75d5d43f068"
 _DIGEST = re.compile(r"^sha256:[a-f0-9]{64}$")
 _GENERATION = re.compile(r"^[a-f0-9]{64}$")
 _COMMIT = re.compile(r"^[a-f0-9]{40}$")
@@ -393,7 +394,15 @@ def _reject_constant(_value: str) -> NoReturn:
     _fail()
 
 
-def parse_canonical_json(payload: bytes, *, maximum: int) -> Any:
+def _parse_bounded_json(payload: bytes, *, maximum: int) -> Any:
+    """Parse digest-bound JSON without requiring a producer-owned encoding.
+
+    The exact pilot baseline's sealed deployment document predates this
+    upgrader and may use a noncanonical ASCII JSON serialization.  It still
+    receives the same duplicate-key, numeric, depth, collection, string,
+    encoding, and size protections as canonical prepared-release documents.
+    """
+
     if (
         type(payload) is not bytes
         or not payload
@@ -416,7 +425,11 @@ def parse_canonical_json(payload: bytes, *, maximum: int) -> Any:
         raise
     except (UnicodeError, ValueError, RecursionError, json.JSONDecodeError) as error:
         raise CandidateError(_ERROR) from error
-    bounded = _bounded_copy(parsed)
+    return _bounded_copy(parsed)
+
+
+def parse_canonical_json(payload: bytes, *, maximum: int) -> Any:
+    bounded = _parse_bounded_json(payload, maximum=maximum)
     if canonical_json(bounded) != payload:
         _fail()
     return bounded
@@ -872,7 +885,12 @@ def _validate_receipt(
         or source_record["digest"] != digest(source_payload)
     ):
         _fail()
-    source_document = parse_canonical_json(source_payload, maximum=MAX_COMPOSE_BYTES)
+    source_parser = (
+        _parse_bounded_json
+        if receipt["installed_commit"] == _PILOT_BASELINE_COMMIT
+        else parse_canonical_json
+    )
+    source_document = source_parser(source_payload, maximum=MAX_COMPOSE_BYTES)
     prepared_record = _exact_mapping(
         receipt["candidate_compose"], _COMPOSE_RECORD_KEYS
     )

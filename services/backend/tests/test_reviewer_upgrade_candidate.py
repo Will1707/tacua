@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 import os
 from pathlib import Path
 import shutil
@@ -38,6 +39,8 @@ class ReleaseFixture:
         *,
         local_build: bool = True,
         omitted_source: str | None = None,
+        pretty_source_compose: bool = False,
+        installed_commit: str = INSTALLED_COMMIT,
     ) -> None:
         self.base = base.resolve()
         self.base.chmod(0o700)
@@ -73,9 +76,18 @@ class ReleaseFixture:
                     "dockerfile": dockerfile,
                 }
         self.source_compose = self.base / "sealed-source-compose.json"
-        self.source_compose.write_bytes(
-            CANDIDATE.canonical_json(self.source_document)
+        source_payload = (
+            json.dumps(
+                self.source_document,
+                ensure_ascii=True,
+                indent=2,
+                sort_keys=False,
+            ).encode("ascii")
+            + b"\n"
+            if pretty_source_compose
+            else CANDIDATE.canonical_json(self.source_document)
         )
+        self.source_compose.write_bytes(source_payload)
         self.source_compose.chmod(CANDIDATE.SOURCE_COMPOSE_MODE)
 
         self.tools_directory = self.base / "tools"
@@ -105,7 +117,7 @@ class ReleaseFixture:
         ]
         generation = CANDIDATE.release_generation_id(
             candidate_commit=CANDIDATE_COMMIT,
-            installed_commit=INSTALLED_COMMIT,
+            installed_commit=installed_commit,
             repository_identity=REPOSITORY_IDENTITY,
             tree_digest_value=CANDIDATE.tree_digest(self.file_records),
             source_compose_path=str(self.source_compose),
@@ -183,7 +195,7 @@ class ReleaseFixture:
             },
             "contract_version": CANDIDATE.PREPARATION_RECEIPT_CONTRACT,
             "generation_id": generation,
-            "installed_commit": INSTALLED_COMMIT,
+            "installed_commit": installed_commit,
             "receipt_digest": "",
             "release_binding": {
                 "device": root_metadata.st_dev,
@@ -270,6 +282,8 @@ class ReviewerUpgradeCandidateTests(unittest.TestCase):
         *,
         local_build: bool = True,
         omitted_source: str | None = None,
+        pretty_source_compose: bool = False,
+        installed_commit: str = INSTALLED_COMMIT,
     ) -> ReleaseFixture:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -277,6 +291,8 @@ class ReviewerUpgradeCandidateTests(unittest.TestCase):
             Path(temporary.name),
             local_build=local_build,
             omitted_source=omitted_source,
+            pretty_source_compose=pretty_source_compose,
+            installed_commit=installed_commit,
         )
 
     def assert_invalid(self, fixture: ReleaseFixture, **kwargs: object) -> None:
@@ -612,27 +628,51 @@ class ReviewerUpgradeCandidateTests(unittest.TestCase):
                     target.write_bytes(b"tampered ingress\n")
                 self.assert_invalid(fixture)
 
-    def test_source_and_candidate_compose_require_canonical_json(self) -> None:
-        cases = ("source", "candidate")
-        for case in cases:
-            with self.subTest(case=case):
-                fixture = self.fixture()
-                if case == "source":
-                    target = fixture.source_compose
-                    target.chmod(0o600)
-                    target.write_bytes(target.read_bytes() + b"\n")
-                    target.chmod(CANDIDATE.SOURCE_COMPOSE_MODE)
-                    fixture.receipt["source_compose"]["digest"] = CANDIDATE.digest(
-                        target.read_bytes()
-                    )
-                else:
-                    target = fixture.candidate_path
-                    target.write_bytes(target.read_bytes() + b"\n")
-                    fixture.receipt["candidate_compose"]["digest"] = CANDIDATE.digest(
-                        target.read_bytes()
-                    )
-                fixture.write_receipt()
-                self.assert_invalid(fixture)
+    def test_pilot_source_compose_accepts_bound_noncanonical_json(self) -> None:
+        fixture = self.fixture(
+            pretty_source_compose=True,
+            installed_commit=CANDIDATE._PILOT_BASELINE_COMMIT,
+        )
+
+        prepared = CANDIDATE.load_prepared_release(fixture.release)
+
+        self.assertEqual(prepared.receipt, fixture.receipt)
+
+    def test_later_source_compose_still_requires_canonical_json(self) -> None:
+        fixture = self.fixture(pretty_source_compose=True)
+
+        self.assert_invalid(fixture)
+
+    def test_later_release_cannot_select_pilot_parser_by_resealing_receipt(self) -> None:
+        fixture = self.fixture(pretty_source_compose=True)
+        fixture.receipt["installed_commit"] = CANDIDATE._PILOT_BASELINE_COMMIT
+        fixture.write_receipt()
+
+        self.assert_invalid(fixture)
+
+    def test_candidate_compose_requires_canonical_json(self) -> None:
+        fixture = self.fixture()
+        target = fixture.candidate_path
+        target.write_bytes(target.read_bytes() + b"\n")
+        fixture.receipt["candidate_compose"]["digest"] = CANDIDATE.digest(
+            target.read_bytes()
+        )
+        fixture.write_receipt()
+
+        self.assert_invalid(fixture)
+
+    def test_bounded_source_json_parser_rejects_ambiguous_or_unsafe_values(self) -> None:
+        cases = (
+            b'{"a":1,"a":2}',
+            b'{"value":NaN}',
+            b'{"value":9223372036854775808}',
+            b"\xef\xbb\xbf{}",
+            b'{"value":"\xff"}',
+        )
+        for payload in cases:
+            with self.subTest(payload=payload):
+                with self.assertRaises(CANDIDATE.CandidateError):
+                    CANDIDATE._parse_bounded_json(payload, maximum=1024)
 
     def test_compose_allows_only_exact_relocations_and_reviewer_image(self) -> None:
         cases = (
