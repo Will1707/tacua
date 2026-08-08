@@ -1280,24 +1280,41 @@ def _bootstrap_prepublication_locked(
     # Starting the resumer here would necessarily contend on the serial lock
     # held by this bootstrap.  Prove a clean idle service instead; the armed
     # path starts it only after the selector is published by the transaction.
-    for verb in ("stop", "reset-failed"):
+    _run(
+        commands,
+        runner,
+        [
+            str(commands.systemctl),
+            "--user",
+            "stop",
+            "--",
+            RESUME_UNIT,
+        ],
+        timeout=manager.RECONCILE_TIMEOUT_SECONDS,
+        code="UPGRADE_BOOTSTRAP_RESUMER_NOT_IDLE",
+    )
+    try:
         _run(
             commands,
             runner,
             [
                 str(commands.systemctl),
                 "--user",
-                verb,
+                "reset-failed",
                 "--",
                 RESUME_UNIT,
             ],
-            timeout=(
-                manager.RECONCILE_TIMEOUT_SECONDS
-                if verb == "stop"
-                else manager.CONTROL_TIMEOUT_SECONDS
-            ),
+            timeout=manager.CONTROL_TIMEOUT_SECONDS,
             code="UPGRADE_BOOTSTRAP_RESUMER_NOT_IDLE",
         )
+    except BootstrapError as error:
+        if error.code != "UPGRADE_BOOTSTRAP_RESUMER_NOT_IDLE":
+            raise
+        # Some systemd versions return non-zero when reset-failed targets an
+        # already healthy unit.  Accept the idempotent command failure only if
+        # the exact authoritative manager state below still proves the strict
+        # postcondition.
+        pass
     idle = _show(
         commands,
         runner,

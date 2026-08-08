@@ -211,6 +211,92 @@ class ReviewerUpgradeBootstrapTests(unittest.TestCase):
         self.assertEqual(receipt["status"], "path_armed_idle")
         self.assertEqual(runner.responses, [])
 
+    def test_already_idle_reset_failure_accepts_strict_postcondition(self) -> None:
+        runner = self._runner()
+        runner.responses[8] = MANAGER.ManagerError(
+            "UPGRADE_MANAGER_COMMAND_FAILED"
+        )
+
+        receipt = BOOTSTRAP.bootstrap_prepublication(
+            self.templates,
+            self.bindings,
+            None,
+            self.commands,
+            runner,
+        )
+
+        self.assertEqual(receipt["status"], "path_armed_idle")
+        self.assertEqual(runner.responses, [])
+
+    def test_reset_failure_never_accepts_non_idle_postcondition(self) -> None:
+        runner = self._runner()
+        runner.responses[8] = MANAGER.ManagerError(
+            "UPGRADE_MANAGER_COMMAND_FAILED"
+        )
+        runner.responses[9] = properties(
+            ActiveState="failed",
+            SubState="failed",
+            Result="exit-code",
+            ExecMainStatus="1",
+        )
+
+        with self.assertRaisesRegex(
+            BOOTSTRAP.BootstrapError,
+            "UPGRADE_BOOTSTRAP_RESUMER_NOT_IDLE",
+        ):
+            BOOTSTRAP.bootstrap_prepublication(
+                self.templates,
+                self.bindings,
+                None,
+                self.commands,
+                runner,
+            )
+
+        self.assertFalse(any("enable" in call[0] for call in runner.calls))
+
+    def test_reset_failure_never_accepts_unprovable_postcondition(self) -> None:
+        runner = self._runner()
+        runner.responses[8] = MANAGER.ManagerError(
+            "UPGRADE_MANAGER_COMMAND_FAILED"
+        )
+        runner.responses[9] = MANAGER.ManagerError(
+            "UPGRADE_MANAGER_COMMAND_FAILED"
+        )
+
+        with self.assertRaisesRegex(
+            BOOTSTRAP.BootstrapError,
+            "UPGRADE_BOOTSTRAP_RESUMER_NOT_IDLE",
+        ):
+            BOOTSTRAP.bootstrap_prepublication(
+                self.templates,
+                self.bindings,
+                None,
+                self.commands,
+                runner,
+            )
+
+        self.assertFalse(any("enable" in call[0] for call in runner.calls))
+
+    def test_stop_failure_remains_fatal_even_when_unit_was_idle(self) -> None:
+        runner = self._runner()
+        runner.responses[7] = MANAGER.ManagerError(
+            "UPGRADE_MANAGER_COMMAND_FAILED"
+        )
+
+        with self.assertRaisesRegex(
+            BOOTSTRAP.BootstrapError,
+            "UPGRADE_BOOTSTRAP_RESUMER_NOT_IDLE",
+        ):
+            BOOTSTRAP.bootstrap_prepublication(
+                self.templates,
+                self.bindings,
+                None,
+                self.commands,
+                runner,
+            )
+
+        self.assertFalse(any("enable" in call[0] for call in runner.calls))
+
     def test_non_idle_resumer_state_never_arms_path(self) -> None:
         runner = self._runner()
         runner.responses[9] = properties(
