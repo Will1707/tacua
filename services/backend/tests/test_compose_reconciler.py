@@ -365,6 +365,87 @@ class ComposeReconcilerTests(unittest.TestCase):
             with self.assertRaisesRegex(RECONCILER.ReconcileError, "RECONCILE_STATE_INVALID"):
                 RECONCILER.reconcile(state)
 
+    def test_atomic_write_never_unlinks_foreign_random_staging_collision(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._fixture(Path(directory))
+            target = state / RECONCILER.DESIRED_FILE
+            suffix = "a" * 12
+            staging = state / (
+                f".{target.name}.next-{os.getpid()}-{suffix}"
+            )
+            foreign_payload = b"foreign staging payload"
+            staging.write_bytes(foreign_payload)
+            staging.chmod(0o600)
+            identity = staging.stat()
+
+            with mock.patch.object(
+                RECONCILER.secrets,
+                "token_hex",
+                return_value=suffix,
+            ), self.assertRaisesRegex(
+                RECONCILER.ReconcileError,
+                "RECONCILE_STATE_INVALID",
+            ):
+                RECONCILER._atomic_private_write(
+                    target,
+                    b"replacement payload",
+                    replace=True,
+                )
+
+            current = staging.stat()
+            self.assertEqual(foreign_payload, staging.read_bytes())
+            self.assertEqual(
+                (identity.st_dev, identity.st_ino),
+                (current.st_dev, current.st_ino),
+            )
+
+    def test_atomic_write_cleans_owned_staging_when_replace_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._fixture(Path(directory))
+            target = state / RECONCILER.ACTIVATION_FILE
+            suffix = "b" * 12
+            staging = state / (
+                f".{target.name}.next-{os.getpid()}-{suffix}"
+            )
+
+            with mock.patch.object(
+                RECONCILER.secrets,
+                "token_hex",
+                return_value=suffix,
+            ), mock.patch.object(
+                RECONCILER.os,
+                "replace",
+                side_effect=OSError(errno.EIO, "synthetic replace failure"),
+            ), self.assertRaisesRegex(
+                RECONCILER.ReconcileError,
+                "RECONCILE_STATE_INVALID",
+            ):
+                RECONCILER._atomic_private_write(
+                    target,
+                    b"activation payload",
+                    replace=True,
+                )
+
+            self.assertFalse(staging.exists())
+            self.assertFalse(target.exists())
+
+    def test_bound_state_accepts_random_and_legacy_staging_residue(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = self._fixture(Path(directory))
+            random_staging = (
+                state / ".desired-state.json.next-12345-deadbeefcafe"
+            )
+            legacy_staging = state / ".activation.json.next-67890"
+            for staging in (random_staging, legacy_staging):
+                staging.write_bytes(b"retained staging payload")
+                staging.chmod(0o600)
+
+            desired, _manifest, _compose = RECONCILER._load_bound_state(state)
+
+            self.assertEqual("maintenance", desired["desired"])
+
     def test_live_restart_policy_accepts_only_unless_stopped_zero(self) -> None:
         self.assertTrue(
             RECONCILER._restart_policy_valid({"Name": "unless-stopped"})

@@ -86,6 +86,21 @@ class ReviewerUpgradeTransactionTests(unittest.TestCase):
             ingress.parent.mkdir(mode=0o700, parents=True)
             ingress.write_bytes(b"synthetic ingress\n")
             ingress.chmod(0o600)
+        candidate_backend = candidate_repository / "services" / "backend"
+        candidate_scripts = candidate_backend / "scripts"
+        candidate_scripts.mkdir(mode=0o700)
+        shutil.copy2(
+            ROOT
+            / "services"
+            / "backend"
+            / "scripts"
+            / "reconcile_compose_deployment.py",
+            candidate_scripts / "reconcile_compose_deployment.py",
+        )
+        shutil.copytree(
+            ROOT / "services" / "backend" / "systemd",
+            candidate_backend / "systemd",
+        )
         source_document = {
             "configs": {
                 "tacua_loopback_ingress": {
@@ -703,6 +718,17 @@ class ReviewerUpgradeTransactionTests(unittest.TestCase):
             plan["sealed_state_directory"],
         )
         self.assertEqual(
+            plan["finalize"]["reconcile_bindings"]["reconciler"],
+            str(
+                self.root
+                / "candidate-repository"
+                / "services"
+                / "backend"
+                / "scripts"
+                / "reconcile_compose_deployment.py"
+            ),
+        )
+        self.assertEqual(
             plan["finalize"]["unit_directory"],
             str(self.root / "user-units"),
         )
@@ -734,6 +760,50 @@ class ReviewerUpgradeTransactionTests(unittest.TestCase):
             progress["details"]["operation_directory_binding"],
             UPGRADE._operation_directory_binding(inhibitor_path.parent),
         )
+
+    def test_prepare_renders_finalize_units_from_candidate_repository(self) -> None:
+        renderer = UPGRADE.upgrade_systemd.render_reconcile_unit_bundle
+        with mock.patch.object(
+            UPGRADE.upgrade_systemd,
+            "render_reconcile_unit_bundle",
+            wraps=renderer,
+        ) as render:
+            _state, _candidate, _transaction, _document, plan = self._prepare()
+
+        candidate_backend = (
+            self.root / "candidate-repository" / "services" / "backend"
+        )
+        render.assert_called_once()
+        self.assertEqual(
+            render.call_args.args[0],
+            candidate_backend / "systemd",
+        )
+        self.assertEqual(
+            plan["finalize"]["reconcile_bindings"]["reconciler"],
+            str(
+                candidate_backend
+                / "scripts"
+                / "reconcile_compose_deployment.py"
+            ),
+        )
+
+    def test_plan_rejects_finalize_reconciler_rebinding(self) -> None:
+        _state, _candidate, _transaction, plan_document, _plan = self._prepare()
+        rebound = deepcopy(plan_document)
+        rebound["plan"]["finalize"]["reconcile_bindings"]["reconciler"] = str(
+            self.root
+            / "source-repository"
+            / "services"
+            / "backend"
+            / "scripts"
+            / "reconcile_compose_deployment.py"
+        )
+
+        with self.assertRaisesRegex(
+            UPGRADE.UpgradeError,
+            "REVIEWER_UPGRADE_STATE_INVALID",
+        ):
+            UPGRADE._validate_plan(rebound)
 
     def test_plan_binds_backup_without_plan_digest_circularity(self) -> None:
         state, _candidate, _transaction, plan_document, plan = self._prepare()

@@ -23,6 +23,7 @@ import os
 from pathlib import Path
 import pwd
 import re
+import secrets
 import shutil
 import ssl
 import stat
@@ -67,7 +68,7 @@ CONTAINER_ID = re.compile(r"^[a-f0-9]{64}$")
 UNIT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]{0,119}\.service$")
 RESOURCE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$")
 STATE_STAGING = re.compile(
-    r"^\.(?:activation|desired-state)\.json\.next-[0-9]+$"
+    r"^\.(?:activation|desired-state)\.json\.next-[0-9]+(?:-[a-f0-9]{12})?$"
 )
 GENERATION_STAGING = re.compile(
     r"^\.[A-Za-z0-9][A-Za-z0-9._-]{0,95}\.next-[0-9]+-[a-f0-9]{12}$"
@@ -864,12 +865,49 @@ def _atomic_private_write(
 ) -> None:
     if mode not in {0o400, 0o600}:
         raise ReconcileError("RECONCILE_STATE_INVALID")
-    temporary = path.parent / f".{path.name}.next-{os.getpid()}"
+    directory = _safe_directory(path.parent)
+    temporary = f".{path.name}.next-{os.getpid()}-{secrets.token_hex(6)}"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
+    directory_descriptor: int | None = None
+    temporary_identity: tuple[int, int] | None = None
+    temporary_present = False
     try:
-        descriptor = os.open(temporary, flags, 0o600)
+        directory_before = directory.lstat()
+        directory_descriptor = os.open(
+            directory,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        directory_opened = os.fstat(directory_descriptor)
+        if (
+            not stat.S_ISDIR(directory_opened.st_mode)
+            or (directory_opened.st_dev, directory_opened.st_ino)
+            != (directory_before.st_dev, directory_before.st_ino)
+            or directory_opened.st_uid != os.geteuid()
+            or stat.S_IMODE(directory_opened.st_mode) != 0o700
+        ):
+            raise ReconcileError("RECONCILE_STATE_INVALID")
+        descriptor = os.open(
+            temporary,
+            flags,
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+        temporary_present = True
         try:
+            created = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(created.st_mode)
+                or created.st_uid != os.geteuid()
+                or created.st_nlink != 1
+                or stat.S_IMODE(created.st_mode) != 0o600
+                or created.st_size != 0
+            ):
+                raise ReconcileError("RECONCILE_STATE_INVALID")
+            temporary_identity = (created.st_dev, created.st_ino)
             offset = 0
             while offset < len(payload):
                 written = os.write(descriptor, payload[offset:])
@@ -882,19 +920,61 @@ def _atomic_private_write(
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
-        if not replace and (path.exists() or path.is_symlink()):
-            raise ReconcileError("RECONCILE_STATE_EXISTS")
-        os.replace(temporary, path)
-        _fsync_directory(path.parent)
+        if not replace:
+            try:
+                os.stat(
+                    path.name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                raise ReconcileError("RECONCILE_STATE_EXISTS")
+        os.replace(
+            temporary,
+            path.name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
+        temporary_present = False
+        os.fsync(directory_descriptor)
     except ReconcileError:
         raise
     except OSError as error:
         raise ReconcileError("RECONCILE_STATE_INVALID") from error
     finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        primary_error_active = sys.exc_info()[0] is not None
+        cleanup_error: OSError | None = None
+        if temporary_present and directory_descriptor is not None:
+            try:
+                current = os.stat(
+                    temporary,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    temporary_identity is None
+                    or not stat.S_ISREG(current.st_mode)
+                    or current.st_uid != os.geteuid()
+                    or current.st_nlink != 1
+                    or (current.st_dev, current.st_ino) != temporary_identity
+                ):
+                    raise OSError("atomic state staging identity changed")
+                os.unlink(temporary, dir_fd=directory_descriptor)
+                os.fsync(directory_descriptor)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                cleanup_error = error
+        if directory_descriptor is not None:
+            try:
+                os.close(directory_descriptor)
+            except OSError as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+        if cleanup_error is not None and not primary_error_active:
+            raise ReconcileError("RECONCILE_STATE_INVALID") from cleanup_error
 
 
 def _remove_generation_draft(path: Path) -> None:

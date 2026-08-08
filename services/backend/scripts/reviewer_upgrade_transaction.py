@@ -783,6 +783,7 @@ def _prepare_finalize_plan(
     sealed_state: Path,
     manifest: Mapping[str, Any],
     *,
+    candidate_repository_root: Path,
     unit_directory: Path,
     lock_file: Path,
     operation_directory: Path,
@@ -798,6 +799,13 @@ def _prepare_finalize_plan(
         operation_directory,
         "REVIEWER_UPGRADE_INPUT_INVALID",
     )
+    if not isinstance(candidate_repository_root, Path):
+        _fail("REVIEWER_UPGRADE_INPUT_INVALID")
+    candidate_repository = _canonical_path(
+        candidate_repository_root,
+        "REVIEWER_UPGRADE_INPUT_INVALID",
+    )
+    candidate_backend = candidate_repository / "services" / "backend"
     expected_lock = reconciler._lock_path(str(manifest.get("project")))
     if (
         not isinstance(lock_file, Path)
@@ -812,8 +820,13 @@ def _prepare_finalize_plan(
         runtime = manifest["runtime"]
         commands = manifest["commands"]
         python = Path(sys.executable).resolve(strict=True)
-        reconciler_path = (SCRIPT_DIRECTORY / "reconcile_compose_deployment.py").resolve(
-            strict=True
+        reconciler_path = _canonical_path(
+            candidate_backend / "scripts" / "reconcile_compose_deployment.py",
+            "REVIEWER_UPGRADE_INPUT_INVALID",
+        )
+        systemd_templates = _canonical_path(
+            candidate_backend / "systemd",
+            "REVIEWER_UPGRADE_INPUT_INVALID",
         )
         anchor = Path(runtime["xdg_runtime_directory"]) / "tacua-reconcile.anchor.json"
         systemctl = Path(commands["systemctl"])
@@ -832,7 +845,7 @@ def _prepare_finalize_plan(
         replacements = target_bindings.replacements()
         old_units = upgrade_systemd.snapshot_installed_units(units)
         target_units = upgrade_systemd.render_reconcile_unit_bundle(
-            SCRIPT_DIRECTORY.parent / "systemd",
+            systemd_templates,
             target_bindings,
         )
         descriptors = unit_artifacts.prepare_unit_bundle_artifacts(
@@ -867,13 +880,19 @@ def _prepare_finalize_plan(
         ],
         "unit_directory": str(units),
     }
-    _validate_finalize_plan(finalize_plan, str(sealed_state), manifest)
+    _validate_finalize_plan(
+        finalize_plan,
+        str(sealed_state),
+        str(candidate_repository),
+        manifest,
+    )
     return finalize_plan, descriptors
 
 
 def _validate_finalize_plan(
     value: Any,
     sealed_state_directory: str,
+    candidate_repository_root: str,
     manifest: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != FINALIZE_PLAN_KEYS:
@@ -902,8 +921,17 @@ def _validate_finalize_plan(
             "timer_enable_link": links[0],
         }.items()
     }
+    candidate_repository = _plan_path(candidate_repository_root)
+    expected_reconciler = (
+        candidate_repository
+        / "services"
+        / "backend"
+        / "scripts"
+        / "reconcile_compose_deployment.py"
+    )
     if (
         paths["state_directory"] != Path(sealed_state_directory)
+        or paths["reconciler"] != expected_reconciler
         or paths["systemctl"].name != "systemctl"
         or paths["systemd_analyze"].name != "systemd-analyze"
         or paths["python"] == paths["reconciler"]
@@ -1054,6 +1082,7 @@ def _finalize_bindings(
     finalize_plan = _validate_finalize_plan(
         plan["finalize"],
         plan["sealed_state_directory"],
+        plan["candidate_repository_root"],
         target_manifest,
     )
     sealed_gate = _validate_processing_gate(
@@ -1239,6 +1268,7 @@ def _validate_plan(plan_document: Mapping[str, Any]) -> dict[str, Any]:
     _validate_finalize_plan(
         plan["finalize"],
         plan["sealed_state_directory"],
+        plan["candidate_repository_root"],
     )
     try:
         unit_artifacts.validate_unit_artifact_descriptors(plan["unit_artifacts"])
@@ -1401,6 +1431,7 @@ def _load_processing_lock_epoch(
     finalize_plan = _validate_finalize_plan(
         plan["finalize"],
         plan["sealed_state_directory"],
+        plan["candidate_repository_root"],
     )
     lock_file = _plan_path(finalize_plan["reconcile_bindings"]["lock_file"])
     initial = deepcopy(finalize_plan["processing_lock_epoch"])
@@ -2520,6 +2551,7 @@ def _prepare_after_serial_preflight(
             transaction,
             sealed_state,
             manifest,
+            candidate_repository_root=candidate_repository,
             unit_directory=unit_directory,
             lock_file=lock_file,
             operation_directory=operation_directory,
@@ -4349,6 +4381,7 @@ def _resume_serialized(
     _validate_finalize_plan(
         plan["finalize"],
         plan["sealed_state_directory"],
+        plan["candidate_repository_root"],
         initial_manifest,
     )
     _bind_resume_abi(
