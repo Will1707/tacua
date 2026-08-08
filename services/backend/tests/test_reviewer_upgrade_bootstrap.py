@@ -164,6 +164,22 @@ class ReviewerUpgradeBootstrapTests(unittest.TestCase):
         values.update(overrides)
         return properties(**values)
 
+    def _path_reset_healthy(self, **overrides: str) -> bytes:
+        values = {
+            "FragmentPath": str(
+                self.unit_directory / BOOTSTRAP.PATH_UNIT
+            ),
+            "DropInPaths": "",
+            "LoadState": "loaded",
+            "NeedDaemonReload": "no",
+            "UnitFileState": "disabled",
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "Result": "success",
+        }
+        values.update(overrides)
+        return properties(**values)
+
     def _runner(
         self,
         *extra_responses,
@@ -319,6 +335,161 @@ class ReviewerUpgradeBootstrapTests(unittest.TestCase):
             )
 
         self.assertFalse(any("enable" in call[0] for call in runner.calls))
+
+    def test_path_reset_failure_accepts_only_strict_healthy_retry_states(
+        self,
+    ) -> None:
+        states = (
+            {},
+            {"UnitFileState": "enabled"},
+            {
+                "UnitFileState": "enabled",
+                "ActiveState": "active",
+                "SubState": "waiting",
+            },
+        )
+        for overrides in states:
+            with self.subTest(overrides=overrides):
+                runner = self._runner()
+                runner.responses[10] = MANAGER.ManagerError(
+                    "UPGRADE_MANAGER_COMMAND_FAILED"
+                )
+                runner.responses.insert(
+                    11,
+                    self._path_reset_healthy(**overrides),
+                )
+
+                receipt = BOOTSTRAP.bootstrap_prepublication(
+                    self.templates,
+                    self.bindings,
+                    None,
+                    self.commands,
+                    runner,
+                )
+
+                self.assertEqual(receipt["status"], "path_armed_idle")
+                self.assertEqual(runner.responses, [])
+
+    def test_path_reset_failure_rejects_nonhealthy_postcondition(self) -> None:
+        invalid = (
+            {"FragmentPath": "/wrong/path"},
+            {"DropInPaths": "/unexpected/drop-in.conf"},
+            {"LoadState": "not-found"},
+            {"NeedDaemonReload": "yes"},
+            {"Result": "exit-code"},
+            {
+                "UnitFileState": "disabled",
+                "ActiveState": "failed",
+                "SubState": "failed",
+                "Result": "exit-code",
+            },
+        )
+        for overrides in invalid:
+            with self.subTest(overrides=overrides):
+                runner = self._runner()
+                runner.responses[10] = MANAGER.ManagerError(
+                    "UPGRADE_MANAGER_COMMAND_FAILED"
+                )
+                runner.responses.insert(
+                    11,
+                    self._path_reset_healthy(**overrides),
+                )
+
+                with self.assertRaisesRegex(
+                    BOOTSTRAP.BootstrapError,
+                    "UPGRADE_BOOTSTRAP_PATH_ARM_FAILED",
+                ):
+                    BOOTSTRAP.bootstrap_prepublication(
+                        self.templates,
+                        self.bindings,
+                        None,
+                        self.commands,
+                        runner,
+                    )
+
+                self.assertFalse(
+                    any("enable" in call[0] for call in runner.calls)
+                )
+
+    def test_path_enable_failure_after_reset_fallback_remains_fatal(self) -> None:
+        runner = self._runner()
+        runner.responses[10] = MANAGER.ManagerError(
+            "UPGRADE_MANAGER_COMMAND_FAILED"
+        )
+        runner.responses.insert(11, self._path_reset_healthy())
+        runner.responses[12] = MANAGER.ManagerError(
+            "UPGRADE_MANAGER_COMMAND_FAILED"
+        )
+
+        with self.assertRaisesRegex(
+            BOOTSTRAP.BootstrapError,
+            "UPGRADE_BOOTSTRAP_PATH_ARM_FAILED",
+        ):
+            BOOTSTRAP.bootstrap_prepublication(
+                self.templates,
+                self.bindings,
+                None,
+                self.commands,
+                runner,
+            )
+
+        self.assertFalse(
+            any(
+                call[0][-1] == BOOTSTRAP.PATH_UNIT
+                and "restart" in call[0]
+                for call in runner.calls
+            )
+        )
+
+    def test_path_reset_failure_rejects_unprovable_postcondition(self) -> None:
+        runner = self._runner()
+        runner.responses[10] = MANAGER.ManagerError(
+            "UPGRADE_MANAGER_COMMAND_FAILED"
+        )
+        runner.responses.insert(
+            11,
+            MANAGER.ManagerError("UPGRADE_MANAGER_COMMAND_FAILED"),
+        )
+
+        with self.assertRaisesRegex(
+            BOOTSTRAP.BootstrapError,
+            "UPGRADE_BOOTSTRAP_PATH_ARM_FAILED",
+        ):
+            BOOTSTRAP.bootstrap_prepublication(
+                self.templates,
+                self.bindings,
+                None,
+                self.commands,
+                runner,
+            )
+
+        self.assertFalse(any("enable" in call[0] for call in runner.calls))
+
+    def test_path_enable_failure_remains_fatal(self) -> None:
+        runner = self._runner()
+        runner.responses[11] = MANAGER.ManagerError(
+            "UPGRADE_MANAGER_COMMAND_FAILED"
+        )
+
+        with self.assertRaisesRegex(
+            BOOTSTRAP.BootstrapError,
+            "UPGRADE_BOOTSTRAP_PATH_ARM_FAILED",
+        ):
+            BOOTSTRAP.bootstrap_prepublication(
+                self.templates,
+                self.bindings,
+                None,
+                self.commands,
+                runner,
+            )
+
+        self.assertFalse(
+            any(
+                call[0][-1] == BOOTSTRAP.PATH_UNIT
+                and "restart" in call[0]
+                for call in runner.calls
+            )
+        )
 
     def test_render_pins_exact_placeholder_abi_and_canonical_paths(self) -> None:
         first = BOOTSTRAP.render_stable_unit_bundle(

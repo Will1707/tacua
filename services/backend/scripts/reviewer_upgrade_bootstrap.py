@@ -1333,23 +1333,73 @@ def _bootstrap_prepublication_locked(
         _fail("UPGRADE_BOOTSTRAP_RESUMER_NOT_IDLE")
     _require_serial_lock(bindings, serial_descriptor, serial_binding)
     _require_active_absent(bindings.state_parent)
-    for argv in (
-        [
-            str(commands.systemctl),
-            "--user",
-            "reset-failed",
-            "--",
-            PATH_UNIT,
-        ],
-        [str(commands.systemctl), "--user", "enable", "--", PATH_UNIT],
-    ):
+    try:
         _run(
             commands,
             runner,
-            argv,
+            [
+                str(commands.systemctl),
+                "--user",
+                "reset-failed",
+                "--",
+                PATH_UNIT,
+            ],
             timeout=manager.CONTROL_TIMEOUT_SECONDS,
             code="UPGRADE_BOOTSTRAP_PATH_ARM_FAILED",
         )
+    except BootstrapError as error:
+        if error.code != "UPGRADE_BOOTSTRAP_PATH_ARM_FAILED":
+            raise
+        # As with the resumer above, some systemd versions report failure for
+        # reset-failed on an already healthy path unit.  Accept only a fresh,
+        # exact manager proof.  The three states cover a new bootstrap and the
+        # two idempotent retry windows around enable/restart.
+        healthy_path = _show(
+            commands,
+            runner,
+            PATH_UNIT,
+            (
+                "FragmentPath",
+                "DropInPaths",
+                "LoadState",
+                "NeedDaemonReload",
+                "UnitFileState",
+                "ActiveState",
+                "SubState",
+                "Result",
+            ),
+            code="UPGRADE_BOOTSTRAP_PATH_ARM_FAILED",
+        )
+        common = {
+            "FragmentPath": str(bindings.unit_directory / PATH_UNIT),
+            "DropInPaths": "",
+            "LoadState": "loaded",
+            "NeedDaemonReload": "no",
+            "Result": "success",
+        }
+        if (
+            {key: healthy_path[key] for key in common} != common
+            or (
+                healthy_path["UnitFileState"],
+                healthy_path["ActiveState"],
+                healthy_path["SubState"],
+            )
+            not in {
+                ("disabled", "inactive", "dead"),
+                ("enabled", "inactive", "dead"),
+                ("enabled", "active", "waiting"),
+            }
+        ):
+            _fail("UPGRADE_BOOTSTRAP_PATH_ARM_FAILED")
+    _require_serial_lock(bindings, serial_descriptor, serial_binding)
+    _require_active_absent(bindings.state_parent)
+    _run(
+        commands,
+        runner,
+        [str(commands.systemctl), "--user", "enable", "--", PATH_UNIT],
+        timeout=manager.CONTROL_TIMEOUT_SECONDS,
+        code="UPGRADE_BOOTSTRAP_PATH_ARM_FAILED",
+    )
     link = _timer_link(bindings)
     try:
         manager.prove_enable_links_durable(
