@@ -710,13 +710,16 @@ def _without_docker_mutation(
 
     def guarded(argv: Sequence[str], *, timeout: int = 30) -> bytes:
         command = tuple(argv)
-        if command[: len(docker_prefix)] == docker_prefix:
+        if command[:1] == docker_prefix[:1]:
+            if command[: len(docker_prefix)] != docker_prefix:
+                raise reconciler.ReconcileError("RECONCILE_STATE_CHANGED")
             tail = command[len(docker_prefix) :]
             read = (
                 tail[:1] in {("info",), ("ps",)}
                 or tail[:2]
                 in {
                     ("container", "inspect"),
+                    ("container", "ls"),
                     ("network", "inspect"),
                     ("network", "ls"),
                     ("volume", "inspect"),

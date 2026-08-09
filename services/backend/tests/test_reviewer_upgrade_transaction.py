@@ -3530,6 +3530,148 @@ class ReviewerUpgradeTransactionTests(unittest.TestCase):
         desired, _manifest, _compose = UPGRADE.reconciler._load_bound_state(state)
         self.assertEqual(desired["desired"], "maintenance")
 
+    def test_abandonment_guard_supports_the_real_healthy_set_running_trace(
+        self,
+    ) -> None:
+        state, _transaction, _document, _plan, _progress, gate = (
+            self._checkpoint_exhausted_backup()
+        )
+        desired, manifest, compose = UPGRADE.reconciler._load_bound_state(
+            state
+        )
+        self.assertEqual(desired["desired"], "maintenance")
+        docker = UPGRADE.reconciler._docker_prefix(manifest)
+        project_filter = (
+            "label=com.docker.compose.project=" + manifest["project"]
+        )
+        backend_volume = next(
+            mount["Name"]
+            for mount in manifest["containers"]["backend"]["mounts"]
+            if mount.get("Destination") == "/var/lib/tacua"
+        )
+        container_ids = {
+            item["id"] for item in manifest["containers"].values()
+        }
+        backend_id = manifest["containers"]["backend"]["id"]
+        daemon = manifest["daemon"]
+        daemon_document = {
+            "CgroupDriver": daemon["cgroup_driver"],
+            "CgroupVersion": daemon["cgroup_version"],
+            "DockerRootDir": daemon["docker_root_directory"],
+            "ID": daemon["id"],
+            "SecurityOptions": daemon["security_options"],
+        }
+        calls: list[tuple[list[str], int]] = []
+
+        def trace_runner(argv, *, timeout):
+            command = list(argv)
+            calls.append((command, timeout))
+            if command == [
+                manifest["commands"]["systemctl"],
+                "--user",
+                "is-active",
+                "--quiet",
+                "--",
+                manifest["commands"]["docker_service"],
+            ]:
+                return b""
+            if command == [*docker, "info", "--format", "{{json .}}"]:
+                return UPGRADE.reconciler._canonical(daemon_document)
+            if command[-2:] == ["--filter", project_filter]:
+                return ("\n".join(sorted(container_ids)) + "\n").encode(
+                    "ascii"
+                )
+            if command[-2:] == ["--filter", f"volume={backend_volume}"]:
+                return (backend_id + "\n").encode("ascii")
+            raise AssertionError((command, timeout))
+
+        guarded = ABANDON._without_docker_mutation(
+            trace_runner,
+            manifest,
+            compose,
+        )
+
+        def inspect_deployment(
+            selected_manifest,
+            selected_compose,
+            selected_runner,
+            *,
+            allow_missing_network_consumers=False,
+        ):
+            self.assertEqual(selected_manifest, manifest)
+            self.assertEqual(selected_compose, compose)
+            self.assertTrue(allow_missing_network_consumers)
+            self.assertEqual(
+                UPGRADE.reconciler._listed_container_ids(
+                    selected_runner,
+                    docker,
+                    project_filter,
+                    "RECONCILE_CONTAINER_DRIFT",
+                ),
+                container_ids,
+            )
+            self.assertEqual(
+                UPGRADE.reconciler._listed_container_ids(
+                    selected_runner,
+                    docker,
+                    f"volume={backend_volume}",
+                    "RECONCILE_CONTAINER_DRIFT",
+                ),
+                {backend_id},
+            )
+            return {
+                "containers": manifest["containers"],
+                "resources": manifest["resources"],
+            }, True
+
+        with (
+            mock.patch.object(
+                UPGRADE.reconciler,
+                "_adopt_host_lock",
+                return_value=79,
+            ),
+            mock.patch.object(
+                UPGRADE.reconciler,
+                "_inspect_deployment",
+                side_effect=inspect_deployment,
+            ),
+            mock.patch.object(
+                UPGRADE.reconciler,
+                "_tailnet_state",
+                side_effect=[({}, False), ({}, True)],
+            ),
+            mock.patch.object(UPGRADE.reconciler, "_enable_serve"),
+            mock.patch.object(UPGRADE.reconciler, "_smoke"),
+        ):
+            result = UPGRADE.reconciler.set_running(
+                state,
+                runner=guarded,
+                lock_descriptor=79,
+                upgrade_inhibitor=gate["inhibitor"],
+            )
+
+        self.assertEqual(
+            result,
+            {"code": "RECONCILE_RECOVERED", "status": "recovered"},
+        )
+        current, _manifest, _compose = UPGRADE.reconciler._load_bound_state(
+            state
+        )
+        self.assertEqual(current["desired"], "running")
+        self.assertIsNone(UPGRADE.reconciler._load_activation(state, current))
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(
+            [command[len(docker) :2 + len(docker)] for command, _ in calls[1:]],
+            [["info", "--format"], ["container", "ls"], ["container", "ls"]],
+        )
+        self.assertFalse(
+            any(
+                action in command
+                for command, _timeout in calls
+                for action in ("start", "stop", "rm", "up")
+            )
+        )
+
     def test_abandonment_running_transition_denies_docker_recovery_mutations(
         self,
     ) -> None:
@@ -3550,6 +3692,20 @@ class ReviewerUpgradeTransactionTests(unittest.TestCase):
             "backend",
         ]
         self.assertEqual(guarded(read_only, timeout=30), b"read-only\n")
+        container_read = [
+            *ABANDON.reconciler._docker_prefix(manifest),
+            "container",
+            "ls",
+            "--all",
+            "--no-trunc",
+            "--quiet",
+            "--filter",
+            f"label=com.docker.compose.project={manifest['project']}",
+        ]
+        self.assertEqual(
+            guarded(container_read, timeout=30),
+            b"read-only\n",
+        )
         with self.assertRaises(UPGRADE.reconciler.ReconcileError):
             guarded(
                 [
@@ -3580,7 +3736,24 @@ class ReviewerUpgradeTransactionTests(unittest.TestCase):
                 ],
                 timeout=30,
             )
-        self.assertEqual(calls, [(read_only, 30)])
+        with self.assertRaises(UPGRADE.reconciler.ReconcileError):
+            guarded(
+                [manifest["commands"]["docker"], "start", "deadbeef"],
+                timeout=30,
+            )
+        with self.assertRaises(UPGRADE.reconciler.ReconcileError):
+            guarded(
+                [
+                    manifest["commands"]["docker"],
+                    "--host",
+                    "unix:///run/user/1000/other.sock",
+                    "container",
+                    "rm",
+                    "deadbeef",
+                ],
+                timeout=30,
+            )
+        self.assertEqual(calls, [(read_only, 30), (container_read, 30)])
 
 
 if __name__ == "__main__":
