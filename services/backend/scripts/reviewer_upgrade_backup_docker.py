@@ -17,6 +17,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
+import time
 from typing import Any, NoReturn
 
 if __package__:
@@ -59,6 +60,8 @@ _ERROR = "REVIEWER_UPGRADE_BACKUP_DOCKER_INVALID"
 _ACTION_FAILED = "REVIEWER_UPGRADE_BACKUP_DOCKER_ACTION_FAILED"
 _AUX_LABEL_PREFIX = "io.tacua.reviewer-upgrade."
 _AUX_ROLES = ("archive", "normalize", "prepare", "verify")
+_POST_ACTION_INSPECTION_ATTEMPTS = 3
+_POST_ACTION_INSPECTION_INTERVAL_SECONDS = 0.05
 
 CommandRunner = Callable[..., bytes]
 SmokeRunner = Callable[[Path, Path, str], None]
@@ -71,6 +74,13 @@ class DockerBackupError(RuntimeError):
     def __init__(self, code: str = _ERROR) -> None:
         super().__init__(code)
         self.code = code
+
+
+class _BackendIndexMiss(DockerBackupError):
+    """Exact successful Docker index absence eligible for bounded retry."""
+
+    def __init__(self) -> None:
+        super().__init__(_ACTION_FAILED)
 
 
 def _fail(code: str = _ERROR) -> NoReturn:
@@ -525,6 +535,8 @@ class DockerBackupRunner:
         self.command_runner = command_runner
         self.smoke_runner = smoke_runner
         self.state_loader = state_loader
+        self._post_stop_inspection_pending = False
+        self._post_start_inspection_pending = False
         try:
             canonical_transaction = validate_transaction_directory(self.transaction)
         except JournalError as error:
@@ -718,21 +730,29 @@ class DockerBackupRunner:
             _fail()
         return attempt, number, digest
 
-    def _inspect_backend(self) -> dict[str, str]:
+    def _inspect_backend(
+        self,
+        *,
+        classify_index_miss: bool = False,
+    ) -> dict[str, str]:
+        if type(classify_index_miss) is not bool:
+            _fail()
         container_id = self.bindings.backend_container_id
-        self._line(
-            self._run(
-                [
-                    *self._compose_prefix(),
-                    "ps",
-                    "--no-trunc",
-                    "-aq",
-                    "backend",
-                ],
-                timeout=30,
-            ),
-            container_id,
+        compose_index = self._run(
+            [
+                *self._compose_prefix(),
+                "ps",
+                "--no-trunc",
+                "-aq",
+                "backend",
+            ],
+            timeout=30,
         )
+        if compose_index == b"":
+            if classify_index_miss:
+                raise _BackendIndexMiss()
+            _fail(_ACTION_FAILED)
+        self._line(compose_index, container_id)
         self._line(
             self._run(
                 [
@@ -747,22 +767,24 @@ class DockerBackupRunner:
             ),
             self.bindings.backend_image_id,
         )
-        self._line(
-            self._run(
-                [
-                    *self._docker(),
-                    "container",
-                    "ls",
-                    "--all",
-                    "--no-trunc",
-                    "--quiet",
-                    "--filter",
-                    f"volume={self.bindings.state_volume}",
-                ],
-                timeout=30,
-            ),
-            container_id,
+        volume_index = self._run(
+            [
+                *self._docker(),
+                "container",
+                "ls",
+                "--all",
+                "--no-trunc",
+                "--quiet",
+                "--filter",
+                f"volume={self.bindings.state_volume}",
+            ],
+            timeout=30,
         )
+        if volume_index == b"":
+            if classify_index_miss:
+                raise _BackendIndexMiss()
+            _fail(_ACTION_FAILED)
+        self._line(volume_index, container_id)
         document = _strict_json(
             self._run(
                 [*self._docker(), "container", "inspect", container_id],
@@ -805,6 +827,35 @@ class DockerBackupRunner:
             "status": status,
         }
 
+    def _inspect_backend_in_statuses(
+        self,
+        accepted_statuses: frozenset[str],
+    ) -> dict[str, str]:
+        if not accepted_statuses or not accepted_statuses.issubset(
+            {"created", "exited", "running"}
+        ):
+            _fail()
+        for attempt in range(_POST_ACTION_INSPECTION_ATTEMPTS):
+            try:
+                observed = self._inspect_backend(classify_index_miss=True)
+            except _BackendIndexMiss:
+                if attempt + 1 == _POST_ACTION_INSPECTION_ATTEMPTS:
+                    _fail(_ACTION_FAILED)
+                time.sleep(_POST_ACTION_INSPECTION_INTERVAL_SECONDS)
+                continue
+            if observed["status"] not in accepted_statuses:
+                _fail(_ACTION_FAILED)
+            return observed
+        _fail(_ACTION_FAILED)
+
+    def _inspect_stopped_backend(self) -> dict[str, str]:
+        return self._inspect_backend_in_statuses(frozenset({"exited"}))
+
+    def _inspect_started_backend(self) -> dict[str, str]:
+        return self._inspect_backend_in_statuses(
+            frozenset({"created", "running"})
+        )
+
     def _exact_container_action(self, action: str) -> dict[str, str]:
         self._reap_auxiliaries()
         container_id = self.bindings.backend_container_id
@@ -812,14 +863,14 @@ class DockerBackupRunner:
         argv = [*self._docker(), "container", command]
         timeout = 45 if command == "stop" else 30
         if command == "stop":
-            argv.extend(["--time", "30"])
+            argv.extend(["--timeout", "30"])
         argv.append(container_id)
         self._line(self._run(argv, timeout=timeout), container_id)
-        observed = self._inspect_backend()
-        if command == "stop" and observed["status"] != "exited":
-            _fail(_ACTION_FAILED)
-        if command == "start" and observed["status"] not in {"created", "running"}:
-            _fail(_ACTION_FAILED)
+        observed = (
+            self._inspect_stopped_backend()
+            if command == "stop"
+            else self._inspect_started_backend()
+        )
         return {
             "container_id": container_id,
             "status": "stopped" if command == "stop" else "started",
@@ -1062,7 +1113,14 @@ class DockerBackupRunner:
             else []
         )
         expected_user = "10001:10001" if role == "archive" else "0:0"
-        expected_capabilities = ["CHOWN", "FOWNER"] if role in {"normalize", "prepare"} else []
+        expected_capabilities = {
+            "normalize": [
+                "CAP_CHOWN",
+                "CAP_DAC_READ_SEARCH",
+                "CAP_FOWNER",
+            ],
+            "prepare": ["CAP_CHOWN", "CAP_FOWNER"],
+        }.get(role, [])
         projected_mounts: dict[str, dict[str, Any]] = {}
         for raw_mount in mounts:
             if type(raw_mount) is not dict or type(raw_mount.get("Destination")) is not str:
@@ -1195,7 +1253,7 @@ class DockerBackupRunner:
                             *self._docker(),
                             "container",
                             "stop",
-                            "--time",
+                            "--timeout",
                             "10",
                             container_id,
                         ],
@@ -1253,6 +1311,8 @@ class DockerBackupRunner:
             ),
             "--cap-add",
             "CHOWN",
+            "--cap-add",
+            "DAC_READ_SEARCH",
             "--cap-add",
             "FOWNER",
             "--mount",
@@ -1472,12 +1532,25 @@ class DockerBackupRunner:
             if request != self._backend_request():
                 _fail()
             self._validate_sealed_state()
+            if self._post_stop_inspection_pending:
+                self._post_stop_inspection_pending = False
+                return self._inspect_stopped_backend()
+            if self._post_start_inspection_pending:
+                self._post_start_inspection_pending = False
+                return self._inspect_started_backend()
             return self._inspect_backend()
         if action in {"stop_backend", "start_backend"}:
             if request != {"container_id": self.bindings.backend_container_id}:
                 _fail()
             self._validate_sealed_state()
-            return self._exact_container_action(action)
+            self._post_stop_inspection_pending = False
+            self._post_start_inspection_pending = False
+            result = self._exact_container_action(action)
+            if action == "stop_backend":
+                self._post_stop_inspection_pending = True
+            else:
+                self._post_start_inspection_pending = True
+            return result
         if action == "smoke_backend":
             expected = {
                 "config": self.bindings.config.to_json(),
