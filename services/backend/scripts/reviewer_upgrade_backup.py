@@ -44,6 +44,9 @@ BACKUP_BINDINGS_CONTRACT = "tacua.reviewer-upgrade-backup-bindings@1.0.0"
 BACKUP_LEDGER_CONTRACT = "tacua.reviewer-upgrade-backup-ledger@1.0.0"
 BACKUP_ATTEMPT_CONTRACT = "tacua.reviewer-upgrade-backup-attempt@1.0.0"
 BACKUP_RECEIPT_CONTRACT = "tacua.reviewer-upgrade-backup-receipt@1.0.0"
+EXHAUSTED_BACKUP_EVIDENCE_CONTRACT = (
+    "tacua.reviewer-upgrade-exhausted-backup-evidence@1.0.0"
+)
 
 BACKUP_LEDGER_FILE = "backup-ledger.json"
 BACKUP_LEDGER_STAGING_FILE = ".backup-ledger.json.next"
@@ -1992,6 +1995,141 @@ def run_backup_attempt(
         return validate_backup_receipt(receipt, sealed)
 
 
+def validate_exhausted_backup_evidence_document(value: Any) -> dict[str, Any]:
+    """Validate the bounded proof projection used by terminal receipts."""
+
+    document = _plain_dict(
+        value,
+        {
+            "attempts",
+            "bindings_digest",
+            "contract_version",
+            "ledger_digest",
+            "plan_digest",
+            "sequence",
+        },
+    )
+    attempts = document.get("attempts")
+    if (
+        document.get("contract_version")
+        != EXHAUSTED_BACKUP_EVIDENCE_CONTRACT
+        or type(attempts) is not list
+        or len(attempts) != MAX_BACKUP_ATTEMPTS
+        or document.get("sequence") != MAX_BACKUP_ATTEMPTS
+        or type(document.get("sequence")) is not int
+        or type(document["sequence"]) is bool
+        or any(
+            type(document.get(key)) is not str
+            or DIGEST.fullmatch(document[key]) is None
+            for key in ("bindings_digest", "ledger_digest", "plan_digest")
+        )
+    ):
+        _raise_invalid()
+    validated: list[dict[str, Any]] = []
+    for number, value in enumerate(attempts, start=1):
+        attempt = _plain_dict(
+            value,
+            {"attempt_digest", "number", "relative_path"},
+        )
+        if (
+            attempt.get("number") != number
+            or type(attempt.get("number")) is not int
+            or type(attempt["number"]) is bool
+            or attempt.get("relative_path")
+            != _attempt_path(number, quarantine=True)
+            or type(attempt.get("attempt_digest")) is not str
+            or DIGEST.fullmatch(attempt["attempt_digest"]) is None
+        ):
+            _raise_invalid()
+        validated.append(attempt)
+    result = dict(document)
+    result["attempts"] = validated
+    return result
+
+
+def validate_exhausted_backup_evidence(
+    transaction_directory: Path | os.PathLike[str] | str,
+    bindings: BackupBindings | Mapping[str, Any],
+) -> dict[str, Any]:
+    """Prove the one terminal, marker-only three-failure backup state.
+
+    This is deliberately read-only.  Unlike the normal backup resumer it does
+    not repair a ledger draft, recover a container, quarantine an attempt, or
+    append a ledger entry.  It accepts only three canonical ``failed`` ledger
+    entries whose exact quarantine directories each contain one immutable
+    attempt marker and no bundle, receipt, or publication draft.
+    """
+
+    sealed = validate_backup_bindings(bindings)
+    _verify_host_bindings(sealed)
+    with _open_transaction(transaction_directory) as (
+        transaction,
+        transaction_descriptor,
+        _binding,
+    ):
+        if (
+            _file_exists(transaction_descriptor, BACKUP_LEDGER_STAGING_FILE)
+            or not _file_exists(transaction_descriptor, BACKUP_LEDGER_FILE)
+        ):
+            _raise_invalid()
+        ledger = _load_ledger_file(
+            transaction_descriptor,
+            BACKUP_LEDGER_FILE,
+            sealed,
+        )
+        expected_entries = [
+            {
+                "number": number,
+                "relative_path": _attempt_path(number, quarantine=True),
+                "status": "failed",
+            }
+            for number in range(1, MAX_BACKUP_ATTEMPTS + 1)
+        ]
+        observed = _scan_attempt_namespace(
+            transaction,
+            transaction_descriptor,
+        )
+        if (
+            ledger["sequence"] != MAX_BACKUP_ATTEMPTS
+            or ledger["entries"] != expected_entries
+            or observed
+            != {
+                number: (_attempt_path(number, quarantine=True), True)
+                for number in range(1, MAX_BACKUP_ATTEMPTS + 1)
+            }
+        ):
+            _raise_invalid()
+        attempts: list[dict[str, Any]] = []
+        for number in range(1, MAX_BACKUP_ATTEMPTS + 1):
+            relative_path = _attempt_path(number, quarantine=True)
+            path = transaction / relative_path
+            if _attempt_entries(path, transaction) != {ATTEMPT_MARKER_FILE}:
+                _raise_invalid()
+            marker = _load_attempt_marker(
+                path,
+                transaction,
+                sealed,
+                number,
+            )
+            attempts.append(
+                {
+                    "attempt_digest": marker["attempt_digest"],
+                    "number": number,
+                    "relative_path": relative_path,
+                }
+            )
+        return validate_exhausted_backup_evidence_document(
+            {
+                "attempts": attempts,
+                "bindings_digest": ledger["bindings_digest"],
+                "contract_version": EXHAUSTED_BACKUP_EVIDENCE_CONTRACT,
+                "ledger_digest": ledger["ledger_digest"],
+                "plan_digest": ledger["plan_digest"],
+                "sequence": ledger["sequence"],
+            }
+        )
+
+
 __all__ = [
     "ATTEMPT_MARKER_FILE",
     "ATTEMPT_RECEIPT_FILE",
@@ -2002,9 +2140,12 @@ __all__ = [
     "BackupBindings",
     "BackupError",
     "BackupFileBinding",
+    "EXHAUSTED_BACKUP_EVIDENCE_CONTRACT",
     "MAX_BACKUP_ATTEMPTS",
     "MAX_HEALTH_ATTEMPTS",
     "run_backup_attempt",
     "validate_backup_bindings",
+    "validate_exhausted_backup_evidence",
+    "validate_exhausted_backup_evidence_document",
     "validate_backup_receipt",
 ]

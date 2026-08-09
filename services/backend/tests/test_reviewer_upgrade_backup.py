@@ -259,6 +259,7 @@ class ReviewerUpgradeBackupTests(unittest.TestCase):
             "image_ref": self.bindings.backend_image_ref,
             "state_volume": self.bindings.state_volume,
         })
+
         self.assertEqual(archive_request["host_tree_policy"], {
             "directory_mode": 0o700,
             "file_mode": 0o600,
@@ -296,6 +297,97 @@ class ReviewerUpgradeBackupTests(unittest.TestCase):
                 "smoke_backend",
             ],
         )
+
+    def test_exhausted_marker_only_failures_have_read_only_terminal_proof(
+        self,
+    ) -> None:
+        runner = FakeRunner(self.bindings)
+        runner.fail("archive_backup", BACKUP.MAX_BACKUP_ATTEMPTS)
+        for _number in range(BACKUP.MAX_BACKUP_ATTEMPTS):
+            with self.assertRaisesRegex(
+                BACKUP.BackupError,
+                "REVIEWER_UPGRADE_BACKUP_FAILED",
+            ):
+                self._run(runner)
+
+        before = {
+            path.relative_to(self.transaction): (
+                path.lstat().st_ino,
+                path.lstat().st_mtime_ns,
+                path.read_bytes() if path.is_file() else None,
+            )
+            for path in self.transaction.rglob("*")
+        }
+        evidence = BACKUP.validate_exhausted_backup_evidence(
+            self.transaction,
+            self.bindings,
+        )
+        after = {
+            path.relative_to(self.transaction): (
+                path.lstat().st_ino,
+                path.lstat().st_mtime_ns,
+                path.read_bytes() if path.is_file() else None,
+            )
+            for path in self.transaction.rglob("*")
+        }
+
+        self.assertEqual(before, after)
+        self.assertEqual(evidence["sequence"], 3)
+        self.assertEqual(
+            [attempt["number"] for attempt in evidence["attempts"]],
+            [1, 2, 3],
+        )
+        self.assertTrue(
+            all(
+                attempt["relative_path"]
+                == f"backup-quarantine-{attempt['number']:02d}"
+                for attempt in evidence["attempts"]
+            )
+        )
+
+    def test_exhausted_proof_rejects_every_non_marker_attempt_state(self) -> None:
+        runner = FakeRunner(self.bindings)
+        runner.fail("archive_backup", BACKUP.MAX_BACKUP_ATTEMPTS)
+        for _number in range(BACKUP.MAX_BACKUP_ATTEMPTS):
+            with self.assertRaises(BACKUP.BackupError):
+                self._run(runner)
+
+        cases = ("bundle", "ledger_staging", "marker_draft")
+        for case in cases:
+            with self.subTest(case=case):
+                if case == "bundle":
+                    extra = (
+                        self.transaction
+                        / "backup-quarantine-03"
+                        / BACKUP.BACKUP_BUNDLE_DIRECTORY
+                    )
+                    extra.mkdir(mode=0o700)
+                elif case == "ledger_staging":
+                    extra = self.transaction / BACKUP.BACKUP_LEDGER_STAGING_FILE
+                    extra.write_bytes(
+                        (self.transaction / BACKUP.BACKUP_LEDGER_FILE).read_bytes()
+                    )
+                    extra.chmod(0o600)
+                else:
+                    extra = (
+                        self.transaction
+                        / "backup-quarantine-03"
+                        / ".attempt.json.next-123-000000000000"
+                    )
+                    extra.write_bytes(b"untrusted\n")
+                    extra.chmod(0o600)
+                with self.assertRaisesRegex(
+                    BACKUP.BackupError,
+                    "REVIEWER_UPGRADE_BACKUP_INVALID",
+                ):
+                    BACKUP.validate_exhausted_backup_evidence(
+                        self.transaction,
+                        self.bindings,
+                    )
+                if extra.is_dir():
+                    extra.rmdir()
+                else:
+                    extra.unlink()
 
     def test_exact_hardlinked_receipt_publication_is_repaired_and_reverified(self) -> None:
         runner = FakeRunner(self.bindings)

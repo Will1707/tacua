@@ -505,8 +505,72 @@ success.
     "$systemctl_binary" --user restart \
     tacua-reviewer-upgrade-resume.service
   ```
-- There is no automated rollback command. The verified backup and old sealed
-  generation are recovery evidence, not authorization to improvise a restore.
+- The one supported pre-replacement abandonment is deliberately narrower than
+  rollback. It accepts only `backing_up` with all three backup attempts
+  durably recorded as `failed`, where every quarantine contains only its exact
+  immutable `attempt.json`. It additionally proves that the old unit bundle is
+  still installed, no seal or completion artifact exists, and the exact old
+  container/resource projection is healthy. A bundle, receipt draft, unknown
+  quarantine entry, replaced reviewer, promoted unit, changed source binding,
+  or any other phase fails closed before recovery mutation.
+
+  Quiesce the user resumer before invoking it. This needs no root authority:
+
+  ```sh
+  "$systemctl_binary" --user show \
+    tacua-reviewer-upgrade-resume.path \
+    tacua-reviewer-upgrade-resume.service \
+    --property=Id \
+    --property=LoadState \
+    --property=ActiveState \
+    --property=SubState \
+    --property=Result \
+    --property=ExecMainStatus \
+    --no-pager
+
+  "$systemctl_binary" --user stop tacua-reviewer-upgrade-resume.path
+  "$systemctl_binary" --user stop tacua-reviewer-upgrade-resume.service
+  ```
+
+  Require both units to be inactive before proceeding. If the service was
+  activating or deactivating, wait for the stop, then re-run the strict status,
+  source, gate, ledger, quarantine, and deployment proofs; do not assume the
+  interrupted state is still eligible.
+
+  Run the checked-in command with the exact operation identifier from the
+  active selector. Do not print the selector or plan:
+
+  ```sh
+  "$python_binary" -B \
+    "$candidate_repository/services/backend/scripts/reviewer_upgrade_abandon.py" \
+    --state-parent "$state_parent" \
+    --operation-id "$operation_id" \
+    --serial-lock-file "$serial_lock_file"
+  ```
+
+  Success is the bounded canonical result
+  `{"code":"REVIEWER_UPGRADE_ABANDONED","operation_id":"...","status":"abandoned"}`.
+  Under the existing serial and deployment locks, the command returns only the
+  exact old source generation to `running` while retaining the inhibitor,
+  proves public and loopback smoke, durably removes only that bound inhibitor
+  and its empty directory, publishes `abandonment-receipt.json`, hard-links the
+  exact active selector as `retired-active.json`, and then unlinks and fsyncs
+  only `active.json`. The running transition denies unexpected Docker service
+  or Compose-start recovery commands; Docker is inspected but its containers,
+  images, networks, and volumes are not changed by abandonment.
+
+  Every mutation boundary has one exact retry state: running with the gate
+  retained; an empty bound gate directory; gate absent before receipt;
+  receipt present before selector retirement; or the same selector inode under
+  both names before the active link is removed. A retry re-proves the old live
+  deployment and retained evidence. It never rewrites progress, ledger,
+  quarantine, plan, unit artifacts, or candidate Compose evidence. After
+  success, restart the path unit, require it to be waiting with no active
+  service invocation, prove normal reconciliation `running`, prove reviewer
+  upgrade status idle, and only then prepare a fresh upgrade.
+- There is no general automated rollback command. The verified backup and old
+  sealed generation are recovery evidence, not authorization to improvise a
+  restore.
   Never delete `active.json`, edit JSON, remove the inhibitor, run Compose
   removal commands, change Serve manually, or replace units while a
   transaction is active. A rollback requires a separately reviewed restore

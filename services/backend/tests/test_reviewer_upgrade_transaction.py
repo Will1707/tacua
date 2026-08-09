@@ -19,6 +19,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = ROOT / "services/backend/scripts/reviewer_upgrade_transaction.py"
+ABANDON_SCRIPT = ROOT / "services/backend/scripts/reviewer_upgrade_abandon.py"
 
 
 def _load_script():
@@ -34,6 +35,21 @@ def _load_script():
 
 
 UPGRADE = _load_script()
+
+
+def _load_abandon_script():
+    specification = importlib.util.spec_from_file_location(
+        "tacua_reviewer_upgrade_abandon_test",
+        ABANDON_SCRIPT,
+    )
+    if specification is None or specification.loader is None:
+        raise RuntimeError("reviewer upgrade abandon cannot be loaded")
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
+ABANDON = _load_abandon_script()
 
 
 OLD_IMAGE_ID = "sha256:" + "1" * 64
@@ -625,6 +641,120 @@ class ReviewerUpgradeTransactionTests(unittest.TestCase):
             desired,
             manifest,
             compose,
+        )
+
+    def _checkpoint_exhausted_backup(
+        self,
+    ) -> tuple[Path, Path, dict, dict, dict, dict]:
+        (
+            state,
+            transaction,
+            plan_document,
+            plan,
+            maintenance,
+            _desired,
+            _manifest,
+            _compose,
+        ) = self._checkpoint_maintenance()
+        gate = maintenance["details"]["processing_gate"]
+        progress = UPGRADE._checkpoint(
+            transaction,
+            plan_document,
+            UPGRADE.BACKING_UP,
+            {"processing_gate": gate},
+        )
+        bindings = UPGRADE._backup_bindings(plan_document, plan)
+        with UPGRADE.backup._open_transaction(transaction) as (
+            bound_transaction,
+            descriptor,
+            _binding,
+        ):
+            ledger = UPGRADE.backup._load_or_create_ledger(
+                descriptor,
+                bindings,
+            )
+            for number in range(1, UPGRADE.backup.MAX_BACKUP_ATTEMPTS + 1):
+                UPGRADE.backup._create_attempt(
+                    bound_transaction,
+                    descriptor,
+                    bindings,
+                    number,
+                )
+                UPGRADE.backup._quarantine_attempt(
+                    bound_transaction,
+                    descriptor,
+                    bindings,
+                    number,
+                )
+                ledger = UPGRADE.backup._append_ledger_entry(
+                    descriptor,
+                    bindings,
+                    ledger,
+                    number,
+                    "failed",
+                )
+        return state, transaction, plan_document, plan, progress, gate
+
+    def _set_running(self, state: Path) -> None:
+        desired_path = state / UPGRADE.reconciler.DESIRED_FILE
+        desired = json.loads(desired_path.read_text(encoding="ascii"))
+        desired["desired"] = "running"
+        desired["state_digest"] = UPGRADE.reconciler._document_digest(
+            desired,
+            "state_digest",
+        )
+        desired_path.write_bytes(UPGRADE.reconciler._canonical(desired))
+        desired_path.chmod(0o600)
+
+    def _abandon_patches(self, state: Path):
+        _desired, manifest, _compose = UPGRADE.reconciler._load_bound_state(state)
+        deployment = {
+            "containers": manifest["containers"],
+            "resources": manifest["resources"],
+        }
+
+        def set_running(
+            selected_state,
+            *,
+            runner,
+            lock_descriptor,
+            upgrade_inhibitor,
+        ):
+            self.assertEqual(selected_state, state)
+            self.assertEqual(lock_descriptor, 79)
+            self.assertIsNotNone(runner)
+            self.assertEqual(upgrade_inhibitor["project"], manifest["project"])
+            self._set_running(state)
+            return {"code": "RECONCILE_RECOVERED", "status": "recovered"}
+
+        def tailnet_state(_manifest, _compose, _runner):
+            desired, _current_manifest, _current_compose = (
+                UPGRADE.reconciler._load_bound_state(state)
+            )
+            return {}, desired["desired"] == "running"
+
+        return (
+            mock.patch.object(
+                ABANDON.upgrade,
+                "_deployment_lock",
+                return_value=nullcontext(79),
+            ),
+            mock.patch.object(
+                ABANDON,
+                "_prove_original_deployment",
+                return_value=deployment,
+            ),
+            mock.patch.object(
+                ABANDON.reconciler,
+                "set_running",
+                side_effect=set_running,
+            ),
+            mock.patch.object(
+                ABANDON.reconciler,
+                "_tailnet_state",
+                side_effect=tailnet_state,
+            ),
+            mock.patch.object(ABANDON.reconciler, "_smoke"),
         )
 
     def _checkpoint_active_sealing(
@@ -3187,6 +3317,270 @@ class ReviewerUpgradeTransactionTests(unittest.TestCase):
             ):
                 emitted.add(first.value)
         self.assertEqual(emitted - set(cases), set())
+
+    def test_exhausted_abandonment_retains_evidence_and_permits_fresh_selector(
+        self,
+    ) -> None:
+        state, transaction, _document, _plan, _progress, _gate = (
+            self._checkpoint_exhausted_backup()
+        )
+        preserved_paths = [
+            transaction / UPGRADE.journal.PLAN_FILE,
+            transaction / UPGRADE.journal.PROGRESS_FILE,
+            transaction / UPGRADE.backup.BACKUP_LEDGER_FILE,
+            *[
+                transaction
+                / f"backup-quarantine-{number:02d}"
+                / UPGRADE.backup.ATTEMPT_MARKER_FILE
+                for number in range(1, 4)
+            ],
+        ]
+        preserved = {path: path.read_bytes() for path in preserved_paths}
+        patches = self._abandon_patches(state)
+        with patches[0], patches[1], patches[2] as set_running, patches[3], patches[4]:
+            result = ABANDON.abandon_exhausted_backup(
+                self.root,
+                "reviewer-test-operation",
+                serial_lock_file=self.root / UPGRADE.SERIAL_LOCK_FILE,
+                runner=mock.Mock(),
+            )
+
+        self.assertEqual(result["status"], "abandoned")
+        self.assertEqual(set_running.call_count, 1)
+        self.assertFalse(
+            (self.root / UPGRADE.UPGRADES_DIRECTORY / UPGRADE.ACTIVE_FILE).exists()
+        )
+        retired = transaction / ABANDON.RETIRED_ACTIVE_FILE
+        self.assertTrue(retired.is_file())
+        self.assertEqual(retired.lstat().st_nlink, 1)
+        receipt = ABANDON._existing_receipt(transaction)
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt["status"], "abandoned")
+        self.assertEqual(
+            receipt["backup_evidence"]["sequence"],
+            UPGRADE.backup.MAX_BACKUP_ATTEMPTS,
+        )
+        for path, payload in preserved.items():
+            self.assertEqual(path.read_bytes(), payload)
+        desired, _manifest, _compose = UPGRADE.reconciler._load_bound_state(state)
+        self.assertEqual(desired["desired"], "running")
+        self.assertFalse(Path(_gate["operation_directory"]).exists())
+
+        upgrades = self.root / UPGRADE.UPGRADES_DIRECTORY
+        fresh = UPGRADE._publish_active(
+            upgrades,
+            "reviewer-fresh-operation",
+            "sha256:" + "f" * 64,
+        )
+        self.assertEqual(fresh["operation_id"], "reviewer-fresh-operation")
+        UPGRADE._clear_active(upgrades, fresh)
+
+    def test_abandonment_recovers_after_running_before_gate_removal(self) -> None:
+        state, transaction, _document, _plan, _progress, gate = (
+            self._checkpoint_exhausted_backup()
+        )
+        patches = self._abandon_patches(state)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], mock.patch.object(
+            ABANDON,
+            "_remove_gate",
+            side_effect=ABANDON.AbandonError(ABANDON._RECOVERY_FAILED),
+        ):
+            with self.assertRaises(ABANDON.AbandonError):
+                ABANDON.abandon_exhausted_backup(
+                    self.root,
+                    "reviewer-test-operation",
+                    serial_lock_file=self.root / UPGRADE.SERIAL_LOCK_FILE,
+                    runner=mock.Mock(),
+                )
+        desired, _manifest, _compose = UPGRADE.reconciler._load_bound_state(state)
+        self.assertEqual(desired["desired"], "running")
+        self.assertTrue(Path(gate["operation_directory"]).exists())
+        self.assertIsNone(ABANDON._existing_receipt(transaction))
+
+        patches = self._abandon_patches(state)
+        with patches[0], patches[1], patches[2] as set_running, patches[3], patches[4]:
+            result = ABANDON.abandon_exhausted_backup(
+                self.root,
+                "reviewer-test-operation",
+                serial_lock_file=self.root / UPGRADE.SERIAL_LOCK_FILE,
+                runner=mock.Mock(),
+            )
+        self.assertEqual(result["status"], "abandoned")
+        self.assertEqual(set_running.call_count, 1)
+
+    def test_abandonment_recovers_empty_gate_directory_and_missing_receipt(
+        self,
+    ) -> None:
+        state, transaction, _document, _plan, _progress, gate = (
+            self._checkpoint_exhausted_backup()
+        )
+        operation = Path(gate["operation_directory"])
+        real_rmdir = os.rmdir
+        failed = False
+
+        def interrupt_rmdir(path, *args, **kwargs):
+            nonlocal failed
+            if not failed and path == operation.name:
+                failed = True
+                raise OSError("synthetic interruption")
+            return real_rmdir(path, *args, **kwargs)
+
+        patches = self._abandon_patches(state)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], mock.patch.object(
+            ABANDON.os,
+            "rmdir",
+            side_effect=interrupt_rmdir,
+        ):
+            with self.assertRaises(ABANDON.AbandonError):
+                ABANDON.abandon_exhausted_backup(
+                    self.root,
+                    "reviewer-test-operation",
+                    serial_lock_file=self.root / UPGRADE.SERIAL_LOCK_FILE,
+                    runner=mock.Mock(),
+                )
+        self.assertTrue(operation.is_dir())
+        self.assertEqual(list(operation.iterdir()), [])
+        self.assertEqual(
+            ABANDON._gate_state(ABANDON._processing_gate_binding(gate)),
+            "empty",
+        )
+
+        patches = self._abandon_patches(state)
+        with patches[0], patches[1], patches[2] as set_running, patches[3], patches[4]:
+            result = ABANDON.abandon_exhausted_backup(
+                self.root,
+                "reviewer-test-operation",
+                serial_lock_file=self.root / UPGRADE.SERIAL_LOCK_FILE,
+                runner=mock.Mock(),
+            )
+        self.assertEqual(result["status"], "abandoned")
+        self.assertEqual(set_running.call_count, 0)
+        self.assertIsNotNone(ABANDON._existing_receipt(transaction))
+
+    def test_abandonment_recovers_receipt_and_selector_hardlink_windows(self) -> None:
+        state, transaction, _document, _plan, _progress, _gate = (
+            self._checkpoint_exhausted_backup()
+        )
+        patches = self._abandon_patches(state)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], mock.patch.object(
+            ABANDON,
+            "_retire_active",
+            side_effect=ABANDON.AbandonError(ABANDON._STATE_CHANGED),
+        ):
+            with self.assertRaises(ABANDON.AbandonError):
+                ABANDON.abandon_exhausted_backup(
+                    self.root,
+                    "reviewer-test-operation",
+                    serial_lock_file=self.root / UPGRADE.SERIAL_LOCK_FILE,
+                    runner=mock.Mock(),
+                )
+        receipt = ABANDON._existing_receipt(transaction)
+        self.assertIsNotNone(receipt)
+        upgrades = self.root / UPGRADE.UPGRADES_DIRECTORY
+        active = upgrades / UPGRADE.ACTIVE_FILE
+        retired = transaction / ABANDON.RETIRED_ACTIVE_FILE
+        os.link(active, retired, follow_symlinks=False)
+        UPGRADE.reconciler._fsync_directory(transaction)
+        self.assertEqual(active.lstat().st_nlink, 2)
+
+        patches = self._abandon_patches(state)
+        active_validator = mock.patch.object(
+            ABANDON.upgrade,
+            "_load_active_locked",
+            side_effect=AssertionError("nlink=2 active validator invoked"),
+        )
+        with (
+            patches[0],
+            patches[1],
+            patches[2] as set_running,
+            patches[3],
+            patches[4],
+            active_validator,
+        ):
+            result = ABANDON.abandon_exhausted_backup(
+                self.root,
+                "reviewer-test-operation",
+                serial_lock_file=self.root / UPGRADE.SERIAL_LOCK_FILE,
+                runner=mock.Mock(),
+            )
+        self.assertEqual(result["status"], "abandoned")
+        self.assertEqual(set_running.call_count, 0)
+        self.assertFalse(active.exists())
+        self.assertEqual(retired.lstat().st_nlink, 1)
+        self.assertEqual(ABANDON._existing_receipt(transaction), receipt)
+
+    def test_abandonment_rejects_bundle_or_later_artifact_before_mutation(self) -> None:
+        state, transaction, _document, _plan, _progress, _gate = (
+            self._checkpoint_exhausted_backup()
+        )
+        (transaction / UPGRADE.SEALED_STATE_DIRECTORY).mkdir(mode=0o700)
+        patches = self._abandon_patches(state)
+        with patches[0], patches[1], patches[2] as set_running, patches[3], patches[4]:
+            with self.assertRaisesRegex(
+                ABANDON.AbandonError,
+                "REVIEWER_UPGRADE_ABANDON_NOT_EXHAUSTED",
+            ):
+                ABANDON.abandon_exhausted_backup(
+                    self.root,
+                    "reviewer-test-operation",
+                    serial_lock_file=self.root / UPGRADE.SERIAL_LOCK_FILE,
+                    runner=mock.Mock(),
+                )
+        self.assertEqual(set_running.call_count, 0)
+        desired, _manifest, _compose = UPGRADE.reconciler._load_bound_state(state)
+        self.assertEqual(desired["desired"], "maintenance")
+
+    def test_abandonment_running_transition_denies_docker_recovery_mutations(
+        self,
+    ) -> None:
+        state, _candidate = self._fixture()
+        _desired, manifest, compose = UPGRADE.reconciler._load_bound_state(state)
+        calls = []
+
+        def runner(argv, *, timeout):
+            calls.append((list(argv), timeout))
+            return b"read-only\n"
+
+        guarded = ABANDON._without_docker_mutation(runner, manifest, compose)
+        read_only = [
+            *ABANDON.reconciler._compose_prefix(manifest, compose),
+            "ps",
+            "--no-trunc",
+            "-aq",
+            "backend",
+        ]
+        self.assertEqual(guarded(read_only, timeout=30), b"read-only\n")
+        with self.assertRaises(UPGRADE.reconciler.ReconcileError):
+            guarded(
+                [
+                    *ABANDON.reconciler._compose_prefix(manifest, compose),
+                    "start",
+                    *UPGRADE.reconciler.SERVICES,
+                ],
+                timeout=60,
+            )
+        with self.assertRaises(UPGRADE.reconciler.ReconcileError):
+            guarded(
+                [
+                    manifest["commands"]["systemctl"],
+                    "--user",
+                    "start",
+                    "--",
+                    manifest["commands"]["docker_service"],
+                ],
+                timeout=30,
+            )
+        with self.assertRaises(UPGRADE.reconciler.ReconcileError):
+            guarded(
+                [
+                    *ABANDON.reconciler._docker_prefix(manifest),
+                    "image",
+                    "rm",
+                    "unexpected-image",
+                ],
+                timeout=30,
+            )
+        self.assertEqual(calls, [(read_only, 30)])
 
 
 if __name__ == "__main__":
