@@ -3318,6 +3318,121 @@ class ReviewerUpgradeTransactionTests(unittest.TestCase):
                 emitted.add(first.value)
         self.assertEqual(emitted - set(cases), set())
 
+    def test_abandonment_accepts_only_the_single_legacy_reconciler_path(
+        self,
+    ) -> None:
+        _state, _candidate, _transaction, plan_document, plan = self._prepare(
+            drive_gate=False
+        )
+        self.assertEqual(
+            ABANDON._validate_abandon_plan(plan_document),
+            plan,
+        )
+        legacy_plan = deepcopy(plan)
+        legacy_reconciler = (
+            self.root
+            / "retained-legacy-closure"
+            / "services"
+            / "backend"
+            / "scripts"
+            / "reconcile_compose_deployment.py"
+        )
+        legacy_plan["finalize"]["reconcile_bindings"]["reconciler"] = str(
+            legacy_reconciler
+        )
+        legacy_document = UPGRADE.journal._plan_document(legacy_plan)
+        with self.assertRaisesRegex(
+            UPGRADE.UpgradeError,
+            "REVIEWER_UPGRADE_STATE_INVALID",
+        ):
+            UPGRADE._validate_plan(legacy_document)
+
+        validated = ABANDON._validate_abandon_plan(legacy_document)
+
+        self.assertEqual(validated, legacy_document["plan"])
+        self.assertEqual(
+            validated["finalize"]["reconcile_bindings"]["reconciler"],
+            str(legacy_reconciler),
+        )
+
+        invalid_suffix = deepcopy(legacy_plan)
+        invalid_suffix["finalize"]["reconcile_bindings"]["reconciler"] = str(
+            self.root / "retained-legacy-closure" / "reconciler.py"
+        )
+        second_difference = deepcopy(legacy_plan)
+        second_difference["finalize"]["timer_enable_link_paths"] = [
+            str(self.root / "unexpected.timer")
+        ]
+        source_bound = deepcopy(legacy_plan)
+        source_bound["finalize"]["reconcile_bindings"]["reconciler"] = str(
+            Path(source_bound["source_repository_root"])
+            / "services"
+            / "backend"
+            / "scripts"
+            / "reconcile_compose_deployment.py"
+        )
+        for name, selected in {
+            "invalid_suffix": invalid_suffix,
+            "second_difference": second_difference,
+            "source_bound": source_bound,
+        }.items():
+            with self.subTest(name=name), self.assertRaisesRegex(
+                ABANDON.AbandonError,
+                "REVIEWER_UPGRADE_ABANDON_INVALID",
+            ):
+                ABANDON._validate_abandon_plan(
+                    UPGRADE.journal._plan_document(selected)
+                )
+
+        stale_digest = deepcopy(legacy_document)
+        stale_digest["plan"]["project"] = "stale-project"
+        with self.assertRaisesRegex(
+            ABANDON.AbandonError,
+            "REVIEWER_UPGRADE_ABANDON_INVALID",
+        ):
+            ABANDON._validate_abandon_plan(stale_digest)
+
+    def test_abandonment_never_delegates_a_plan_bound_reconciler(self) -> None:
+        _state, _candidate, _transaction, _document, plan = self._prepare(
+            drive_gate=False
+        )
+        legacy = (
+            self.root
+            / "legacy"
+            / "services"
+            / "backend"
+            / "scripts"
+            / "reconcile_compose_deployment.py"
+        )
+        plan = deepcopy(plan)
+        plan["finalize"]["reconcile_bindings"]["reconciler"] = str(legacy)
+        candidate = (
+            Path(plan["candidate_repository_root"])
+            / "services"
+            / "backend"
+            / "scripts"
+            / "reconcile_compose_deployment.py"
+        )
+        source = (
+            Path(plan["source_repository_root"])
+            / "services"
+            / "backend"
+            / "scripts"
+            / "reconcile_compose_deployment.py"
+        )
+        delegate = mock.Mock(return_value=b"ok")
+        guarded = ABANDON._deny_plan_reconciler_execution(delegate, plan)
+
+        for path in (legacy, candidate, source):
+            with self.subTest(path=path), self.assertRaisesRegex(
+                UPGRADE.reconciler.ReconcileError,
+                "RECONCILE_STATE_CHANGED",
+            ):
+                guarded(["/usr/bin/python3", "-B", str(path)], timeout=30)
+        delegate.assert_not_called()
+        self.assertEqual(guarded(["/usr/bin/true"], timeout=10), b"ok")
+        delegate.assert_called_once_with(["/usr/bin/true"], timeout=10)
+
     def test_exhausted_abandonment_retains_evidence_and_permits_fresh_selector(
         self,
     ) -> None:
@@ -3337,7 +3452,18 @@ class ReviewerUpgradeTransactionTests(unittest.TestCase):
         ]
         preserved = {path: path.read_bytes() for path in preserved_paths}
         patches = self._abandon_patches(state)
-        with patches[0], patches[1], patches[2] as set_running, patches[3], patches[4]:
+        with (
+            patches[0],
+            patches[1],
+            patches[2] as set_running,
+            patches[3],
+            patches[4],
+            mock.patch.object(
+                ABANDON.upgrade,
+                "_load_transaction",
+                side_effect=AssertionError("global transaction loader invoked"),
+            ),
+        ):
             result = ABANDON.abandon_exhausted_backup(
                 self.root,
                 "reviewer-test-operation",

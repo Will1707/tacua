@@ -83,6 +83,110 @@ def _expected_active(operation_id: str, plan_digest: str) -> dict[str, str]:
         raise AbandonError(_INVALID) from error
 
 
+def _validate_abandon_plan(
+    plan_document: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate a current plan or one exact pre-replacement path legacy."""
+
+    try:
+        original_document = journal._validate_plan(plan_document)
+        return upgrade._validate_plan(original_document)
+    except journal.JournalError as error:
+        raise AbandonError(_INVALID) from error
+    except upgrade.UpgradeError as strict_error:
+        if strict_error.code != "REVIEWER_UPGRADE_STATE_INVALID":
+            raise AbandonError(_INVALID) from strict_error
+    try:
+        plan = original_document["plan"]
+        finalize_plan = plan["finalize"]
+        bindings = finalize_plan["reconcile_bindings"]
+        original = upgrade._plan_path(bindings["reconciler"])
+        candidate = upgrade._plan_path(plan["candidate_repository_root"])
+        source = upgrade._plan_path(plan["source_repository_root"])
+        expected = (
+            candidate
+            / "services"
+            / "backend"
+            / "scripts"
+            / "reconcile_compose_deployment.py"
+        )
+        source_expected = (
+            source
+            / "services"
+            / "backend"
+            / "scripts"
+            / "reconcile_compose_deployment.py"
+        )
+        if (
+            original in {expected, source_expected}
+            or original.parts[-4:]
+            != (
+                "services",
+                "backend",
+                "scripts",
+                "reconcile_compose_deployment.py",
+            )
+        ):
+            _fail(_INVALID)
+        projected_plan = deepcopy(plan)
+        projected_plan["finalize"]["reconcile_bindings"]["reconciler"] = str(
+            expected
+        )
+        projection = journal._plan_document(projected_plan)
+        normalized = upgrade._validate_plan(projection)
+    except AbandonError:
+        raise
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        journal.JournalError,
+        upgrade.UpgradeError,
+    ) as error:
+        raise AbandonError(_INVALID) from error
+    normalized["finalize"]["reconcile_bindings"]["reconciler"] = str(
+        original
+    )
+    if normalized != plan:
+        _fail(_INVALID)
+    return deepcopy(plan)
+
+
+def _load_abandon_transaction(
+    upgrades: Path,
+    active: Mapping[str, str],
+) -> tuple[Path, dict[str, Any], dict[str, Any], dict[str, Any]]:
+    transaction = upgrade._transaction_directory(
+        upgrades,
+        active["operation_id"],
+    )
+    try:
+        plan_document = journal.load_plan(transaction)
+        progress = journal.load_progress(transaction, plan_document)
+        plan = _validate_abandon_plan(plan_document)
+        if (
+            plan_document["plan_digest"] != active["plan_digest"]
+            or plan["operation_id"] != active["operation_id"]
+            or Path(plan["source_state_directory"]).parent != upgrades.parent
+            or Path(plan["sealed_state_directory"])
+            != transaction / upgrade.SEALED_STATE_DIRECTORY
+            or progress is None
+            or progress.get("phase") not in upgrade.SUPPORTED_PHASES
+        ):
+            _fail(_INVALID)
+        upgrade._validate_progress(
+            progress,
+            transaction,
+            plan,
+            plan_document["plan_digest"],
+        )
+    except AbandonError:
+        raise
+    except (journal.JournalError, upgrade.UpgradeError) as error:
+        raise AbandonError(_INVALID) from error
+    return transaction, plan_document, plan, progress
+
+
 def _load_operation(
     state_parent: Path,
     operation_id: str,
@@ -102,7 +206,7 @@ def _load_operation(
             _fail(_INVALID)
         transaction = upgrade._transaction_directory(upgrades, operation_id)
         plan_document = journal.load_plan(transaction)
-        plan = upgrade._validate_plan(plan_document)
+        plan = _validate_abandon_plan(plan_document)
         progress = journal.load_progress(transaction, plan_document)
         if progress is None:
             _fail(_INVALID)
@@ -110,7 +214,7 @@ def _load_operation(
             operation_id,
             plan_document["plan_digest"],
         )
-        loaded = upgrade._load_transaction(upgrades, expected_active)
+        loaded = _load_abandon_transaction(upgrades, expected_active)
     except AbandonError:
         raise
     except (journal.JournalError, upgrade.UpgradeError) as error:
@@ -746,6 +850,42 @@ def _without_docker_mutation(
     return guarded
 
 
+def _deny_plan_reconciler_execution(
+    runner: Runner,
+    plan: Mapping[str, Any],
+) -> Runner:
+    """Deny every reconciler path sealed into current or legacy plan data."""
+
+    try:
+        legacy = upgrade._plan_path(
+            plan["finalize"]["reconcile_bindings"]["reconciler"]
+        )
+        candidate = (
+            upgrade._plan_path(plan["candidate_repository_root"])
+            / "services"
+            / "backend"
+            / "scripts"
+            / "reconcile_compose_deployment.py"
+        )
+        source = (
+            upgrade._plan_path(plan["source_repository_root"])
+            / "services"
+            / "backend"
+            / "scripts"
+            / "reconcile_compose_deployment.py"
+        )
+    except (KeyError, TypeError, ValueError, upgrade.UpgradeError) as error:
+        raise AbandonError(_INVALID) from error
+    denied = frozenset(str(path) for path in (legacy, candidate, source))
+
+    def guarded(argv: Sequence[str], *, timeout: int = 30) -> bytes:
+        if any(type(item) is str and item in denied for item in argv):
+            raise reconciler.ReconcileError("RECONCILE_STATE_CHANGED")
+        return runner(argv, timeout=timeout)
+
+    return guarded
+
+
 def _restore_original_running(
     plan_document: Mapping[str, Any],
     plan: Mapping[str, Any],
@@ -1021,6 +1161,10 @@ def abandon_exhausted_backup(
                     selected_runner = reconciler._runner_for_manifest(manifest)
                 except reconciler.ReconcileError as error:
                     raise AbandonError(_RECOVERY_FAILED) from error
+            selected_runner = _deny_plan_reconciler_execution(
+                selected_runner,
+                plan,
+            )
             source = _restore_original_running(
                 plan_document,
                 plan,
