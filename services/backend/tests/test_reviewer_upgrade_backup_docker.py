@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from copy import deepcopy
 import hashlib
 import json
@@ -166,8 +167,14 @@ class FakeDocker:
             "HostConfig": {
                 "AutoRemove": True,
                 "CapAdd": (
-                    ["CHOWN", "FOWNER"]
-                    if role in {"normalize", "prepare"}
+                    [
+                        "CAP_CHOWN",
+                        "CAP_DAC_READ_SEARCH",
+                        "CAP_FOWNER",
+                    ]
+                    if role == "normalize"
+                    else ["CAP_CHOWN", "CAP_FOWNER"]
+                    if role == "prepare"
                     else None
                 ),
                 "CapDrop": ["ALL"],
@@ -250,7 +257,20 @@ class FakeDocker:
             if identifier == self.bindings.backend_container_id:
                 state = self.backend_document[0]["State"]
                 state.clear()
-                state.update({"Running": False, "Status": "exited"})
+                state.update({
+                    "Health": {"Status": "unhealthy"},
+                    "Running": False,
+                    "Status": "exited",
+                })
+                for network in self.backend_document[0][
+                    "NetworkSettings"
+                ]["Networks"].values():
+                    network.update({
+                        "EndpointID": "",
+                        "Gateway": "",
+                        "IPAddress": "",
+                        "MacAddress": "",
+                    })
             else:
                 if self.auxiliaries[identifier][0]["HostConfig"]["AutoRemove"]:
                     self.auxiliaries.pop(identifier)
@@ -392,7 +412,18 @@ class ReviewerUpgradeDockerBackupTests(unittest.TestCase):
                 "Type": "volume",
             }],
             "Name": "/tacua-backend-1",
-            "NetworkSettings": {"Networks": {}},
+            "NetworkSettings": {
+                "Networks": {
+                    "tacua_private": {
+                        "Aliases": ["backend", "tacua-backend-1"],
+                        "EndpointID": "e" * 64,
+                        "Gateway": "172.28.0.1",
+                        "IPAddress": "172.28.0.2",
+                        "MacAddress": "02:42:ac:1c:00:02",
+                        "NetworkID": "d" * 64,
+                    },
+                },
+            },
             "State": {
                 "Health": {"Status": "healthy"},
                 "Running": True,
@@ -528,6 +559,161 @@ class ReviewerUpgradeDockerBackupTests(unittest.TestCase):
             sleeper=lambda _seconds: None,
         )
 
+    def _post_stop_index_runner(
+        self,
+        gate: str,
+        failures: int,
+    ) -> tuple[Callable[..., bytes], dict[str, int]]:
+        self.assertIn(gate, {"compose", "volume"})
+        stats = {"failed": 0, "remaining": failures}
+
+        def command_runner(
+            raw_argv: list[str],
+            *,
+            timeout: int,
+        ) -> bytes:
+            argv = list(raw_argv)
+            stopped = (
+                self.fake.backend_document[0]["State"]["Status"] == "exited"
+            )
+            selected = (
+                gate == "compose" and "compose" in argv and "ps" in argv
+            ) or (
+                gate == "volume"
+                and "container" in argv
+                and "ls" in argv
+                and f"volume={self.state_volume}" in argv
+            )
+            if stopped and selected and stats["remaining"]:
+                stats["failed"] += 1
+                stats["remaining"] -= 1
+                return b""
+            return self.fake(argv, timeout=timeout)
+
+        return command_runner, stats
+
+    def _assert_backup_retries_second_post_stop_observation(
+        self,
+        gate: str,
+    ) -> None:
+        command_runner, stats = self._post_stop_index_runner(gate, 1)
+        armed = False
+
+        def gated_command_runner(
+            raw_argv: list[str],
+            *,
+            timeout: int,
+        ) -> bytes:
+            if not armed:
+                return self.fake(raw_argv, timeout=timeout)
+            return command_runner(raw_argv, timeout=timeout)
+
+        self.adapter.command_runner = gated_command_runner
+
+        def runner(action: str, request: dict) -> dict:
+            nonlocal armed
+            result = self.adapter(action, request)
+            if action == "stop_backend":
+                armed = True
+            return result
+
+        with mock.patch.object(DOCKER_BACKUP.time, "sleep") as sleeper:
+            receipt = BACKUP.run_backup_attempt(
+                self.transaction,
+                self.bindings,
+                runner,
+                health_attempts=2,
+                health_interval_seconds=0,
+                sleeper=lambda _seconds: None,
+            )
+
+        self.assertEqual(receipt["status"], "backup_ready")
+        self.assertEqual(stats, {"failed": 1, "remaining": 0})
+        sleeper.assert_called_once_with(
+            DOCKER_BACKUP._POST_ACTION_INSPECTION_INTERVAL_SECONDS,
+        )
+
+    def _post_start_index_runner(
+        self,
+        gate: str,
+        failures: int,
+        *,
+        arm_on_start_command: bool,
+    ) -> tuple[Callable[..., bytes], dict[str, int | bool]]:
+        self.assertIn(gate, {"compose", "volume"})
+        stats: dict[str, int | bool] = {
+            "armed": False,
+            "failed": 0,
+            "remaining": failures,
+        }
+
+        def command_runner(
+            raw_argv: list[str],
+            *,
+            timeout: int,
+        ) -> bytes:
+            argv = list(raw_argv)
+            selected = (
+                gate == "compose" and "compose" in argv and "ps" in argv
+            ) or (
+                gate == "volume"
+                and "container" in argv
+                and "ls" in argv
+                and f"volume={self.state_volume}" in argv
+            )
+            if stats["armed"] and selected and stats["remaining"]:
+                stats["armed"] = False
+                stats["failed"] = int(stats["failed"]) + 1
+                stats["remaining"] = int(stats["remaining"]) - 1
+                return b""
+            payload = self.fake(argv, timeout=timeout)
+            if (
+                arm_on_start_command
+                and "container" in argv
+                and "start" in argv
+                and argv[-1] == self.container_id
+            ):
+                stats["armed"] = True
+            return payload
+
+        return command_runner, stats
+
+    def _assert_backup_retries_second_post_start_observation(
+        self,
+        gate: str,
+    ) -> None:
+        command_runner, stats = self._post_start_index_runner(
+            gate,
+            1,
+            arm_on_start_command=False,
+        )
+        self.adapter.command_runner = command_runner
+
+        def runner(action: str, request: dict) -> dict:
+            result = self.adapter(action, request)
+            if action == "start_backend":
+                stats["armed"] = True
+            return result
+
+        with mock.patch.object(DOCKER_BACKUP.time, "sleep") as sleeper:
+            receipt = BACKUP.run_backup_attempt(
+                self.transaction,
+                self.bindings,
+                runner,
+                health_attempts=2,
+                health_interval_seconds=0,
+                sleeper=lambda _seconds: None,
+            )
+
+        self.assertEqual(receipt["status"], "backup_ready")
+        self.assertEqual(
+            stats,
+            {"armed": False, "failed": 1, "remaining": 0},
+        )
+        sleeper.assert_called_once_with(
+            DOCKER_BACKUP._POST_ACTION_INSPECTION_INTERVAL_SECONDS,
+        )
+
     def test_full_sealed_manifest_runs_all_actions_without_live_docker(self) -> None:
         receipt = self._run_backup()
 
@@ -555,6 +741,342 @@ class ReviewerUpgradeDockerBackupTests(unittest.TestCase):
             receipt["bundle"]["sha256"],
         )
         self.assertEqual((bundle / "state/database.sqlite3").stat().st_size, 0)
+
+    def test_post_stop_attestation_retries_transient_index_drift(self) -> None:
+        for gate in ("compose", "volume"):
+            with self.subTest(gate=gate):
+                self.fake.backend_document = deepcopy(self.backend_document)
+                self.fake.calls.clear()
+                self.adapter.command_runner, stats = (
+                    self._post_stop_index_runner(gate, 1)
+                )
+                with mock.patch.object(
+                    DOCKER_BACKUP.time,
+                    "sleep",
+                ) as sleeper:
+                    result = self.adapter(
+                        "stop_backend",
+                        {"container_id": self.container_id},
+                    )
+
+                self.assertEqual(result["status"], "stopped")
+                backend_stop = next(
+                    argv
+                    for argv, _timeout in self.fake.calls
+                    if argv[-5:]
+                    == [
+                        "container",
+                        "stop",
+                        "--timeout",
+                        "30",
+                        self.container_id,
+                    ]
+                )
+                self.assertNotIn("--time", backend_stop)
+                self.assertEqual(stats, {"failed": 1, "remaining": 0})
+                sleeper.assert_called_once_with(
+                    DOCKER_BACKUP._POST_ACTION_INSPECTION_INTERVAL_SECONDS,
+                )
+
+    def test_backup_retries_second_post_stop_compose_observation(self) -> None:
+        self._assert_backup_retries_second_post_stop_observation("compose")
+
+    def test_backup_retries_second_post_stop_volume_observation(self) -> None:
+        self._assert_backup_retries_second_post_stop_observation("volume")
+
+    def test_post_start_attestation_retries_transient_index_drift(self) -> None:
+        for gate in ("compose", "volume"):
+            with self.subTest(gate=gate):
+                self.fake.backend_document = deepcopy(self.backend_document)
+                self.fake.backend_document[0]["State"] = {
+                    "Health": {"Status": "unhealthy"},
+                    "Running": False,
+                    "Status": "exited",
+                }
+                self.adapter.command_runner, stats = self._post_start_index_runner(
+                    gate,
+                    1,
+                    arm_on_start_command=True,
+                )
+                with mock.patch.object(
+                    DOCKER_BACKUP.time,
+                    "sleep",
+                ) as sleeper:
+                    result = self.adapter(
+                        "start_backend",
+                        {"container_id": self.container_id},
+                    )
+
+                self.assertEqual(result["status"], "started")
+                self.assertEqual(
+                    stats,
+                    {"armed": False, "failed": 1, "remaining": 0},
+                )
+                sleeper.assert_called_once_with(
+                    DOCKER_BACKUP._POST_ACTION_INSPECTION_INTERVAL_SECONDS,
+                )
+
+    def test_backup_retries_second_post_start_compose_observation(self) -> None:
+        self._assert_backup_retries_second_post_start_observation("compose")
+
+    def test_backup_retries_second_post_start_volume_observation(self) -> None:
+        self._assert_backup_retries_second_post_start_observation("volume")
+
+    def test_persistent_post_stop_index_failure_recovers_without_bundle(
+        self,
+    ) -> None:
+        attempts = DOCKER_BACKUP._POST_ACTION_INSPECTION_ATTEMPTS
+        self.adapter.command_runner, stats = self._post_stop_index_runner(
+            "compose",
+            attempts,
+        )
+        with mock.patch.object(DOCKER_BACKUP.time, "sleep") as sleeper:
+            with self.assertRaisesRegex(
+                BACKUP.BackupError,
+                "^REVIEWER_UPGRADE_BACKUP_FAILED$",
+            ):
+                self._run_backup()
+
+        quarantine = self.transaction / "backup-quarantine-01"
+        self.assertEqual(stats, {"failed": attempts, "remaining": 0})
+        self.assertEqual(sleeper.call_count, attempts - 1)
+        self.assertTrue(quarantine.is_dir())
+        self.assertFalse((quarantine / "bundle").exists())
+        self.assertFalse(
+            any("run" in argv for argv, _timeout in self.fake.calls)
+        )
+        self.assertEqual(
+            self.fake.backend_document[0]["State"],
+            {
+                "Health": {"Status": "healthy"},
+                "Running": True,
+                "Status": "running",
+            },
+        )
+
+    def test_post_stop_attestation_does_not_retry_invalid_state(self) -> None:
+        with (
+            mock.patch.object(
+                self.adapter,
+                "_inspect_backend",
+                side_effect=DOCKER_BACKUP.DockerBackupError(
+                    DOCKER_BACKUP._ERROR,
+                ),
+            ) as inspect_backend,
+            mock.patch.object(DOCKER_BACKUP.time, "sleep") as sleeper,
+        ):
+            with self.assertRaisesRegex(
+                DOCKER_BACKUP.DockerBackupError,
+                "^REVIEWER_UPGRADE_BACKUP_DOCKER_INVALID$",
+            ):
+                self.adapter._inspect_stopped_backend()
+
+        inspect_backend.assert_called_once_with(classify_index_miss=True)
+        sleeper.assert_not_called()
+
+    def test_post_action_attestation_does_not_retry_invariant_violations(
+        self,
+    ) -> None:
+        wrong_projection = deepcopy(self.backend_document)
+        wrong_projection[0]["Config"]["Image"] = "tacua-backend:drift"
+        wrong_status = deepcopy(self.backend_document)
+        wrong_status[0]["State"] = {
+            "Health": {"Status": "unhealthy"},
+            "Running": False,
+            "Status": "exited",
+        }
+        wrong_health = deepcopy(self.backend_document)
+        wrong_health[0]["State"]["Health"] = {"Status": "corrupt"}
+
+        def compose(argv: list[str]) -> bool:
+            return "compose" in argv and "ps" in argv
+
+        def image(argv: list[str]) -> bool:
+            return argv[-5:-2] == ["image", "inspect", "--format"]
+
+        def volume(argv: list[str]) -> bool:
+            return (
+                "container" in argv
+                and "ls" in argv
+                and f"volume={self.state_volume}" in argv
+            )
+
+        def inspect(argv: list[str]) -> bool:
+            return argv[-3:-1] == ["container", "inspect"]
+
+        cases: list[
+            tuple[str, Callable[[list[str]], bool], bytes | BaseException]
+        ] = [
+            (
+                "command_failure",
+                compose,
+                RECONCILER.ReconcileError("RECONCILE_COMMAND_FAILED"),
+            ),
+            ("newline_only", compose, b"\n"),
+            ("wrong_compose_id", compose, b"9" * 64 + b"\n"),
+            ("wrong_image_id", image, b"9" * 64 + b"\n"),
+            ("wrong_volume_id", volume, b"9" * 64 + b"\n"),
+            ("malformed_inspect", inspect, b"{"),
+            (
+                "projection_drift",
+                inspect,
+                json.dumps(wrong_projection).encode("ascii"),
+            ),
+            (
+                "unexpected_status",
+                inspect,
+                json.dumps(wrong_status).encode("ascii"),
+            ),
+            (
+                "invalid_health",
+                inspect,
+                json.dumps(wrong_health).encode("ascii"),
+            ),
+        ]
+        for name, selected, replacement in cases:
+            with self.subTest(name=name):
+                hits = 0
+
+                def command_runner(
+                    raw_argv: list[str],
+                    *,
+                    timeout: int,
+                ) -> bytes:
+                    nonlocal hits
+                    argv = list(raw_argv)
+                    if selected(argv) and hits == 0:
+                        hits += 1
+                        if isinstance(replacement, BaseException):
+                            raise replacement
+                        return replacement
+                    return self.fake(argv, timeout=timeout)
+
+                self.adapter.command_runner = command_runner
+                with mock.patch.object(
+                    DOCKER_BACKUP.time,
+                    "sleep",
+                ) as sleeper:
+                    with self.assertRaisesRegex(
+                        DOCKER_BACKUP.DockerBackupError,
+                        "^REVIEWER_UPGRADE_BACKUP_DOCKER_ACTION_FAILED$",
+                    ):
+                        self.adapter._inspect_backend_in_statuses(
+                            frozenset({"running"})
+                        )
+
+                self.assertEqual(hits, 1)
+                sleeper.assert_not_called()
+
+    def test_transient_index_miss_then_invariant_violation_stops_immediately(
+        self,
+    ) -> None:
+        observations = 0
+
+        def command_runner(
+            raw_argv: list[str],
+            *,
+            timeout: int,
+        ) -> bytes:
+            nonlocal observations
+            argv = list(raw_argv)
+            if "compose" in argv and "ps" in argv:
+                observations += 1
+                if observations == 1:
+                    return b""
+                if observations == 2:
+                    return b"9" * 64 + b"\n"
+            return self.fake(argv, timeout=timeout)
+
+        self.adapter.command_runner = command_runner
+        with mock.patch.object(DOCKER_BACKUP.time, "sleep") as sleeper:
+            with self.assertRaisesRegex(
+                DOCKER_BACKUP.DockerBackupError,
+                "^REVIEWER_UPGRADE_BACKUP_DOCKER_ACTION_FAILED$",
+            ):
+                self.adapter._inspect_started_backend()
+
+        self.assertEqual(observations, 2)
+        sleeper.assert_called_once_with(
+            DOCKER_BACKUP._POST_ACTION_INSPECTION_INTERVAL_SECONDS,
+        )
+
+    def test_persistent_public_post_action_index_failure_is_bounded_and_consumed(
+        self,
+    ) -> None:
+        attempts = DOCKER_BACKUP._POST_ACTION_INSPECTION_ATTEMPTS
+        for action in ("stop_backend", "start_backend"):
+            with self.subTest(action=action):
+                self.fake.backend_document = deepcopy(self.backend_document)
+                if action == "start_backend":
+                    self.fake.backend_document[0]["State"] = {
+                        "Health": {"Status": "unhealthy"},
+                        "Running": False,
+                        "Status": "exited",
+                    }
+                self.fake.calls.clear()
+                self.adapter.command_runner = self.fake
+                self.adapter._post_stop_inspection_pending = False
+                self.adapter._post_start_inspection_pending = False
+                self.adapter(
+                    action,
+                    {"container_id": self.container_id},
+                )
+
+                observations = 0
+
+                def persistent_index_miss(
+                    raw_argv: list[str],
+                    *,
+                    timeout: int,
+                ) -> bytes:
+                    nonlocal observations
+                    argv = list(raw_argv)
+                    if "compose" in argv and "ps" in argv:
+                        observations += 1
+                        return b""
+                    return self.fake(argv, timeout=timeout)
+
+                self.adapter.command_runner = persistent_index_miss
+                with mock.patch.object(
+                    DOCKER_BACKUP.time,
+                    "sleep",
+                ) as sleeper:
+                    with self.assertRaisesRegex(
+                        DOCKER_BACKUP.DockerBackupError,
+                        "^REVIEWER_UPGRADE_BACKUP_DOCKER_ACTION_FAILED$",
+                    ):
+                        self.adapter(
+                            "inspect_backend",
+                            self.adapter._backend_request(),
+                        )
+
+                self.assertEqual(observations, attempts)
+                self.assertEqual(sleeper.call_count, attempts - 1)
+                self.assertFalse(self.adapter._post_stop_inspection_pending)
+                self.assertFalse(self.adapter._post_start_inspection_pending)
+                mutations = [
+                    argv
+                    for argv, _timeout in self.fake.calls
+                    if "container" in argv
+                    and any(item in argv for item in ("stop", "start"))
+                    and argv[-1] == self.container_id
+                ]
+                self.assertEqual(len(mutations), 1)
+
+                with mock.patch.object(
+                    DOCKER_BACKUP.time,
+                    "sleep",
+                ) as ordinary_sleeper:
+                    with self.assertRaisesRegex(
+                        DOCKER_BACKUP.DockerBackupError,
+                        "^REVIEWER_UPGRADE_BACKUP_DOCKER_ACTION_FAILED$",
+                    ):
+                        self.adapter(
+                            "inspect_backend",
+                            self.adapter._backend_request(),
+                        )
+                self.assertEqual(observations, attempts + 1)
+                ordinary_sleeper.assert_not_called()
 
     def test_running_desired_state_is_rejected_before_any_command(self) -> None:
         desired_path = self.source / RECONCILER.DESIRED_FILE
@@ -714,7 +1236,113 @@ class ReviewerUpgradeDockerBackupTests(unittest.TestCase):
             and any(action in argv for action in ("stop", "rm", "start"))
         ]
         self.assertIn(identifier, mutations[0])
+        self.assertIn("--timeout", mutations[0])
+        self.assertNotIn("--time", mutations[0])
         self.assertEqual(mutations[1][-1], self.container_id)
+
+    def test_normalize_uses_only_the_minimal_traversal_capability(self) -> None:
+        receipt = self._run_backup()
+        self.assertEqual(receipt["status"], "backup_ready")
+        auxiliary_runs = [
+            argv for argv, _timeout in self.fake.calls if "run" in argv
+        ]
+        by_role = {
+            role: next(
+                argv
+                for argv in auxiliary_runs
+                if argv[argv.index("--name") + 1].endswith("-" + role)
+            )
+            for role in ("normalize", "prepare")
+        }
+
+        def capabilities(argv: list[str]) -> list[str]:
+            return [
+                argv[index + 1]
+                for index, value in enumerate(argv)
+                if value == "--cap-add"
+            ]
+
+        self.assertEqual(
+            capabilities(by_role["normalize"]),
+            ["CHOWN", "DAC_READ_SEARCH", "FOWNER"],
+        )
+        self.assertEqual(
+            capabilities(by_role["prepare"]),
+            ["CHOWN", "FOWNER"],
+        )
+        self.assertNotIn("DAC_OVERRIDE", by_role["normalize"])
+
+    def test_exact_canonical_normalize_orphan_is_reaped(self) -> None:
+        attempt = self.transaction / "backup-attempt-01"
+        attempt.mkdir(mode=0o700)
+        (attempt / "bundle").mkdir(mode=0o700)
+        self.fake.backend_document[0]["State"] = {
+            "Running": False,
+            "Status": "exited",
+        }
+        identifier = self.fake.add_orphan(
+            self.adapter,
+            number=1,
+            role="normalize",
+        )
+        self.fake.calls.clear()
+
+        result = self.adapter(
+            "start_backend",
+            {"container_id": self.container_id},
+        )
+
+        self.assertEqual(result["status"], "started")
+        self.assertNotIn(identifier, self.fake.auxiliaries)
+
+    def test_noncanonical_normalize_capabilities_fail_closed(self) -> None:
+        invalid_capabilities = {
+            "missing": ["CAP_CHOWN", "CAP_FOWNER"],
+            "substituted": [
+                "CAP_CHOWN",
+                "CAP_DAC_OVERRIDE",
+                "CAP_FOWNER",
+            ],
+            "extra": [
+                "CAP_CHOWN",
+                "CAP_DAC_READ_SEARCH",
+                "CAP_FOWNER",
+                "CAP_SYS_ADMIN",
+            ],
+        }
+        for name, capabilities in invalid_capabilities.items():
+            with self.subTest(name=name):
+                self.fake.auxiliaries.clear()
+                attempt = self.transaction / "backup-attempt-01"
+                attempt.mkdir(mode=0o700, exist_ok=True)
+                (attempt / "bundle").mkdir(mode=0o700, exist_ok=True)
+                identifier = self.fake.add_orphan(
+                    self.adapter,
+                    number=1,
+                    role="normalize",
+                )
+                self.fake.auxiliaries[identifier][0]["HostConfig"][
+                    "CapAdd"
+                ] = capabilities
+                self.fake.calls.clear()
+
+                with self.assertRaisesRegex(
+                    DOCKER_BACKUP.DockerBackupError,
+                    "^REVIEWER_UPGRADE_BACKUP_DOCKER_ACTION_FAILED$",
+                ):
+                    self.adapter(
+                        "start_backend",
+                        {"container_id": self.container_id},
+                    )
+
+                self.assertIn(identifier, self.fake.auxiliaries)
+                self.assertFalse(
+                    any(
+                        "container" in argv
+                        and any(item in argv for item in ("stop", "rm", "start"))
+                        for argv, _timeout in self.fake.calls
+                    )
+                )
 
     def test_unknown_matching_orphan_fails_closed_without_removal(self) -> None:
         attempt = self.transaction / "backup-attempt-01"
