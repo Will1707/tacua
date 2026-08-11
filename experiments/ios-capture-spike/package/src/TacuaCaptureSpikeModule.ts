@@ -244,9 +244,12 @@ type CaptureErrorEvent = {
 type BackendTransportConfiguration = {
   readonly backendOrigin: string;
   readonly transportConfigurationDigest: string;
-  readonly transportPolicyVersion: "tacua.sdk-transport@1.0.0";
+  readonly transportPolicyVersion: "tacua.sdk-transport@1.1.0";
+  readonly maxSegmentBytes: number;
+  readonly maxDiagnosticBytes: number;
+  readonly maxCompletionBytes: number;
   readonly protocolVersion: "tacua.sdk-backend@1.0.0";
-  readonly sdkProfileContractVersion: "tacua.sdk-profile@1.0.0";
+  readonly sdkProfileContractVersion: "tacua.sdk-profile@1.1.0";
   readonly sdkProfileDigest: string;
   readonly queueSchemaVersion: 4;
   readonly credentialStorage: "ios_keychain_when_unlocked_this_device_only";

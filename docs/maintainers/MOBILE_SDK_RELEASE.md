@@ -32,7 +32,7 @@ and final GitHub Release shell step receive it explicitly.
 
    ```sh
    node .github/scripts/package-mobile-sdk.mjs \
-     --tag mobile-sdk-v0.1.0 \
+     --tag mobile-sdk-v0.2.0 \
      --dry-run
    ```
 
@@ -46,9 +46,9 @@ and final GitHub Release shell step receive it explicitly.
 4. Create and locally verify a signed, annotated tag, then push only that tag:
 
    ```sh
-   git tag -s mobile-sdk-v0.1.0 -m "Tacua mobile SDK 0.1.0"
-   git tag -v mobile-sdk-v0.1.0
-   git push origin mobile-sdk-v0.1.0
+   git tag -s mobile-sdk-v0.2.0 -m "Tacua mobile SDK 0.2.0"
+   git tag -v mobile-sdk-v0.2.0
+   git push origin mobile-sdk-v0.2.0
    ```
 
    If signed Git tags are not configured, stop and configure a signing key.
@@ -72,7 +72,7 @@ Download both assets from the GitHub Release and verify them in the same
 directory:
 
 ```sh
-shasum -a 256 -c tacua-mobile-sdk-0.1.0.tgz.sha256
+shasum -a 256 -c tacua-mobile-sdk-0.2.0.tgz.sha256
 ```
 
 An Expo QA app can then use the public, versioned release URL directly:
@@ -80,7 +80,7 @@ An Expo QA app can then use the public, versioned release URL directly:
 ```json
 {
   "dependencies": {
-    "@tacua/mobile-sdk": "https://github.com/Will1707/tacua/releases/download/mobile-sdk-v0.1.0/tacua-mobile-sdk-0.1.0.tgz"
+    "@tacua/mobile-sdk": "https://github.com/Will1707/tacua/releases/download/mobile-sdk-v0.2.0/tacua-mobile-sdk-0.2.0.tgz"
   }
 }
 ```

@@ -8,9 +8,12 @@ const path = require("node:path");
 const { TextDecoder } = require("node:util");
 
 const MAX_SDK_PROFILE_BYTES = 64 * 1024;
-const PROFILE_CONTRACT = "tacua.sdk-profile@1.0.0";
+const PROFILE_CONTRACT = "tacua.sdk-profile@1.1.0";
 const PROTOCOL_VERSION = "tacua.sdk-backend@1.0.0";
-const TRANSPORT_POLICY_VERSION = "tacua.sdk-transport@1.0.0";
+const TRANSPORT_POLICY_VERSION = "tacua.sdk-transport@1.1.0";
+const MAX_SEGMENT_BYTES_RANGE = Object.freeze([1, 1_073_741_824]);
+const MAX_DIAGNOSTIC_BYTES_RANGE = Object.freeze([1_024, 3_145_728]);
+const MAX_COMPLETION_BYTES_RANGE = Object.freeze([1_024, 4_194_304]);
 const SCOPE_POLICY_CONTRACT = "tacua.capture-scope-policy@1.0.0";
 const RETENTION_POLICY_VERSION = "tacua.retention-v1";
 const ID_PATTERN = /^[a-z][a-z0-9_-]{2,63}$/u;
@@ -142,6 +145,13 @@ function requireValue(condition, field) {
   if (!condition) throw new Error(`${field} is invalid.`);
 }
 
+function requireBoundedInteger(value, range, field) {
+  requireValue(
+    Number.isSafeInteger(value) && value >= range[0] && value <= range[1],
+    field,
+  );
+}
+
 function isCanonicalTimestamp(value) {
   if (typeof value !== "string" || !TIMESTAMP_PATTERN.test(value)) return false;
   const milliseconds = Date.parse(value);
@@ -227,9 +237,15 @@ function validateSdkProfile(profile, serialized) {
   requireValue(digest(subject) === profile.profile_digest, "sdkProfile.profile_digest");
   validateBuildIdentity(profile.build_identity);
   validateScopePolicy(profile.capture_scope_policy, profile);
-  requireExactKeys(profile.transport_configuration, ["backend_origin", "transport_policy_version"], "sdkProfile.transport_configuration");
+  requireExactKeys(profile.transport_configuration, [
+    "backend_origin", "max_completion_bytes", "max_diagnostic_bytes", "max_segment_bytes",
+    "transport_policy_version",
+  ], "sdkProfile.transport_configuration");
   requireValue(profile.transport_configuration.transport_policy_version === TRANSPORT_POLICY_VERSION, "sdkProfile.transport_configuration.transport_policy_version");
   requireValue(profile.transport_configuration.backend_origin === profile.backend_origin, "sdkProfile.transport_configuration.backend_origin pin");
+  requireBoundedInteger(profile.transport_configuration.max_segment_bytes, MAX_SEGMENT_BYTES_RANGE, "sdkProfile.transport_configuration.max_segment_bytes");
+  requireBoundedInteger(profile.transport_configuration.max_diagnostic_bytes, MAX_DIAGNOSTIC_BYTES_RANGE, "sdkProfile.transport_configuration.max_diagnostic_bytes");
+  requireBoundedInteger(profile.transport_configuration.max_completion_bytes, MAX_COMPLETION_BYTES_RANGE, "sdkProfile.transport_configuration.max_completion_bytes");
   const profileAllowsLoopback = profile.backend_origin.startsWith("http://");
   requireValue(
     normalizeBackendOrigin(profile.backend_origin, profileAllowsLoopback) === profile.backend_origin,
@@ -361,6 +377,21 @@ function applyInfoPlist(rawInfoPlist, options) {
   setExact(infoPlist, "TacuaCaptureDistribution", options.distribution);
   setExact(infoPlist, "TacuaSDKProfileJSON", options.sdkProfileCanonicalJSON);
   setExact(infoPlist, "TacuaSDKProfileDigest", options.sdkProfile.profile_digest);
+  setExact(
+    infoPlist,
+    "TacuaMaxSegmentBytes",
+    options.sdkProfile.transport_configuration.max_segment_bytes,
+  );
+  setExact(
+    infoPlist,
+    "TacuaMaxDiagnosticBytes",
+    options.sdkProfile.transport_configuration.max_diagnostic_bytes,
+  );
+  setExact(
+    infoPlist,
+    "TacuaMaxCompletionBytes",
+    options.sdkProfile.transport_configuration.max_completion_bytes,
+  );
   setExact(infoPlist, "NSMicrophoneUsageDescription", options.microphonePermission);
 
   const urlTypes = infoPlist.CFBundleURLTypes ?? [];

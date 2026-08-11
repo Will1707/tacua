@@ -13,6 +13,7 @@ enum TacuaCaptureUploadError: Error, Equatable {
   case admissionMissing
   case admissionConflict
   case payloadUnavailable
+  case transportLimitExceeded
   case transportOutcomeUnknown
   case receiptCommitPending
   case cleanupPending
@@ -31,6 +32,7 @@ enum TacuaCaptureUploadError: Error, Equatable {
     case .admissionMissing: return "ERR_TACUA_UPLOAD_ADMISSION_MISSING"
     case .admissionConflict: return "ERR_TACUA_UPLOAD_ADMISSION_CONFLICT"
     case .payloadUnavailable: return "ERR_TACUA_UPLOAD_PAYLOAD"
+    case .transportLimitExceeded: return "ERR_TACUA_UPLOAD_LIMIT"
     case .transportOutcomeUnknown: return "ERR_TACUA_UPLOAD_OUTCOME_UNKNOWN"
     case .receiptCommitPending: return "ERR_TACUA_UPLOAD_RECEIPT_COMMIT"
     case .cleanupPending: return "ERR_TACUA_UPLOAD_CLEANUP"
@@ -51,6 +53,8 @@ enum TacuaCaptureUploadError: Error, Equatable {
     case .admissionMissing: return "The immutable finalized-capture admission is missing."
     case .admissionConflict: return "The admission artifact and durable queue disagree."
     case .payloadUnavailable: return "An admitted local payload is missing or changed."
+    case .transportLimitExceeded:
+      return "This capture exceeds the immutable backend transport limit for this QA build."
     case .transportOutcomeUnknown:
       return "The backend outcome is unknown; retry to recover the exact durable operation."
     case .receiptCommitPending:
@@ -208,6 +212,8 @@ final class TacuaCaptureUploadCoordinator {
   private let retentionChecker: TacuaSDKLocalRetentionChecking?
   private let sender: TacuaSDKBackendOperationSending
   private let clock: TacuaMonotonicClock
+  private let completionRequestTransform:
+    (TacuaPreparedBackendRequest) -> TacuaPreparedBackendRequest
   private let operationLock = NSLock()
   private var activeLocalSessionIDs = Set<String>()
 
@@ -219,7 +225,9 @@ final class TacuaCaptureUploadCoordinator {
     resumeRecoveryInspector: TacuaSDKResumeRecoveryInspecting,
     sender: TacuaSDKBackendOperationSending,
     retentionChecker: TacuaSDKLocalRetentionChecking? = nil,
-    clock: TacuaMonotonicClock = TacuaSystemMonotonicClock()
+    clock: TacuaMonotonicClock = TacuaSystemMonotonicClock(),
+    completionRequestTransform: @escaping
+      (TacuaPreparedBackendRequest) -> TacuaPreparedBackendRequest = { $0 }
   ) {
     self.configuration = configuration
     self.captureRootDirectory = captureRootDirectory.standardizedFileURL
@@ -229,6 +237,7 @@ final class TacuaCaptureUploadCoordinator {
     self.sender = sender
     self.retentionChecker = retentionChecker
     self.clock = clock
+    self.completionRequestTransform = completionRequestTransform
   }
 
   func drive(localSessionID: String) async throws -> TacuaCaptureUploadResult {
@@ -405,6 +414,26 @@ final class TacuaCaptureUploadCoordinator {
       return
     }
 
+    let limitRequest = TacuaPreparedBackendRequest(
+      kind: original.kind,
+      operationID: original.operationID,
+      credentialID: original.requestCredentialID,
+      canonicalData: original.canonicalRequest,
+      requestDigest: original.requestDigest
+    )
+    do {
+      try TacuaSDKTransportLimitValidator.validate(
+        limitRequest,
+        configuration: configuration
+      )
+    } catch TacuaSDKBackendClientError.requestExceedsTransportLimit {
+      // This deterministic build/profile mismatch is known before the durable request is moved
+      // to outcome-unknown. Retrying cannot make the sealed transport limit larger.
+      throw TacuaCaptureUploadError.transportLimitExceeded
+    } catch {
+      throw TacuaCaptureUploadError.admissionConflict
+    }
+
     var attemptedQueue = baseline
     let attempt: TacuaOperationAttempt
     do {
@@ -501,6 +530,9 @@ final class TacuaCaptureUploadCoordinator {
         || clientError == .unsafeLocalPayload || clientError == .localPayloadTooLarge
       {
         throw TacuaCaptureUploadError.payloadUnavailable
+      }
+      if clientError == .requestExceedsTransportLimit {
+        throw TacuaCaptureUploadError.transportLimitExceeded
       }
       throw TacuaCaptureUploadError.transportOutcomeUnknown
     } catch let error as TacuaCaptureUploadError { throw error }
@@ -631,7 +663,7 @@ final class TacuaCaptureUploadCoordinator {
     ])
     let manifestDigest = try TacuaCanonicalJSON.digest(.object(manifest))
     manifest["manifest_digest"] = .string(manifestDigest)
-    let request = try TacuaSDKBackendRequests.completion(
+    let request = completionRequestTransform(try TacuaSDKBackendRequests.completion(
       completionID: plan.completionID,
       sessionID: sessionID,
       scopeDigest: scopeDigest,
@@ -640,7 +672,17 @@ final class TacuaCaptureUploadCoordinator {
       segmentReceipts: segmentReceipts,
       diagnosticReceipts: diagnosticReceipts,
       requestedAt: requestedAt
-    )
+    ))
+    do {
+      try TacuaSDKTransportLimitValidator.validate(
+        request,
+        configuration: configuration
+      )
+    } catch TacuaSDKBackendClientError.requestExceedsTransportLimit {
+      throw TacuaCaptureUploadError.transportLimitExceeded
+    } catch {
+      throw TacuaCaptureUploadError.admissionConflict
+    }
     guard try TacuaSDKBackendProtocol.validateRequest(request.canonicalData) == .completion else {
       throw TacuaCaptureUploadError.admissionConflict
     }

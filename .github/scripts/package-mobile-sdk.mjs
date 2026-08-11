@@ -70,6 +70,7 @@ const allowedRuntimePaths = new Set([
   "plugin/config.js",
   "plugin/withTacua.js",
   "src/BackendManagedHostController.ts",
+  "src/BackendManagedHostLifecycleAdapter.ts",
   "src/TacuaCaptureSpikeModule.ts",
   "src/index.ts",
 ]);

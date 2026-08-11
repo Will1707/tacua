@@ -23,7 +23,14 @@ BUNDLE_ID_PATTERN = re.compile(
     r"^[A-Za-z][A-Za-z0-9-]{0,62}(?:\.[A-Za-z0-9][A-Za-z0-9-]{0,62})+$"
 )
 DIGEST_PATTERN = re.compile(r"^sha256:[a-f0-9]{64}$")
-TRANSPORT_POLICY_VERSION = "tacua.sdk-transport@1.0.0"
+TRANSPORT_POLICY_VERSION = "tacua.sdk-transport@1.1.0"
+MAX_SEGMENT_BYTES = 1_073_741_824
+MAX_DIAGNOSTIC_BYTES = 3_145_728
+MAX_COMPLETION_BYTES = 4_194_304
+DIAGNOSTIC_REQUEST_OVERHEAD_ALLOWANCE_BYTES = 65_536
+DEFAULT_MAX_SEGMENT_BYTES = 268_435_456
+DEFAULT_MAX_DIAGNOSTIC_BYTES = MAX_DIAGNOSTIC_BYTES
+DEFAULT_MAX_COMPLETION_BYTES = MAX_COMPLETION_BYTES
 MAX_CONFIG_BYTES = 2_097_152
 MAX_CONFIG_JSON_NESTING_DEPTH = 64
 MAX_ADMIN_SECRET_FILE_BYTES = 4_098
@@ -120,9 +127,9 @@ class PilotConfig:
     listen_port: int = 8080
     launch_code_ttl_seconds: int = 300
     credential_ttl_seconds: int = 2_592_000
-    max_segment_bytes: int = 268_435_456
-    max_diagnostic_bytes: int = 16_777_216
-    max_completion_bytes: int = 16_777_216
+    max_segment_bytes: int = DEFAULT_MAX_SEGMENT_BYTES
+    max_diagnostic_bytes: int = DEFAULT_MAX_DIAGNOSTIC_BYTES
+    max_completion_bytes: int = DEFAULT_MAX_COMPLETION_BYTES
     raw_retention_days: int = 30
     derived_retention_days: int = 30
     tombstone_retention_days: int = 30
@@ -146,9 +153,12 @@ class PilotConfig:
         return value if isinstance(value, str) else ""
 
     @property
-    def transport_configuration(self) -> dict[str, str]:
+    def transport_configuration(self) -> dict[str, Any]:
         return {
             "backend_origin": self.backend_origin,
+            "max_completion_bytes": self.max_completion_bytes,
+            "max_diagnostic_bytes": self.max_diagnostic_bytes,
+            "max_segment_bytes": self.max_segment_bytes,
             "transport_policy_version": self.transport_policy_version,
         }
 
@@ -414,9 +424,23 @@ def _config_from_document(raw: dict[str, Any]) -> PilotConfig:
         listen_port=_bounded_int(raw, "listen_port", 8080, 1, 65535),
         launch_code_ttl_seconds=_bounded_int(raw, "launch_code_ttl_seconds", 300, 30, 3600),
         credential_ttl_seconds=_bounded_int(raw, "credential_ttl_seconds", 2_592_000, 300, 2_592_000),
-        max_segment_bytes=_bounded_int(raw, "max_segment_bytes", 268_435_456, 1, 1_073_741_824),
-        max_diagnostic_bytes=_bounded_int(raw, "max_diagnostic_bytes", 16_777_216, 1024, 16_777_216),
-        max_completion_bytes=_bounded_int(raw, "max_completion_bytes", 16_777_216, 1024, 67_108_864),
+        max_segment_bytes=_bounded_int(
+            raw, "max_segment_bytes", DEFAULT_MAX_SEGMENT_BYTES, 1, MAX_SEGMENT_BYTES
+        ),
+        max_diagnostic_bytes=_bounded_int(
+            raw,
+            "max_diagnostic_bytes",
+            DEFAULT_MAX_DIAGNOSTIC_BYTES,
+            1024,
+            MAX_DIAGNOSTIC_BYTES,
+        ),
+        max_completion_bytes=_bounded_int(
+            raw,
+            "max_completion_bytes",
+            DEFAULT_MAX_COMPLETION_BYTES,
+            1024,
+            MAX_COMPLETION_BYTES,
+        ),
         raw_retention_days=raw_days,
         derived_retention_days=derived_days,
         tombstone_retention_days=_bounded_int(raw, "tombstone_retention_days", 30, 1, 30),

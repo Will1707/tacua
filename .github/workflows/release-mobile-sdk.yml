@@ -80,6 +80,9 @@ jobs:
         working-directory: experiments/ios-capture-spike/package
         run: sh tests/run-core-tests.sh
 
+      - name: Exercise the real SDK-to-backend loopback boundary
+        run: python3 -B experiments/ios-capture-spike/package/tests/sdk_backend_loopback_e2e.py
+
       - name: Build the release tarball and checksum
         id: package
         env:
@@ -119,21 +122,12 @@ jobs:
           cp experiments/ios-capture-spike/harness/src/App.tsx "$packed_harness/src/App.tsx"
           cp experiments/ios-capture-spike/harness/src/backend-contract.typecheck.ts \
             "$packed_harness/src/backend-contract.typecheck.ts"
-          node --input-type=module - \
+          node .github/scripts/prepare-packed-mobile-sdk-harness.mjs \
             experiments/ios-capture-spike/harness/package.json \
             "$packed_harness/package.json" \
-            "$RELEASE_DIRECTORY/$TARBALL_FILENAME" <<'NODE'
-          import { readFileSync, writeFileSync } from "node:fs";
-          import { pathToFileURL } from "node:url";
-          const [sourcePath, destinationPath, tarballPath] = process.argv.slice(2);
-          const manifest = JSON.parse(readFileSync(sourcePath, "utf8"));
-          manifest.name = "@tacua/packed-sdk-release-harness";
-          manifest.dependencies["@tacua/mobile-sdk"] = pathToFileURL(tarballPath).href;
-          writeFileSync(destinationPath, `${JSON.stringify(manifest, null, 2)}\n`, {
-            encoding: "utf8",
-            mode: 0o600,
-          });
-          NODE
+            "$packed_harness/package-lock.json" \
+            experiments/ios-capture-spike/package/package.json \
+            "$RELEASE_DIRECTORY/$TARBALL_FILENAME"
           cd "$packed_harness"
           npm install --package-lock-only --ignore-scripts --no-audit --no-fund --offline
           npm ci --ignore-scripts --no-audit --no-fund

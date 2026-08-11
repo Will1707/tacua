@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from . import __version__
+from .config import DIAGNOSTIC_REQUEST_OVERHEAD_ALLOWANCE_BYTES
 from .contracts import PROTOCOL_VERSION, canonical_json
 from .service import (
     ApiError,
@@ -349,7 +350,10 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
         if self.command == "PUT" and diagnostic:
             bearer = self._bearer()
             self.backend.preauthorize_sdk_route(diagnostic.group("session_id"), bearer)
-            body = self._read_json(self.backend.config.max_diagnostic_bytes + 65_536)
+            body = self._read_json(
+                self.backend.config.max_diagnostic_bytes
+                + DIAGNOSTIC_REQUEST_OVERHEAD_ALLOWANCE_BYTES
+            )
             self._send_protocol(
                 self.backend.upload_diagnostic(
                     diagnostic.group("session_id"), diagnostic.group("upload_id"), bearer, body

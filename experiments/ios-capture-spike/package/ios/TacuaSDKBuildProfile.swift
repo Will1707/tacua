@@ -30,7 +30,7 @@ struct TacuaSDKCaptureArtifacts: Equatable {
 /// Expo config plugin. Runtime parsing is independent of JavaScript so an OTA update or caller
 /// cannot substitute the registered build, capture scope, retention, or transport origin.
 struct TacuaSDKBuildProfile: Equatable {
-  static let contractVersion = "tacua.sdk-profile@1.0.0"
+  static let contractVersion = "tacua.sdk-profile@1.1.0"
   static let scopePolicyContractVersion = "tacua.capture-scope-policy@1.0.0"
   static let retentionPolicyVersion = "tacua.retention-v1"
   static let profileJSONInfoPlistKey = "TacuaSDKProfileJSON"
@@ -100,11 +100,18 @@ struct TacuaSDKBuildProfile: Equatable {
     else { throw TacuaSDKBuildProfileError.transportConfigurationMismatch }
     do {
       let transportObject = try transport.requiringObject(keys: [
-        "backend_origin", "transport_policy_version",
+        "backend_origin", "max_completion_bytes", "max_diagnostic_bytes",
+        "max_segment_bytes", "transport_policy_version",
       ])
       guard transportObject["backend_origin"]?.stringValue == configuration.normalizedOrigin,
         transportObject["transport_policy_version"]?.stringValue
           == TacuaBackendConfiguration.policyVersion,
+        transportObject["max_segment_bytes"]?.integerValue
+          == Int64(configuration.maxSegmentBytes),
+        transportObject["max_diagnostic_bytes"]?.integerValue
+          == Int64(configuration.maxDiagnosticBytes),
+        transportObject["max_completion_bytes"]?.integerValue
+          == Int64(configuration.maxCompletionBytes),
         try TacuaCanonicalJSON.digest(transport) == configuration.configurationDigest,
         buildIdentity.objectValue?["transport_configuration_digest"]?.stringValue
           == configuration.configurationDigest

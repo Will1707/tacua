@@ -8,7 +8,7 @@
   },
   "deleted_at": "2026-07-21T10:03:05Z",
   "deletion_id": "deletion_synthetic",
-  "deletion_request_digest": "sha256:896326b56812e6c1dbd8a776415901a57b47ee43706b89615b4f08c39bdf06a5",
+  "deletion_request_digest": "sha256:576428a987a77d6da1691b0cb85ed2f1b4457c92ff232060c78cbd221af8cbc8",
   "erasure": {
     "derived_data": "deleted",
     "diagnostics": "deleted",
@@ -19,7 +19,7 @@
   "local_credential_cleanup": "authorized_after_durable_tombstone",
   "message_type": "deletion_tombstone",
   "protocol_version": "tacua.sdk-backend@1.0.0",
-  "scope_digest": "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50",
+  "scope_digest": "sha256:c38600d56cdb3bc8a0d94c0dd7e6323f863d1ccbc6953b6c71421e7c08512a20",
   "session_access": {
     "completion": "revoked",
     "evidence": "revoked",
@@ -27,6 +27,6 @@
     "uploads": "revoked"
   },
   "session_id": "session_synthetic",
-  "tombstone_digest": "sha256:c1bdb082747c6cdd9a2000ec453a41a32796439c65b1c3271bd082bec8918f25",
+  "tombstone_digest": "sha256:df0b2facebbeee5723ee4936f839667b86ca0760c2fd0e0642b2d1e6531f49f8",
   "tombstone_expires_at": "2026-09-21T10:03:05Z"
 }

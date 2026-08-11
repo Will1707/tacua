@@ -22,13 +22,13 @@ copy; do not include it in an ordinary production/App Store target.
 ## Installation
 
 Tacua distributes this pre-release SDK as a versioned GitHub Release tarball,
-not through the npm registry. After the `mobile-sdk-v0.1.0` release exists, an
+not through the npm registry. After the `mobile-sdk-v0.2.0` release exists, an
 Expo QA app can pin it directly:
 
 ```json
 {
   "dependencies": {
-    "@tacua/mobile-sdk": "https://github.com/Will1707/tacua/releases/download/mobile-sdk-v0.1.0/tacua-mobile-sdk-0.1.0.tgz"
+    "@tacua/mobile-sdk": "https://github.com/Will1707/tacua/releases/download/mobile-sdk-v0.2.0/tacua-mobile-sdk-0.2.0.tgz"
   }
 }
 ```
@@ -73,7 +73,8 @@ media upload consent flow; bundling the manifest does not replace consent.
 The package now also contains the native foundation for
 `tacua.sdk-backend@1.0.0`: canonical request builders, exhaustive local request
 and response validation, a build-pinned backend origin, a redirect-rejecting and
-response-bounded `URLSession` client, Keychain-backed credentials, immutable
+response-bounded `URLSession` client, sealed backend request-size limits,
+Keychain-backed credentials, immutable
 request replay, and a crash-safe queue. Native START and RESUME lifecycle
 coordinators consume approved launches exactly once, create device-only
 credentials, validate and send the frozen exchanges, and commit validated
@@ -86,6 +87,18 @@ only after the validated completion receipt is durable. Authenticated backend
 deletion is also implemented as a fixed, exactly replayable `user_requested`
 operation. `stop()` remains intentionally local and never enqueues or transmits
 evidence by itself.
+
+The backend compiler seals `max_segment_bytes`, `max_diagnostic_bytes`, and
+`max_completion_bytes` into `tacua.sdk-transport@1.1.0`. The Expo plugin copies
+those exact integers into the QA app's Info.plist and the native profile parser
+requires both authorities to agree. Oversized segment media, canonical
+diagnostic envelopes, and canonical completion requests fail locally before any
+network request and before the queue records an outcome-unknown attempt.
+The generated profile defaults to 256 MiB segment media, a 3 MiB canonical
+diagnostic envelope, and a 4 MiB complete canonical completion request. The
+diagnostic and completion values are also their configurable maxima so the
+backend can never advertise a request size that exceeds the SDK's bounded
+canonical parser and durable queue.
 
 The native design-point limit is 30 minutes, further capped by the immutable
 backend START raw-media deadline. Native retention evaluation converts that
@@ -211,30 +224,37 @@ const processed = await TacuaCapture.processAdmittedCapture({
 });
 ```
 
-### Backend-managed host controller
+### Backend-managed host lifecycle adapter
 
-`createBackendManagedHostController()` is the dependency-light orchestration
-foundation for an Expo QA host. It is intentionally not a React hook and does
-not create a second app. A future host screen can subscribe to its immutable
-snapshot and render the finite `phase`, `mutation`, and `actions` unions without
-reimplementing lifecycle ordering:
+`createBackendManagedHostLifecycleAdapter()` creates the existing finite-state
+controller and owns its React Native host lifecycle. It installs `Linking` and
+`AppState` listeners before startup work, performs authoritative native
+discovery, privately delivers `Linking.getInitialURL()`, serializes later URL
+and foreground work, and disposes the controller with both listeners. It is not
+a React hook and does not create a second app:
 
 ```ts
 import * as TacuaCapture from '@tacua/mobile-sdk';
 
-const controller = TacuaCapture.createBackendManagedHostController({
+const host = TacuaCapture.createBackendManagedHostLifecycleAdapter({
   segmentDurationSeconds: 10,
+  onError(error) {
+    // Only operation + host_lifecycle_rejected are exposed. The platform/native
+    // error, incoming URL, and launch code never enter this callback.
+    reportLifecycleFailure(error);
+  },
 });
 
-const unsubscribe = controller.subscribe((snapshot) => {
+const unsubscribe = host.controller.subscribe((snapshot) => {
   // Render snapshot.phase and snapshot.actions. While mutation is non-null,
   // actions is empty so a UI cannot start an overlapping native mutation.
   renderCaptureState(snapshot);
 });
 
-// Forward an incoming link immediately. The controller does not retain the URL,
-// launch code, consent-request ID, or approved-launch ID in its public snapshot.
-await controller.prepareLaunch(incomingURL);
+// Resolves after initial discovery and any initial launch URL have been delivered.
+// A rejection is BackendManagedHostLifecycleAdapterError and contains no source error.
+await host.ready;
+const controller = host.controller;
 
 // Present the exact consent contract named by the awaiting_launch_consent phase.
 await controller.respondToLaunchConsent(true);
@@ -255,13 +275,25 @@ if (next.kind === 'plan_ready' && next.nextAction === 'start_capture') {
 await controller.stopCapture();
 await controller.admitAndDrain();
 
-// Call only on a real inactive/background -> active transition. It retries an
-// already admitted exact native request, or discovers admitted work after relaunch.
-await controller.notifyForeground();
-
 unsubscribe();
-controller.dispose();
+host.dispose();
 ```
+
+The adapter ignores an exact duplicate launch URL after its first delivery
+attempt, without retaining the URL itself. Only an
+`inactive`/`background`-to-`active` transition invokes `notifyForeground()`;
+bursts are coalesced while preserving a transition that arrives during native
+work. `dispose()` is idempotent, removes both host listeners immediately,
+suppresses queued callbacks, and disposes its owned controller. Results that
+arrive after teardown cannot trigger initial-URL reads, URL delivery, discovery,
+or state publication; an in-flight RESUME match also cancels its newly prepared
+native consent handle before rejecting.
+
+`createBackendManagedHostController()` remains the dependency-light lower-level
+seam for tests or a non-React-Native host. Such a host must deliberately own
+initial discovery, incoming URL delivery, foreground transition filtering,
+serialization, and teardown itself. Neither factory retains a URL, launch code,
+consent-request ID, or approved-launch ID in its public state.
 
 Every mutating method is serialized. Discovery is capped (64 sessions by
 default, configurable only from 1 through 128), segment duration stays inside
@@ -509,6 +541,14 @@ mismatch fails before any admission file is materialized. Inspect
 `getBackendQueueStatus(localSessionId).sessionArtifactsAvailable` to distinguish
 the legacy case.
 
+Transport policy 1.1 is an intentional clean-cutover boundary. A schema-4 queue
+already bound to the earlier 1.0 transport digest cannot be rebound silently to
+the new closed subject. Finish and retire every local session with the old QA
+build before installing a 1.1-profile build. For an explicitly disposable local
+development install, reconcile its backend sessions first and then uninstall
+the old QA app to remove its local queue. A digest mismatch otherwise remains a
+fail-closed RESUME error; the SDK does not rewrite immutable queued requests.
+
 Admission projects the private journal into one SDK-owned diagnostic envelope,
 merges sanitized manifest marks/gaps that were not already journaled, and always
 appends a terminal `custom_state` event from provider `capture_summary`. The
@@ -523,7 +563,8 @@ real capture-manifest gap. New journals stop at 9,998 events, reserving the
 terminal summary and a content-free `diagnostic_projection_overflow` signal.
 Admission preserves manifest marks/gaps before routine diagnostics, reports the
 exact omitted count and time range, and deterministically constrains the final
-canonical envelope to four MiB. It can still recover a torn legacy 9,999-event
+canonical envelope to the sealed transport limit (3 MiB in the generated
+profile). It can still recover a torn legacy 9,999-event
 journal into the runtime's 10,000th hard slot before bounded projection.
 Capture manifests accept at most 2,048 manual markers and 2,048 gaps; the final
 gap slot coalesces additional interruptions into an explicit overflow sentinel.
@@ -757,6 +798,18 @@ Run the platform-independent policy tests from this directory:
 ```sh
 sh tests/run-core-tests.sh
 ```
+
+On macOS, run the real SDK/backend transport boundary from the repository root:
+
+```sh
+python3 -B experiments/ios-capture-spike/package/tests/sdk_backend_loopback_e2e.py
+```
+
+That E2E compiles the production Swift URLSession client, starts the production
+Python backend on an ephemeral loopback port, and verifies START, a file-backed
+segment upload, exact replay, HTTP framing, and the persisted SQLite/object
+bytes and digest. It does not replace the signed physical-device, ATS/TLS, or
+remote-deployment gates.
 
 The tests cover terminal classification, deadline behavior, media-clock segment boundaries, dual-clock microphone stall detection, crash-window source selection, structural handoff validation, expiry/build-independent deletion authorization, and fail-closed stop-timeout decisions.
 

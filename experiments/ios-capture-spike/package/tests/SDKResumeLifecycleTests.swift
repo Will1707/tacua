@@ -480,6 +480,14 @@ private func canonicalFixture(_ root: URL, _ name: String) throws -> Data {
   try TacuaCanonicalJSON.data(fixtureValue(root, name))
 }
 
+private func diagnosticContentDigest(_ root: URL) throws -> String {
+  try requireValue(
+    fixtureValue(root, "diagnostic-upload-request")
+      .objectValue?["transport"]?.objectValue?["content_digest"]?.stringValue,
+    "Diagnostic fixture transport content digest is missing"
+  )
+}
+
 private func fixtureScopeDigest(_ harness: ResumeLifecycleHarness) throws -> String {
   let value = try TacuaCanonicalJSON.parse(harness.scope)
   return try requireValue(
@@ -662,8 +670,7 @@ private func makeCompletedBaseQueue(
       TacuaLocalPayloadBinding(
         role: .diagnosticEnvelope,
         relativePath: "diagnostics/events.json",
-        contentDigest:
-          "sha256:6f395bf765e73eac49e90ff444ce8965ce31b452a683f26e03e8554497e4efbf"
+        contentDigest: try diagnosticContentDigest(fixtureRoot)
       )
     ],
     queue: &queue,

@@ -10,7 +10,8 @@ four `__TACUA_DERIVE_SHA256__` values are mandatory markers, not placeholders
 to fill by hand. The dependency-free compiler derives and seals:
 
 - `build_identity.transport_configuration_digest` from the normalized backend
-  origin and frozen transport policy;
+  origin, frozen transport policy, and exact segment, diagnostic-envelope, and
+  completion-request byte limits;
 - the SDK protocol `build_identity.build_identity_digest`;
 - `approved_handoff.build_identity.sdk.configuration_digest` from that same
   transport pin; and
@@ -18,7 +19,8 @@ to fill by hand. The dependency-free compiler derives and seals:
 
 The same invocation can project the deployment pin into a secret-free,
 canonical SDK profile. The profile contains the exact registered SDK
-`build_identity`, normalized backend origin and transport digest, and the static
+`build_identity`, normalized backend origin, exact transport byte limits and
+transport digest, and the static
 capture-scope policy: organization/project/application/build pins, required
 consent contract, and raw/derived retention. It contains no launch code,
 credential, administrator secret, or provider key.

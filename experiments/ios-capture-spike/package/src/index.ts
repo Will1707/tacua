@@ -51,6 +51,7 @@ import {
   type StartedCaptureSessionPlan,
 } from "./TacuaCaptureSpikeModule";
 import { type EventSubscription } from "expo-modules-core";
+import { AppState, Linking } from "react-native";
 import {
   createBackendManagedHostControllerForPrimitives,
   type BackendManagedHostAction,
@@ -67,6 +68,15 @@ import {
   type BackendManagedRecorderSnapshot,
   type BackendManagedSessionSummary,
 } from "./BackendManagedHostController";
+import {
+  BackendManagedHostLifecycleAdapterError,
+  createBackendManagedHostLifecycleAdapterForPrimitives,
+  type BackendManagedHostAppState,
+  type BackendManagedHostLifecycleAdapter,
+  type BackendManagedHostLifecycleAdapterOptions,
+  type BackendManagedHostLifecycleError,
+  type BackendManagedHostLifecycleOperation,
+} from "./BackendManagedHostLifecycleAdapter";
 
 export type {
   AppAudioAppendDrop,
@@ -129,7 +139,14 @@ export type {
   BackendManagedQueueRequirement,
   BackendManagedRecorderSnapshot,
   BackendManagedSessionSummary,
+  BackendManagedHostAppState,
+  BackendManagedHostLifecycleAdapter,
+  BackendManagedHostLifecycleAdapterOptions,
+  BackendManagedHostLifecycleError,
+  BackendManagedHostLifecycleOperation,
 };
+
+export { BackendManagedHostLifecycleAdapterError };
 
 /**
  * Creates the dependency-light orchestration boundary for a backend-managed Expo QA host.
@@ -195,6 +212,56 @@ export function createBackendManagedHostController(
     },
     options,
   );
+}
+
+/**
+ * Creates and owns a backend-managed controller plus the React Native host lifecycle wiring.
+ * Await `ready` before rendering startup recovery/consent state. Incoming launch URLs are delivered
+ * directly into the controller and are never projected through the returned adapter or safe errors.
+ */
+export function createBackendManagedHostLifecycleAdapter(
+  options: BackendManagedHostLifecycleAdapterOptions = {},
+): BackendManagedHostLifecycleAdapter {
+  const controller = createBackendManagedHostController({
+    ...(options.segmentDurationSeconds === undefined
+      ? {}
+      : { segmentDurationSeconds: options.segmentDurationSeconds }),
+    ...(options.maximumDiscoveredSessions === undefined
+      ? {}
+      : { maximumDiscoveredSessions: options.maximumDiscoveredSessions }),
+  });
+  return createBackendManagedHostLifecycleAdapterForPrimitives(
+    controller,
+    {
+      getInitialURL: () => Linking.getInitialURL(),
+      getCurrentAppState: () => normalizeAppState(AppState.currentState),
+      subscribeIncomingURL: (listener) => {
+        const subscription = Linking.addEventListener("url", ({ url }) => {
+          listener(url);
+        });
+        return () => subscription.remove();
+      },
+      subscribeAppState: (listener) => {
+        const subscription = AppState.addEventListener("change", (state) => {
+          listener(normalizeAppState(state));
+        });
+        return () => subscription.remove();
+      },
+    },
+    options.onError === undefined ? {} : { onError: options.onError },
+  );
+}
+
+function normalizeAppState(state: string | null): BackendManagedHostAppState {
+  switch (state) {
+    case "active":
+    case "background":
+    case "inactive":
+    case "extension":
+      return state;
+    default:
+      return "unknown";
+  }
 }
 
 export function getCapabilities(): CaptureCapabilities {

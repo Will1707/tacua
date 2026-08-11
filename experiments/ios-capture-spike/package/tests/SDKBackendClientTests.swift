@@ -150,6 +150,7 @@ enum SDKBackendClientTests {
     try await responseBoundsAndContentTypeFailClosed(fixtureRoot)
     try await structuredErrorsSurfaceOnlyAfterExactValidation(fixtureRoot)
     try await resealedInvalidRequestsNeverReachTransport(fixtureRoot)
+    try await configuredRequestLimitsRejectBeforeTransport(fixtureRoot)
     try await uploadStagingScavengerIsBoundedAndFailClosed(fixtureRoot)
     try await unsafeSegmentSourcesNeverReachTransport(fixtureRoot)
     print("Tacua SDK backend client tests passed")
@@ -371,7 +372,10 @@ enum SDKBackendClientTests {
 
   private static func makeClient(
     credentials: TestCredentialStore,
-    maximumResponseBytes: Int = TacuaSDKBackendProtocol.maximumResponseBytes
+    maximumResponseBytes: Int = TacuaSDKBackendProtocol.maximumResponseBytes,
+    maxSegmentBytes: Int = TacuaBackendConfiguration.defaultMaxSegmentBytes,
+    maxDiagnosticBytes: Int = TacuaBackendConfiguration.defaultMaxDiagnosticBytes,
+    maxCompletionBytes: Int = TacuaBackendConfiguration.defaultMaxCompletionBytes
   ) throws -> TacuaSDKBackendClient {
     let sessionConfiguration = TacuaBoundedURLSessionTransport.secureConfiguration()
     sessionConfiguration.protocolClasses = [MockURLProtocol.self]
@@ -383,7 +387,10 @@ enum SDKBackendClientTests {
       configuration: try TacuaBackendConfiguration(
         buildConfiguredOrigin: "https://qa.tacua.example",
         allowInsecureLoopback: false,
-        debugBuild: false
+        debugBuild: false,
+        maxSegmentBytes: maxSegmentBytes,
+        maxDiagnosticBytes: maxDiagnosticBytes,
+        maxCompletionBytes: maxCompletionBytes
       ),
       credentialStore: credentials,
       transport: transport
@@ -776,6 +783,124 @@ enum SDKBackendClientTests {
       )
     }
     try require(MockURLProtocol.requests().isEmpty, "Invalid manifest must fail locally")
+  }
+
+  private static func configuredRequestLimitsRejectBeforeTransport(_ root: URL) async throws {
+    let credentials = TestCredentialStore()
+    credentials.values["credential_current"] = Data(repeating: 0x4A, count: 32)
+
+    let segmentData = try canonicalFixture(root, "segment-upload-intent")
+    let segmentRoot = try rootObject(segmentData)
+    let segment = TacuaPreparedBackendRequest(
+      kind: .segment,
+      operationID: segmentRoot["upload_id"]!.stringValue!,
+      credentialID: segmentRoot["credential_id"]!.stringValue!,
+      canonicalData: segmentData,
+      requestDigest: segmentRoot["intent_digest"]!.stringValue!
+    )
+    MockURLProtocol.install { _ in
+      MockResponse(status: 500, headers: ["Content-Type": "application/json"], data: Data())
+    }
+    do {
+      _ = try await makeClient(
+        credentials: credentials,
+        maxSegmentBytes: 1_024
+      ).uploadSegment(
+        segment,
+        fileURL: root.appendingPathComponent("must-not-be-opened.mov"),
+        sessionDirectory: root,
+        transportCredentialID: "credential_current"
+      )
+      throw ClientTestFailure.assertion("Oversized segment was sent")
+    } catch let error as TacuaSDKBackendClientError {
+      try require(
+        error == .requestExceedsTransportLimit,
+        "Oversized segment did not retain its terminal local limit error"
+      )
+    }
+    try require(MockURLProtocol.requests().isEmpty, "Oversized segment reached transport")
+
+    let diagnosticData = try canonicalFixture(root, "diagnostic-upload-request")
+    let diagnosticRoot = try rootObject(diagnosticData)
+    let diagnostic = TacuaPreparedBackendRequest(
+      kind: .diagnostic,
+      operationID: diagnosticRoot["upload_id"]!.stringValue!,
+      credentialID: diagnosticRoot["credential_id"]!.stringValue!,
+      canonicalData: diagnosticData,
+      requestDigest: diagnosticRoot["request_digest"]!.stringValue!
+    )
+    MockURLProtocol.install { _ in
+      MockResponse(status: 500, headers: ["Content-Type": "application/json"], data: Data())
+    }
+    do {
+      _ = try await makeClient(
+        credentials: credentials,
+        maxDiagnosticBytes: 1_024
+      ).send(diagnostic, transportCredentialID: "credential_current")
+      throw ClientTestFailure.assertion("Oversized diagnostic was sent")
+    } catch let error as TacuaSDKBackendClientError {
+      try require(
+        error == .requestExceedsTransportLimit,
+        "Oversized diagnostic did not retain its terminal local limit error"
+      )
+    }
+    try require(MockURLProtocol.requests().isEmpty, "Oversized diagnostic reached transport")
+
+    let completionData = try canonicalFixture(root, "completion-request")
+    let completionRoot = try rootObject(completionData)
+    let completion = TacuaPreparedBackendRequest(
+      kind: .completion,
+      operationID: completionRoot["completion_id"]!.stringValue!,
+      credentialID: completionRoot["credential_id"]!.stringValue!,
+      canonicalData: completionData,
+      requestDigest: completionRoot["request_digest"]!.stringValue!
+    )
+    MockURLProtocol.install { _ in
+      MockResponse(status: 500, headers: ["Content-Type": "application/json"], data: Data())
+    }
+    do {
+      _ = try await makeClient(
+        credentials: credentials,
+        maxCompletionBytes: 1_024
+      ).send(completion, transportCredentialID: "credential_current")
+      throw ClientTestFailure.assertion("Oversized completion was sent")
+    } catch let error as TacuaSDKBackendClientError {
+      try require(
+        error == .requestExceedsTransportLimit,
+        "Oversized completion did not retain its terminal local limit error"
+      )
+    }
+    try require(MockURLProtocol.requests().isEmpty, "Oversized completion reached transport")
+
+    let parserOversizedCompletion = TacuaPreparedBackendRequest(
+      kind: .completion,
+      operationID: "completion_parser_limit",
+      credentialID: "credential_current",
+      canonicalData: Data(
+        repeating: 0x78,
+        count: TacuaBackendConfiguration.defaultMaxCompletionBytes + 1
+      ),
+      requestDigest: "sha256:" + String(repeating: "0", count: 64)
+    )
+    MockURLProtocol.install { _ in
+      MockResponse(status: 500, headers: ["Content-Type": "application/json"], data: Data())
+    }
+    do {
+      _ = try await makeClient(credentials: credentials).send(
+        parserOversizedCompletion,
+        transportCredentialID: "credential_current"
+      )
+      throw ClientTestFailure.assertion("Parser-oversized completion was sent")
+    } catch let error as TacuaSDKBackendClientError {
+      try require(
+        error == .requestExceedsTransportLimit,
+        "Parser-oversized completion lost its stable terminal limit error"
+      )
+    }
+    try require(
+      MockURLProtocol.requests().isEmpty,
+      "Parser-oversized completion reached transport"
+    )
   }
 
   private static func unsafeSegmentSourcesNeverReachTransport(_ root: URL) async throws {

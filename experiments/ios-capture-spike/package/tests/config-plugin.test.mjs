@@ -78,6 +78,9 @@ test("seals one explicit non-production QA plugin configuration from the backend
   assert.equal(infoPlist.TacuaCaptureDistribution, "testflight");
   assert.equal(infoPlist.TacuaSDKProfileJSON, profileText.trimEnd());
   assert.equal(infoPlist.TacuaSDKProfileDigest, options.sdkProfile.profile_digest);
+  assert.equal(infoPlist.TacuaMaxSegmentBytes, 268_435_456);
+  assert.equal(infoPlist.TacuaMaxDiagnosticBytes, 3_145_728);
+  assert.equal(infoPlist.TacuaMaxCompletionBytes, 4_194_304);
   assert.strictEqual(applyInfoPlist(infoPlist, options), infoPlist);
   assert.equal(infoPlist.CFBundleURLTypes.length, 1);
   assert.equal(normalizeBackendOrigin("https://QA.EXAMPLE.COM:443", false), "https://qa.example.com");
@@ -87,6 +90,7 @@ test("fails closed on conflicting or malformed native configuration", () => {
   const options = validateOptions(valid);
   assert.throws(() => applyInfoPlist({ TacuaBackendOrigin: "https://other.example.com" }, options), /conflicts/);
   assert.throws(() => applyInfoPlist({ TacuaSDKProfileDigest: `sha256:${"0".repeat(64)}` }, options), /conflicts/);
+  assert.throws(() => applyInfoPlist({ TacuaMaxSegmentBytes: 1 }, options), /conflicts/);
   assert.throws(() => applyInfoPlist({ CFBundleURLTypes: {} }, options), /CFBundleURLTypes/);
   const existing = {
     CFBundleURLTypes: [
@@ -195,6 +199,19 @@ test("ships privacy, Apache license, and NOTICE resources with the iOS SDK", () 
   assert.match(fs.readFileSync(path.join(packageRoot, "NOTICE"), "utf8"), /Tacua contributors/);
 });
 
+test("maps malformed native transport limits to the closed build-gate reason", () => {
+  const packageRoot = path.resolve(testDirectory, "..");
+  const moduleSource = fs.readFileSync(
+    path.join(packageRoot, "ios", "TacuaCaptureSpikeModule.swift"),
+    "utf8",
+  );
+
+  assert.match(
+    moduleSource,
+    /case \.invalidTransportLimit, \.invalidPathSegment, \.buildIdentityMismatch:\s*return \(nil, "invalid_qa_build_configuration"\)/,
+  );
+});
+
 test("rejects tampering even when an attacker recomputes the outer profile digest", () => {
   const cases = [
     (profile) => { profile.capture_scope_policy.organization_id = "Org-invalid"; },
@@ -202,6 +219,12 @@ test("rejects tampering even when an attacker recomputes the outer profile diges
     (profile) => { profile.capture_scope_policy.retention.raw_media_days = 31; },
     (profile) => { profile.build_identity.build_identity_digest = `sha256:${"0".repeat(64)}`; },
     (profile) => { profile.transport_configuration.transport_policy_version = "tacua.sdk-transport@2.0.0"; },
+    (profile) => { profile.transport_configuration.max_segment_bytes = 0; },
+    (profile) => { profile.transport_configuration.max_diagnostic_bytes = 3_145_729; },
+    (profile) => { profile.transport_configuration.max_completion_bytes = 4_194_305; },
+    (profile) => { profile.transport_configuration.max_completion_bytes = 1_024.5; },
+    (profile) => { delete profile.transport_configuration.max_completion_bytes; },
+    (profile) => { profile.transport_configuration.unbounded = true; },
     (profile) => { profile.admin_secret = "must-not-be-embedded"; },
   ];
   for (const mutate of cases) {

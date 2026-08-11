@@ -8,7 +8,7 @@
   },
   "exchange_id": "exchange_receiving_resume",
   "exchange_kind": "resume_session",
-  "exchange_receipt_digest": "sha256:567ab24503ecf7bfa00a5ad36630461c2c7723d14774d3cff97d8df9f3509c1a",
+  "exchange_receipt_digest": "sha256:fc1e4de85ba4ae7a29b4865010a5d8d8e816c4eec3faf75000865be5d6241b3f",
   "issued_at": "2026-07-21T10:02:02Z",
   "message_type": "launch_exchange_receipt",
   "previous_credential_revocation": {
@@ -18,11 +18,11 @@
   },
   "protocol_version": "tacua.sdk-backend@1.0.0",
   "received_at": "2026-07-21T10:02:02Z",
-  "request_digest": "sha256:fb229fcb70a04ba483a6451a8650d74282c63c4e7ecf82ad9c8c250e90334f93",
+  "request_digest": "sha256:138febebf0e629b3847098aa22e8b8f3a89a7c1174d3caf6ca7a795359a07081",
   "scope": {
     "application_id": "app_synthetic",
     "build_id": "build_synthetic",
-    "build_identity_digest": "sha256:234578e520242629d531f7a9649e0417dd9e67d8761572530f054f65e7dc4b63",
+    "build_identity_digest": "sha256:53effba69a9d01818c4bf41763e97833cc3dc46ab45c9fd7a1e027b8e1707c91",
     "capture_scope": "app_only",
     "consent": {
       "diagnostics": "granted",
@@ -41,7 +41,7 @@
       "policy_version": "tacua.retention-v1",
       "raw_media_days": 30
     },
-    "scope_digest": "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50"
+    "scope_digest": "sha256:c38600d56cdb3bc8a0d94c0dd7e6323f863d1ccbc6953b6c71421e7c08512a20"
   },
   "session_id": "session_synthetic",
   "session_state": "receiving"
