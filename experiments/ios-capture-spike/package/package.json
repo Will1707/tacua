@@ -1,6 +1,6 @@
 {
   "name": "@tacua/mobile-sdk",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pre-release iOS capture, diagnostics, recovery, and self-hosted transport SDK for Tacua QA builds",
   "license": "Apache-2.0",
   "private": true,

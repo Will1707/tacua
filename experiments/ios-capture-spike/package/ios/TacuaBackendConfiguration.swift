@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import CoreFoundation
 import Foundation
 
 enum TacuaQABuildConfigurationError: Error, Equatable {
@@ -91,6 +92,7 @@ enum TacuaBackendConfigurationError: Error, Equatable {
   case invalidOrigin
   case insecureOrigin
   case loopbackDevelopmentOnly
+  case invalidTransportLimit
   case invalidPathSegment
   case buildIdentityMismatch
 }
@@ -98,10 +100,22 @@ enum TacuaBackendConfigurationError: Error, Equatable {
 struct TacuaBackendConfiguration: Equatable {
   static let originInfoPlistKey = "TacuaBackendOrigin"
   static let insecureLoopbackInfoPlistKey = "TacuaAllowInsecureLoopback"
-  static let policyVersion = "tacua.sdk-transport@1.0.0"
+  static let maxSegmentBytesInfoPlistKey = "TacuaMaxSegmentBytes"
+  static let maxDiagnosticBytesInfoPlistKey = "TacuaMaxDiagnosticBytes"
+  static let maxCompletionBytesInfoPlistKey = "TacuaMaxCompletionBytes"
+  static let policyVersion = "tacua.sdk-transport@1.1.0"
+  static let maxSegmentBytesUpperBound = 1_073_741_824
+  static let maxDiagnosticBytesUpperBound = 3_145_728
+  static let maxCompletionBytesUpperBound = 4_194_304
+  static let defaultMaxSegmentBytes = 268_435_456
+  static let defaultMaxDiagnosticBytes = maxDiagnosticBytesUpperBound
+  static let defaultMaxCompletionBytes = maxCompletionBytesUpperBound
 
   let origin: URL
   let normalizedOrigin: String
+  let maxSegmentBytes: Int
+  let maxDiagnosticBytes: Int
+  let maxCompletionBytes: Int
   let configurationDigest: String
   /// Present for the real app-bundle configuration path. Direct construction is retained for
   /// isolated protocol tests and non-bundle tooling, which do not have an Info.plist authority.
@@ -111,8 +125,15 @@ struct TacuaBackendConfiguration: Equatable {
     buildConfiguredOrigin: String,
     allowInsecureLoopback: Bool,
     debugBuild: Bool,
+    maxSegmentBytes: Int = Self.defaultMaxSegmentBytes,
+    maxDiagnosticBytes: Int = Self.defaultMaxDiagnosticBytes,
+    maxCompletionBytes: Int = Self.defaultMaxCompletionBytes,
     qaBuildConfiguration: TacuaQABuildConfiguration? = nil
   ) throws {
+    guard (1...Self.maxSegmentBytesUpperBound).contains(maxSegmentBytes),
+      (1_024...Self.maxDiagnosticBytesUpperBound).contains(maxDiagnosticBytes),
+      (1_024...Self.maxCompletionBytesUpperBound).contains(maxCompletionBytes)
+    else { throw TacuaBackendConfigurationError.invalidTransportLimit }
     guard var components = URLComponents(string: buildConfiguredOrigin),
       let rawScheme = components.scheme,
       let rawHost = components.host,
@@ -160,10 +181,16 @@ struct TacuaBackendConfiguration: Equatable {
     }
     origin = normalizedURL
     normalizedOrigin = normalized
+    self.maxSegmentBytes = maxSegmentBytes
+    self.maxDiagnosticBytes = maxDiagnosticBytes
+    self.maxCompletionBytes = maxCompletionBytes
     self.qaBuildConfiguration = qaBuildConfiguration
     configurationDigest = try TacuaCanonicalJSON.digest(
       .object([
         "backend_origin": .string(normalized),
+        "max_completion_bytes": .integer(Int64(maxCompletionBytes)),
+        "max_diagnostic_bytes": .integer(Int64(maxDiagnosticBytes)),
+        "max_segment_bytes": .integer(Int64(maxSegmentBytes)),
         "transport_policy_version": .string(Self.policyVersion),
       ])
     )
@@ -184,10 +211,23 @@ struct TacuaBackendConfiguration: Equatable {
     }
     let allowInsecureLoopback =
       bundle.object(forInfoDictionaryKey: insecureLoopbackInfoPlistKey) as? Bool ?? false
+    guard let maxSegmentBytes = Self.infoPlistInteger(
+      bundle: bundle,
+      key: maxSegmentBytesInfoPlistKey
+    ), let maxDiagnosticBytes = Self.infoPlistInteger(
+      bundle: bundle,
+      key: maxDiagnosticBytesInfoPlistKey
+    ), let maxCompletionBytes = Self.infoPlistInteger(
+      bundle: bundle,
+      key: maxCompletionBytesInfoPlistKey
+    ) else { throw TacuaBackendConfigurationError.invalidTransportLimit }
     return try TacuaBackendConfiguration(
       buildConfiguredOrigin: origin,
       allowInsecureLoopback: allowInsecureLoopback,
       debugBuild: debugBuild,
+      maxSegmentBytes: maxSegmentBytes,
+      maxDiagnosticBytes: maxDiagnosticBytes,
+      maxCompletionBytes: maxCompletionBytes,
       qaBuildConfiguration: qaBuildConfiguration
     )
   }
@@ -231,6 +271,15 @@ struct TacuaBackendConfiguration: Equatable {
 
   private static func isLoopback(_ host: String) -> Bool {
     host == "localhost" || host == "127.0.0.1" || host == "::1"
+  }
+
+  private static func infoPlistInteger(bundle: Bundle, key: String) -> Int? {
+    guard let number = bundle.object(forInfoDictionaryKey: key) as? NSNumber,
+      CFGetTypeID(number) != CFBooleanGetTypeID(),
+      ["c", "s", "i", "l", "q", "C", "S", "I", "L", "Q"]
+        .contains(String(cString: number.objCType))
+    else { return nil }
+    return Int(exactly: number.int64Value)
   }
 
   private static func validHost(_ host: String) -> Bool {

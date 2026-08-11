@@ -183,9 +183,12 @@ export async function typecheckBackendContract(): Promise<void> {
   const transport: TacuaCapture.BackendTransportConfiguration =
     TacuaCapture.getBackendTransportConfiguration();
   const queueSchemaVersion: 4 = transport.queueSchemaVersion;
-  const sdkProfileContractVersion: "tacua.sdk-profile@1.0.0" =
+  const sdkProfileContractVersion: "tacua.sdk-profile@1.1.0" =
     transport.sdkProfileContractVersion;
   const sdkProfileDigest: string = transport.sdkProfileDigest;
+  const maxSegmentBytes: number = transport.maxSegmentBytes;
+  const maxDiagnosticBytes: number = transport.maxDiagnosticBytes;
+  const maxCompletionBytes: number = transport.maxCompletionBytes;
   const discovered: readonly TacuaCapture.BackendSessionDiscoveryRecord[] =
     await TacuaCapture.listBackendSessions();
   for (const record of discovered) {
@@ -473,6 +476,9 @@ export async function typecheckBackendContract(): Promise<void> {
   void queueSchemaVersion;
   void sdkProfileContractVersion;
   void sdkProfileDigest;
+  void maxSegmentBytes;
+  void maxDiagnosticBytes;
+  void maxCompletionBytes;
   void activeCapability;
   void startedCredentialAvailability;
   void receivingState;

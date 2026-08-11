@@ -78,6 +78,7 @@ node --test .github/scripts/validate-processor-image-inputs.test.mjs
 node --test .github/scripts/verify-processor-container.test.mjs
 node .github/scripts/validate-processor-image-inputs.mjs
 sh experiments/ios-capture-spike/package/tests/run-core-tests.sh
+python3 -B experiments/ios-capture-spike/package/tests/sdk_backend_loopback_e2e.py
 npm --prefix apps/reviewer ci --ignore-scripts --no-audit --no-fund
 node .github/scripts/generate-reviewer-third-party-notices.mjs
 npm --prefix apps/reviewer test

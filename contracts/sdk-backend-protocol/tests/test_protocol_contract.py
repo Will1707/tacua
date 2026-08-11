@@ -506,6 +506,24 @@ class ProtocolContractTests(unittest.TestCase):
             }
         )
         manifest["segments"].append(second_segment)
+        first_accounting = manifest["app_audio_accounting"]["segments"][0]
+        first_accounting.update(
+            {"append_attempts": 2, "appended_samples": 2, "drops": []}
+        )
+        second_accounting = copy.deepcopy(first_accounting)
+        second_accounting.update(
+            {
+                "segment_id": second_intent["segment_id"],
+                "sequence": 1,
+                "attempt_start_index": 3,
+                "append_attempts": 2,
+                "appended_samples": 1,
+                "drops": [
+                    {"attempt_index": 3, "cause": "input_backpressure"}
+                ],
+            }
+        )
+        manifest["app_audio_accounting"]["segments"].append(second_accounting)
         manifest["upload"]["receipts"].append(copy.deepcopy(second_receipt["runtime_receipt"]))
         completion_request["capture_manifest"] = protocol.runtime.seal(manifest)
         completion_request["segment_receipts"] = [second_receipt, first_receipt]
@@ -567,10 +585,119 @@ class ProtocolContractTests(unittest.TestCase):
         expected = protocol.digest(
             {
                 "backend_origin": "https://qa.tacua.example",
-                "transport_policy_version": "tacua.sdk-transport@1.0.0",
+                "max_completion_bytes": 4_194_304,
+                "max_diagnostic_bytes": 3_145_728,
+                "max_segment_bytes": 268_435_456,
+                "transport_policy_version": "tacua.sdk-transport@1.1.0",
             }
         )
         self.assertEqual(build["transport_configuration_digest"], expected)
+
+    def test_maximum_runtime_manifest_can_exceed_native_completion_cap(self) -> None:
+        """Keep the SDK's pre-parser completion-limit guard demonstrably reachable."""
+
+        completion = load("completion-request.json")
+        manifest = completion["capture_manifest"]
+        segment_template = copy.deepcopy(manifest["segments"][0])
+        accounting_template = copy.deepcopy(
+            manifest["app_audio_accounting"]["segments"][0]
+        )
+        receipt_template = load("segment-upload-receipt.json")
+        runtime_template = copy.deepcopy(receipt_template["runtime_receipt"])
+        segments: list[dict] = []
+        accounting_segments: list[dict] = []
+        runtime_receipts: list[dict] = []
+        segment_receipts: list[dict] = []
+        gaps: list[dict] = []
+
+        for index in range(2_048):
+            segment_id = f"segment_{index:04d}"
+            upload_id = f"upload_segment_{index:04d}"
+            object_id = f"object_{index:04d}"
+
+            segment = copy.deepcopy(segment_template)
+            segment.update({"segment_id": segment_id, "sequence": index})
+            segment["time_range"].update({"start_ms": index, "end_ms": index + 1})
+            segments.append(segment)
+
+            accounting = copy.deepcopy(accounting_template)
+            accounting.update(
+                {
+                    "segment_id": segment_id,
+                    "sequence": index,
+                    "attempt_start_index": index + 1,
+                    "append_attempts": 1,
+                    "appended_samples": 1,
+                    "drops": [],
+                }
+            )
+            accounting_segments.append(accounting)
+
+            runtime_receipt = copy.deepcopy(runtime_template)
+            runtime_receipt.update(
+                {
+                    "object_id": object_id,
+                    "segment_id": segment_id,
+                    "size_bytes": segment["content"]["size_bytes"],
+                    "content_digest": segment["content"]["content_digest"],
+                }
+            )
+            runtime_receipt["receipt_digest"] = protocol.runtime.digest_without(
+                runtime_receipt,
+                "receipt_digest",
+            )
+            runtime_receipts.append(runtime_receipt)
+
+            receipt = copy.deepcopy(receipt_template)
+            receipt.update(
+                {
+                    "upload_id": upload_id,
+                    "sequence": index,
+                    "segment_id": segment_id,
+                    "sidecar_digest": segment["content"]["sidecar_digest"],
+                    "transport_digest": segment["content"]["content_digest"],
+                    "runtime_receipt": runtime_receipt,
+                }
+            )
+            segment_receipts.append(protocol.seal(receipt))
+            gaps.append(
+                {
+                    "affected_streams": ["app_video"],
+                    "detail": "x" * 512,
+                    "gap_id": f"gap_{index:04d}",
+                    "reason": "unknown",
+                    "time_range": {
+                        "clock": "session_monotonic",
+                        "start_ms": index,
+                        "end_ms": index + 1,
+                    },
+                }
+            )
+
+        manifest["monotonic_duration_ms"] = 2_048
+        manifest["segments"] = segments
+        manifest["gaps"] = gaps
+        manifest["upload"]["receipts"] = runtime_receipts
+        manifest["app_audio_accounting"].update(
+            {
+                "append_attempts": 2_048,
+                "reserved_through_index": 2_048,
+                "complete": True,
+                "segments": accounting_segments,
+                "unknown_ranges": [],
+            }
+        )
+        completion["capture_manifest"] = protocol.runtime.seal(manifest)
+        completion["segment_receipts"] = segment_receipts
+        completion = protocol.seal(completion)
+
+        protocol.validate(completion)
+        manifest_size = len(
+            protocol.canonical_json(completion["capture_manifest"]).encode("utf-8")
+        )
+        completion_size = len(protocol.canonical_json(completion).encode("utf-8"))
+        self.assertLessEqual(manifest_size, 4_194_304)
+        self.assertGreater(completion_size, 4_194_304)
 
     def test_completion_receipt_is_cleanup_authority_not_agent_authority(self) -> None:
         request = load("completion-request.json")

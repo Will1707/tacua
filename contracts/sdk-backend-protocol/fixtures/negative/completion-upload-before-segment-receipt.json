@@ -1,7 +1,29 @@
 {
   "capture_manifest": {
+    "app_audio_accounting": {
+      "append_attempts": 4,
+      "complete": true,
+      "reserved_through_index": 4,
+      "segments": [
+        {
+          "append_attempts": 4,
+          "appended_samples": 3,
+          "attempt_start_index": 1,
+          "drops": [
+            {
+              "attempt_index": 3,
+              "cause": "input_backpressure"
+            }
+          ],
+          "segment_id": "segment_synthetic",
+          "sequence": 0
+        }
+      ],
+      "unknown_ranges": [],
+      "version": 1
+    },
     "build_id": "build_synthetic",
-    "build_identity_digest": "sha256:234578e520242629d531f7a9649e0417dd9e67d8761572530f054f65e7dc4b63",
+    "build_identity_digest": "sha256:53effba69a9d01818c4bf41763e97833cc3dc46ab45c9fd7a1e027b8e1707c91",
     "capture_scope": "app_only",
     "capture_state": "complete",
     "contract_version": "tacua.capture-upload-manifest@1.0.0",
@@ -22,7 +44,7 @@
         }
       }
     ],
-    "manifest_digest": "sha256:143fc8ea96b9f4dc1cc28c0de33e7e9219abce0622e6370fb9e5cfa5dfa2aa37",
+    "manifest_digest": "sha256:c603ea61892e58b0fd2030d5e4ba2adfbd91ca9ee36d248eaa3b80cb448325bc",
     "manifest_version": 2,
     "media_type": "application/vnd.tacua.capture-upload-manifest+json;version=1.0.0",
     "monotonic_duration_ms": 60000,
@@ -85,32 +107,32 @@
   "diagnostic_receipts": [
     {
       "credential_id": "credential_receiving_resume",
-      "diagnostic_receipt_digest": "sha256:62d566bef8be86883818cfe2edeb4a07e797ce6c3d56b0f1260adf58f9fef8f5",
-      "envelope_digest": "sha256:9842a35e46a1cb1b914c3a3500eeb35bb3020dedf5f6a9f5b10170b7cbd7479d",
+      "diagnostic_receipt_digest": "sha256:129a3dcd8a7866b3d8f1186c8090f91773e7590d641acedd8a17b72f647a12d9",
+      "envelope_digest": "sha256:e8f3e81881cedcd226ed40799d7c8ea412fbf9460350b54552740e8c7c8281f2",
       "envelope_id": "envelope_synthetic",
       "message_type": "diagnostic_upload_receipt",
       "object_id": "object_diagnostic_synthetic",
       "protocol_version": "tacua.sdk-backend@1.0.0",
       "receipt_id": "receipt_diagnostic_synthetic",
       "received_at": "2026-07-21T10:02:04Z",
-      "request_digest": "sha256:8262c9a2865a735afe517349c57a40bc1b8135e785d0e1db1b3bd9056cc93d68",
-      "scope_digest": "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50",
+      "request_digest": "sha256:cf69ab0a27e4d7a781c757a4d03a1e9db28afe405496a2d48f246b75e294d167",
+      "scope_digest": "sha256:c38600d56cdb3bc8a0d94c0dd7e6323f863d1ccbc6953b6c71421e7c08512a20",
       "session_id": "session_synthetic",
       "size_bytes": 3774,
-      "transport_digest": "sha256:6f395bf765e73eac49e90ff444ce8965ce31b452a683f26e03e8554497e4efbf",
+      "transport_digest": "sha256:5d81177ee85d25cb44f11989ece74ae516430c4326210b4df1427c244f55cf69",
       "upload_id": "upload_diagnostic_synthetic"
     }
   ],
   "message_type": "completion_request",
   "protocol_version": "tacua.sdk-backend@1.0.0",
-  "request_digest": "sha256:e54467bc42c01698aaed7639013afa9810b1468eab13c2592422e24c97eda1e5",
+  "request_digest": "sha256:79790043659ad954b8138568b9f87c7c7064c2c290c03be3940b1d48c3088fee",
   "requested_at": "2026-07-21T10:02:05Z",
-  "scope_digest": "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50",
+  "scope_digest": "sha256:c38600d56cdb3bc8a0d94c0dd7e6323f863d1ccbc6953b6c71421e7c08512a20",
   "segment_receipts": [
     {
       "content_type": "video/quicktime",
       "credential_id": "credential_synthetic",
-      "intent_digest": "sha256:1279a5bb8440de4c4e169c93e359eb8abef623d9137a922d2fc95aec5d6cd686",
+      "intent_digest": "sha256:29206f6a501eb2c0c82d63489245d81d4c6ad93b6d2f73e0b6237c1e68c0e074",
       "message_type": "segment_upload_receipt",
       "protocol_version": "tacua.sdk-backend@1.0.0",
       "runtime_receipt": {
@@ -121,9 +143,9 @@
         "segment_id": "segment_synthetic",
         "size_bytes": 2048
       },
-      "scope_digest": "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50",
+      "scope_digest": "sha256:c38600d56cdb3bc8a0d94c0dd7e6323f863d1ccbc6953b6c71421e7c08512a20",
       "segment_id": "segment_synthetic",
-      "segment_receipt_digest": "sha256:16a7995055070f892ae225fe9352d039fefbe49912a922f8fbb7bb3a01a70347",
+      "segment_receipt_digest": "sha256:e9aa26267c8bbf548a3f2a646518e26db6bb1c5c2ec53a1f730b1b9a35d9ae58",
       "sequence": 0,
       "session_id": "session_synthetic",
       "sidecar_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",

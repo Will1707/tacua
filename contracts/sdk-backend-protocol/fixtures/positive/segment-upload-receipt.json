@@ -1,7 +1,7 @@
 {
   "content_type": "video/quicktime",
   "credential_id": "credential_synthetic",
-  "intent_digest": "sha256:1279a5bb8440de4c4e169c93e359eb8abef623d9137a922d2fc95aec5d6cd686",
+  "intent_digest": "sha256:29206f6a501eb2c0c82d63489245d81d4c6ad93b6d2f73e0b6237c1e68c0e074",
   "message_type": "segment_upload_receipt",
   "protocol_version": "tacua.sdk-backend@1.0.0",
   "runtime_receipt": {
@@ -12,9 +12,9 @@
     "segment_id": "segment_synthetic",
     "size_bytes": 2048
   },
-  "scope_digest": "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50",
+  "scope_digest": "sha256:c38600d56cdb3bc8a0d94c0dd7e6323f863d1ccbc6953b6c71421e7c08512a20",
   "segment_id": "segment_synthetic",
-  "segment_receipt_digest": "sha256:00500257fe3fb5315c871a2f5619daca5a1689c00084d98440f1727de16b8d76",
+  "segment_receipt_digest": "sha256:8ba85bb0f2e61f0e45e440e014b2500ccc22dc54d34c63376d1ec3af91b4b280",
   "sequence": 0,
   "session_id": "session_synthetic",
   "sidecar_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",

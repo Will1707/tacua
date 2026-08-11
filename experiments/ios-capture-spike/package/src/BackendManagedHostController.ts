@@ -461,7 +461,7 @@ class Controller implements BackendManagedHostController {
 
   refresh = (): Promise<void> =>
     this.run("refresh", async () => {
-      await this.refreshInternal();
+      await this.awaitActive(this.refreshInternal());
     });
 
   prepareLaunch = (launchURL: string): Promise<void> =>
@@ -503,10 +503,11 @@ class Controller implements BackendManagedHostController {
           );
         }
         if (prepared.expectedSessionId !== null) {
-          matchedLocalSessionId = await this.matchResumeTarget(
-            prepared.expectedSessionId,
+          matchedLocalSessionId = await this.awaitActive(
+            this.matchResumeTarget(prepared.expectedSessionId),
           );
         }
+        this.assertNotDisposed();
       } catch (error) {
         this.primitives.cancelBackendLaunch(prepared.consentRequestId);
         throw error;
@@ -545,16 +546,19 @@ class Controller implements BackendManagedHostController {
         return;
       }
 
-      let approved: ApprovedBackendLaunch;
+      let approved: ApprovedBackendLaunch | null = null;
       try {
         approved = this.primitives.confirmBackendLaunchConsent(
           pending.consentRequestId,
           true,
         );
+        this.assertNotDisposed();
       } catch (error) {
         // The native gate is volatile. Preparing another link replaces any orphaned approved
         // handle, but cancel the known request first and return the host to a retryable state.
-        this.primitives.cancelBackendLaunch(pending.consentRequestId);
+        this.primitives.cancelBackendLaunch(
+          approved?.approvedLaunchId ?? pending.consentRequestId,
+        );
         this.setPhase({ kind: "idle" });
         throw error;
       }
@@ -596,11 +600,13 @@ class Controller implements BackendManagedHostController {
       this.approvedLaunch = null;
       try {
         if (approved.launchKind === "start") {
-          const plan = await this.primitives.createCaptureSessionPlan({
-            approvedLaunchId: approved.approvedLaunchId,
-            segmentDurationSeconds: duration,
-          });
-          await this.installStartedPlan(plan, "start");
+          const plan = await this.awaitActive(
+            this.primitives.createCaptureSessionPlan({
+              approvedLaunchId: approved.approvedLaunchId,
+              segmentDurationSeconds: duration,
+            }),
+          );
+          await this.awaitActive(this.installStartedPlan(plan, "start"));
           return;
         }
 
@@ -612,14 +618,18 @@ class Controller implements BackendManagedHostController {
             "A resume launch has no exact target",
           );
         }
-        const rematched = await this.matchResumeTarget(expectedRemoteSessionId);
+        const rematched = await this.awaitActive(
+          this.matchResumeTarget(expectedRemoteSessionId),
+        );
         if (rematched !== localSessionId) {
           throw controllerError(
             "ambiguous_resume_target",
             "The resume target changed before exchange",
           );
         }
-        const queue = await this.primitives.getBackendQueueStatus(localSessionId);
+        const queue = await this.awaitActive(
+          this.primitives.getBackendQueueStatus(localSessionId),
+        );
         if (
           queue.resumeRequirement?.kind !== "resume_session" ||
           queue.resumeRequirement.canConsumeApprovedLaunch !== true
@@ -629,12 +639,14 @@ class Controller implements BackendManagedHostController {
             "The queue cannot consume a resume launch",
           );
         }
-        const plan = await this.primitives.resumeCaptureSessionPlan({
-          approvedLaunchId: approved.approvedLaunchId,
-          localSessionId,
-          segmentDurationSeconds: duration,
-        });
-        await this.installResumedPlan(plan, "resume");
+        const plan = await this.awaitActive(
+          this.primitives.resumeCaptureSessionPlan({
+            approvedLaunchId: approved.approvedLaunchId,
+            localSessionId,
+            segmentDurationSeconds: duration,
+          }),
+        );
+        await this.awaitActive(this.installResumedPlan(plan, "resume"));
       } catch (error) {
         this.primitives.cancelBackendLaunch(approved.approvedLaunchId);
         this.setPhase({
@@ -652,8 +664,8 @@ class Controller implements BackendManagedHostController {
   ): Promise<void> =>
     this.run("recover_start_plan", async () => {
       const duration = validateSegmentDuration(segmentDurationSeconds);
-      const status = await this.primitives.getBackendStartRecoveryStatus(
-        localSessionId,
+      const status = await this.awaitActive(
+        this.primitives.getBackendStartRecoveryStatus(localSessionId),
       );
       if (!status.canRecoverWithoutLaunch) {
         throw controllerError(
@@ -663,17 +675,21 @@ class Controller implements BackendManagedHostController {
           "START cannot be recovered without a launch",
         );
       }
-      const plan = await this.primitives.recoverStartedCaptureSessionPlan({
-        localSessionId,
-        segmentDurationSeconds: duration,
-      });
+      const plan = await this.awaitActive(
+        this.primitives.recoverStartedCaptureSessionPlan({
+          localSessionId,
+          segmentDurationSeconds: duration,
+        }),
+      );
       if (plan.localSessionId !== localSessionId) {
         throw controllerError(
           "native_rejected",
           "Recovered START returned a different local session",
         );
       }
-      await this.installStartedPlan(plan, "recovered_start");
+      await this.awaitActive(
+        this.installStartedPlan(plan, "recovered_start"),
+      );
     });
 
   recoverResumePlan = (
@@ -682,8 +698,8 @@ class Controller implements BackendManagedHostController {
   ): Promise<void> =>
     this.run("recover_resume_plan", async () => {
       const duration = validateSegmentDuration(segmentDurationSeconds);
-      const status = await this.primitives.getBackendResumeRecoveryStatus(
-        localSessionId,
+      const status = await this.awaitActive(
+        this.primitives.getBackendResumeRecoveryStatus(localSessionId),
       );
       if (!status.canRecoverWithoutLaunch) {
         throw controllerError(
@@ -693,17 +709,21 @@ class Controller implements BackendManagedHostController {
           "RESUME cannot be recovered without a launch",
         );
       }
-      const plan = await this.primitives.recoverResumedCaptureSessionPlan({
-        localSessionId,
-        segmentDurationSeconds: duration,
-      });
+      const plan = await this.awaitActive(
+        this.primitives.recoverResumedCaptureSessionPlan({
+          localSessionId,
+          segmentDurationSeconds: duration,
+        }),
+      );
       if (plan.localSessionId !== localSessionId) {
         throw controllerError(
           "native_rejected",
           "Recovered RESUME returned a different local session",
         );
       }
-      await this.installResumedPlan(plan, "recovered_resume");
+      await this.awaitActive(
+        this.installResumedPlan(plan, "recovered_resume"),
+      );
     });
 
   abandonStart = (
@@ -711,8 +731,8 @@ class Controller implements BackendManagedHostController {
     acknowledgeRemoteSessionMayExist: boolean,
   ): Promise<void> =>
     this.run("abandon_start", async () => {
-      const status = await this.primitives.getBackendStartRecoveryStatus(
-        localSessionId,
+      const status = await this.awaitActive(
+        this.primitives.getBackendStartRecoveryStatus(localSessionId),
       );
       if (!status.canAbandonLocally) {
         throw controllerError(
@@ -732,17 +752,19 @@ class Controller implements BackendManagedHostController {
           "Unknown remote START outcomes require acknowledgement",
         );
       }
-      await this.primitives.abandonBackendStart(
-        localSessionId,
-        acknowledgeRemoteSessionMayExist,
+      await this.awaitActive(
+        this.primitives.abandonBackendStart(
+          localSessionId,
+          acknowledgeRemoteSessionMayExist,
+        ),
       );
-      await this.refreshInternal();
+      await this.awaitActive(this.refreshInternal());
     });
 
   resetPreparedResume = (localSessionId: string): Promise<void> =>
     this.run("reset_prepared_resume", async () => {
-      const status = await this.primitives.getBackendResumeRecoveryStatus(
-        localSessionId,
+      const status = await this.awaitActive(
+        this.primitives.getBackendResumeRecoveryStatus(localSessionId),
       );
       if (!status.canResetPreparedCredential) {
         throw controllerError(
@@ -752,8 +774,10 @@ class Controller implements BackendManagedHostController {
           "RESUME cannot be reset locally",
         );
       }
-      await this.primitives.resetPreparedBackendResume(localSessionId);
-      await this.refreshInternal();
+      await this.awaitActive(
+        this.primitives.resetPreparedBackendResume(localSessionId),
+      );
+      await this.awaitActive(this.refreshInternal());
     });
 
   startPlannedCapture = (): Promise<void> =>
@@ -772,7 +796,9 @@ class Controller implements BackendManagedHostController {
       }
       let status: CaptureStatus;
       try {
-        status = await this.primitives.start(plan.captureOptions);
+        status = await this.awaitActive(
+          this.primitives.start(plan.captureOptions),
+        );
         assertRecordingStatus(status, plan.localSessionId);
       } catch (error) {
         this.reconcileCaptureMutationFailure("started", plan.localSessionId);
@@ -803,7 +829,9 @@ class Controller implements BackendManagedHostController {
       }
       let status: CaptureStatus;
       try {
-        status = await this.primitives.resume(plan.captureOptions);
+        status = await this.awaitActive(
+          this.primitives.resume(plan.captureOptions),
+        );
         assertRecordingStatus(status, plan.localSessionId);
       } catch (error) {
         this.reconcileCaptureMutationFailure("resumed", plan.localSessionId);
@@ -837,7 +865,7 @@ class Controller implements BackendManagedHostController {
         });
         return;
       }
-      const terminal = await this.primitives.stop();
+      const terminal = await this.awaitActive(this.primitives.stop());
       if (terminal.recorderRecording) {
         throw controllerError(
           "native_rejected",
@@ -880,8 +908,8 @@ class Controller implements BackendManagedHostController {
           "No verified partial with current authority is ready",
         );
       }
-      const kept = await this.primitives.markPartialReadyForUpload(
-        plan.captureOptions,
+      const kept = await this.awaitActive(
+        this.primitives.markPartialReadyForUpload(plan.captureOptions),
       );
       if (kept.sessionId !== plan.localSessionId) {
         throw controllerError(
@@ -912,21 +940,23 @@ class Controller implements BackendManagedHostController {
           "No stopped session is selected",
         );
       }
-      await this.admitAndDrainInternal(resolved);
+      await this.awaitActive(this.admitAndDrainInternal(resolved));
     });
 
   notifyForeground = (): Promise<void> =>
     this.run("foreground_retry", async () => {
       if (this.primitives.getStatus().recorderRecording) {
-        await this.refreshInternal();
+        await this.awaitActive(this.refreshInternal());
         return;
       }
       if (this.pendingDrainSessionId) {
-        await this.drainInternal(this.pendingDrainSessionId);
+        await this.awaitActive(
+          this.drainInternal(this.pendingDrainSessionId),
+        );
         return;
       }
 
-      const sessions = await this.discoverSessions();
+      const sessions = await this.awaitActive(this.discoverSessions());
       this.replaceSessionsAndRecorder(sessions);
       const admitted = sessions.filter(
         (session) =>
@@ -936,7 +966,7 @@ class Controller implements BackendManagedHostController {
       );
       for (const session of admitted) {
         this.pendingDrainSessionId = session.localSessionId;
-        await this.drainInternal(session.localSessionId);
+        await this.awaitActive(this.drainInternal(session.localSessionId));
       }
     });
 
@@ -954,7 +984,9 @@ class Controller implements BackendManagedHostController {
           "Authenticated reset cannot begin while capture is recording",
         );
       }
-      const queue = await this.primitives.getBackendQueueStatus(localSessionId);
+      const queue = await this.awaitActive(
+        this.primitives.getBackendQueueStatus(localSessionId),
+      );
       if (!queue.exists || queue.localSessionId !== localSessionId) {
         throw controllerError(
           "session_not_found",
@@ -997,9 +1029,11 @@ class Controller implements BackendManagedHostController {
       // outcome must be requested again and is replayed exactly by the native deletion journal.
       this.resetRequest = null;
       this.setPhase(request.priorPhase);
-      const deleted = await this.primitives.deleteBackendSession({
-        localSessionId: request.localSessionId,
-      });
+      const deleted = await this.awaitActive(
+        this.primitives.deleteBackendSession({
+          localSessionId: request.localSessionId,
+        }),
+      );
       if (
         deleted.localSessionId !== request.localSessionId ||
         deleted.remoteDataDeleted !== true ||
@@ -1042,13 +1076,29 @@ class Controller implements BackendManagedHostController {
       }
     }
     if (this.pendingConsent) {
-      this.primitives.cancelBackendLaunch(this.pendingConsent.consentRequestId);
+      try {
+        this.primitives.cancelBackendLaunch(
+          this.pendingConsent.consentRequestId,
+        );
+      } catch {
+        // Teardown remains non-throwing; native launch handles are volatile and process-scoped.
+      }
     }
     if (this.approvedLaunch) {
-      this.primitives.cancelBackendLaunch(this.approvedLaunch.approvedLaunchId);
+      try {
+        this.primitives.cancelBackendLaunch(
+          this.approvedLaunch.approvedLaunchId,
+        );
+      } catch {
+        // Continue clearing all JS-held authority even if native teardown rejects cancellation.
+      }
     }
     this.pendingConsent = null;
     this.approvedLaunch = null;
+    this.installedPlan = null;
+    this.activeCaptureSessionId = null;
+    this.pendingDrainSessionId = null;
+    this.resetRequest = null;
     this.listeners.clear();
   };
 
@@ -1071,7 +1121,7 @@ class Controller implements BackendManagedHostController {
           // Reconcile the recorder first so an unrelated queue-discovery failure cannot leave an
           // auto-stopped or errored ReplayKit session projected as actively recording.
           this.replaceRecorder(this.primitives.getStatus());
-          await this.refreshInternal();
+          await this.awaitActive(this.refreshInternal());
         } finally {
           // A failed reconciliation is surfaced through the controller's bounded error projection.
           // Do not spin on the same signal, but preserve a signal that arrived during the attempt.
@@ -1103,7 +1153,7 @@ class Controller implements BackendManagedHostController {
       this.assertNotDisposed();
       this.patchSnapshot({ mutation: operation, lastError: null });
       try {
-        await task();
+        await this.awaitActive(task());
       } catch (error) {
         this.patchSnapshot({ lastError: projectError(operation, error) });
         throw error;
@@ -1119,7 +1169,7 @@ class Controller implements BackendManagedHostController {
   }
 
   private async refreshInternal(): Promise<void> {
-    const sessions = await this.discoverSessions();
+    const sessions = await this.awaitActive(this.discoverSessions());
     this.replaceSessionsAndRecorder(sessions);
   }
 
@@ -1197,10 +1247,12 @@ class Controller implements BackendManagedHostController {
   private async discoverSessions(): Promise<
     readonly BackendManagedSessionSummary[]
   > {
-    const [records, recoverable] = await Promise.all([
-      this.primitives.listBackendSessions(),
-      this.primitives.listRecoverableSessions(),
-    ]);
+    const [records, recoverable] = await this.awaitActive(
+      Promise.all([
+        this.primitives.listBackendSessions(),
+        this.primitives.listRecoverableSessions(),
+      ]),
+    );
     const localCaptureById = new Map(
       recoverable.map((session) => [session.sessionId, session]),
     );
@@ -1216,22 +1268,26 @@ class Controller implements BackendManagedHostController {
 
     const summaries: BackendManagedSessionSummary[] = [];
     for (const localSessionId of [...ids].sort()) {
-      const start = await this.primitives.getBackendStartRecoveryStatus(
-        localSessionId,
+      const start = await this.awaitActive(
+        this.primitives.getBackendStartRecoveryStatus(localSessionId),
       );
       // START and RESUME recovery are mutually exclusive. Native deliberately rejects a RESUME
       // inspection while an active START journal owns this session, so preserve that START
       // recovery action instead of turning discovery into a generic refresh failure.
       const resume =
         start.state === "none" || start.state === "queue_committed"
-          ? await this.primitives.getBackendResumeRecoveryStatus(localSessionId)
+          ? await this.awaitActive(
+              this.primitives.getBackendResumeRecoveryStatus(localSessionId),
+            )
           : emptyResumeRecovery(localSessionId);
       const recoveryBlocksQueue =
         !["none", "queue_committed"].includes(start.state) ||
         !["none", "queue_committed"].includes(resume.state);
       const queue = recoveryBlocksQueue
         ? emptyQueue(localSessionId)
-        : await this.primitives.getBackendQueueStatus(localSessionId);
+        : await this.awaitActive(
+            this.primitives.getBackendQueueStatus(localSessionId),
+          );
       const capture = localCaptureById.get(localSessionId) ?? null;
       summaries.push(
         projectSessionSummary(localSessionId, capture, queue, start, resume),
@@ -1241,7 +1297,9 @@ class Controller implements BackendManagedHostController {
   }
 
   private async matchResumeTarget(expectedRemoteSessionId: string): Promise<string> {
-    const records = await this.primitives.listBackendSessions();
+    const records = await this.awaitActive(
+      this.primitives.listBackendSessions(),
+    );
     if (records.length > this.maximumDiscoveredSessions) {
       throw controllerError(
         "session_limit_exceeded",
@@ -1252,7 +1310,9 @@ class Controller implements BackendManagedHostController {
     for (const localSessionId of new Set(
       records.map((record) => record.localSessionId),
     )) {
-      const queue = await this.primitives.getBackendQueueStatus(localSessionId);
+      const queue = await this.awaitActive(
+        this.primitives.getBackendQueueStatus(localSessionId),
+      );
       if (
         queue.exists &&
         queue.localSessionId === localSessionId &&
@@ -1292,7 +1352,9 @@ class Controller implements BackendManagedHostController {
         "START plan identifiers do not agree",
       );
     }
-    await this.projectInstalledPlan(plan.localSessionId, source, true);
+    await this.awaitActive(
+      this.projectInstalledPlan(plan.localSessionId, source, true),
+    );
     this.installedPlan = {
       localSessionId: plan.localSessionId,
       captureOptions: plan.captureOptions,
@@ -1318,10 +1380,12 @@ class Controller implements BackendManagedHostController {
         "RESUME capture options name a different session",
       );
     }
-    await this.projectInstalledPlan(
-      plan.localSessionId,
-      source,
-      plan.captureOptions !== null,
+    await this.awaitActive(
+      this.projectInstalledPlan(
+        plan.localSessionId,
+        source,
+        plan.captureOptions !== null,
+      ),
     );
     this.installedPlan = {
       localSessionId: plan.localSessionId,
@@ -1334,7 +1398,9 @@ class Controller implements BackendManagedHostController {
     source: "start" | "resume" | "recovered_start" | "recovered_resume",
     hasCaptureOptions: boolean,
   ): Promise<void> {
-    const recoverable = await this.primitives.listRecoverableSessions();
+    const recoverable = await this.awaitActive(
+      this.primitives.listRecoverableSessions(),
+    );
     if (recoverable.length > this.maximumDiscoveredSessions) {
       throw controllerError(
         "session_limit_exceeded",
@@ -1374,11 +1440,11 @@ class Controller implements BackendManagedHostController {
   }
 
   private async admitAndDrainInternal(localSessionId: string): Promise<void> {
-    const start = await this.primitives.getBackendStartRecoveryStatus(
-      localSessionId,
+    const start = await this.awaitActive(
+      this.primitives.getBackendStartRecoveryStatus(localSessionId),
     );
-    const resume = await this.primitives.getBackendResumeRecoveryStatus(
-      localSessionId,
+    const resume = await this.awaitActive(
+      this.primitives.getBackendResumeRecoveryStatus(localSessionId),
     );
     if (
       !["none", "queue_committed"].includes(start.state) ||
@@ -1391,7 +1457,9 @@ class Controller implements BackendManagedHostController {
         "Lifecycle recovery must finish before admission",
       );
     }
-    const queue = await this.primitives.getBackendQueueStatus(localSessionId);
+    const queue = await this.awaitActive(
+      this.primitives.getBackendQueueStatus(localSessionId),
+    );
     if (!queue.exists || queue.localSessionId !== localSessionId) {
       throw controllerError(
         "session_not_found",
@@ -1411,7 +1479,9 @@ class Controller implements BackendManagedHostController {
     }
     const hasAdmittedOperations = admittedOperationCount(queue) > 0;
     if (!hasAdmittedOperations) {
-      const recoverable = await this.primitives.listRecoverableSessions();
+      const recoverable = await this.awaitActive(
+        this.primitives.listRecoverableSessions(),
+      );
       const capture = recoverable.find(
         (candidate) => candidate.sessionId === localSessionId,
       );
@@ -1421,8 +1491,8 @@ class Controller implements BackendManagedHostController {
           "Only explicitly finalized capture can be admitted",
         );
       }
-      const admission = await this.primitives.admitFinalizedCapture(
-        localSessionId,
+      const admission = await this.awaitActive(
+        this.primitives.admitFinalizedCapture(localSessionId),
       );
       if (admission.localSessionId !== localSessionId) {
         throw controllerError(
@@ -1432,14 +1502,16 @@ class Controller implements BackendManagedHostController {
       }
     }
     this.pendingDrainSessionId = localSessionId;
-    await this.drainInternal(localSessionId);
+    await this.awaitActive(this.drainInternal(localSessionId));
   }
 
   private async drainInternal(localSessionId: string): Promise<void> {
     try {
-      const processed = await this.primitives.processAdmittedCapture({
-        localSessionId,
-      });
+      const processed = await this.awaitActive(
+        this.primitives.processAdmittedCapture({
+          localSessionId,
+        }),
+      );
       if (
         processed.localSessionId !== localSessionId ||
         processed.payloadCleanupState !== "payloads_removed" ||
@@ -1461,6 +1533,7 @@ class Controller implements BackendManagedHostController {
         result: "uploaded",
       });
     } catch (error) {
+      if (this.disposed) throw error;
       this.pendingDrainSessionId = localSessionId;
       this.setPhase({ kind: "upload_retry", localSessionId });
       throw error;
@@ -1475,6 +1548,7 @@ class Controller implements BackendManagedHostController {
     mode: "started" | "resumed",
     plannedLocalSessionId: string,
   ): void {
+    if (this.disposed) return;
     try {
       const current = this.primitives.getStatus();
       this.updateRecorder(current);
@@ -1518,6 +1592,7 @@ class Controller implements BackendManagedHostController {
       >
     >,
   ): void {
+    if (this.disposed) return;
     const next: BackendManagedHostSnapshot = {
       ...this.snapshot,
       ...patch,
@@ -1532,6 +1607,8 @@ class Controller implements BackendManagedHostController {
         // A rendering subscriber must not break native lifecycle serialization.
       }
     }
+    // A subscriber may synchronously dispose its owner while handling this publication.
+    this.assertNotDisposed();
   }
 
   private withActions(
@@ -1669,6 +1746,22 @@ class Controller implements BackendManagedHostController {
     if (this.disposed) {
       throw controllerError("invalid_state", "Controller is disposed");
     }
+  }
+
+  private async awaitActive<Result>(
+    operation: Promise<Result>,
+  ): Promise<Result> {
+    let result: Result;
+    try {
+      result = await operation;
+    } catch (error) {
+      // Teardown wins over a late native rejection so disposed callers never receive private
+      // operation detail and cannot continue from an ambiguous lifecycle boundary.
+      this.assertNotDisposed();
+      throw error;
+    }
+    this.assertNotDisposed();
+    return result;
   }
 }
 

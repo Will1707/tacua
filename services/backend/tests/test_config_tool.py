@@ -63,6 +63,16 @@ class ConfigToolTests(unittest.TestCase):
         self.assertEqual(SDK_PROFILE_CONTRACT, profile["contract_version"])
         self.assertEqual("https://qa.example.com", profile["backend_origin"])
         self.assertEqual(
+            {
+                "backend_origin": "https://qa.example.com",
+                "max_completion_bytes": 4_194_304,
+                "max_diagnostic_bytes": 3_145_728,
+                "max_segment_bytes": 268_435_456,
+                "transport_policy_version": "tacua.sdk-transport@1.1.0",
+            },
+            profile["transport_configuration"],
+        )
+        self.assertEqual(
             profile["transport_configuration_digest"],
             profile["build_identity"]["transport_configuration_digest"],
         )
@@ -145,6 +155,50 @@ class ConfigToolTests(unittest.TestCase):
             changed_profile["profile_digest"],
         )
         parse_config_text(self.render(changed))
+
+    def test_each_transport_limit_reseals_the_build_handoff_and_sdk_profile(self) -> None:
+        original_config_text, original_profile_text = compile_config_artifacts(
+            self.template_text()
+        )
+        original_config = json.loads(original_config_text)
+        original_profile = json.loads(original_profile_text)
+        cases = {
+            "max_segment_bytes": 134_217_728,
+            "max_diagnostic_bytes": 2_097_152,
+            "max_completion_bytes": 3_145_728,
+        }
+        for field, value in cases.items():
+            with self.subTest(field=field):
+                document = self.template_document()
+                document[field] = value
+                changed_config_text, changed_profile_text = compile_config_artifacts(
+                    self.render(document)
+                )
+                changed_config = json.loads(changed_config_text)
+                changed_profile = json.loads(changed_profile_text)
+                self.assertEqual(value, changed_profile["transport_configuration"][field])
+                self.assertNotEqual(
+                    original_config["build_identity"]["transport_configuration_digest"],
+                    changed_config["build_identity"]["transport_configuration_digest"],
+                )
+                self.assertNotEqual(
+                    original_config["build_identity"]["build_identity_digest"],
+                    changed_config["build_identity"]["build_identity_digest"],
+                )
+                self.assertNotEqual(
+                    original_config["approved_handoff"]["build_identity"][
+                        "build_identity_digest"
+                    ],
+                    changed_config["approved_handoff"]["build_identity"][
+                        "build_identity_digest"
+                    ],
+                )
+                self.assertNotEqual(
+                    original_profile["profile_digest"], changed_profile["profile_digest"]
+                )
+                self.assertEqual(
+                    changed_config["build_identity"], changed_profile["build_identity"]
+                )
 
     def test_native_binary_digest_reseals_only_the_handoff_projection(self) -> None:
         original_config_text, original_profile_text = compile_config_artifacts(
@@ -266,6 +320,16 @@ class ConfigToolTests(unittest.TestCase):
         )
         secret_bearing = self.template_document()
         secret_bearing["admin_secret"] = "must-never-be-consumed"
+        invalid_limits = []
+        for field, value in (
+            ("max_segment_bytes", 0),
+            ("max_diagnostic_bytes", 3_145_729),
+            ("max_completion_bytes", 4_194_305),
+            ("max_completion_bytes", True),
+        ):
+            invalid = self.template_document()
+            invalid[field] = value
+            invalid_limits.append(self.render(invalid))
 
         for serialized in (
             malformed,
@@ -278,6 +342,7 @@ class ConfigToolTests(unittest.TestCase):
             stale_digest,
             self.render(inconsistent),
             self.render(secret_bearing),
+            *invalid_limits,
         ):
             with self.subTest(serialized=serialized[:80]), self.assertRaises(ConfigError):
                 compile_config_template(serialized)

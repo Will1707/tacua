@@ -34,6 +34,7 @@ jobs:
         run: |
           node --test .github/scripts/check-markdown-links.test.mjs
           node --test .github/scripts/package-mobile-sdk.test.mjs
+          node --test .github/scripts/prepare-packed-mobile-sdk-harness.test.mjs
           node --test .github/scripts/validate-backend-image-inputs.test.mjs
           node --test .github/scripts/validate-processor-image-inputs.test.mjs
           node --test .github/scripts/validate-mobile-sdk-release-run.test.mjs
@@ -190,6 +191,9 @@ jobs:
       - name: Run SDK core and harness type checks
         working-directory: experiments/ios-capture-spike/package
         run: sh tests/run-core-tests.sh
+
+      - name: Exercise the real SDK-to-backend loopback boundary
+        run: python3 -B experiments/ios-capture-spike/package/tests/sdk_backend_loopback_e2e.py
 
       - name: Verify the SDK release-package boundary and reproducibility
         run: |

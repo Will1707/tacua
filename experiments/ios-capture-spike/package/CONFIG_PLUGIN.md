@@ -46,7 +46,10 @@ different value:
 - `TacuaCaptureBuildVariant`;
 - `TacuaCaptureDistribution`;
 - `TacuaSDKProfileJSON` (the canonical profile without its file LF);
-- `TacuaSDKProfileDigest`; and
+- `TacuaSDKProfileDigest`;
+- `TacuaMaxSegmentBytes`;
+- `TacuaMaxDiagnosticBytes`;
+- `TacuaMaxCompletionBytes`; and
 - `NSMicrophoneUsageDescription`.
 
 It also registers `launchScheme` in `CFBundleURLTypes`. Use a dedicated 2–64
@@ -54,8 +57,14 @@ character scheme. Browser, OS-service, and Tacua reviewer schemes are rejected
 so an opaque launch code cannot be routed outside the QA app. The reviewer app
 must be configured with that same scheme.
 
-The complete SDK profile, `backendOrigin`, the variant, and the distribution are
-public build metadata.
+The complete SDK profile, `backendOrigin`, the three transport byte limits, the
+variant, and the distribution are public build metadata. The native SDK requires
+the three integer plist pins to match the sealed `tacua.sdk-transport@1.1.0`
+configuration and rejects oversized segment bytes, diagnostic-envelope bytes,
+or completion-request bytes before opening the network. The generated profile
+uses 3 MiB and 4 MiB as the diagnostic and completion maxima respectively;
+these are also the native canonical-parser and durable-queue admission bounds,
+not independently expandable server-only allowances.
 Do not put an administrator token, SDK bearer credential, launch code, model
 key, or another secret in plugin options or Expo public environment variables.
 

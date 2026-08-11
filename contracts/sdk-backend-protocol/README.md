@@ -37,7 +37,7 @@ The transport configuration digest is the Tacua canonical-JSON digest of
 exactly this closed subject (with the deployment's normalized origin):
 
 ```json
-{"backend_origin":"https://qa.tacua.example","transport_policy_version":"tacua.sdk-transport@1.0.0"}
+{"backend_origin":"https://qa.tacua.example","max_completion_bytes":4194304,"max_diagnostic_bytes":3145728,"max_segment_bytes":268435456,"transport_policy_version":"tacua.sdk-transport@1.1.0"}
 ```
 
 `backend_origin` is an origin, not a base URL: lowercase the scheme and host,
@@ -46,11 +46,17 @@ remove the default port, accept only an empty or root path, normalize the root
 canonical origin therefore has no trailing slash. Production and QA
 configurations require `https`; only local development may use `http` with a
 loopback host.
-The QA binary pins the normalized origin, policy version, and resulting digest
+The QA binary pins the normalized origin, policy version, exact segment,
+diagnostic-envelope, and completion-request byte ceilings, and resulting digest
 at build time. Its launch deep link carries only an opaque launch code and
 cannot replace that configuration. The backend independently pins the expected
 build-identity and transport-configuration digests for the launch authorization
 and rejects any mismatch before issuing a session credential.
+The checked-in profile uses 256 MiB for segment media, 3 MiB for the canonical
+diagnostic envelope, and 4 MiB for the complete canonical completion request.
+The diagnostic and completion maxima are deliberately bounded by the native
+canonical parser and durable-queue pipeline; an operator cannot configure a
+larger server allowance that the SDK cannot represent safely.
 
 The SDK generates `exchange_id`, `credential_id`, and a high-entropy bearer
 secret, and writes the secret to iOS Keychain with

@@ -974,7 +974,7 @@ enum TransportQueueTests {
         TacuaLocalPayloadBinding(
           role: .diagnosticEnvelope,
           relativePath: "diagnostics/events.json",
-          contentDigest: "sha256:6f395bf765e73eac49e90ff444ce8965ce31b452a683f26e03e8554497e4efbf"
+          contentDigest: try diagnosticContentDigest(root)
         )
       ],
       queue: &preparedQueue,
@@ -1742,7 +1742,10 @@ enum TransportQueueTests {
     )
     try queue.applyExchange(
       remoteSessionID: "session_synthetic",
-      scopeDigest: "sha256:112e576cdc6e5baac76cd40b0b2f49182e573039e7107a1eaf0605ff99f67f50",
+      scopeDigest: try requireValue(
+        queue.scopeDigest,
+        "Completion replay fixture lost its durable scope binding"
+      ),
       credentialID: "credential_replay_current",
       transportConfigurationDigest: transportDigest,
       expiresAt: "2026-08-21T10:00:00Z",
@@ -1843,6 +1846,16 @@ enum TransportQueueTests {
     return try TacuaCanonicalJSON.data(try TacuaCanonicalJSON.parse(data))
   }
 
+  private static func diagnosticContentDigest(_ root: URL) throws -> String {
+    let request = try TacuaCanonicalJSON.parse(
+      canonicalFixture(root, "diagnostic-upload-request")
+    )
+    return try requireValue(
+      request.objectValue?["transport"]?.objectValue?["content_digest"]?.stringValue,
+      "Diagnostic fixture lost its transport content digest"
+    )
+  }
+
   private static func fixtureQueue(
     _ root: URL,
     requestName: String,
@@ -1913,7 +1926,7 @@ enum TransportQueueTests {
           TacuaLocalPayloadBinding(
             role: .diagnosticEnvelope,
             relativePath: "diagnostics/events.json",
-            contentDigest: "sha256:6f395bf765e73eac49e90ff444ce8965ce31b452a683f26e03e8554497e4efbf"
+            contentDigest: try diagnosticContentDigest(root)
           )
         ],
         queue: &queue,

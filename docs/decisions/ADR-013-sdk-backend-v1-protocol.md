@@ -27,13 +27,21 @@ artifacts. The protocol has these properties:
    policy. The tested iOS bundle identifier belongs to the build identity and
    is not overloaded as Tacua's internal application ID. The build identity
    also binds `transport_configuration_digest`, the canonical-JSON digest of
-   exactly `backend_origin` and `transport_policy_version`. The origin is
+   the closed `tacua.sdk-transport@1.1.0` subject: `backend_origin`,
+   `max_segment_bytes`, `max_diagnostic_bytes`, `max_completion_bytes`, and
+   `transport_policy_version`. The required byte limits are therefore immutable
+   build inputs shared by the backend and SDK. The origin is
    normalized to a lowercase scheme and host with its default port removed and
    accepts only an empty or root path; a root `/` is normalized away, so the
    canonical origin has no trailing slash. User information, non-root paths,
    queries, and fragments are rejected. QA and production require HTTPS;
    loopback HTTP is local-development only.
-2. The QA build pins that normalized backend origin and transport policy. A
+2. The QA build pins that normalized backend origin, transport policy, and
+   request byte limits. It rejects an oversized segment, diagnostic envelope,
+   or completion locally before network I/O and before an operation becomes
+   outcome-unknown. Diagnostic envelopes are capped at 3 MiB and complete
+   canonical completion requests at 4 MiB so every permitted request remains
+   within the native canonical parser and bounded durable-queue pipeline. A
    launch deep link supplies only an opaque code and cannot override them. The
    backend independently pins the expected build and transport digests, and the
    SDK rejects redirects rather than forwarding launch or bearer credentials

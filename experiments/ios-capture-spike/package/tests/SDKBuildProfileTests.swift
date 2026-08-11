@@ -47,6 +47,9 @@ enum SDKBuildProfileTests {
     let artifacts = try profile.captureArtifacts(
       consentGrantedAt: "2026-07-22T12:00:00Z"
     )
+    try require(profile.configuration.maxSegmentBytes == 268_435_456, "Wrong segment limit")
+    try require(profile.configuration.maxDiagnosticBytes == 3_145_728, "Wrong diagnostic limit")
+    try require(profile.configuration.maxCompletionBytes == 4_194_304, "Wrong completion limit")
     try require(artifacts.buildID == "build_example", "Wrong build projection")
     try require(artifacts.bundleIdentifier == "com.example.app", "Wrong bundle projection")
     try require(
@@ -66,6 +69,20 @@ enum SDKBuildProfileTests {
         canonicalJSON: TacuaCanonicalJSON.data(.object(tampered)),
         claimedProfileDigest: claimed,
         configuration: configuration
+      )
+    }
+    let wrongLimits = try TacuaBackendConfiguration(
+      buildConfiguredOrigin: "https://qa.example.com",
+      allowInsecureLoopback: false,
+      debugBuild: false,
+      maxSegmentBytes: 134_217_728,
+      qaBuildConfiguration: qaBuild
+    )
+    try expect(.transportConfigurationMismatch) {
+      _ = try TacuaSDKBuildProfile(
+        canonicalJSON: Data(canonical),
+        claimedProfileDigest: claimed,
+        configuration: wrongLimits
       )
     }
     try expect(.profileDigestMismatch) {

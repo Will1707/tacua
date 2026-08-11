@@ -14,13 +14,19 @@ private func expectConfigurationError(
   _ expected: TacuaBackendConfigurationError,
   origin: String,
   allowInsecureLoopback: Bool = false,
-  debugBuild: Bool = false
+  debugBuild: Bool = false,
+  maxSegmentBytes: Int = TacuaBackendConfiguration.defaultMaxSegmentBytes,
+  maxDiagnosticBytes: Int = TacuaBackendConfiguration.defaultMaxDiagnosticBytes,
+  maxCompletionBytes: Int = TacuaBackendConfiguration.defaultMaxCompletionBytes
 ) throws {
   do {
     _ = try TacuaBackendConfiguration(
       buildConfiguredOrigin: origin,
       allowInsecureLoopback: allowInsecureLoopback,
-      debugBuild: debugBuild
+      debugBuild: debugBuild,
+      maxSegmentBytes: maxSegmentBytes,
+      maxDiagnosticBytes: maxDiagnosticBytes,
+      maxCompletionBytes: maxCompletionBytes
     )
     throw BackendConfigurationTestFailure.assertion("Expected \(expected), but origin was accepted")
   } catch let error as TacuaBackendConfigurationError {
@@ -34,6 +40,8 @@ enum BackendConfigurationTests {
     try qaBuildGateRejectsProductionAndMalformedConfiguration()
     try buildIdentityMustMatchNativeQABuildAuthority()
     try normalizesBuildConfiguredHTTPSOrigin()
+    try transportLimitsAreExactNativeConfiguration()
+    try bundleConfigurationReadsExactTransportLimits()
     try rejectsRuntimeOverrideShapes()
     try loopbackHTTPRequiresExplicitDebugConfiguration()
     try endpointCannotEscapeOrigin()
@@ -129,7 +137,7 @@ enum BackendConfigurationTests {
     try require(config.normalizedOrigin == "https://qa.example.com", "Origin was not normalized")
     try require(
       config.configurationDigest
-        == "sha256:c247c8dfdd0a21d4410748aa9f847d026008c7a0c3944f1a54a1183f1e67b452",
+        == "sha256:edb112f00c2dfd730be887ac981f0bf6eeaaec72180506cfbf1541fb25652ac2",
       "Configuration digest does not match the protocol subject"
     )
     let slashConfig = try TacuaBackendConfiguration(
@@ -142,6 +150,88 @@ enum BackendConfigurationTests {
       slashConfig.configurationDigest == config.configurationDigest,
       "Equivalent origins produced different configuration digests"
     )
+  }
+
+  private static func transportLimitsAreExactNativeConfiguration() throws {
+    let custom = try TacuaBackendConfiguration(
+      buildConfiguredOrigin: "https://qa.example.com",
+      allowInsecureLoopback: false,
+      debugBuild: false,
+      maxSegmentBytes: 4_194_304,
+      maxDiagnosticBytes: 1_048_576,
+      maxCompletionBytes: 2_097_152
+    )
+    try require(custom.maxSegmentBytes == 4_194_304, "Segment limit was not retained")
+    try require(custom.maxDiagnosticBytes == 1_048_576, "Diagnostic limit was not retained")
+    try require(custom.maxCompletionBytes == 2_097_152, "Completion limit was not retained")
+
+    let defaults = try TacuaBackendConfiguration(
+      buildConfiguredOrigin: "https://qa.example.com",
+      allowInsecureLoopback: false,
+      debugBuild: false
+    )
+    try require(
+      custom.configurationDigest != defaults.configurationDigest,
+      "Transport limit changes did not change the sealed configuration digest"
+    )
+    try expectConfigurationError(
+      .invalidTransportLimit,
+      origin: "https://qa.example.com",
+      maxSegmentBytes: 0
+    )
+    try expectConfigurationError(
+      .invalidTransportLimit,
+      origin: "https://qa.example.com",
+      maxDiagnosticBytes: TacuaBackendConfiguration.maxDiagnosticBytesUpperBound + 1
+    )
+    try expectConfigurationError(
+      .invalidTransportLimit,
+      origin: "https://qa.example.com",
+      maxCompletionBytes: 1_023
+    )
+    try expectConfigurationError(
+      .invalidTransportLimit,
+      origin: "https://qa.example.com",
+      maxCompletionBytes: TacuaBackendConfiguration.maxCompletionBytesUpperBound + 1
+    )
+  }
+
+  private static func bundleConfigurationReadsExactTransportLimits() throws {
+    let bundleRoot = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "tacua-transport-limits-\(UUID().uuidString).bundle",
+      isDirectory: true
+    )
+    let contents = bundleRoot.appendingPathComponent("Contents", isDirectory: true)
+    try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: bundleRoot) }
+    let plist: [String: Any] = [
+      "CFBundleIdentifier": "dev.tacua.transport-limit-tests",
+      "CFBundlePackageType": "BNDL",
+      TacuaQABuildConfiguration.enabledInfoPlistKey: true,
+      TacuaQABuildConfiguration.buildVariantInfoPlistKey: "preview",
+      TacuaQABuildConfiguration.distributionInfoPlistKey: "testflight",
+      TacuaBackendConfiguration.originInfoPlistKey: "https://qa.example.com",
+      TacuaBackendConfiguration.insecureLoopbackInfoPlistKey: false,
+      TacuaBackendConfiguration.maxSegmentBytesInfoPlistKey: 8_388_608,
+      TacuaBackendConfiguration.maxDiagnosticBytesInfoPlistKey: 2_097_152,
+      TacuaBackendConfiguration.maxCompletionBytesInfoPlistKey: 4_194_304,
+    ]
+    let plistBytes = try PropertyListSerialization.data(
+      fromPropertyList: plist,
+      format: .xml,
+      options: 0
+    )
+    try plistBytes.write(to: contents.appendingPathComponent("Info.plist"))
+    guard let bundle = Bundle(path: bundleRoot.path) else {
+      throw BackendConfigurationTestFailure.assertion("Could not load temporary test bundle")
+    }
+    let configuration = try TacuaBackendConfiguration.fromBuildConfiguration(
+      bundle: bundle,
+      debugBuild: false
+    )
+    try require(configuration.maxSegmentBytes == 8_388_608, "Bundle segment pin was lost")
+    try require(configuration.maxDiagnosticBytes == 2_097_152, "Bundle diagnostic pin was lost")
+    try require(configuration.maxCompletionBytes == 4_194_304, "Bundle completion pin was lost")
   }
 
   private static func rejectsRuntimeOverrideShapes() throws {

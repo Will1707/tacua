@@ -191,9 +191,6 @@ class BackendHarness(unittest.TestCase):
             consent_contract=self.scope["consent"]["policy_version"],
             backend_origin="https://qa.tacua.example",
             state_directory=Path(self.temporary.name),
-            max_segment_bytes=1_048_576,
-            max_diagnostic_bytes=1_048_576,
-            max_completion_bytes=4_194_304,
         )
         self.backend = PilotBackend(self.config, self.admin_secret, clock=self.clock)
 

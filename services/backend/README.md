@@ -317,8 +317,9 @@ the separate mode-`0444` file reachable only through its mode-`0700` private
 host directory, safe deployment parent, and the read-only Compose mount.
 
 The configuration pins one full sealed `build_identity` artifact for this V1
-deployment. Its `transport_configuration_digest` must match `backend_origin`
-and the configured transport policy. To authorize another build, deploy a
+deployment. Its `transport_configuration_digest` must match `backend_origin`,
+the configured transport policy, and the exact segment, diagnostic-envelope,
+and completion-request byte limits. To authorize another build, deploy a
 separately pinned instance or explicitly reset/reconfigure an empty instance.
 It also requires an `approved_handoff` object with exactly `build_identity`,
 `authority`, and `registry_revision`. The handoff build identity must be a full

@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   MAX_RUNTIME_FILE_BYTES,
@@ -11,6 +14,37 @@ import {
   validateRuntimePath,
   validateRuntimeText,
 } from "./package-mobile-sdk.mjs";
+
+const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+
+test("0.2 candidate pins its handoff and documents the 1.1 clean cutover", () => {
+  const manifest = JSON.parse(readFileSync(
+    path.join(repositoryRoot, "experiments/ios-capture-spike/package/package.json"),
+    "utf8",
+  ));
+  const template = JSON.parse(readFileSync(
+    path.join(repositoryRoot, "services/backend/config.template.example.json"),
+    "utf8",
+  ));
+  const readme = readFileSync(
+    path.join(repositoryRoot, "experiments/ios-capture-spike/package/README.md"),
+    "utf8",
+  );
+  const runbook = readFileSync(
+    path.join(repositoryRoot, "docs/maintainers/MOBILE_SDK_RELEASE.md"),
+    "utf8",
+  );
+
+  assert.equal(manifest.version, "0.2.0");
+  assert.equal(
+    template.approved_handoff.build_identity.sdk.package_version,
+    manifest.version,
+  );
+  assert.match(readme, /Transport policy 1\.1 is an intentional clean-cutover boundary\./);
+  assert.match(readme, /cannot be rebound silently/);
+  assert.match(readme, /mobile-sdk-v0\.2\.0/);
+  assert.match(runbook, /mobile-sdk-v0\.2\.0/);
+});
 
 function report(overrides = {}) {
   return {
@@ -33,6 +67,7 @@ test("release paths are closed to an audited runtime file set", () => {
     "ios/TacuaCaptureSpike.podspec",
     "plugin/config.js",
     "src/BackendManagedHostController.ts",
+    "src/BackendManagedHostLifecycleAdapter.ts",
     "src/index.ts",
     "README.md",
   ]) {

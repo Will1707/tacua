@@ -281,6 +281,7 @@ enum CaptureAdmissionTests {
     try durableQueueRejectsHostArtifactSubstitution(fixtures)
     try sameBootResumeAnchorMapsHistoricalCapture(fixtures)
     try rejectsCaptureBeforeBackendSession(fixtures)
+    try configuredDiagnosticLimitFailsClosedBeforeAdmission(fixtures)
     try journalDiagnosticsProjectAndBindSource(fixtures)
     try fullJournalStillAdmitsLateManifestSignalsDeterministically(fixtures)
     try legacyFullTornJournalStillRecovers(fixtures)
@@ -296,6 +297,8 @@ enum CaptureAdmissionTests {
     try conflictingStableIDDoesNotMaterialize(fixtures)
     try extraAdmissionOperationDoesNotMaterialize(fixtures)
     try await uploadCoordinatorDrivesCompletionAndCleanup(fixtures)
+    try await uploadTransportLimitRejectsBeforeUnknownOutcome(fixtures)
+    try await completionParserBoundaryRejectsBeforeQueueAndNetwork(fixtures)
     try await uploadRechecksRetentionBetweenNetworkOperations(fixtures)
     try await uploadCancelsAtRetentionDeadlineWithoutAwaitingLateSender(fixtures)
     try await uploadAtRetentionBoundaryStartsNoRequest(fixtures)
@@ -622,6 +625,10 @@ enum CaptureAdmissionTests {
         TacuaCaptureAdmissionCoordinator.diagnosticFileName
       )
     )
+    try require(
+      diagnosticData.count <= harness.configuration.maxDiagnosticBytes,
+      "Admission materialized a diagnostic above the sealed transport limit"
+    )
     let diagnostic = try TacuaCanonicalJSON.parse(diagnosticData)
     let envelope = try diagnostic.requiringObject(keys: [
       "build_id", "build_identity_digest", "collection_gaps", "contract_version",
@@ -715,6 +722,43 @@ enum CaptureAdmissionTests {
     let afterRotation = try harness.coordinator.admit(harness.input)
     try require(afterRotation.alreadyAdmitted, "Exact older-credential admission was rejected")
     try require(harness.queues.compareAndSwapCount == 1, "Rotation retry mutated the queue")
+  }
+
+  private static func configuredDiagnosticLimitFailsClosedBeforeAdmission(
+    _ fixtures: URL
+  ) throws {
+    let harness = try makeHarness(
+      fixtures: fixtures,
+      suffix: "diagnostic_limit",
+      maxDiagnosticBytes: 1_024
+    )
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+
+    do {
+      _ = try harness.coordinator.admit(harness.input)
+      throw CaptureAdmissionTestFailure.assertion(
+        "Admission exceeded a sealed diagnostic limit"
+      )
+    } catch let error as TacuaCaptureAdmissionError {
+      try require(
+        error == .captureArtifactMismatch,
+        "Configured diagnostic limit returned the wrong local failure"
+      )
+    }
+    try require(
+      harness.queues.compareAndSwapCount == 0,
+      "Configured diagnostic limit mutated the durable queue"
+    )
+    let session = harness.root.appendingPathComponent(
+      harness.localSessionID,
+      isDirectory: true
+    )
+    try require(
+      !FileManager.default.fileExists(atPath: session.appendingPathComponent(
+        TacuaCaptureAdmissionCoordinator.diagnosticFileName
+      ).path),
+      "Configured diagnostic limit published an oversized envelope"
+    )
   }
 
   private static func durableQueueAdmitsWithoutHostArtifacts(_ fixtures: URL) throws {
@@ -1477,6 +1521,129 @@ enum CaptureAdmissionTests {
     try require(sender.observedCallCount() == 3, "Completed retry performed network I/O")
   }
 
+  private static func uploadTransportLimitRejectsBeforeUnknownOutcome(
+    _ fixtures: URL
+  ) async throws {
+    let harness = try makeHarness(
+      fixtures: fixtures,
+      suffix: "upload_transport_limit",
+      maxSegmentBytes: 1_024
+    )
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    _ = try harness.coordinator.admit(harness.input)
+    let baseline = try required(harness.queues.queue, "Limited upload lost its admitted queue")
+    let operation = try required(
+      baseline.operations.first(where: { $0.kind == .segment }),
+      "Limited upload did not enqueue its segment"
+    )
+    try require(operation.state == .prepared, "Limited segment was not initially prepared")
+
+    let sender = AdmissionTestSender { _ in
+      throw CaptureAdmissionTestFailure.assertion("Over-limit upload reached the sender")
+    }
+    let coordinator = TacuaCaptureUploadCoordinator(
+      configuration: harness.configuration,
+      captureRootDirectory: harness.root,
+      queueStore: harness.queues,
+      lifecycleGate: harness.gate,
+      resumeRecoveryInspector: harness.resume,
+      sender: sender,
+      clock: harness.clock
+    )
+
+    for attempt in 1...2 {
+      do {
+        _ = try await coordinator.drive(localSessionID: harness.localSessionID)
+        throw CaptureAdmissionTestFailure.assertion(
+          "Over-limit upload attempt \(attempt) unexpectedly succeeded"
+        )
+      } catch let error as TacuaCaptureUploadError {
+        try require(
+          error == .transportLimitExceeded,
+          "Over-limit upload returned \(error), not its stable terminal local error"
+        )
+        try require(
+          error.code == "ERR_TACUA_UPLOAD_LIMIT",
+          "Over-limit upload changed its stable public error code"
+        )
+      }
+      try require(sender.observedCallCount() == 0, "Over-limit upload performed network I/O")
+      try require(
+        harness.queues.queue == baseline,
+        "Over-limit upload moved its durable operation to outcome-unknown"
+      )
+    }
+  }
+
+  private static func completionParserBoundaryRejectsBeforeQueueAndNetwork(
+    _ fixtures: URL
+  ) async throws {
+    let harness = try makeHarness(fixtures: fixtures, suffix: "completion_limit")
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    _ = try harness.coordinator.admit(harness.input)
+    let sender = AdmissionTestSender { request in
+      try validatedReceipt(for: request, fixtures: fixtures)
+    }
+    let coordinator = TacuaCaptureUploadCoordinator(
+      configuration: harness.configuration,
+      captureRootDirectory: harness.root,
+      queueStore: harness.queues,
+      lifecycleGate: harness.gate,
+      resumeRecoveryInspector: harness.resume,
+      sender: sender,
+      clock: harness.clock,
+      completionRequestTransform: { request in
+        TacuaPreparedBackendRequest(
+          kind: request.kind,
+          operationID: request.operationID,
+          credentialID: request.credentialID,
+          canonicalData: Data(
+            repeating: 0x78,
+            count: TacuaBackendConfiguration.defaultMaxCompletionBytes + 1
+          ),
+          requestDigest: request.requestDigest
+        )
+      }
+    )
+
+    var stoppedQueue: TacuaTransportQueueV3?
+    for attempt in 1...2 {
+      do {
+        _ = try await coordinator.drive(localSessionID: harness.localSessionID)
+        throw CaptureAdmissionTestFailure.assertion(
+          "Parser-boundary completion attempt \(attempt) unexpectedly succeeded"
+        )
+      } catch let error as TacuaCaptureUploadError {
+        try require(
+          error == .transportLimitExceeded,
+          "Parser-boundary completion lost its stable terminal limit error"
+        )
+        try require(
+          error.code == "ERR_TACUA_UPLOAD_LIMIT",
+          "Parser-boundary completion changed its public error code"
+        )
+      }
+      let queue = try required(harness.queues.queue, "Completion limit lost its queue")
+      try require(
+        queue.operations.filter({ $0.kind == .completion }).isEmpty,
+        "Over-limit completion became durable"
+      )
+      try require(
+        queue.operations.allSatisfy({ $0.state == .responseStored }),
+        "Completion limit changed an upload's durable state"
+      )
+      if let stoppedQueue {
+        try require(queue == stoppedQueue, "Completion limit retry mutated the queue")
+      } else {
+        stoppedQueue = queue
+      }
+      try require(
+        sender.observedCallCount() == 2,
+        "Over-limit completion reached the network sender"
+      )
+    }
+  }
+
   private static func uploadCancellationKeepsUnknownOutcomeAndLease(
     _ fixtures: URL
   ) async throws {
@@ -1978,9 +2145,36 @@ enum CaptureAdmissionTests {
     return try TacuaCanonicalJSON.parse(data)
   }
 
+  private static func buildAndScope(
+    fixtures: URL,
+    transportConfigurationDigest: String
+  ) throws -> (build: Data, scope: Data) {
+    guard case .object(var build) = try fixture(fixtures, "build-identity"),
+      case .object(var scope) = try fixture(fixtures, "capture-scope")
+    else { throw CaptureAdmissionTestFailure.assertion("Build/scope fixtures were malformed") }
+    build["transport_configuration_digest"] = .string(transportConfigurationDigest)
+    let buildDigest = try TacuaCanonicalJSON.digest(
+      .object(build),
+      omittingRootField: "build_identity_digest"
+    )
+    build["build_identity_digest"] = .string(buildDigest)
+    scope["build_identity_digest"] = .string(buildDigest)
+    let scopeDigest = try TacuaCanonicalJSON.digest(
+      .object(scope),
+      omittingRootField: "scope_digest"
+    )
+    scope["scope_digest"] = .string(scopeDigest)
+    return (
+      try TacuaCanonicalJSON.data(.object(build)),
+      try TacuaCanonicalJSON.data(.object(scope))
+    )
+  }
+
   private static func makeHarness(
     fixtures: URL,
     suffix: String,
+    maxSegmentBytes: Int = TacuaBackendConfiguration.defaultMaxSegmentBytes,
+    maxDiagnosticBytes: Int = TacuaBackendConfiguration.defaultMaxDiagnosticBytes,
     projectedDiagnosticEventLimit: Int = TacuaDiagnosticJournal.maximumEvents,
     projectedDiagnosticEventByteLimit: Int = TacuaCaptureAdmissionCoordinator
       .maximumProjectedDiagnosticEventBytes,
@@ -1999,10 +2193,14 @@ enum CaptureAdmissionTests {
     let configuration = try TacuaBackendConfiguration(
       buildConfiguredOrigin: "https://qa.tacua.example",
       allowInsecureLoopback: false,
-      debugBuild: false
+      debugBuild: false,
+      maxSegmentBytes: maxSegmentBytes,
+      maxDiagnosticBytes: maxDiagnosticBytes
     )
-    let buildData = try Data(contentsOf: fixtures.appendingPathComponent("build-identity.json"))
-    let scopeData = try Data(contentsOf: fixtures.appendingPathComponent("capture-scope.json"))
+    let (buildData, scopeData) = try buildAndScope(
+      fixtures: fixtures,
+      transportConfigurationDigest: configuration.configurationDigest
+    )
     let clock = AdmissionTestClock(
       uptimeMilliseconds: 1_180_000,
       bootSessionID: "boot_capture_admission"

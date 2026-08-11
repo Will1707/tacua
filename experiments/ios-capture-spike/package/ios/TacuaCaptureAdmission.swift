@@ -1031,7 +1031,14 @@ final class TacuaCaptureAdmissionCoordinator {
       return (envelope, try TacuaCanonicalJSON.data(envelope), digest)
     }
 
-    var diagnosticEventByteLimit = projectedDiagnosticEventByteLimit
+    let diagnosticEnvelopeByteLimit = min(
+      configuration.maxDiagnosticBytes,
+      TacuaCanonicalJSON.defaultMaximumBytes
+    )
+    var diagnosticEventByteLimit = min(
+      projectedDiagnosticEventByteLimit,
+      diagnosticEnvelopeByteLimit
+    )
     var diagnosticProjection = try projectDiagnosticEnvelope(
       source: diagnosticSource?.snapshot,
       markers: manifest.markers,
@@ -1042,8 +1049,8 @@ final class TacuaCaptureAdmissionCoordinator {
       eventByteLimit: diagnosticEventByteLimit
     )
     var diagnosticArtifact = try finalizeDiagnosticEnvelope(diagnosticProjection)
-    while diagnosticArtifact.data.count > TacuaCanonicalJSON.defaultMaximumBytes {
-      let excess = diagnosticArtifact.data.count - TacuaCanonicalJSON.defaultMaximumBytes
+    while diagnosticArtifact.data.count > diagnosticEnvelopeByteLimit {
+      let excess = diagnosticArtifact.data.count - diagnosticEnvelopeByteLimit
       let nextLimit = diagnosticEventByteLimit - excess - 4_096
       guard nextLimit >= 16 * 1_024, nextLimit < diagnosticEventByteLimit else {
         throw TacuaCaptureAdmissionError.captureArtifactMismatch

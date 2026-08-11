@@ -54,7 +54,10 @@ build_identity = protocol.seal(
         "transport_configuration_digest": protocol.digest(
             {
                 "backend_origin": "https://qa.tacua.example",
-                "transport_policy_version": "tacua.sdk-transport@1.0.0",
+                "max_completion_bytes": 4_194_304,
+                "max_diagnostic_bytes": 3_145_728,
+                "max_segment_bytes": 268_435_456,
+                "transport_policy_version": "tacua.sdk-transport@1.1.0",
             }
         ),
         "expo": {

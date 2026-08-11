@@ -15,6 +15,9 @@ from typing import Any, Sequence
 
 from .config import (
     APPROVED_HANDOFF_CONTRACT,
+    DEFAULT_MAX_COMPLETION_BYTES,
+    DEFAULT_MAX_DIAGNOSTIC_BYTES,
+    DEFAULT_MAX_SEGMENT_BYTES,
     MAX_CONFIG_BYTES,
     TRANSPORT_POLICY_VERSION,
     ConfigError,
@@ -26,7 +29,7 @@ from .contracts import ContractError, canonical_json, digest, seal
 
 
 DERIVE_MARKER = "__TACUA_DERIVE_SHA256__"
-SDK_PROFILE_CONTRACT = "tacua.sdk-profile@1.0.0"
+SDK_PROFILE_CONTRACT = "tacua.sdk-profile@1.1.0"
 SCOPE_POLICY_CONTRACT = "tacua.capture-scope-policy@1.0.0"
 RETENTION_POLICY_VERSION = "tacua.retention-v1"
 DERIVED_PATHS = (
@@ -186,6 +189,15 @@ def compile_config_template(serialized: str) -> str:
     transport_digest = digest(
         {
             "backend_origin": normalized_origin,
+            "max_completion_bytes": document.get(
+                "max_completion_bytes", DEFAULT_MAX_COMPLETION_BYTES
+            ),
+            "max_diagnostic_bytes": document.get(
+                "max_diagnostic_bytes", DEFAULT_MAX_DIAGNOSTIC_BYTES
+            ),
+            "max_segment_bytes": document.get(
+                "max_segment_bytes", DEFAULT_MAX_SEGMENT_BYTES
+            ),
             "transport_policy_version": policy,
         }
     )

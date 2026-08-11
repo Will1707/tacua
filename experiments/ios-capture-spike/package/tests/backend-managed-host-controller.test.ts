@@ -869,6 +869,102 @@ test("dispose removes native lifecycle listeners and ignores later callbacks", a
   );
 });
 
+test("dispose during RESUME target matching cancels the in-flight consent handle", async () => {
+  const harness = createHarness();
+  harness.setPreparedExpectedSessionId(REMOTE_SESSION_ID);
+  harness.queues.set(LOCAL_SESSION_ID, resumeQueue());
+  let releaseMatching: (() => void) | null = null;
+  const originalList = harness.sdk.listBackendSessions;
+  const sdk: BackendManagedHostPrimitives = {
+    ...harness.sdk,
+    listBackendSessions: async () => {
+      harness.calls.push("resume-match-enter");
+      await new Promise<void>((resolve) => {
+        releaseMatching = resolve;
+      });
+      return originalList();
+    },
+  };
+  const controller = createBackendManagedHostControllerForPrimitives(sdk);
+  const preparation = controller.prepareLaunch(
+    `tacua-test://tacua/start?launch_code=${LAUNCH_CODE}&session_id=${REMOTE_SESSION_ID}`,
+  );
+  while (releaseMatching === null) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+
+  controller.dispose();
+  const revisionAtDisposal = controller.getSnapshot().revision;
+  const release = releaseMatching as (() => void) | null;
+  release?.();
+  await assert.rejects(
+    preparation,
+    (error: unknown) =>
+      error instanceof BackendManagedHostControllerError &&
+      error.category === "invalid_state",
+  );
+
+  assert.equal(controller.getSnapshot().revision, revisionAtDisposal);
+  assert.equal(controller.getSnapshot().phase.kind, "idle");
+  assert.equal(
+    harness.calls.filter(
+      (call) => call === "cancel:consent_controller",
+    ).length,
+    1,
+  );
+  assert.equal(
+    harness.calls.some((call) => call.startsWith("queue:")),
+    false,
+  );
+  assert.equal(harness.lifecycleListenerCount(), 0);
+  assert.equal(JSON.stringify(controller.getSnapshot()).includes(LAUNCH_CODE), false);
+});
+
+test("dispose during refresh prevents all post-await discovery and snapshot writes", async () => {
+  const harness = createHarness();
+  harness.queues.set(LOCAL_SESSION_ID, readyQueue());
+  let releaseRecords: (() => void) | null = null;
+  const originalList = harness.sdk.listBackendSessions;
+  const sdk: BackendManagedHostPrimitives = {
+    ...harness.sdk,
+    listBackendSessions: async () => {
+      harness.calls.push("refresh-list-enter");
+      await new Promise<void>((resolve) => {
+        releaseRecords = resolve;
+      });
+      return originalList();
+    },
+  };
+  const controller = createBackendManagedHostControllerForPrimitives(sdk);
+  const refresh = controller.refresh();
+  while (releaseRecords === null) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+
+  controller.dispose();
+  const revisionAtDisposal = controller.getSnapshot().revision;
+  const release = releaseRecords as (() => void) | null;
+  release?.();
+  await assert.rejects(
+    refresh,
+    (error: unknown) =>
+      error instanceof BackendManagedHostControllerError &&
+      error.category === "invalid_state",
+  );
+
+  assert.equal(controller.getSnapshot().revision, revisionAtDisposal);
+  assert.deepEqual(controller.getSnapshot().sessions, []);
+  assert.equal(
+    harness.calls.some(
+      (call) =>
+        call.startsWith("start-recovery:") ||
+        call.startsWith("resume-recovery:") ||
+        call.startsWith("queue:"),
+    ),
+    false,
+  );
+});
+
 test("mutations are serialized across asynchronous native discovery", async () => {
   const harness = createHarness();
   let releaseDiscovery: (() => void) | null = null;

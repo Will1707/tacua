@@ -15,7 +15,66 @@ enum TacuaSDKBackendClientError: Error, Equatable {
   case localPayloadMismatch
   case unsafeLocalPayload
   case localPayloadTooLarge
+  case requestExceedsTransportLimit
   case transportFailure
+}
+
+enum TacuaSDKTransportLimitValidator {
+  static let diagnosticRequestOverheadAllowanceBytes = 65_536
+
+  static func validate(
+    _ request: TacuaPreparedBackendRequest,
+    configuration: TacuaBackendConfiguration
+  ) throws {
+    switch request.kind {
+    case .diagnostic:
+      guard request.canonicalData.count
+        <= configuration.maxDiagnosticBytes + diagnosticRequestOverheadAllowanceBytes
+      else { throw TacuaSDKBackendClientError.requestExceedsTransportLimit }
+    case .completion:
+      guard request.canonicalData.count <= configuration.maxCompletionBytes else {
+        throw TacuaSDKBackendClientError.requestExceedsTransportLimit
+      }
+    case .segment, .deletion:
+      break
+    }
+
+    let root: [String: TacuaJSONValue]
+    do {
+      guard case .object(let object) = try TacuaCanonicalJSON.parse(request.canonicalData),
+        try TacuaCanonicalJSON.data(.object(object)) == request.canonicalData
+      else { throw TacuaSDKBackendClientError.invalidRequest }
+      root = object
+    } catch let error as TacuaSDKBackendClientError {
+      throw error
+    } catch {
+      throw TacuaSDKBackendClientError.invalidRequest
+    }
+
+    switch request.kind {
+    case .segment:
+      guard case .object(let transport)? = root["transport"],
+        let size = transport["size_bytes"]?.integerValue
+      else { throw TacuaSDKBackendClientError.invalidRequest }
+      guard size <= Int64(configuration.maxSegmentBytes) else {
+        throw TacuaSDKBackendClientError.requestExceedsTransportLimit
+      }
+    case .diagnostic:
+      guard let envelope = root["envelope"] else {
+        throw TacuaSDKBackendClientError.invalidRequest
+      }
+      let size: Int
+      do { size = try TacuaCanonicalJSON.data(envelope).count }
+      catch { throw TacuaSDKBackendClientError.invalidRequest }
+      guard size <= configuration.maxDiagnosticBytes else {
+        throw TacuaSDKBackendClientError.requestExceedsTransportLimit
+      }
+    case .completion:
+      break
+    case .deletion:
+      break
+    }
+  }
 }
 
 protocol TacuaBoundedHTTPTransporting {
@@ -264,6 +323,7 @@ final class TacuaSDKBackendClient {
     transportCredentialID: String
   ) async throws -> TacuaValidatedBackendReceipt {
     guard request.kind != .segment else { throw TacuaSDKBackendClientError.invalidRequest }
+    try TacuaSDKTransportLimitValidator.validate(request, configuration: configuration)
     let validatedKind = try TacuaSDKBackendProtocol.validateRequest(request.canonicalData)
     guard validatedKind.rawValue == request.kind.rawValue else {
       throw TacuaSDKBackendClientError.invalidRequest
@@ -303,6 +363,7 @@ final class TacuaSDKBackendClient {
     transportCredentialID: String
   ) async throws -> TacuaValidatedBackendReceipt {
     guard request.kind == .segment else { throw TacuaSDKBackendClientError.invalidRequest }
+    try TacuaSDKTransportLimitValidator.validate(request, configuration: configuration)
     guard try TacuaSDKBackendProtocol.validateRequest(request.canonicalData) == .segment else {
       throw TacuaSDKBackendClientError.invalidRequest
     }
