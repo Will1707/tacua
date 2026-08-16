@@ -9,6 +9,18 @@ enum TacuaCaptureGapInsertionDisposition: Equatable {
   case replaceLastWithOverflowSentinel
 }
 
+enum TacuaManifestPersistenceAttempt: Equatable {
+  case durable
+  case publishedUnconfirmed
+  case unpublished
+}
+
+enum TacuaIssueMarkerPersistenceResolution: Equatable {
+  case committed
+  case rejected
+  case outcomeUnknown
+}
+
 /// Process-local sequence for real ReplayKit video callbacks accepted by the active writer.
 /// Synthetic held frames used at segment boundaries never pass through this counter.
 struct TacuaRetainedReplayKitVideoFrameClock {
@@ -54,6 +66,36 @@ enum TacuaCapturePolicy {
 
   static func canAppendProcessableIssueMark(existingCount: Int) -> Bool {
     existingCount >= 0 && existingCount < maximumProcessableIssueMarks
+  }
+
+  /// Resolves the marker reservation before its redundant journal record is appended. A rename
+  /// followed by a failed directory fsync is visible but not yet crash-durable, so the exact
+  /// publication must be confirmed before the caller may report success or write the journal.
+  static func resolveIssueMarkerPersistence(
+    initialAttempt: TacuaManifestPersistenceAttempt,
+    confirmPublishedManifest: () -> Bool,
+    removeMarker: () -> Void,
+    persistMarkerFreeManifest: () -> TacuaManifestPersistenceAttempt,
+    confirmPublishedRollback: () -> Bool
+  ) -> TacuaIssueMarkerPersistenceResolution {
+    switch initialAttempt {
+    case .durable:
+      return .committed
+    case .unpublished:
+      removeMarker()
+      return .rejected
+    case .publishedUnconfirmed:
+      if confirmPublishedManifest() { return .committed }
+      removeMarker()
+      switch persistMarkerFreeManifest() {
+      case .durable:
+        return .rejected
+      case .publishedUnconfirmed:
+        return confirmPublishedRollback() ? .rejected : .outcomeUnknown
+      case .unpublished:
+        return .outcomeUnknown
+      }
+    }
   }
 
   static func captureGapInsertionDisposition(

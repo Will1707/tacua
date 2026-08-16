@@ -469,10 +469,30 @@ final class TacuaCaptureSession {
       // Publish the capacity reservation before its redundant journal entry. A crash can now
       // leave a manifest-only marker (which admission projects), but never an uncounted journal
       // marker that lets a later process exceed the processor's twelve-mark boundary.
-      guard persistManifestAndReport() else {
+      let persistenceResolution = TacuaCapturePolicy.resolveIssueMarkerPersistence(
+        initialAttempt: persistManifestAttempt(),
+        confirmPublishedManifest: { [self] in confirmManifestPublication() },
+        removeMarker: { [self] in
+          manifest.markers.removeAll { $0.id == marker.id }
+        },
+        persistMarkerFreeManifest: { [self] in persistManifestAttempt() },
+        confirmPublishedRollback: { [self] in confirmManifestPublication() }
+      )
+      switch persistenceResolution {
+      case .committed:
+        break
+      case .rejected:
+        reportManifestPersistenceFailure()
         completion(.failure(TacuaCaptureSpikeError.storageIO(
           "Tacua could not persist the issue marker."
         )))
+        return
+      case .outcomeUnknown:
+        reportCapturePersistenceFailure(
+          .markerPersistenceOutcomeUnknown,
+          reason: "marker_persist_outcome_unknown"
+        )
+        completion(.failure(TacuaCaptureSpikeError.markerPersistenceOutcomeUnknown))
         return
       }
       let journaled = appendSystemDiagnosticBestEffort(.issueMark(
@@ -1998,16 +2018,50 @@ final class TacuaCaptureSession {
       try persistManifest()
       return true
     } catch {
-      let code = TacuaCaptureSpikeError.storageIO(
-        "Tacua could not persist the capture manifest."
-      ).code
-      appendErrorCode(code)
-      eventSink("onError", ["code": code, "reason": "manifest_persist_failed"])
-      guard !manifestPersistenceFailed else { return false }
-      manifestPersistenceFailed = true
-      if manifest.state == "recording", !isStopping {
-        requestStopOnQueue(reason: "manifest_persist_failed")
-      }
+      reportManifestPersistenceFailure()
+      return false
+    }
+  }
+
+  private func persistManifestAttempt() -> TacuaManifestPersistenceAttempt {
+    var publicationOccurred = false
+    do {
+      try Self.persist(
+        manifest: manifest,
+        to: manifestURL,
+        publicationOccurred: &publicationOccurred
+      )
+      return .durable
+    } catch {
+      return publicationOccurred ? .publishedUnconfirmed : .unpublished
+    }
+  }
+
+  private func reportManifestPersistenceFailure() {
+    reportCapturePersistenceFailure(
+      .storageIO("Tacua could not persist the capture manifest."),
+      reason: "manifest_persist_failed"
+    )
+  }
+
+  private func reportCapturePersistenceFailure(
+    _ error: TacuaCaptureSpikeError,
+    reason: String
+  ) {
+    appendErrorCode(error.code)
+    eventSink("onError", ["code": error.code, "reason": reason])
+    guard !manifestPersistenceFailed else { return }
+    manifestPersistenceFailed = true
+    if manifest.state == "recording", !isStopping {
+      requestStopOnQueue(reason: reason)
+    }
+  }
+
+  private func confirmManifestPublication() -> Bool {
+    do {
+      try Self.synchronizeDirectory(at: manifestURL.deletingLastPathComponent())
+      return true
+    } catch {
       return false
     }
   }
@@ -2338,6 +2392,20 @@ final class TacuaCaptureSession {
   }
 
   private static func persist(manifest: CaptureManifest, to url: URL) throws {
+    var publicationOccurred = false
+    try persist(
+      manifest: manifest,
+      to: url,
+      publicationOccurred: &publicationOccurred
+    )
+  }
+
+  private static func persist(
+    manifest: CaptureManifest,
+    to url: URL,
+    publicationOccurred: inout Bool
+  ) throws {
+    publicationOccurred = false
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     let data = try encoder.encode(manifest)
@@ -2367,6 +2435,11 @@ final class TacuaCaptureSession {
       throw TacuaCaptureSpikeError.storageIO("Tacua could not atomically publish its manifest.")
     }
     published = true
+    publicationOccurred = true
+    try synchronizeDirectory(at: directory)
+  }
+
+  private static func synchronizeDirectory(at directory: URL) throws {
     let directoryDescriptor = open(directory.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
     guard directoryDescriptor >= 0 else {
       throw TacuaCaptureSpikeError.storageIO("Tacua could not open its manifest directory.")

@@ -33,6 +33,7 @@ enum CapturePolicyTests {
     try deadlineAndMicrophoneContinuity()
     try videoClockContinuity()
     try retainedReplayKitVideoFrameSequence()
+    try issueMarkerPersistenceResolution()
     try segmentRotation()
     try crashWindowRecoverySource()
     try candidateHandoffValidation()
@@ -114,6 +115,103 @@ enum CapturePolicyTests {
         overflowSentinelPresent: false
       ) == nil,
       "An already-invalid gap collection was accepted"
+    )
+  }
+
+  private static func issueMarkerPersistenceResolution() throws {
+    var events: [String] = []
+    let durable = TacuaCapturePolicy.resolveIssueMarkerPersistence(
+      initialAttempt: .durable,
+      confirmPublishedManifest: { events.append("confirm"); return false },
+      removeMarker: { events.append("remove") },
+      persistMarkerFreeManifest: { events.append("rollback"); return .unpublished },
+      confirmPublishedRollback: { events.append("confirm_rollback"); return false }
+    )
+    try expect(durable == .committed, "A durable marker was not committed")
+    try expect(events.isEmpty, "A durable marker performed unnecessary recovery work")
+
+    events = []
+    let unpublished = TacuaCapturePolicy.resolveIssueMarkerPersistence(
+      initialAttempt: .unpublished,
+      confirmPublishedManifest: { events.append("confirm"); return false },
+      removeMarker: { events.append("remove") },
+      persistMarkerFreeManifest: { events.append("rollback"); return .unpublished },
+      confirmPublishedRollback: { events.append("confirm_rollback"); return false }
+    )
+    try expect(unpublished == .rejected, "An unpublished marker was not rejected")
+    try expect(events == ["remove"], "An unpublished marker was not rolled back in memory first")
+
+    events = []
+    let confirmed = TacuaCapturePolicy.resolveIssueMarkerPersistence(
+      initialAttempt: .publishedUnconfirmed,
+      confirmPublishedManifest: { events.append("confirm"); return true },
+      removeMarker: { events.append("remove") },
+      persistMarkerFreeManifest: { events.append("rollback"); return .unpublished },
+      confirmPublishedRollback: { events.append("confirm_rollback"); return false }
+    )
+    try expect(confirmed == .committed, "A confirmed marker publication was not committed")
+    try expect(events == ["confirm"], "Confirmation performed unrelated rollback work")
+
+    events = []
+    let rolledBack = TacuaCapturePolicy.resolveIssueMarkerPersistence(
+      initialAttempt: .publishedUnconfirmed,
+      confirmPublishedManifest: { events.append("confirm"); return false },
+      removeMarker: { events.append("remove") },
+      persistMarkerFreeManifest: { events.append("rollback"); return .publishedUnconfirmed },
+      confirmPublishedRollback: { events.append("confirm_rollback"); return true }
+    )
+    try expect(rolledBack == .rejected, "A confirmed marker rollback was not rejected cleanly")
+    try expect(
+      events == ["confirm", "remove", "rollback", "confirm_rollback"],
+      "The ambiguous marker rollback did not preserve safe ordering"
+    )
+
+    events = []
+    let durablyRolledBack = TacuaCapturePolicy.resolveIssueMarkerPersistence(
+      initialAttempt: .publishedUnconfirmed,
+      confirmPublishedManifest: { events.append("confirm"); return false },
+      removeMarker: { events.append("remove") },
+      persistMarkerFreeManifest: { events.append("rollback"); return .durable },
+      confirmPublishedRollback: { events.append("confirm_rollback"); return false }
+    )
+    try expect(
+      durablyRolledBack == .rejected,
+      "A durably replaced marker manifest was not rejected cleanly"
+    )
+    try expect(
+      events == ["confirm", "remove", "rollback"],
+      "A durable rollback performed an unnecessary confirmation"
+    )
+
+    events = []
+    let unknown = TacuaCapturePolicy.resolveIssueMarkerPersistence(
+      initialAttempt: .publishedUnconfirmed,
+      confirmPublishedManifest: { events.append("confirm"); return false },
+      removeMarker: { events.append("remove") },
+      persistMarkerFreeManifest: { events.append("rollback"); return .unpublished },
+      confirmPublishedRollback: { events.append("confirm_rollback"); return true }
+    )
+    try expect(unknown == .outcomeUnknown, "An ambiguous marker result claimed ordinary failure")
+    try expect(
+      events == ["confirm", "remove", "rollback"],
+      "The outcome-unknown path performed an invalid confirmation"
+    )
+
+    events = []
+    let unconfirmedRollback = TacuaCapturePolicy.resolveIssueMarkerPersistence(
+      initialAttempt: .publishedUnconfirmed,
+      confirmPublishedManifest: { events.append("confirm"); return false },
+      removeMarker: { events.append("remove") },
+      persistMarkerFreeManifest: { events.append("rollback"); return .publishedUnconfirmed },
+      confirmPublishedRollback: { events.append("confirm_rollback"); return false }
+    )
+    try expect(
+      unconfirmedRollback == .outcomeUnknown,
+      "An unconfirmed marker-free rollback claimed an ordinary failure"
+    )
+    try expect(
+      events == ["confirm", "remove", "rollback", "confirm_rollback"],
+      "The failed rollback confirmation did not preserve safe ordering"
     )
   }
 
