@@ -983,7 +983,7 @@ final class TacuaCaptureAdmissionCoordinator {
     guard let processableIssueMarkCount = TacuaCapturePolicy.processableIssueMarkCount(
       manifestMarkerIDs: manifestMarkerIDs,
       journalMarkerIDs: journalMarkerIDs
-    ), processableIssueMarkCount <= TacuaCapturePolicy.maximumProcessableIssueMarks
+    ), TacuaCapturePolicy.isProcessableIssueMarkCountValid(processableIssueMarkCount)
     else { throw TacuaCaptureAdmissionError.captureArtifactMismatch }
     let summary: TacuaJSONValue = .object([
       "app_audio_accounting_complete": .bool(

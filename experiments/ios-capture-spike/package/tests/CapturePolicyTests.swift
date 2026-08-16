@@ -82,6 +82,14 @@ enum CapturePolicyTests {
       !TacuaCapturePolicy.canAppendProcessableIssueMark(existingCount: 12),
       "Native capture allowed a marker that would make the processor reject the capture"
     )
+    try expect(
+      TacuaCapturePolicy.isProcessableIssueMarkCountValid(12),
+      "Recovery rejected the exact processor-supported issue-mark boundary"
+    )
+    try expect(
+      !TacuaCapturePolicy.isProcessableIssueMarkCountValid(13),
+      "Recovery accepted a capture that the processor must reject"
+    )
     let manifestMarkerIDs = (0..<11).map { "m_\($0)" }
     try expect(
       TacuaCapturePolicy.processableIssueMarkCount(

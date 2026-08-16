@@ -383,9 +383,10 @@ final class TacuaCaptureSession {
       guard let recoveredIssueMarkCount = TacuaCapturePolicy.processableIssueMarkCount(
         manifestMarkerIDs: manifestMarkerIDs,
         journalMarkerIDs: journalMarkerIDs
-      ) else {
+      ), TacuaCapturePolicy.isProcessableIssueMarkCountValid(recoveredIssueMarkCount)
+      else {
         throw TacuaCaptureSpikeError.recoveryIO(
-          "The stored issue-marker projection is inconsistent."
+          "The stored issue-marker projection is inconsistent or exceeds its processable limit."
         )
       }
       processableIssueMarkCount = recoveredIssueMarkCount

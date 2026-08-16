@@ -74,7 +74,12 @@ enum TacuaCapturePolicy {
   }
 
   static func canAppendProcessableIssueMark(existingCount: Int) -> Bool {
-    existingCount >= 0 && existingCount < maximumProcessableIssueMarks
+    isProcessableIssueMarkCountValid(existingCount)
+      && existingCount < maximumProcessableIssueMarks
+  }
+
+  static func isProcessableIssueMarkCountValid(_ count: Int) -> Bool {
+    (0...maximumProcessableIssueMarks).contains(count)
   }
 
   /// Mirrors admission's issue-mark de-duplication. Every journal record projects one event;
