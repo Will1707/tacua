@@ -275,8 +275,10 @@ enum CaptureAdmissionTests {
     try admitsExactlyOnceAndSanitizes(fixtures)
     try retainedMarkerPTSProjectsManifestFallback(fixtures)
     try retainedMarkerPTSOverridesJournalTimestamp(fixtures)
+    try recoveredJournalOnlyMarkerCountsTowardSummary(fixtures)
     try retainedMarkerPTSUsesLaterSegmentAtSharedBoundary(fixtures)
     try retainedMarkerPTSDoesNotBindFutureOverlappingSegment(fixtures)
+    try retainedMarkerPTSUsesProjectedHeldOpeningBoundary(fixtures)
     try missingRetainedMarkerSegmentBecomesUnavailable(fixtures)
     try completedCaptureRejectsMissingRetainedMarkerSegment(fixtures)
     try legacyMarkerWithoutRetainedPTSProvenanceUsesHostTimestamp(fixtures)
@@ -773,6 +775,47 @@ enum CaptureAdmissionTests {
     )
   }
 
+  private static func recoveredJournalOnlyMarkerCountsTowardSummary(
+    _ fixtures: URL
+  ) throws {
+    let harness = try makeHarness(fixtures: fixtures, suffix: "marker_journal_only_count")
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    try mutateManifest(harness) { $0["markers"] = [] }
+    let session = harness.root.appendingPathComponent(
+      harness.localSessionID,
+      isDirectory: true
+    )
+    let journal = try TacuaDiagnosticJournal(
+      rootDirectory: TacuaDiagnosticJournal.rootDirectory(sessionDirectory: session),
+      localSessionID: harness.localSessionID,
+      bootSessionID: harness.clock.bootSessionID,
+      maximumEvents: TacuaCapturePolicy.maximumDiagnosticJournalEvents,
+      monotonicClock: { 1_090_000 }
+    )
+    _ = try journal.appendSystemEvent(.issueMark(
+      markerID: stableTestIdentifier(prefix: "m", source: "LEGACY-JOURNAL-ONLY"),
+      kind: .manual
+    ))
+
+    _ = try harness.coordinator.admit(harness.input)
+    try assertIssueMarkElapsed(
+      harness,
+      expectedMilliseconds: 30_000,
+      message: "A recovered journal-only marker was not projected"
+    )
+    let sessionAdmission = try TacuaCanonicalJSON.parse(Data(contentsOf:
+      session.appendingPathComponent(TacuaCaptureAdmissionCoordinator.admissionFileName)
+    ))
+    let summary = try required(
+      sessionAdmission.objectValue?["capture_summary"]?.objectValue,
+      "Capture summary missing"
+    )
+    try require(
+      summary["marker_count"]?.integerValue == 1,
+      "Capture summary omitted the recovered journal-only marker"
+    )
+  }
+
   private static func retainedMarkerPTSUsesLaterSegmentAtSharedBoundary(
     _ fixtures: URL
   ) throws {
@@ -865,6 +908,80 @@ enum CaptureAdmissionTests {
       harness,
       message: "A completed capture referenced an uncommitted marker segment"
     )
+  }
+
+  private static func retainedMarkerPTSUsesProjectedHeldOpeningBoundary(
+    _ fixtures: URL
+  ) throws {
+    for journalBacked in [false, true] {
+      let suffix = journalBacked
+        ? "marker_held_opening_journal"
+        : "marker_held_opening_manifest"
+      let harness = try makeHarness(fixtures: fixtures, suffix: suffix)
+      defer { try? FileManager.default.removeItem(at: harness.root) }
+      // A sparse real frame at capture elapsed/PTS 15 rotates at PTS 10. The synthetic
+      // opening frame is anchored at host elapsed 10, so the real annotated frame remains five
+      // seconds into segment 1 instead of being mistaken for its held boundary frame.
+      try rewriteCaptureWithTwoSegments(
+        harness,
+        firstLastMediaPTSSeconds: 10,
+        secondFirstMediaPTSSeconds: 10,
+        secondFirstHostUptimeSeconds: 1_070,
+        firstLastHostUptimeSeconds: 1_070,
+        secondLastHostUptimeSeconds: 1_076
+      )
+      try setFirstMarkerLatestMediaPTS(harness, value: 15.0)
+      try setFirstMarkerLatestMediaSegmentIndex(harness, value: 1)
+      if journalBacked {
+        let session = harness.root.appendingPathComponent(
+          harness.localSessionID,
+          isDirectory: true
+        )
+        let journal = try TacuaDiagnosticJournal(
+          rootDirectory: TacuaDiagnosticJournal.rootDirectory(sessionDirectory: session),
+          localSessionID: harness.localSessionID,
+          bootSessionID: harness.clock.bootSessionID,
+          maximumEvents: TacuaCapturePolicy.maximumDiagnosticJournalEvents,
+          monotonicClock: { 1_090_000 }
+        )
+        _ = try journal.appendSystemEvent(.issueMark(
+          markerID: stableTestIdentifier(prefix: "m", source: "LOCAL-MARKER-PRIVATE"),
+          kind: .manual
+        ))
+      }
+
+      _ = try harness.coordinator.admit(harness.input)
+      try assertIssueMarkElapsed(
+        harness,
+        expectedMilliseconds: 15_000,
+        message: "A held opening frame double-counted the sparse ReplayKit callback gap"
+      )
+      let session = harness.root.appendingPathComponent(
+        harness.localSessionID,
+        isDirectory: true
+      )
+      let admission = try TacuaCanonicalJSON.parse(Data(contentsOf:
+        session.appendingPathComponent(TacuaCaptureAdmissionCoordinator.admissionFileName)
+      ))
+      let seed = try required(
+        admission.objectValue?["capture_manifest_seed"]?.objectValue,
+        "Capture manifest seed missing"
+      )
+      let segments = try required(seed["segments"]?.arrayValue, "Runtime segments missing")
+      let secondRange = try required(
+        segments[1].objectValue?["time_range"]?.objectValue,
+        "Second segment time range missing"
+      )
+      let segmentStart = try required(
+        secondRange["start_ms"]?.integerValue,
+        "Second segment start missing"
+      )
+      try require(segmentStart == 10_000, "Held segment retained the late callback host time")
+      try require(
+        15_000 - segmentStart == 5_000,
+        "Processor seek offset no longer selects the real annotated frame"
+      )
+    }
   }
 
   private static func legacyMarkerWithoutRetainedPTSProvenanceUsesHostTimestamp(
@@ -2735,7 +2852,9 @@ enum CaptureAdmissionTests {
     _ harness: AdmissionHarness,
     firstLastMediaPTSSeconds: Double,
     secondFirstMediaPTSSeconds: Double,
-    secondFirstHostUptimeSeconds: Double
+    secondFirstHostUptimeSeconds: Double,
+    firstLastHostUptimeSeconds: Double = 1_090,
+    secondLastHostUptimeSeconds: Double = 1_120
   ) throws {
     let session = harness.root.appendingPathComponent(harness.localSessionID, isDirectory: true)
     let firstMediaURL = session.appendingPathComponent("segment-000000.mov")
@@ -2754,7 +2873,7 @@ enum CaptureAdmissionTests {
       firstMediaPTSSeconds: 0,
       lastMediaPTSSeconds: firstLastMediaPTSSeconds,
       firstHostUptimeSeconds: 1_060,
-      lastHostUptimeSeconds: 1_090,
+      lastHostUptimeSeconds: firstLastHostUptimeSeconds,
       durationSeconds: firstLastMediaPTSSeconds,
       videoSamples: 60,
       heldVideoSamples: 1,
@@ -2765,7 +2884,7 @@ enum CaptureAdmissionTests {
       droppedMicrophoneSamples: 0
     )
     let secondLastMediaPTSSeconds = secondFirstMediaPTSSeconds
-      + (1_120 - secondFirstHostUptimeSeconds)
+      + (secondLastHostUptimeSeconds - secondFirstHostUptimeSeconds)
     let second = AdmissionTestSegment(
       index: 1,
       fileName: secondMediaURL.lastPathComponent,
@@ -2774,7 +2893,7 @@ enum CaptureAdmissionTests {
       firstMediaPTSSeconds: secondFirstMediaPTSSeconds,
       lastMediaPTSSeconds: secondLastMediaPTSSeconds,
       firstHostUptimeSeconds: secondFirstHostUptimeSeconds,
-      lastHostUptimeSeconds: 1_120,
+      lastHostUptimeSeconds: secondLastHostUptimeSeconds,
       durationSeconds: secondLastMediaPTSSeconds - secondFirstMediaPTSSeconds,
       videoSamples: 60,
       heldVideoSamples: 1,

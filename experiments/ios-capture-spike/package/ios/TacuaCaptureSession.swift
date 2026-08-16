@@ -59,6 +59,7 @@ final class TacuaCaptureSession {
   private let recorderOwnershipToken: UUID
   private var diagnosticJournal: TacuaDiagnosticJournal?
   private var diagnosticEventCount = 0
+  private var processableIssueMarkCount = 0
   private var diagnosticContainsCollectionGap = false
   private var diagnosticAppState = TacuaDiagnosticAppState.unknown
 
@@ -372,6 +373,22 @@ final class TacuaCaptureSession {
       let diagnosticSnapshot = try journal.snapshot()
       diagnosticJournal = journal
       diagnosticEventCount = diagnosticSnapshot.entries.count
+      let manifestMarkerIDs = manifest.markers.map {
+        Self.stableDiagnosticIdentifier(prefix: "m", source: $0.id)
+      }
+      let journalMarkerIDs = diagnosticSnapshot.entries.compactMap { entry -> String? in
+        if case .issueMark(let markerID, _) = entry.event { return markerID }
+        return nil
+      }
+      guard let recoveredIssueMarkCount = TacuaCapturePolicy.processableIssueMarkCount(
+        manifestMarkerIDs: manifestMarkerIDs,
+        journalMarkerIDs: journalMarkerIDs
+      ) else {
+        throw TacuaCaptureSpikeError.recoveryIO(
+          "The stored issue-marker projection is inconsistent."
+        )
+      }
+      processableIssueMarkCount = recoveredIssueMarkCount
       diagnosticContainsCollectionGap = diagnosticSnapshot.containsCollectionGap
       diagnosticAppState = diagnosticSnapshot.entries.reversed().compactMap { entry in
         if case .event(.appStateChanged(_, let toState)) = entry.event { return toState }
@@ -481,7 +498,7 @@ final class TacuaCaptureSession {
       }
       // This queue serializes the capacity check and append across every JS caller and overlay.
       guard TacuaCapturePolicy.canAppendProcessableIssueMark(
-        existingCount: manifest.markers.count
+        existingCount: processableIssueMarkCount
       ) else {
         completion(.failure(TacuaCaptureSpikeError.markerLimitReached))
         return
@@ -513,6 +530,7 @@ final class TacuaCaptureSession {
       )
       switch persistenceResolution {
       case .committed:
+        processableIssueMarkCount += 1
         break
       case .rejected:
         reportManifestPersistenceFailure()
@@ -1261,6 +1279,34 @@ final class TacuaCaptureSession {
         return
       }
       for boundarySeconds in boundaries {
+        guard let activeWriter = self.writer else {
+          failAndStopOnQueue(
+            error: TacuaCaptureSpikeError.writerCreation(
+              "Tacua lost the active writer while rotating capture segments."
+            ),
+            gapReason: "segment_rotation_writer_missing"
+          )
+          return
+        }
+        // ReplayKit sample buffers share the capture media clock. Whether video or audio
+        // triggers a static-screen rotation, the callback pair anchors its synthetic video
+        // boundary; the active writer's last accepted host time prevents backward projection.
+        guard let boundaryHostUptimeSeconds = TacuaCapturePolicy
+          .segmentBoundaryHostUptimeSeconds(
+            boundaryPTSSeconds: boundarySeconds,
+            callbackPTSSeconds: incomingPTSSeconds,
+            callbackHostUptimeSeconds: hostUptimeSeconds,
+            minimumHostUptimeSeconds: activeWriter.lastHostUptimeSeconds
+          )
+        else {
+          failAndStopOnQueue(
+            error: TacuaCaptureSpikeError.writerCreation(
+              "Tacua could not project the segment boundary onto the host clock."
+            ),
+            gapReason: "segment_rotation_clock_projection_failed"
+          )
+          return
+        }
         let boundaryPTS = CMTime(
           seconds: boundarySeconds,
           preferredTimescale: 1_000_000_000
@@ -1272,7 +1318,7 @@ final class TacuaCaptureSession {
         do {
           try rotateCurrentSegment(
             at: boundaryPTS,
-            hostUptimeSeconds: hostUptimeSeconds,
+            hostUptimeSeconds: boundaryHostUptimeSeconds,
             openingVideoSample: openingVideoSample
           )
         } catch {
@@ -2007,7 +2053,9 @@ final class TacuaCaptureSession {
       "state": manifest.state,
       "segmentCount": manifest.segments.count,
       "gapCount": manifest.gaps.count,
-      "markerCount": manifest.markers.count,
+      // The overlay must see the same recovered capacity that mark() enforces, including
+      // legacy journal-only marks that have no manifest fallback.
+      "markerCount": processableIssueMarkCount,
       "errorCodes": manifest.errorCodes,
       "latestMediaPTSSeconds": jsonValue(latestVideoPTS.map(CMTimeGetSeconds)),
       "appendedVideoFrameSequence": retainedReplayKitVideoFrameClock.value,

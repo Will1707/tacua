@@ -49,7 +49,7 @@ final class SegmentWriter {
   private let maximumTrackedAppAudioDrops: Int
 
   private var lastPTS: CMTime
-  private var lastHostUptimeSeconds: Double
+  private(set) var lastHostUptimeSeconds: Double
   private var lastVideoPTS: CMTime
   private var lastVideoSample: CMSampleBuffer?
   private var videoSamples = 0

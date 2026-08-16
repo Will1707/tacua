@@ -77,6 +77,20 @@ enum TacuaCapturePolicy {
     existingCount >= 0 && existingCount < maximumProcessableIssueMarks
   }
 
+  /// Mirrors admission's issue-mark de-duplication. Every journal record projects one event;
+  /// only manifest markers with no journal representation add a fallback event. Counting this
+  /// recovered projection prevents a legacy journal-only marker from opening a thirteenth slot.
+  static func processableIssueMarkCount(
+    manifestMarkerIDs: [String],
+    journalMarkerIDs: [String]
+  ) -> Int? {
+    let manifestSet = Set(manifestMarkerIDs)
+    guard manifestSet.count == manifestMarkerIDs.count else { return nil }
+    let manifestOnlyCount = manifestSet.subtracting(Set(journalMarkerIDs)).count
+    let (count, overflow) = journalMarkerIDs.count.addingReportingOverflow(manifestOnlyCount)
+    return overflow ? nil : count
+  }
+
   static func nextSegmentIndexForRecovery(
     committedSegmentIndexes: [Int],
     retainedMarkerSegmentIndexes: [Int]
@@ -285,6 +299,27 @@ enum TacuaCapturePolicy {
       return min(boundary, incomingPTSSeconds)
     }
     return boundaries.isEmpty ? .none : .boundaries(boundaries)
+  }
+
+  /// Projects a synthetic media boundary onto the host clock using the real ReplayKit callback
+  /// that triggered rotation. Passing the callback host time directly would make a held opening
+  /// frame appear later than its media PTS and shift every processor seek in that segment.
+  static func segmentBoundaryHostUptimeSeconds(
+    boundaryPTSSeconds: Double,
+    callbackPTSSeconds: Double,
+    callbackHostUptimeSeconds: Double,
+    minimumHostUptimeSeconds: Double = 0
+  ) -> Double? {
+    guard boundaryPTSSeconds.isFinite, callbackPTSSeconds.isFinite,
+      callbackHostUptimeSeconds.isFinite, callbackHostUptimeSeconds >= 0,
+      minimumHostUptimeSeconds.isFinite, minimumHostUptimeSeconds >= 0,
+      boundaryPTSSeconds <= callbackPTSSeconds
+    else { return nil }
+    let projected = callbackHostUptimeSeconds - (callbackPTSSeconds - boundaryPTSSeconds)
+    guard projected.isFinite, projected >= minimumHostUptimeSeconds,
+      projected <= callbackHostUptimeSeconds
+    else { return nil }
+    return projected
   }
 
   static func recoverySource(finalExists: Bool, partialExists: Bool) -> RecoverySource? {

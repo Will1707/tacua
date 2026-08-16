@@ -82,6 +82,37 @@ enum CapturePolicyTests {
       !TacuaCapturePolicy.canAppendProcessableIssueMark(existingCount: 12),
       "Native capture allowed a marker that would make the processor reject the capture"
     )
+    let manifestMarkerIDs = (0..<11).map { "m_\($0)" }
+    try expect(
+      TacuaCapturePolicy.processableIssueMarkCount(
+        manifestMarkerIDs: manifestMarkerIDs,
+        journalMarkerIDs: manifestMarkerIDs + ["m_journal_only"]
+      ) == 12,
+      "A recovered journal-only marker was omitted from the native capacity projection"
+    )
+    try expect(
+      !TacuaCapturePolicy.canAppendProcessableIssueMark(existingCount:
+        TacuaCapturePolicy.processableIssueMarkCount(
+          manifestMarkerIDs: manifestMarkerIDs,
+          journalMarkerIDs: manifestMarkerIDs + ["m_journal_only"]
+        ) ?? -1
+      ),
+      "Recovery reopened a thirteenth processor issue-mark slot"
+    )
+    try expect(
+      TacuaCapturePolicy.processableIssueMarkCount(
+        manifestMarkerIDs: ["m_manifest_only"],
+        journalMarkerIDs: ["m_journal", "m_journal"]
+      ) == 3,
+      "Duplicate journal records were undercounted relative to admission"
+    )
+    try expect(
+      TacuaCapturePolicy.processableIssueMarkCount(
+        manifestMarkerIDs: ["m_collision", "m_collision"],
+        journalMarkerIDs: []
+      ) == nil,
+      "Colliding manifest marker identifiers were accepted during recovery"
+    )
     try expect(
       TacuaCapturePolicy.captureGapInsertionDisposition(
         existingCount: 2_046,
@@ -381,7 +412,6 @@ enum CapturePolicyTests {
       "The marker clock must be unavailable before the first retained ReplayKit video frame"
     )
     try expect(sequence.latestSegmentIndex == nil, "The marker segment must start unavailable")
-
     sequence.recordReplayKitAppend(ptsSeconds: 10, segmentIndex: 0, wasAppended: false)
     try expect(
       sequence.value == 0,
@@ -443,6 +473,65 @@ enum CapturePolicyTests {
   }
 
   private static func segmentRotation() throws {
+    try expect(
+      TacuaCapturePolicy.segmentBoundaryHostUptimeSeconds(
+        boundaryPTSSeconds: 10,
+        callbackPTSSeconds: 15,
+        callbackHostUptimeSeconds: 115
+      ) == 110,
+      "A sparse ReplayKit callback did not project its synthetic boundary onto the host clock"
+    )
+    try expect(
+      [10.0, 20.0, 30.0].compactMap {
+        TacuaCapturePolicy.segmentBoundaryHostUptimeSeconds(
+          boundaryPTSSeconds: $0,
+          callbackPTSSeconds: 35,
+          callbackHostUptimeSeconds: 135
+        )
+      } == [110, 120, 130],
+      "Catch-up rotation did not preserve monotonic media-to-host boundary spacing"
+    )
+    try expect(
+      TacuaCapturePolicy.segmentBoundaryHostUptimeSeconds(
+        boundaryPTSSeconds: 15,
+        callbackPTSSeconds: 15,
+        callbackHostUptimeSeconds: 115
+      ) == 115,
+      "An exact ReplayKit boundary changed its real callback host time"
+    )
+    try expect(
+      TacuaCapturePolicy.segmentBoundaryHostUptimeSeconds(
+        boundaryPTSSeconds: 16,
+        callbackPTSSeconds: 15,
+        callbackHostUptimeSeconds: 115
+      ) == nil,
+      "A boundary after its real callback received a fabricated host time"
+    )
+    try expect(
+      TacuaCapturePolicy.segmentBoundaryHostUptimeSeconds(
+        boundaryPTSSeconds: 10,
+        callbackPTSSeconds: 15,
+        callbackHostUptimeSeconds: 115,
+        minimumHostUptimeSeconds: 110.001
+      ) == nil,
+      "A boundary regressing behind the active writer host clock was accepted"
+    )
+    try expect(
+      TacuaCapturePolicy.segmentBoundaryHostUptimeSeconds(
+        boundaryPTSSeconds: .nan,
+        callbackPTSSeconds: 15,
+        callbackHostUptimeSeconds: 115
+      ) == nil,
+      "A non-finite boundary received a fabricated host time"
+    )
+    try expect(
+      TacuaCapturePolicy.segmentBoundaryHostUptimeSeconds(
+        boundaryPTSSeconds: 0,
+        callbackPTSSeconds: 20,
+        callbackHostUptimeSeconds: 10
+      ) == nil,
+      "A boundary before host-clock origin received a negative host time"
+    )
     try expect(
       TacuaCapturePolicy.segmentRotationBoundary(
         startedAtPTSSeconds: 100,

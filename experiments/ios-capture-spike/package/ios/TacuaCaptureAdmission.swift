@@ -966,6 +966,25 @@ final class TacuaCaptureAdmissionCoordinator {
         "time_range": timeRange(start: 0, end: timeline.durationMilliseconds),
       ]))
     }
+    let diagnosticSource = try loadDiagnosticSource(
+      localSessionID: localSessionID,
+      bootSessionID: manifest.bootSessionId!,
+      sessionDescriptor: sessionDescriptor
+    )
+    if let diagnosticSource { tracked.append(diagnosticSource.identity) }
+    let manifestMarkerIDs = manifest.markers.map {
+      stableIdentifier(prefix: "m", source: $0.id)
+    }
+    let journalMarkerIDs = diagnosticSource?.snapshot.entries.compactMap {
+      entry -> String? in
+      if case .issueMark(let markerID, _) = entry.event { return markerID }
+      return nil
+    } ?? []
+    guard let processableIssueMarkCount = TacuaCapturePolicy.processableIssueMarkCount(
+      manifestMarkerIDs: manifestMarkerIDs,
+      journalMarkerIDs: journalMarkerIDs
+    ), processableIssueMarkCount <= TacuaCapturePolicy.maximumProcessableIssueMarks
+    else { throw TacuaCaptureAdmissionError.captureArtifactMismatch }
     let summary: TacuaJSONValue = .object([
       "app_audio_accounting_complete": .bool(
         manifest.schemaVersion == 4 && manifest.appAudioAppendAccountingComplete == true
@@ -982,17 +1001,11 @@ final class TacuaCaptureAdmissionCoordinator {
       "app_audio_available": .bool((manifest.appAudioSamplesObserved ?? 0) > 0),
       "error_count": .integer(Int64(manifest.errorCodes.count)),
       "gap_count": .integer(Int64(runtimeGaps.count)),
-      "marker_count": .integer(Int64(manifest.markers.count)),
+      "marker_count": .integer(Int64(processableIssueMarkCount)),
       "microphone_available": .bool(true),
       "segment_count": .integer(Int64(segmentPlans.count)),
     ])
     let summaryDigest = try TacuaCanonicalJSON.digest(summary)
-    let diagnosticSource = try loadDiagnosticSource(
-      localSessionID: localSessionID,
-      bootSessionID: manifest.bootSessionId!,
-      sessionDescriptor: sessionDescriptor
-    )
-    if let diagnosticSource { tracked.append(diagnosticSource.identity) }
     func finalizeDiagnosticEnvelope(
       _ projection: TacuaAdmissionDiagnosticProjection
     ) throws -> (envelope: TacuaJSONValue, data: Data, digest: String) {
@@ -1505,7 +1518,6 @@ final class TacuaCaptureAdmissionCoordinator {
       markerPTS <= segment.lastMediaPTSSeconds,
       segment.endMilliseconds > segment.startMilliseconds
     else { throw TacuaCaptureAdmissionError.captureArtifactMismatch }
-
     let mediaOffset = try relativeMilliseconds(
       markerPTS,
       origin: segment.firstMediaPTSSeconds,
@@ -1517,7 +1529,8 @@ final class TacuaCaptureAdmissionCoordinator {
     }
     // Runtime segment ranges are half-open. The persisted writer index disambiguates a PTS shared
     // by adjacent segments; a terminal frame is kept one millisecond inside that exact segment,
-    // matching the processor's existing seek clamp.
+    // matching the processor's existing seek clamp. Synthetic segment boundaries are projected
+    // onto the host clock from the real callback pair before their sidecars are written.
     return .available(elapsedMilliseconds: min(rawElapsed, segment.endMilliseconds - 1))
   }
 
