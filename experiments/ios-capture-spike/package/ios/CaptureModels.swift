@@ -188,6 +188,9 @@ struct CaptureMarker: Codable {
   let hostUptimeSeconds: Double
   /// Latest real ReplayKit video PTS successfully appended to retained media at mark time.
   let latestMediaPTSSeconds: Double?
+  /// Writer segment that accepted latestMediaPTSSeconds. Admission binds retained provenance only
+  /// after this exact segment commits, so a failed writer cannot manufacture issue evidence.
+  let latestMediaSegmentIndex: Int?
   /// Present only when latestMediaPTSSeconds uses retained-frame rather than legacy
   /// observed-PTS semantics.
   let latestMediaPTSProvenance: String?

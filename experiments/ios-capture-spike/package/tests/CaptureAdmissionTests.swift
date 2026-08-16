@@ -277,6 +277,8 @@ enum CaptureAdmissionTests {
     try retainedMarkerPTSOverridesJournalTimestamp(fixtures)
     try retainedMarkerPTSUsesLaterSegmentAtSharedBoundary(fixtures)
     try retainedMarkerPTSDoesNotBindFutureOverlappingSegment(fixtures)
+    try missingRetainedMarkerSegmentBecomesUnavailable(fixtures)
+    try completedCaptureRejectsMissingRetainedMarkerSegment(fixtures)
     try legacyMarkerWithoutRetainedPTSProvenanceUsesHostTimestamp(fixtures)
     try rejectsMalformedRetainedMarkerPTS(fixtures)
     try admitsCompleteSchema4AppAudioAccounting(fixtures)
@@ -782,6 +784,7 @@ enum CaptureAdmissionTests {
       secondFirstMediaPTSSeconds: 30,
       secondFirstHostUptimeSeconds: 1_090
     )
+    try setFirstMarkerLatestMediaSegmentIndex(harness, value: 1)
 
     _ = try harness.coordinator.admit(harness.input)
     try assertIssueMarkElapsed(
@@ -809,6 +812,58 @@ enum CaptureAdmissionTests {
       harness,
       expectedMilliseconds: 20_000,
       message: "A future discontinuity segment stole an earlier overlapping marker PTS"
+    )
+  }
+
+  private static func missingRetainedMarkerSegmentBecomesUnavailable(
+    _ fixtures: URL
+  ) throws {
+    for journalBacked in [false, true] {
+      let suffix = journalBacked
+        ? "marker_segment_missing_journal"
+        : "marker_segment_missing_manifest"
+      let harness = try makeHarness(fixtures: fixtures, suffix: suffix)
+      defer { try? FileManager.default.removeItem(at: harness.root) }
+      try setManifestState(harness, value: "partial_ready_for_upload")
+      // PTS 20 overlaps committed segment 0, but the native marker records failed segment 1.
+      // Admission must not steal the frame from the wrong writer.
+      try setFirstMarkerLatestMediaPTS(harness, value: 20.0)
+      try setFirstMarkerLatestMediaSegmentIndex(harness, value: 1)
+      if journalBacked {
+        let session = harness.root.appendingPathComponent(
+          harness.localSessionID,
+          isDirectory: true
+        )
+        let journal = try TacuaDiagnosticJournal(
+          rootDirectory: TacuaDiagnosticJournal.rootDirectory(sessionDirectory: session),
+          localSessionID: harness.localSessionID,
+          bootSessionID: harness.clock.bootSessionID,
+          maximumEvents: TacuaCapturePolicy.maximumDiagnosticJournalEvents,
+          monotonicClock: { 1_090_000 }
+        )
+        _ = try journal.appendSystemEvent(.issueMark(
+          markerID: stableTestIdentifier(prefix: "m", source: "LOCAL-MARKER-PRIVATE"),
+          kind: .manual
+        ))
+      }
+
+      _ = try harness.coordinator.admit(harness.input)
+      try assertIssueMarkerUnavailable(
+        harness,
+        message: "A marker from an uncommitted writer became actionable issue evidence"
+      )
+    }
+  }
+
+  private static func completedCaptureRejectsMissingRetainedMarkerSegment(
+    _ fixtures: URL
+  ) throws {
+    let harness = try makeHarness(fixtures: fixtures, suffix: "marker_segment_missing_completed")
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    try setFirstMarkerLatestMediaSegmentIndex(harness, value: 1)
+    try expectMarkerPTSRejection(
+      harness,
+      message: "A completed capture referenced an uncommitted marker segment"
     )
   }
 
@@ -857,6 +912,22 @@ enum CaptureAdmissionTests {
     try expectMarkerPTSRejection(
       unknownProvenance,
       message: "Unknown retained-frame PTS provenance was admitted"
+    )
+
+    let missingIndex = try makeHarness(fixtures: fixtures, suffix: "marker_segment_missing_index")
+    defer { try? FileManager.default.removeItem(at: missingIndex.root) }
+    try removeFirstMarkerLatestMediaSegmentIndex(missingIndex)
+    try expectMarkerPTSRejection(
+      missingIndex,
+      message: "Retained-frame provenance without a writer segment was admitted"
+    )
+
+    let negativeIndex = try makeHarness(fixtures: fixtures, suffix: "marker_segment_negative")
+    defer { try? FileManager.default.removeItem(at: negativeIndex.root) }
+    try setFirstMarkerLatestMediaSegmentIndex(negativeIndex, value: -1)
+    try expectMarkerPTSRejection(
+      negativeIndex,
+      message: "Retained-frame provenance with a negative writer segment was admitted"
     )
   }
 
@@ -2464,6 +2535,7 @@ enum CaptureAdmissionTests {
         "label": "PRIVATE_MARKER_LABEL",
         "hostUptimeSeconds": 1_090,
         "latestMediaPTSSeconds": 30,
+        "latestMediaSegmentIndex": 0,
         "latestMediaPTSProvenance": TacuaCapturePolicy.retainedMarkerPTSProvenance,
       ]],
       "calibrations": [],
@@ -2637,6 +2709,28 @@ enum CaptureAdmissionTests {
     )
   }
 
+  private static func assertIssueMarkerUnavailable(
+    _ harness: AdmissionHarness,
+    message: String
+  ) throws {
+    let envelope = try TacuaCanonicalJSON.parse(diagnosticEnvelopeData(harness))
+    let events = try required(envelope.objectValue?["events"]?.arrayValue, "Events missing")
+    try require(
+      !events.contains(where: {
+        $0.objectValue?["event_type"]?.stringValue == "issue_mark"
+      }),
+      message
+    )
+    let unavailable = events.filter { event in
+      guard event.objectValue?["event_type"]?.stringValue == "custom_state",
+        let data = event.objectValue?["data"]?.objectValue
+      else { return false }
+      return data["provider_id"]?.stringValue == "issue_mark_media_unavailable"
+        && data["collection_status"]?.stringValue == "unavailable"
+    }
+    try require(unavailable.count == 1, "Missing exact unavailable-marker diagnostic")
+  }
+
   private static func rewriteCaptureWithTwoSegments(
     _ harness: AdmissionHarness,
     firstLastMediaPTSSeconds: Double,
@@ -2718,6 +2812,45 @@ enum CaptureAdmissionTests {
     try require(changed, "Test manifest had no marker to mutate")
   }
 
+  private static func setFirstMarkerLatestMediaSegmentIndex(
+    _ harness: AdmissionHarness,
+    value: Any
+  ) throws {
+    var changed = false
+    try mutateManifest(harness) { manifest in
+      guard var markers = manifest["markers"] as? [Any],
+        var marker = markers.first as? [String: Any]
+      else { return }
+      marker["latestMediaSegmentIndex"] = value
+      markers[0] = marker
+      manifest["markers"] = markers
+      changed = true
+    }
+    try require(changed, "Test manifest had no marker segment to mutate")
+  }
+
+  private static func removeFirstMarkerLatestMediaSegmentIndex(
+    _ harness: AdmissionHarness
+  ) throws {
+    var changed = false
+    try mutateManifest(harness) { manifest in
+      guard var markers = manifest["markers"] as? [Any],
+        var marker = markers.first as? [String: Any]
+      else { return }
+      changed = marker.removeValue(forKey: "latestMediaSegmentIndex") != nil
+      markers[0] = marker
+      manifest["markers"] = markers
+    }
+    try require(changed, "Test marker had no retained segment index to remove")
+  }
+
+  private static func setManifestState(
+    _ harness: AdmissionHarness,
+    value: String
+  ) throws {
+    try mutateManifest(harness) { $0["state"] = value }
+  }
+
   private static func removeFirstMarkerLatestMediaPTSProvenance(
     _ harness: AdmissionHarness
   ) throws {
@@ -2727,6 +2860,7 @@ enum CaptureAdmissionTests {
         var marker = markers.first as? [String: Any]
       else { return }
       changed = marker.removeValue(forKey: "latestMediaPTSProvenance") != nil
+      marker.removeValue(forKey: "latestMediaSegmentIndex")
       markers[0] = marker
       manifest["markers"] = markers
     }

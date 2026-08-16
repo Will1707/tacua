@@ -246,7 +246,38 @@ final class TacuaCaptureSession {
         durationBudgetSeconds = retentionBudget
         durationStopReason = "raw_media_retention_expired"
       }
-      nextSegmentIndex = (manifest.segments.map(\.index).max() ?? -1) + 1
+      var retainedMarkerSegmentIndexes: [Int] = []
+      retainedMarkerSegmentIndexes.reserveCapacity(manifest.markers.count)
+      for marker in manifest.markers {
+        guard let provenance = marker.latestMediaPTSProvenance else {
+          guard marker.latestMediaSegmentIndex == nil else {
+            throw TacuaCaptureSpikeError.recoveryIO(
+              "The stored marker has an incomplete retained-frame binding."
+            )
+          }
+          continue
+        }
+        guard provenance == TacuaCapturePolicy.retainedMarkerPTSProvenance,
+          let markerPTS = marker.latestMediaPTSSeconds,
+          markerPTS.isFinite,
+          let markerSegmentIndex = marker.latestMediaSegmentIndex,
+          (0...TacuaCapturePolicy.maximumSegmentIndex).contains(markerSegmentIndex)
+        else {
+          throw TacuaCaptureSpikeError.recoveryIO(
+            "The stored marker has an invalid retained-frame binding."
+          )
+        }
+        retainedMarkerSegmentIndexes.append(markerSegmentIndex)
+      }
+      guard let recoveredNextSegmentIndex = TacuaCapturePolicy.nextSegmentIndexForRecovery(
+        committedSegmentIndexes: manifest.segments.map(\.index),
+        retainedMarkerSegmentIndexes: retainedMarkerSegmentIndexes
+      ) else {
+        throw TacuaCaptureSpikeError.recoveryIO(
+          "The stored capture exhausted its bounded segment index space."
+        )
+      }
+      nextSegmentIndex = recoveredNextSegmentIndex
       if let lastPTS = manifest.segments.last?.lastMediaPTSSeconds {
         latestVideoPTS = CMTime(seconds: lastPTS, preferredTimescale: 1_000_000_000)
       }
@@ -456,11 +487,13 @@ final class TacuaCaptureSession {
         return
       }
       let retainedPTS = retainedReplayKitVideoFrameClock.latestPTSSeconds
+      let retainedSegmentIndex = retainedReplayKitVideoFrameClock.latestSegmentIndex
       let marker = CaptureMarker(
         id: UUID().uuidString,
         label: label,
         hostUptimeSeconds: ProcessInfo.processInfo.systemUptime,
         latestMediaPTSSeconds: retainedPTS,
+        latestMediaSegmentIndex: retainedSegmentIndex,
         latestMediaPTSProvenance: retainedPTS.map { _ in
           TacuaCapturePolicy.retainedMarkerPTSProvenance
         }
@@ -509,6 +542,7 @@ final class TacuaCaptureSession {
         "label": marker.label,
         "hostUptimeSeconds": marker.hostUptimeSeconds,
         "latestMediaPTSSeconds": jsonValue(marker.latestMediaPTSSeconds),
+        "latestMediaSegmentIndex": jsonValue(marker.latestMediaSegmentIndex),
         "latestMediaPTSProvenance": jsonValue(marker.latestMediaPTSProvenance),
       ]
       eventSink("onMarker", payload)
@@ -1344,6 +1378,7 @@ final class TacuaCaptureSession {
     case .video:
       retainedReplayKitVideoFrameClock.recordReplayKitAppend(
         ptsSeconds: incomingPTSSeconds,
+        segmentIndex: writer.index,
         wasAppended: appendResult.wasAppended
       )
     case .audioApp, .audioMic:
@@ -1420,6 +1455,9 @@ final class TacuaCaptureSession {
     hostUptimeSeconds: Double,
     appendFirstVideoAsHeldFrame: Bool
   ) throws {
+    guard (0...TacuaCapturePolicy.maximumSegmentIndex).contains(nextSegmentIndex) else {
+      throw TacuaCaptureSpikeError.rotationLimitExceeded
+    }
 #if TACUA_CAPTURE_FAULT_INJECTION
     if faultInjection?.shouldFailWriterStorageCheck(segmentIndex: nextSegmentIndex) == true {
       throw TacuaCaptureSpikeError.insufficientStorage

@@ -26,11 +26,17 @@ enum TacuaIssueMarkerPersistenceResolution: Equatable {
 struct TacuaRetainedReplayKitVideoFrameClock {
   private(set) var value = 0
   private(set) var latestPTSSeconds: Double?
+  private(set) var latestSegmentIndex: Int?
 
-  mutating func recordReplayKitAppend(ptsSeconds: Double, wasAppended: Bool) {
-    guard wasAppended, ptsSeconds.isFinite else { return }
+  mutating func recordReplayKitAppend(
+    ptsSeconds: Double,
+    segmentIndex: Int,
+    wasAppended: Bool
+  ) {
+    guard wasAppended, ptsSeconds.isFinite, segmentIndex >= 0 else { return }
     value += 1
     latestPTSSeconds = ptsSeconds
+    latestSegmentIndex = segmentIndex
   }
 }
 
@@ -44,6 +50,9 @@ enum TacuaCapturePolicy {
   /// projection-overflow slot so a late manifest marker or gap can never make admission fail.
   static let maximumDiagnosticJournalEvents = 9_998
   static let maximumManifestGaps = 2_048
+  /// Segment filenames use a six-digit stable index. Retained marker bindings also reserve their
+  /// writer index across recovery, including when that writer never committed a segment.
+  static let maximumSegmentIndex = 999_999
   /// Every native marker becomes one processor issue mark. Keep this lower runtime boundary
   /// separate from the structural manifest cap retained for legacy recovery and admission.
   static let maximumProcessableIssueMarks = 12
@@ -66,6 +75,17 @@ enum TacuaCapturePolicy {
 
   static func canAppendProcessableIssueMark(existingCount: Int) -> Bool {
     existingCount >= 0 && existingCount < maximumProcessableIssueMarks
+  }
+
+  static func nextSegmentIndexForRecovery(
+    committedSegmentIndexes: [Int],
+    retainedMarkerSegmentIndexes: [Int]
+  ) -> Int? {
+    let reserved = committedSegmentIndexes + retainedMarkerSegmentIndexes
+    guard reserved.allSatisfy({ (0...maximumSegmentIndex).contains($0) }) else { return nil }
+    guard let highWater = reserved.max() else { return 0 }
+    guard highWater < maximumSegmentIndex else { return nil }
+    return highWater + 1
   }
 
   /// Resolves the marker reservation before its redundant journal record is appended. A rename

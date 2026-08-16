@@ -264,10 +264,12 @@ test("mark waits for a successfully appended frame before committing native evid
   nativeMarkCalls = 0;
   nativeStatusReads = 0;
   nativeStatus.appendedVideoFrameSequence = 1;
+  let markerCallbackCalls = 0;
   // Initial status, post-hide baseline, then the first retained-frame poll.
   advanceOnStatusRead = 3;
   const renderer = await renderOverlay({
     onMarkerCreated: () => {
+      markerCallbackCalls += 1;
       throw new Error("host callback failures must not roll back a native mark");
     },
   });
@@ -296,8 +298,64 @@ test("mark waits for a successfully appended frame before committing native evid
 
     assert.ok(nativeStatusReads >= 3);
     assert.equal(nativeMarkCalls, 1);
+    assert.equal(markerCallbackCalls, 1);
     assert.ok(press(renderer, "Open Tacua issue tools"));
   } finally {
+    advanceOnStatusRead = null;
+    await TestRenderer.act(async () => renderer.unmount());
+  }
+});
+
+test("native marker success survives capture-state cancellation of its UI operation", async () => {
+  nativeMarkCalls = 0;
+  nativeStatusReads = 0;
+  nativeStatus.appendedVideoFrameSequence = 1;
+  advanceOnStatusRead = 3;
+  const marker = {
+    id: "marker_after_state_change",
+    label: "screen_annotation",
+    hostUptimeSeconds: 10,
+    latestMediaPTSSeconds: 10,
+  };
+  const originalMark = nativeModule.mark;
+  let signalNativeMarkStarted;
+  const nativeMarkStarted = new Promise((resolve) => {
+    signalNativeMarkStarted = resolve;
+  });
+  let resolveNativeMark;
+  const pendingNativeMark = new Promise((resolve) => {
+    resolveNativeMark = resolve;
+  });
+  nativeModule.mark = () => {
+    nativeMarkCalls += 1;
+    signalNativeMarkStarted();
+    return pendingNativeMark;
+  };
+  const createdMarkers = [];
+  const onMarkerCreated = (createdMarker) => createdMarkers.push(createdMarker);
+  const renderer = await renderOverlay({ onMarkerCreated });
+  try {
+    await TestRenderer.act(async () => press(renderer, "Open Tacua issue tools").props.onPress());
+    await TestRenderer.act(async () => {
+      press(renderer, "Mark without drawing").props.onPress();
+      await nativeMarkStarted;
+    });
+    assert.equal(nativeMarkCalls, 1);
+
+    await TestRenderer.act(async () => {
+      renderer.update(overlayElement({ captureState: "stopping", onMarkerCreated }));
+    });
+    assert.equal(renderer.toJSON(), null);
+
+    await TestRenderer.act(async () => {
+      resolveNativeMark(marker);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    assert.deepEqual(createdMarkers, [marker]);
+    assert.equal(renderer.toJSON(), null);
+  } finally {
+    resolveNativeMark(marker);
+    nativeModule.mark = originalMark;
     advanceOnStatusRead = null;
     await TestRenderer.act(async () => renderer.unmount());
   }

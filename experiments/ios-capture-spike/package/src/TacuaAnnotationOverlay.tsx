@@ -385,6 +385,8 @@ export function TacuaAnnotationOverlay({
       await waitForFreshVideoFrame(postHideBaseline, stillCurrent);
       if (!stillCurrent()) return;
       const marker = await TacuaCaptureSpikeModule.mark(markerLabel);
+      // Native persistence is authoritative even if subsequent UI work is cancelled.
+      invokeHostCallback(onMarkerCreated, marker);
       if (!stillCurrent()) return;
       // Leave the annotated pixels on screen briefly after the exact native mark.
       await delay(annotatedFrameHoldMilliseconds);
@@ -392,7 +394,6 @@ export function TacuaAnnotationOverlay({
       setCapturePulse(false);
       dispatch({ type: "save_succeeded" });
       setFeedback("Issue marked");
-      invokeHostCallback(onMarkerCreated, marker);
     } catch (error) {
       if (!stillCurrent()) return;
       setCapturePulse(false);

@@ -33,6 +33,7 @@ enum CapturePolicyTests {
     try deadlineAndMicrophoneContinuity()
     try videoClockContinuity()
     try retainedReplayKitVideoFrameSequence()
+    try retainedMarkerSegmentIndexesSurviveRecovery()
     try issueMarkerPersistenceResolution()
     try segmentRotation()
     try crashWindowRecoverySource()
@@ -215,6 +216,44 @@ enum CapturePolicyTests {
     )
   }
 
+  private static func retainedMarkerSegmentIndexesSurviveRecovery() throws {
+    try expect(
+      TacuaCapturePolicy.nextSegmentIndexForRecovery(
+        committedSegmentIndexes: [],
+        retainedMarkerSegmentIndexes: []
+      ) == 0,
+      "A new session did not start with segment zero"
+    )
+    try expect(
+      TacuaCapturePolicy.nextSegmentIndexForRecovery(
+        committedSegmentIndexes: [0],
+        retainedMarkerSegmentIndexes: [1]
+      ) == 2,
+      "Recovery reused the failed writer index retained by a marker"
+    )
+    try expect(
+      TacuaCapturePolicy.nextSegmentIndexForRecovery(
+        committedSegmentIndexes: [0, 2],
+        retainedMarkerSegmentIndexes: [1]
+      ) == 3,
+      "Recovery did not advance past the complete reserved index set"
+    )
+    try expect(
+      TacuaCapturePolicy.nextSegmentIndexForRecovery(
+        committedSegmentIndexes: [-1],
+        retainedMarkerSegmentIndexes: []
+      ) == nil,
+      "Recovery accepted a negative committed segment index"
+    )
+    try expect(
+      TacuaCapturePolicy.nextSegmentIndexForRecovery(
+        committedSegmentIndexes: [],
+        retainedMarkerSegmentIndexes: [TacuaCapturePolicy.maximumSegmentIndex]
+      ) == nil,
+      "Recovery reused an exhausted retained-marker segment index"
+    )
+  }
+
   private static func sessionOriginSurvivesResume() throws {
     try expect(
       TacuaCapturePolicy.preservedSessionStartHostUptime(
@@ -341,8 +380,9 @@ enum CapturePolicyTests {
       sequence.latestPTSSeconds == nil,
       "The marker clock must be unavailable before the first retained ReplayKit video frame"
     )
+    try expect(sequence.latestSegmentIndex == nil, "The marker segment must start unavailable")
 
-    sequence.recordReplayKitAppend(ptsSeconds: 10, wasAppended: false)
+    sequence.recordReplayKitAppend(ptsSeconds: 10, segmentIndex: 0, wasAppended: false)
     try expect(
       sequence.value == 0,
       "An observed video callback rejected by the writer advanced the retained-video sequence"
@@ -352,7 +392,7 @@ enum CapturePolicyTests {
       "An observed video callback rejected by the writer became the marker media clock"
     )
 
-    sequence.recordReplayKitAppend(ptsSeconds: 11, wasAppended: true)
+    sequence.recordReplayKitAppend(ptsSeconds: 11, segmentIndex: 0, wasAppended: true)
     try expect(
       sequence.value == 1,
       "The first successfully appended ReplayKit video frame did not advance the sequence"
@@ -361,31 +401,44 @@ enum CapturePolicyTests {
       sequence.latestPTSSeconds == 11,
       "The marker media clock did not select the first retained ReplayKit frame"
     )
+    try expect(
+      sequence.latestSegmentIndex == 0,
+      "The marker clock did not retain the writer segment that accepted its frame"
+    )
 
-    sequence.recordReplayKitAppend(ptsSeconds: 12, wasAppended: false)
+    sequence.recordReplayKitAppend(ptsSeconds: 12, segmentIndex: 1, wasAppended: false)
     try expect(
       sequence.value == 1,
       "A later dropped ReplayKit video frame changed the retained-video sequence"
     )
     try expect(
-      sequence.latestPTSSeconds == 11,
-      "A later dropped ReplayKit video frame replaced the retained marker media clock"
+      sequence.latestPTSSeconds == 11 && sequence.latestSegmentIndex == 0,
+      "A later dropped ReplayKit video frame replaced retained marker provenance"
     )
 
-    sequence.recordReplayKitAppend(ptsSeconds: 13, wasAppended: true)
+    sequence.recordReplayKitAppend(ptsSeconds: 13, segmentIndex: 1, wasAppended: true)
     try expect(
       sequence.value == 2,
       "A later successfully appended ReplayKit video frame did not advance the sequence exactly once"
     )
     try expect(
-      sequence.latestPTSSeconds == 13,
-      "The marker media clock did not advance to the later retained ReplayKit frame"
+      sequence.latestPTSSeconds == 13 && sequence.latestSegmentIndex == 1,
+      "The marker media provenance did not advance to the later retained ReplayKit frame"
     )
 
-    sequence.recordReplayKitAppend(ptsSeconds: .nan, wasAppended: true)
+    sequence.recordReplayKitAppend(ptsSeconds: .nan, segmentIndex: 2, wasAppended: true)
     try expect(
-      sequence.value == 2 && sequence.latestPTSSeconds == 13,
+      sequence.value == 2
+        && sequence.latestPTSSeconds == 13
+        && sequence.latestSegmentIndex == 1,
       "An invalid video timestamp changed retained-frame marker state"
+    )
+    sequence.recordReplayKitAppend(ptsSeconds: 14, segmentIndex: -1, wasAppended: true)
+    try expect(
+      sequence.value == 2
+        && sequence.latestPTSSeconds == 13
+        && sequence.latestSegmentIndex == 1,
+      "An invalid writer segment changed retained-frame marker state"
     )
   }
 

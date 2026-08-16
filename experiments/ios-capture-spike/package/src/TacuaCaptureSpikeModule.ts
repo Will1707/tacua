@@ -125,6 +125,7 @@ type CaptureMarker = {
   readonly label: string;
   readonly hostUptimeSeconds: number;
   readonly latestMediaPTSSeconds?: number | null;
+  readonly latestMediaSegmentIndex?: number | null;
   readonly latestMediaPTSProvenance?: "retained_replaykit_append_v1" | null;
 };
 
