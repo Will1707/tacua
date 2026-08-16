@@ -448,27 +448,48 @@ final class TacuaCaptureSession {
         completion(.failure(TacuaCaptureSpikeError.noCaptureRunning))
         return
       }
-      guard manifest.markers.count < TacuaCapturePolicy.maximumManifestMarkers else {
+      // This queue serializes the capacity check and append across every JS caller and overlay.
+      guard TacuaCapturePolicy.canAppendProcessableIssueMark(
+        existingCount: manifest.markers.count
+      ) else {
         completion(.failure(TacuaCaptureSpikeError.markerLimitReached))
         return
       }
+      let retainedPTS = retainedReplayKitVideoFrameClock.latestPTSSeconds
       let marker = CaptureMarker(
         id: UUID().uuidString,
         label: label,
         hostUptimeSeconds: ProcessInfo.processInfo.systemUptime,
-        latestMediaPTSSeconds: retainedReplayKitVideoFrameClock.latestPTSSeconds
+        latestMediaPTSSeconds: retainedPTS,
+        latestMediaPTSProvenance: retainedPTS.map { _ in
+          TacuaCapturePolicy.retainedMarkerPTSProvenance
+        }
       )
       manifest.markers.append(marker)
-      appendSystemDiagnosticBestEffort(.issueMark(
+      // Publish the capacity reservation before its redundant journal entry. A crash can now
+      // leave a manifest-only marker (which admission projects), but never an uncounted journal
+      // marker that lets a later process exceed the processor's twelve-mark boundary.
+      guard persistManifestAndReport() else {
+        completion(.failure(TacuaCaptureSpikeError.storageIO(
+          "Tacua could not persist the issue marker."
+        )))
+        return
+      }
+      let journaled = appendSystemDiagnosticBestEffort(.issueMark(
         markerID: Self.stableDiagnosticIdentifier(prefix: "m", source: marker.id),
         kind: .manual
       ))
-      persistManifestAndReport()
+      if !journaled {
+        // The manifest marker remains authoritative; persist the diagnostic-loss code appended
+        // by the best-effort journal path without changing the reserved marker count.
+        persistManifestAndReport()
+      }
       let payload: [String: Any] = [
         "id": marker.id,
         "label": marker.label,
         "hostUptimeSeconds": marker.hostUptimeSeconds,
         "latestMediaPTSSeconds": jsonValue(marker.latestMediaPTSSeconds),
+        "latestMediaPTSProvenance": jsonValue(marker.latestMediaPTSProvenance),
       ]
       eventSink("onMarker", payload)
       completion(.success(payload))
@@ -1971,20 +1992,23 @@ final class TacuaCaptureSession {
     return NSNull()
   }
 
-  private func persistManifestAndReport() {
+  @discardableResult
+  private func persistManifestAndReport() -> Bool {
     do {
       try persistManifest()
+      return true
     } catch {
       let code = TacuaCaptureSpikeError.storageIO(
         "Tacua could not persist the capture manifest."
       ).code
       appendErrorCode(code)
       eventSink("onError", ["code": code, "reason": "manifest_persist_failed"])
-      guard !manifestPersistenceFailed else { return }
+      guard !manifestPersistenceFailed else { return false }
       manifestPersistenceFailed = true
       if manifest.state == "recording", !isStopping {
         requestStopOnQueue(reason: "manifest_persist_failed")
       }
+      return false
     }
   }
 

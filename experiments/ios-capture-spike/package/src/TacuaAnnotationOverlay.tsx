@@ -25,6 +25,7 @@ import {
 import {
   TacuaCaptureSpikeModule,
   type CaptureMarker,
+  type CaptureStatus,
 } from "./TacuaCaptureSpikeModule";
 
 const defaultMaximumIssueMarks = 12;
@@ -36,8 +37,10 @@ const annotatedFrameHoldMilliseconds = 400;
 type SurfaceSize = Readonly<{ width: number; height: number }>;
 
 export type TacuaAnnotationOverlayProps = Readonly<{
-  /** Show the QA-only control only while ReplayKit is actively recording. */
+  /** Raw ReplayKit state; markability additionally requires captureState === "recording". */
   recording: boolean;
+  /** Native capture lifecycle state used to hide and cancel controls outside markable capture. */
+  captureState: CaptureStatus["state"];
   /** Reset ephemeral marks whenever the SDK starts a different logical session. */
   sessionId: string | null;
   /** Current native marker count. The offline processor accepts at most twelve. */
@@ -246,6 +249,7 @@ function MenuAction({
 
 export function TacuaAnnotationOverlay({
   recording,
+  captureState,
   sessionId,
   issueMarkCount,
   bottomOffset = 24,
@@ -253,6 +257,7 @@ export function TacuaAnnotationOverlay({
   onMarkerCreated,
   onError,
 }: TacuaAnnotationOverlayProps) {
+  const markable = captureState === "recording" && recording;
   const [state, dispatch] = useReducer(
     annotationOverlayReducer,
     undefined,
@@ -275,7 +280,7 @@ export function TacuaAnnotationOverlay({
     dispatch({ type: "reset" });
     setFeedback(null);
     setCapturePulse(false);
-  }, [recording, sessionId]);
+  }, [markable, sessionId]);
 
   useEffect(() => () => {
     operationGeneration.current += 1;
@@ -336,7 +341,7 @@ export function TacuaAnnotationOverlay({
 
   const createIssueMark = useCallback(async (allowEmpty: boolean) => {
     if (
-      !recording
+      !markable
       || savingRef.current
       || state.currentStroke !== null
       || (!allowEmpty && state.strokes.length === 0)
@@ -347,6 +352,9 @@ export function TacuaAnnotationOverlay({
     } catch (error) {
       setFeedback(error instanceof Error ? error.message : "Tacua could not read capture status.");
       invokeHostCallback(onError, error);
+      return;
+    }
+    if (nativeStatus.state !== "recording" || nativeStatus.recorderRecording !== true) {
       return;
     }
     const currentCount = Math.max(issueMarkCount, nativeStatus.markerCount);
@@ -360,7 +368,7 @@ export function TacuaAnnotationOverlay({
     operationGeneration.current = generation;
     const stillCurrent = () => (
       operationGeneration.current === generation
-      && recording
+      && markable
     );
     savingRef.current = true;
     dispatch({ type: "save_started" });
@@ -396,12 +404,12 @@ export function TacuaAnnotationOverlay({
     issueMarkCount,
     onError,
     onMarkerCreated,
-    recording,
+    markable,
     state.currentStroke,
     state.strokes.length,
   ]);
 
-  if (!recording) return null;
+  if (!markable) return null;
 
   const markLimitReached = issueMarkCount >= defaultMaximumIssueMarks;
   const drawingActive = state.activeTool !== null && !state.saving;
@@ -522,7 +530,7 @@ export function TacuaAnnotationOverlay({
             </View>
           ) : null}
           {state.menuOpen ? (
-            <View style={styles.menu}>
+            <View pointerEvents="box-none" style={styles.menu}>
               <MenuAction
                 disabled={markLimitReached}
                 label="Draw"

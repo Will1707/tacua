@@ -32,6 +32,10 @@ enum TacuaCapturePolicy {
   /// projection-overflow slot so a late manifest marker or gap can never make admission fail.
   static let maximumDiagnosticJournalEvents = 9_998
   static let maximumManifestGaps = 2_048
+  /// Every native marker becomes one processor issue mark. Keep this lower runtime boundary
+  /// separate from the structural manifest cap retained for legacy recovery and admission.
+  static let maximumProcessableIssueMarks = 12
+  static let retainedMarkerPTSProvenance = "retained_replaykit_append_v1"
   static let maximumManifestMarkers = 2_048
   static let minimumFreeStorageBytes: Int64 = 256 * 1_024 * 1_024
   static let maximumCatchUpSegmentRotations = 60
@@ -46,6 +50,10 @@ enum TacuaCapturePolicy {
 
   static func isAdmissionDurationValid(_ durationMilliseconds: Int64) -> Bool {
     (0...maximumAdmissionDurationMilliseconds).contains(durationMilliseconds)
+  }
+
+  static func canAppendProcessableIssueMark(existingCount: Int) -> Bool {
+    existingCount >= 0 && existingCount < maximumProcessableIssueMarks
   }
 
   static func captureGapInsertionDisposition(

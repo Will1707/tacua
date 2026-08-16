@@ -65,6 +65,22 @@ enum CapturePolicyTests {
       "The persisted capture marker cap drifted from the runtime contract"
     )
     try expect(
+      TacuaCapturePolicy.maximumProcessableIssueMarks == 12,
+      "The native issue-mark cap drifted from the processor contract"
+    )
+    try expect(
+      TacuaCapturePolicy.retainedMarkerPTSProvenance == "retained_replaykit_append_v1",
+      "The retained-frame marker provenance drifted from the admission contract"
+    )
+    try expect(
+      TacuaCapturePolicy.canAppendProcessableIssueMark(existingCount: 11),
+      "The final processor-supported issue-mark slot was rejected"
+    )
+    try expect(
+      !TacuaCapturePolicy.canAppendProcessableIssueMark(existingCount: 12),
+      "Native capture allowed a marker that would make the processor reject the capture"
+    )
+    try expect(
       TacuaCapturePolicy.captureGapInsertionDisposition(
         existingCount: 2_046,
         overflowSentinelPresent: false

@@ -308,6 +308,29 @@ class OfflineProcessorTests(unittest.TestCase):
         )
         self.assertEqual(ambiguous, {"marker_first", "marker_second"})
 
+    def test_issue_mark_capacity_matches_the_native_capture_limit(self) -> None:
+        events = []
+        for index in range(13):
+            elapsed = index * 1_000
+            events.append(
+                {
+                    "data": {
+                        "kind": "manual",
+                        "marker_id": f"marker_capacity_{index:02d}",
+                        "narration_elapsed_ms": elapsed,
+                    },
+                    "elapsed_ms": elapsed,
+                    "event_id": f"event_capacity_{index:02d}",
+                    "event_type": "issue_mark",
+                    "occurred_at": "2026-08-16T12:00:00Z",
+                    "sequence": index + 1,
+                }
+            )
+
+        self.assertEqual(len(processor.issue_marks([{"events": events[:12]}])), 12)
+        with self.assertRaisesRegex(processor.ProcessorError, "too many issue marks"):
+            processor.issue_marks([{"events": events}])
+
     def test_video_gap_rejects_candidate_before_media_execution(self) -> None:
         source = source_fixture(TERMINAL_FIXTURE / "input.json")
         envelope = json.loads(DIAGNOSTIC_REQUEST.read_bytes())["envelope"]

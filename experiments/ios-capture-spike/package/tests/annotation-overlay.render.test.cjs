@@ -20,6 +20,8 @@ const TestRenderer = fromHarness("react-test-renderer");
 global.IS_REACT_ACT_ENVIRONMENT = true;
 
 const nativeStatus = {
+  state: "recording",
+  recorderRecording: true,
   appendedVideoFrameSequence: 1,
   latestMediaPTSSeconds: 10,
   markerCount: 0,
@@ -113,15 +115,26 @@ function responderEvent(x, y, touches = [{}]) {
   return { nativeEvent: { locationX: x, locationY: y, touches } };
 }
 
+function nearestViewAncestor(node) {
+  let candidate = node.parent;
+  while (candidate && candidate.type !== "View") candidate = candidate.parent;
+  return candidate;
+}
+
+function overlayElement(properties = {}) {
+  return React.createElement(TacuaAnnotationOverlay, {
+    recording: true,
+    captureState: "recording",
+    sessionId: "qa_render_test",
+    issueMarkCount: 0,
+    ...properties,
+  });
+}
+
 async function renderOverlay(properties = {}) {
   let renderer;
   await TestRenderer.act(async () => {
-    renderer = TestRenderer.create(React.createElement(TacuaAnnotationOverlay, {
-      recording: true,
-      sessionId: "qa_render_test",
-      issueMarkCount: 0,
-      ...properties,
-    }));
+    renderer = TestRenderer.create(overlayElement(properties));
   });
   return renderer;
 }
@@ -142,6 +155,7 @@ test("idle bubble passes touches through and exposes bounded drawing choices", a
 
     const open = press(renderer, "Open Tacua issue tools");
     assert.ok(open);
+    assert.equal(nearestViewAncestor(open).props.pointerEvents, "box-none");
     const fabStyle = open.props.style({ pressed: false });
     assert.equal(fabStyle[0].width, 58);
     assert.equal(fabStyle[0].height, 58);
@@ -151,6 +165,7 @@ test("idle bubble passes touches through and exposes bounded drawing choices", a
     assert.ok(press(renderer, "Highlight"));
     assert.ok(press(renderer, "Mark without drawing"));
     assert.equal(press(renderer, "Draw").props.disabled, false);
+    assert.equal(nearestViewAncestor(press(renderer, "Draw")).props.pointerEvents, "box-none");
   } finally {
     await TestRenderer.act(async () => renderer.unmount());
   }
@@ -288,12 +303,53 @@ test("mark waits for a successfully appended frame before committing native evid
   }
 });
 
-test("the QA control is absent when ReplayKit is not recording", async () => {
-  const renderer = await renderOverlay({ recording: false, sessionId: null });
+test("leaving the native recording state cancels an in-flight annotation mark", async () => {
+  nativeMarkCalls = 0;
+  nativeStatusReads = 0;
+  advanceOnStatusRead = null;
+  const renderer = await renderOverlay();
   try {
+    await TestRenderer.act(async () => press(renderer, "Open Tacua issue tools").props.onPress());
+    await TestRenderer.act(async () => {
+      press(renderer, "Mark without drawing").props.onPress();
+      renderer.update(overlayElement({ captureState: "stopping" }));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
     assert.equal(renderer.toJSON(), null);
+    assert.equal(nativeMarkCalls, 0);
   } finally {
     await TestRenderer.act(async () => renderer.unmount());
+  }
+});
+
+test("a stale host render cannot start work after native capture becomes unmarkable", async () => {
+  nativeMarkCalls = 0;
+  nativeStatusReads = 0;
+  nativeStatus.state = "stop_failed_capture_active";
+  const renderer = await renderOverlay();
+  try {
+    await TestRenderer.act(async () => press(renderer, "Open Tacua issue tools").props.onPress());
+    await TestRenderer.act(async () => press(renderer, "Mark without drawing").props.onPress());
+    assert.equal(nativeStatusReads, 1);
+    assert.equal(nativeMarkCalls, 0);
+  } finally {
+    nativeStatus.state = "recording";
+    await TestRenderer.act(async () => renderer.unmount());
+  }
+});
+
+test("the QA control is absent whenever native capture cannot accept marks", async () => {
+  for (const properties of [
+    { recording: false, captureState: "idle", sessionId: null },
+    { recording: true, captureState: "stopping" },
+    { recording: true, captureState: "stop_failed_capture_active" },
+  ]) {
+    const renderer = await renderOverlay(properties);
+    try {
+      assert.equal(renderer.toJSON(), null);
+    } finally {
+      await TestRenderer.act(async () => renderer.unmount());
+    }
   }
 });
 

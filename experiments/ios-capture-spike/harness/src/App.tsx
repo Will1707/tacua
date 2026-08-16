@@ -685,6 +685,7 @@ export default function App(): React.JSX.Element {
       </ScrollView>
       <TacuaCapture.TacuaAnnotationOverlay
         recording={recording}
+        captureState={status?.state ?? 'idle'}
         sessionId={status?.sessionId ?? null}
         issueMarkCount={status?.markerCount ?? 0}
         onError={(error) => log(`Annotation failed: ${safeMessage(error)}`)}

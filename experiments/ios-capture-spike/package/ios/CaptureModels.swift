@@ -188,6 +188,9 @@ struct CaptureMarker: Codable {
   let hostUptimeSeconds: Double
   /// Latest real ReplayKit video PTS successfully appended to retained media at mark time.
   let latestMediaPTSSeconds: Double?
+  /// Present only when latestMediaPTSSeconds uses retained-frame rather than legacy
+  /// observed-PTS semantics.
+  let latestMediaPTSProvenance: String?
 }
 
 struct CaptureCalibration: Codable {
