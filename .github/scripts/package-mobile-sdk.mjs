@@ -71,7 +71,9 @@ const allowedRuntimePaths = new Set([
   "plugin/withTacua.js",
   "src/BackendManagedHostController.ts",
   "src/BackendManagedHostLifecycleAdapter.ts",
+  "src/TacuaAnnotationOverlay.tsx",
   "src/TacuaCaptureSpikeModule.ts",
+  "src/annotation-overlay-state.ts",
   "src/index.ts",
 ]);
 const requiredPaths = allowedRuntimePaths;
@@ -108,6 +110,7 @@ const expectedDependencyVersions = Object.freeze({
 });
 const expectedPeerDependencyVersions = Object.freeze({
   expo: ">=56.0.16 <57",
+  react: ">=19.2.0 <20",
   "react-native": ">=0.85.3 <0.86",
 });
 export const MAX_PACKAGE_FILES = 256;
