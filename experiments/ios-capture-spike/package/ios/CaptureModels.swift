@@ -186,7 +186,14 @@ struct CaptureMarker: Codable {
   let id: String
   let label: String
   let hostUptimeSeconds: Double
+  /// Latest real ReplayKit video PTS successfully appended to retained media at mark time.
   let latestMediaPTSSeconds: Double?
+  /// Writer segment that accepted latestMediaPTSSeconds. Admission binds retained provenance only
+  /// after this exact segment commits, so a failed writer cannot manufacture issue evidence.
+  let latestMediaSegmentIndex: Int?
+  /// Present only when latestMediaPTSSeconds uses retained-frame rather than legacy
+  /// observed-PTS semantics.
+  let latestMediaPTSProvenance: String?
 }
 
 struct CaptureCalibration: Codable {
@@ -275,6 +282,7 @@ enum TacuaCaptureSpikeError: Error {
   case insufficientStorage
   case invalidMarkerLabel
   case markerLimitReached
+  case markerPersistenceOutcomeUnknown
   case storageIO(String)
   case recoveryIO(String)
   case writerCreation(String)
@@ -318,6 +326,7 @@ enum TacuaCaptureSpikeError: Error {
     case .insufficientStorage: return "ERR_TACUA_CAPTURE_STORAGE_LOW"
     case .invalidMarkerLabel: return "ERR_TACUA_CAPTURE_MARKER_LABEL"
     case .markerLimitReached: return "ERR_TACUA_CAPTURE_MARKER_LIMIT"
+    case .markerPersistenceOutcomeUnknown: return "ERR_TACUA_CAPTURE_MARKER_OUTCOME_UNKNOWN"
     case .storageIO: return "ERR_TACUA_CAPTURE_STORAGE_IO"
     case .recoveryIO: return "ERR_TACUA_CAPTURE_RECOVERY_IO"
     case .writerCreation: return "ERR_TACUA_CAPTURE_WRITER_CREATE"
@@ -393,6 +402,8 @@ enum TacuaCaptureSpikeError: Error {
       return "Marker labels use 1-80 ASCII letters, digits, dots, underscores, or hyphens."
     case .markerLimitReached:
       return "The capture reached its bounded manual issue-marker limit."
+    case .markerPersistenceOutcomeUnknown:
+      return "Tacua could not determine whether the issue marker became durable; the capture was stopped without journaling the marker."
     case .storageIO(let detail), .recoveryIO(let detail):
       return detail
     case .writerCreation(let detail), .writerFailed(let detail):

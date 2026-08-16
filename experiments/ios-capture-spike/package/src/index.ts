@@ -77,6 +77,13 @@ import {
   type BackendManagedHostLifecycleError,
   type BackendManagedHostLifecycleOperation,
 } from "./BackendManagedHostLifecycleAdapter";
+export { TacuaAnnotationOverlay } from "./TacuaAnnotationOverlay";
+export type { TacuaAnnotationOverlayProps } from "./TacuaAnnotationOverlay";
+export type {
+  AnnotationPoint,
+  AnnotationStroke,
+  AnnotationTool,
+} from "./annotation-overlay-state";
 
 export type {
   AppAudioAppendDrop,

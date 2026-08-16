@@ -553,10 +553,12 @@ Admission projects the private journal into one SDK-owned diagnostic envelope,
 merges sanitized manifest marks/gaps that were not already journaled, and always
 appends a terminal `custom_state` event from provider `capture_summary`. The
 summary hash contains only allowlisted counts and availability booleans. Native
-journal sequence and uptime are the chronology source; the envelope reassigns a
-dense sequence after deterministic merging and maps uptime to the same-boot
-server-time anchor. A torn final journal append is truncated and represented as
-an unavailable `custom_state` event plus an explicit
+journal sequence and uptime are the chronology source, except that an issue mark
+with explicit retained-frame provenance is projected onto that verified video
+PTS. Legacy markers without that provenance keep their host-time behavior. The
+envelope reassigns a dense sequence after deterministic merging and maps the
+result to the same-boot server-time anchor. A torn final journal append is
+truncated and represented as an unavailable `custom_state` event plus an explicit
 `diagnostic_collection_paused` collection gap; it never invents a capture gap.
 Every diagnostic `capture_gap` instead uses the exact sanitized identifier of a
 real capture-manifest gap. New journals stop at 9,998 events, reserving the
@@ -566,7 +568,9 @@ exact omitted count and time range, and deterministically constrains the final
 canonical envelope to the sealed transport limit (3 MiB in the generated
 profile). It can still recover a torn legacy 9,999-event
 journal into the runtime's 10,000th hard slot before bounded projection.
-Capture manifests accept at most 2,048 manual markers and 2,048 gaps; the final
+Native capture accepts at most twelve manual issue marks, matching the offline
+processor; admission retains a 2,048-marker structural ceiling for legacy and
+recovered manifests. Capture manifests accept at most 2,048 gaps, and the final
 gap slot coalesces additional interruptions into an explicit overflow sentinel.
 Interior corruption, reordering, deletion, an unsafe path, or a different boot
 fails closed.
@@ -744,6 +748,62 @@ validator requires the same source manifest and rejects byte or identity
 substitution.
 The manifest and artifact may expose capture measurements; keep them private
 until the aggregate evidence has been reviewed.
+
+## In-app issue annotation
+
+QA builds may mount `TacuaAnnotationOverlay` as the last sibling above their
+navigation root. The touch-first floating control is visible only while ReplayKit
+is active and the native capture state can accept marks. It offers pen,
+highlighter, and a non-drawing issue mark; pen/highlighter mode deliberately
+pauses interaction with the app beneath it and provides undo, clear, cancel, and
+Mark controls.
+
+Mark keeps only the strokes visible, waits until a later ReplayKit frame is
+successfully appended to the retained movie, writes one native
+`screen_annotation` issue mark, and holds the pixels briefly before clearing
+them. The isolated processor then extracts the visible annotated frame and
+narration window through the existing issue-mark evidence path. Vector points
+remain ephemeral and are never added to diagnostics or the upload contract.
+
+```tsx
+import * as TacuaCapture from '@tacua/mobile-sdk';
+import { useEffect, useState } from 'react';
+import { View } from 'react-native';
+
+export function QARoot() {
+  const [status, setStatus] = useState(() => TacuaCapture.getStatus());
+
+  useEffect(() => {
+    const state = TacuaCapture.subscribe('onState', setStatus);
+    const marker = TacuaCapture.subscribe('onMarker', () => {
+      setStatus(TacuaCapture.getStatus());
+    });
+    return () => {
+      state.remove();
+      marker.remove();
+    };
+  }, []);
+
+  return (
+    <View style={{ flex: 1 }}>
+      <AppNavigator />
+      <TacuaCapture.TacuaAnnotationOverlay
+        recording={status.recorderRecording}
+        captureState={status.state}
+        sessionId={status.sessionId ?? null}
+        issueMarkCount={status.markerCount}
+      />
+    </View>
+  );
+}
+```
+
+Mount this only in the authorized SDK-enabled QA target. A separate Tacua
+reviewer app cannot overlay or record another iOS application. The current
+offline processor accepts at most twelve marks in one capture. The native mark
+API enforces that limit atomically, while the component mirrors it to disable
+actions early. Marks less than twelve seconds apart still produce annotated
+screenshots, but the processor suppresses their overlapping automatic narration.
 
 ## Example
 

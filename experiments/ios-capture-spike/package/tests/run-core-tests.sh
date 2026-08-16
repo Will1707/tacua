@@ -387,6 +387,7 @@ swiftc \
 "$TEST_TMP_DIR/tacua-local-harness-policy-release-tests"
 
 node --check app.plugin.js
+node --check "$PACKAGE_ROOT/../harness/metro.config.js"
 for plugin_file in plugin/*.js; do
   node --check "$plugin_file"
 done
@@ -398,6 +399,10 @@ node --test --experimental-strip-types \
 node --test --experimental-strip-types \
   --disable-warning=MODULE_TYPELESS_PACKAGE_JSON \
   tests/backend-managed-host-lifecycle-adapter.test.ts
+node --test --experimental-strip-types \
+  --disable-warning=MODULE_TYPELESS_PACKAGE_JSON \
+  tests/annotation-overlay-state.test.ts
+node --test tests/annotation-overlay.render.test.cjs
 
 npm --prefix "$PACKAGE_ROOT/../harness" run typecheck
 

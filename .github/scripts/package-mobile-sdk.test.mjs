@@ -68,6 +68,8 @@ test("release paths are closed to an audited runtime file set", () => {
     "plugin/config.js",
     "src/BackendManagedHostController.ts",
     "src/BackendManagedHostLifecycleAdapter.ts",
+    "src/TacuaAnnotationOverlay.tsx",
+    "src/annotation-overlay-state.ts",
     "src/index.ts",
     "README.md",
   ]) {

@@ -9,6 +9,37 @@ enum TacuaCaptureGapInsertionDisposition: Equatable {
   case replaceLastWithOverflowSentinel
 }
 
+enum TacuaManifestPersistenceAttempt: Equatable {
+  case durable
+  case publishedUnconfirmed
+  case unpublished
+}
+
+enum TacuaIssueMarkerPersistenceResolution: Equatable {
+  case committed
+  case rejected
+  case outcomeUnknown
+}
+
+/// Process-local sequence for real ReplayKit video callbacks accepted by the active writer.
+/// Synthetic held frames used at segment boundaries never pass through this counter.
+struct TacuaRetainedReplayKitVideoFrameClock {
+  private(set) var value = 0
+  private(set) var latestPTSSeconds: Double?
+  private(set) var latestSegmentIndex: Int?
+
+  mutating func recordReplayKitAppend(
+    ptsSeconds: Double,
+    segmentIndex: Int,
+    wasAppended: Bool
+  ) {
+    guard wasAppended, ptsSeconds.isFinite, segmentIndex >= 0 else { return }
+    value += 1
+    latestPTSSeconds = ptsSeconds
+    latestSegmentIndex = segmentIndex
+  }
+}
+
 enum TacuaCapturePolicy {
   static let maximumDurationSeconds: Double = 1_800
   /// Admission timestamps are persisted after ReplayKit stop and writer-finalization callbacks.
@@ -19,6 +50,13 @@ enum TacuaCapturePolicy {
   /// projection-overflow slot so a late manifest marker or gap can never make admission fail.
   static let maximumDiagnosticJournalEvents = 9_998
   static let maximumManifestGaps = 2_048
+  /// Segment filenames use a six-digit stable index. Retained marker bindings also reserve their
+  /// writer index across recovery, including when that writer never committed a segment.
+  static let maximumSegmentIndex = 999_999
+  /// Every native marker becomes one processor issue mark. Keep this lower runtime boundary
+  /// separate from the structural manifest cap retained for legacy recovery and admission.
+  static let maximumProcessableIssueMarks = 12
+  static let retainedMarkerPTSProvenance = "retained_replaykit_append_v1"
   static let maximumManifestMarkers = 2_048
   static let minimumFreeStorageBytes: Int64 = 256 * 1_024 * 1_024
   static let maximumCatchUpSegmentRotations = 60
@@ -33,6 +71,70 @@ enum TacuaCapturePolicy {
 
   static func isAdmissionDurationValid(_ durationMilliseconds: Int64) -> Bool {
     (0...maximumAdmissionDurationMilliseconds).contains(durationMilliseconds)
+  }
+
+  static func canAppendProcessableIssueMark(existingCount: Int) -> Bool {
+    isProcessableIssueMarkCountValid(existingCount)
+      && existingCount < maximumProcessableIssueMarks
+  }
+
+  static func isProcessableIssueMarkCountValid(_ count: Int) -> Bool {
+    (0...maximumProcessableIssueMarks).contains(count)
+  }
+
+  /// Mirrors admission's issue-mark de-duplication. Every journal record projects one event;
+  /// only manifest markers with no journal representation add a fallback event. Counting this
+  /// recovered projection prevents a legacy journal-only marker from opening a thirteenth slot.
+  static func processableIssueMarkCount(
+    manifestMarkerIDs: [String],
+    journalMarkerIDs: [String]
+  ) -> Int? {
+    let manifestSet = Set(manifestMarkerIDs)
+    guard manifestSet.count == manifestMarkerIDs.count else { return nil }
+    let manifestOnlyCount = manifestSet.subtracting(Set(journalMarkerIDs)).count
+    let (count, overflow) = journalMarkerIDs.count.addingReportingOverflow(manifestOnlyCount)
+    return overflow ? nil : count
+  }
+
+  static func nextSegmentIndexForRecovery(
+    committedSegmentIndexes: [Int],
+    retainedMarkerSegmentIndexes: [Int]
+  ) -> Int? {
+    let reserved = committedSegmentIndexes + retainedMarkerSegmentIndexes
+    guard reserved.allSatisfy({ (0...maximumSegmentIndex).contains($0) }) else { return nil }
+    guard let highWater = reserved.max() else { return 0 }
+    guard highWater < maximumSegmentIndex else { return nil }
+    return highWater + 1
+  }
+
+  /// Resolves the marker reservation before its redundant journal record is appended. A rename
+  /// followed by a failed directory fsync is visible but not yet crash-durable, so the exact
+  /// publication must be confirmed before the caller may report success or write the journal.
+  static func resolveIssueMarkerPersistence(
+    initialAttempt: TacuaManifestPersistenceAttempt,
+    confirmPublishedManifest: () -> Bool,
+    removeMarker: () -> Void,
+    persistMarkerFreeManifest: () -> TacuaManifestPersistenceAttempt,
+    confirmPublishedRollback: () -> Bool
+  ) -> TacuaIssueMarkerPersistenceResolution {
+    switch initialAttempt {
+    case .durable:
+      return .committed
+    case .unpublished:
+      removeMarker()
+      return .rejected
+    case .publishedUnconfirmed:
+      if confirmPublishedManifest() { return .committed }
+      removeMarker()
+      switch persistMarkerFreeManifest() {
+      case .durable:
+        return .rejected
+      case .publishedUnconfirmed:
+        return confirmPublishedRollback() ? .rejected : .outcomeUnknown
+      case .unpublished:
+        return .outcomeUnknown
+      }
+    }
   }
 
   static func captureGapInsertionDisposition(
@@ -202,6 +304,27 @@ enum TacuaCapturePolicy {
       return min(boundary, incomingPTSSeconds)
     }
     return boundaries.isEmpty ? .none : .boundaries(boundaries)
+  }
+
+  /// Projects a synthetic media boundary onto the host clock using the real ReplayKit callback
+  /// that triggered rotation. Passing the callback host time directly would make a held opening
+  /// frame appear later than its media PTS and shift every processor seek in that segment.
+  static func segmentBoundaryHostUptimeSeconds(
+    boundaryPTSSeconds: Double,
+    callbackPTSSeconds: Double,
+    callbackHostUptimeSeconds: Double,
+    minimumHostUptimeSeconds: Double = 0
+  ) -> Double? {
+    guard boundaryPTSSeconds.isFinite, callbackPTSSeconds.isFinite,
+      callbackHostUptimeSeconds.isFinite, callbackHostUptimeSeconds >= 0,
+      minimumHostUptimeSeconds.isFinite, minimumHostUptimeSeconds >= 0,
+      boundaryPTSSeconds <= callbackPTSSeconds
+    else { return nil }
+    let projected = callbackHostUptimeSeconds - (callbackPTSSeconds - boundaryPTSSeconds)
+    guard projected.isFinite, projected >= minimumHostUptimeSeconds,
+      projected <= callbackHostUptimeSeconds
+    else { return nil }
+    return projected
   }
 
   static func recoverySource(finalExists: Bool, partialExists: Bool) -> RecoverySource? {

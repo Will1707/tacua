@@ -59,6 +59,7 @@ function captureStatus(
     gapCount: 0,
     markerCount: 0,
     errorCodes: [],
+    appendedVideoFrameSequence: 0,
     recorderAvailable: true,
     recorderRecording: recording,
     maximumDurationSeconds: 1_800,

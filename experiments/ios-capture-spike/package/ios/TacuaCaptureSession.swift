@@ -59,6 +59,7 @@ final class TacuaCaptureSession {
   private let recorderOwnershipToken: UUID
   private var diagnosticJournal: TacuaDiagnosticJournal?
   private var diagnosticEventCount = 0
+  private var processableIssueMarkCount = 0
   private var diagnosticContainsCollectionGap = false
   private var diagnosticAppState = TacuaDiagnosticAppState.unknown
 
@@ -72,6 +73,7 @@ final class TacuaCaptureSession {
   private var trackedAppAudioDropCount = 0
   private var latestVideoPTS: CMTime?
   private var latestVideoHostUptimeSeconds: Double?
+  private var retainedReplayKitVideoFrameClock = TacuaRetainedReplayKitVideoFrameClock()
   private var latestMicrophonePTS: CMTime?
   private var latestMicrophoneHostUptimeSeconds: Double?
   private var isStopping = false
@@ -245,28 +247,41 @@ final class TacuaCaptureSession {
         durationBudgetSeconds = retentionBudget
         durationStopReason = "raw_media_retention_expired"
       }
-      nextSegmentIndex = (manifest.segments.map(\.index).max() ?? -1) + 1
+      var retainedMarkerSegmentIndexes: [Int] = []
+      retainedMarkerSegmentIndexes.reserveCapacity(manifest.markers.count)
+      for marker in manifest.markers {
+        guard let provenance = marker.latestMediaPTSProvenance else {
+          guard marker.latestMediaSegmentIndex == nil else {
+            throw TacuaCaptureSpikeError.recoveryIO(
+              "The stored marker has an incomplete retained-frame binding."
+            )
+          }
+          continue
+        }
+        guard provenance == TacuaCapturePolicy.retainedMarkerPTSProvenance,
+          let markerPTS = marker.latestMediaPTSSeconds,
+          markerPTS.isFinite,
+          let markerSegmentIndex = marker.latestMediaSegmentIndex,
+          (0...TacuaCapturePolicy.maximumSegmentIndex).contains(markerSegmentIndex)
+        else {
+          throw TacuaCaptureSpikeError.recoveryIO(
+            "The stored marker has an invalid retained-frame binding."
+          )
+        }
+        retainedMarkerSegmentIndexes.append(markerSegmentIndex)
+      }
+      guard let recoveredNextSegmentIndex = TacuaCapturePolicy.nextSegmentIndexForRecovery(
+        committedSegmentIndexes: manifest.segments.map(\.index),
+        retainedMarkerSegmentIndexes: retainedMarkerSegmentIndexes
+      ) else {
+        throw TacuaCaptureSpikeError.recoveryIO(
+          "The stored capture exhausted its bounded segment index space."
+        )
+      }
+      nextSegmentIndex = recoveredNextSegmentIndex
       if let lastPTS = manifest.segments.last?.lastMediaPTSSeconds {
         latestVideoPTS = CMTime(seconds: lastPTS, preferredTimescale: 1_000_000_000)
       }
-      manifest.handoffTokenIdentifier = handoff.handoffTokenIdentifier
-      manifest.expiresAt = handoff.expiresAt
-      manifest.state = "prepared"
-      manifest.stoppedHostUptimeSeconds = nil
-      manifest.stopReason = nil
-      manifest.resumeCount = (manifest.resumeCount ?? 0) + 1
-      manifest.lastResumedAt = Self.iso8601(Date())
-      let resumeGap = CaptureGap(
-        id: UUID().uuidString,
-        reason: "process_resume",
-        openedHostUptimeSeconds: ProcessInfo.processInfo.systemUptime,
-        closedHostUptimeSeconds: nil,
-        priorMediaPTSSeconds: latestVideoPTS.map(CMTimeGetSeconds),
-        nextMediaPTSSeconds: nil
-      )
-      let boundedResumeGap = Self.appendBoundedGap(resumeGap, to: &manifest)
-      pendingResumeGapId = boundedResumeGap.id
-      try persistManifest()
     } else {
       let bootSessionID = TacuaSystemMonotonicClock().bootSessionID
       guard !bootSessionID.isEmpty else {
@@ -340,6 +355,23 @@ final class TacuaCaptureSession {
       let diagnosticSnapshot = try journal.snapshot()
       diagnosticJournal = journal
       diagnosticEventCount = diagnosticSnapshot.entries.count
+      let manifestMarkerIDs = manifest.markers.map {
+        Self.stableDiagnosticIdentifier(prefix: "m", source: $0.id)
+      }
+      let journalMarkerIDs = diagnosticSnapshot.entries.compactMap { entry -> String? in
+        if case .issueMark(let markerID, _) = entry.event { return markerID }
+        return nil
+      }
+      guard let recoveredIssueMarkCount = TacuaCapturePolicy.processableIssueMarkCount(
+        manifestMarkerIDs: manifestMarkerIDs,
+        journalMarkerIDs: journalMarkerIDs
+      ), TacuaCapturePolicy.isProcessableIssueMarkCountValid(recoveredIssueMarkCount)
+      else {
+        throw TacuaCaptureSpikeError.recoveryIO(
+          "The stored issue-marker projection is inconsistent or exceeds its processable limit."
+        )
+      }
+      processableIssueMarkCount = recoveredIssueMarkCount
       diagnosticContainsCollectionGap = diagnosticSnapshot.containsCollectionGap
       diagnosticAppState = diagnosticSnapshot.entries.reversed().compactMap { entry in
         if case .event(.appStateChanged(_, let toState)) = entry.event { return toState }
@@ -353,6 +385,26 @@ final class TacuaCaptureSession {
         : TacuaCaptureSpikeError.storageIO(
           "Tacua could not create the private diagnostic journal."
         )
+    }
+    if resuming {
+      manifest.handoffTokenIdentifier = handoff.handoffTokenIdentifier
+      manifest.expiresAt = handoff.expiresAt
+      manifest.state = "prepared"
+      manifest.stoppedHostUptimeSeconds = nil
+      manifest.stopReason = nil
+      manifest.resumeCount = (manifest.resumeCount ?? 0) + 1
+      manifest.lastResumedAt = Self.iso8601(Date())
+      let resumeGap = CaptureGap(
+        id: UUID().uuidString,
+        reason: "process_resume",
+        openedHostUptimeSeconds: ProcessInfo.processInfo.systemUptime,
+        closedHostUptimeSeconds: nil,
+        priorMediaPTSSeconds: latestVideoPTS.map(CMTimeGetSeconds),
+        nextMediaPTSSeconds: nil
+      )
+      let boundedResumeGap = Self.appendBoundedGap(resumeGap, to: &manifest)
+      pendingResumeGapId = boundedResumeGap.id
+      try persistManifest()
     }
     initializationCompleted = true
   }
@@ -447,27 +499,72 @@ final class TacuaCaptureSession {
         completion(.failure(TacuaCaptureSpikeError.noCaptureRunning))
         return
       }
-      guard manifest.markers.count < TacuaCapturePolicy.maximumManifestMarkers else {
+      // This queue serializes the capacity check and append across every JS caller and overlay.
+      guard TacuaCapturePolicy.canAppendProcessableIssueMark(
+        existingCount: processableIssueMarkCount
+      ) else {
         completion(.failure(TacuaCaptureSpikeError.markerLimitReached))
         return
       }
+      let retainedPTS = retainedReplayKitVideoFrameClock.latestPTSSeconds
+      let retainedSegmentIndex = retainedReplayKitVideoFrameClock.latestSegmentIndex
       let marker = CaptureMarker(
         id: UUID().uuidString,
         label: label,
         hostUptimeSeconds: ProcessInfo.processInfo.systemUptime,
-        latestMediaPTSSeconds: latestVideoPTS.map(CMTimeGetSeconds)
+        latestMediaPTSSeconds: retainedPTS,
+        latestMediaSegmentIndex: retainedSegmentIndex,
+        latestMediaPTSProvenance: retainedPTS.map { _ in
+          TacuaCapturePolicy.retainedMarkerPTSProvenance
+        }
       )
       manifest.markers.append(marker)
-      appendSystemDiagnosticBestEffort(.issueMark(
+      // Publish the capacity reservation before its redundant journal entry. A crash can now
+      // leave a manifest-only marker (which admission projects), but never an uncounted journal
+      // marker that lets a later process exceed the processor's twelve-mark boundary.
+      let persistenceResolution = TacuaCapturePolicy.resolveIssueMarkerPersistence(
+        initialAttempt: persistManifestAttempt(),
+        confirmPublishedManifest: { [self] in confirmManifestPublication() },
+        removeMarker: { [self] in
+          manifest.markers.removeAll { $0.id == marker.id }
+        },
+        persistMarkerFreeManifest: { [self] in persistManifestAttempt() },
+        confirmPublishedRollback: { [self] in confirmManifestPublication() }
+      )
+      switch persistenceResolution {
+      case .committed:
+        processableIssueMarkCount += 1
+        break
+      case .rejected:
+        reportManifestPersistenceFailure()
+        completion(.failure(TacuaCaptureSpikeError.storageIO(
+          "Tacua could not persist the issue marker."
+        )))
+        return
+      case .outcomeUnknown:
+        reportCapturePersistenceFailure(
+          .markerPersistenceOutcomeUnknown,
+          reason: "marker_persist_outcome_unknown"
+        )
+        completion(.failure(TacuaCaptureSpikeError.markerPersistenceOutcomeUnknown))
+        return
+      }
+      let journaled = appendSystemDiagnosticBestEffort(.issueMark(
         markerID: Self.stableDiagnosticIdentifier(prefix: "m", source: marker.id),
         kind: .manual
       ))
-      persistManifestAndReport()
+      if !journaled {
+        // The manifest marker remains authoritative; persist the diagnostic-loss code appended
+        // by the best-effort journal path without changing the reserved marker count.
+        persistManifestAndReport()
+      }
       let payload: [String: Any] = [
         "id": marker.id,
         "label": marker.label,
         "hostUptimeSeconds": marker.hostUptimeSeconds,
         "latestMediaPTSSeconds": jsonValue(marker.latestMediaPTSSeconds),
+        "latestMediaSegmentIndex": jsonValue(marker.latestMediaSegmentIndex),
+        "latestMediaPTSProvenance": jsonValue(marker.latestMediaPTSProvenance),
       ]
       eventSink("onMarker", payload)
       completion(.success(payload))
@@ -1185,6 +1282,34 @@ final class TacuaCaptureSession {
         return
       }
       for boundarySeconds in boundaries {
+        guard let activeWriter = self.writer else {
+          failAndStopOnQueue(
+            error: TacuaCaptureSpikeError.writerCreation(
+              "Tacua lost the active writer while rotating capture segments."
+            ),
+            gapReason: "segment_rotation_writer_missing"
+          )
+          return
+        }
+        // ReplayKit sample buffers share the capture media clock. Whether video or audio
+        // triggers a static-screen rotation, the callback pair anchors its synthetic video
+        // boundary; the active writer's last accepted host time prevents backward projection.
+        guard let boundaryHostUptimeSeconds = TacuaCapturePolicy
+          .segmentBoundaryHostUptimeSeconds(
+            boundaryPTSSeconds: boundarySeconds,
+            callbackPTSSeconds: incomingPTSSeconds,
+            callbackHostUptimeSeconds: hostUptimeSeconds,
+            minimumHostUptimeSeconds: activeWriter.lastHostUptimeSeconds
+          )
+        else {
+          failAndStopOnQueue(
+            error: TacuaCaptureSpikeError.writerCreation(
+              "Tacua could not project the segment boundary onto the host clock."
+            ),
+            gapReason: "segment_rotation_clock_projection_failed"
+          )
+          return
+        }
         let boundaryPTS = CMTime(
           seconds: boundarySeconds,
           preferredTimescale: 1_000_000_000
@@ -1196,7 +1321,7 @@ final class TacuaCaptureSession {
         do {
           try rotateCurrentSegment(
             at: boundaryPTS,
-            hostUptimeSeconds: hostUptimeSeconds,
+            hostUptimeSeconds: boundaryHostUptimeSeconds,
             openingVideoSample: openingVideoSample
           )
         } catch {
@@ -1298,6 +1423,18 @@ final class TacuaCaptureSession {
       hostUptimeSeconds: hostUptimeSeconds,
       appAudioAttemptIndex: appAudioAttemptIndex
     )
+    switch type {
+    case .video:
+      retainedReplayKitVideoFrameClock.recordReplayKitAppend(
+        ptsSeconds: incomingPTSSeconds,
+        segmentIndex: writer.index,
+        wasAppended: appendResult.wasAppended
+      )
+    case .audioApp, .audioMic:
+      break
+    @unknown default:
+      break
+    }
     if appendResult.wasAppended {
       switch type {
       case .audioMic:
@@ -1367,6 +1504,9 @@ final class TacuaCaptureSession {
     hostUptimeSeconds: Double,
     appendFirstVideoAsHeldFrame: Bool
   ) throws {
+    guard (0...TacuaCapturePolicy.maximumSegmentIndex).contains(nextSegmentIndex) else {
+      throw TacuaCaptureSpikeError.rotationLimitExceeded
+    }
 #if TACUA_CAPTURE_FAULT_INJECTION
     if faultInjection?.shouldFailWriterStorageCheck(segmentIndex: nextSegmentIndex) == true {
       throw TacuaCaptureSpikeError.insufficientStorage
@@ -1916,9 +2056,12 @@ final class TacuaCaptureSession {
       "state": manifest.state,
       "segmentCount": manifest.segments.count,
       "gapCount": manifest.gaps.count,
-      "markerCount": manifest.markers.count,
+      // The overlay must see the same recovered capacity that mark() enforces, including
+      // legacy journal-only marks that have no manifest fallback.
+      "markerCount": processableIssueMarkCount,
       "errorCodes": manifest.errorCodes,
       "latestMediaPTSSeconds": jsonValue(latestVideoPTS.map(CMTimeGetSeconds)),
+      "appendedVideoFrameSequence": retainedReplayKitVideoFrameClock.value,
       "recorderAvailable": recorder.isAvailable,
       "recorderRecording": recorder.isRecording,
       "maximumDurationSeconds": manifest.maximumDurationSeconds
@@ -1958,20 +2101,57 @@ final class TacuaCaptureSession {
     return NSNull()
   }
 
-  private func persistManifestAndReport() {
+  @discardableResult
+  private func persistManifestAndReport() -> Bool {
     do {
       try persistManifest()
+      return true
     } catch {
-      let code = TacuaCaptureSpikeError.storageIO(
-        "Tacua could not persist the capture manifest."
-      ).code
-      appendErrorCode(code)
-      eventSink("onError", ["code": code, "reason": "manifest_persist_failed"])
-      guard !manifestPersistenceFailed else { return }
-      manifestPersistenceFailed = true
-      if manifest.state == "recording", !isStopping {
-        requestStopOnQueue(reason: "manifest_persist_failed")
-      }
+      reportManifestPersistenceFailure()
+      return false
+    }
+  }
+
+  private func persistManifestAttempt() -> TacuaManifestPersistenceAttempt {
+    var publicationOccurred = false
+    do {
+      try Self.persist(
+        manifest: manifest,
+        to: manifestURL,
+        publicationOccurred: &publicationOccurred
+      )
+      return .durable
+    } catch {
+      return publicationOccurred ? .publishedUnconfirmed : .unpublished
+    }
+  }
+
+  private func reportManifestPersistenceFailure() {
+    reportCapturePersistenceFailure(
+      .storageIO("Tacua could not persist the capture manifest."),
+      reason: "manifest_persist_failed"
+    )
+  }
+
+  private func reportCapturePersistenceFailure(
+    _ error: TacuaCaptureSpikeError,
+    reason: String
+  ) {
+    appendErrorCode(error.code)
+    eventSink("onError", ["code": error.code, "reason": reason])
+    guard !manifestPersistenceFailed else { return }
+    manifestPersistenceFailed = true
+    if manifest.state == "recording", !isStopping {
+      requestStopOnQueue(reason: reason)
+    }
+  }
+
+  private func confirmManifestPublication() -> Bool {
+    do {
+      try Self.synchronizeDirectory(at: manifestURL.deletingLastPathComponent())
+      return true
+    } catch {
+      return false
     }
   }
 
@@ -2301,6 +2481,20 @@ final class TacuaCaptureSession {
   }
 
   private static func persist(manifest: CaptureManifest, to url: URL) throws {
+    var publicationOccurred = false
+    try persist(
+      manifest: manifest,
+      to: url,
+      publicationOccurred: &publicationOccurred
+    )
+  }
+
+  private static func persist(
+    manifest: CaptureManifest,
+    to url: URL,
+    publicationOccurred: inout Bool
+  ) throws {
+    publicationOccurred = false
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     let data = try encoder.encode(manifest)
@@ -2330,6 +2524,11 @@ final class TacuaCaptureSession {
       throw TacuaCaptureSpikeError.storageIO("Tacua could not atomically publish its manifest.")
     }
     published = true
+    publicationOccurred = true
+    try synchronizeDirectory(at: directory)
+  }
+
+  private static func synchronizeDirectory(at directory: URL) throws {
     let directoryDescriptor = open(directory.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
     guard directoryDescriptor >= 0 else {
       throw TacuaCaptureSpikeError.storageIO("Tacua could not open its manifest directory.")

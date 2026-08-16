@@ -16,6 +16,7 @@ const sdkManifest = Object.freeze({
   dependencies: { "expo-modules-core": "~56.0.17" },
   peerDependencies: {
     expo: ">=56.0.16 <57",
+    react: ">=19.2.0 <20",
     "react-native": ">=0.85.3 <0.86",
   },
 });
@@ -109,6 +110,7 @@ test("rewrites the workspace link into one integrity-sealed local tarball entry"
     dependencies: { "expo-modules-core": "~56.0.17" },
     peerDependencies: {
       expo: ">=56.0.16 <57",
+      react: ">=19.2.0 <20",
       "react-native": ">=0.85.3 <0.86",
     },
   });

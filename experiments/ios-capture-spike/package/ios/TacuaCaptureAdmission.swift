@@ -165,6 +165,9 @@ private struct TacuaAdmissionLocalMarker: Decodable {
   // enter admission.
   let id: String
   let hostUptimeSeconds: Double
+  let latestMediaPTSSeconds: Double?
+  let latestMediaSegmentIndex: Int?
+  let latestMediaPTSProvenance: String?
 }
 
 private struct TacuaAdmissionDiagnosticSource {
@@ -292,6 +295,7 @@ private struct TacuaAdmissionVerifiedFile {
 }
 
 private struct TacuaAdmissionSegmentPlan {
+  let sourceSegmentIndex: Int
   let sequence: Int64
   let segmentID: String
   let uploadID: String
@@ -302,6 +306,13 @@ private struct TacuaAdmissionSegmentPlan {
   let sidecarDigest: String
   let startMilliseconds: Int64
   let endMilliseconds: Int64
+  let firstMediaPTSSeconds: Double
+  let lastMediaPTSSeconds: Double
+}
+
+private enum TacuaAdmissionMarkerProjection {
+  case available(elapsedMilliseconds: Int64)
+  case unavailable(elapsedMilliseconds: Int64)
 }
 
 private struct TacuaAdmissionAuthority {
@@ -774,7 +785,9 @@ final class TacuaCaptureAdmissionCoordinator {
 
     let sortedSegments = manifest.segments.sorted { left, right in left.index < right.index }
     guard Set(sortedSegments.map(\.index)).count == sortedSegments.count,
-      sortedSegments.allSatisfy({ $0.index >= 0 })
+      sortedSegments.allSatisfy({
+        (0...TacuaCapturePolicy.maximumSegmentIndex).contains($0.index)
+      })
     else { throw TacuaCaptureAdmissionError.captureArtifactMismatch }
     if manifest.schemaVersion == 4 {
       guard validAppAudioAccounting(manifest: manifest, segments: sortedSegments) else {
@@ -830,6 +843,7 @@ final class TacuaCaptureAdmissionCoordinator {
       previousEnd = end
       let sequence = Int64(offset)
       segmentPlans.append(TacuaAdmissionSegmentPlan(
+        sourceSegmentIndex: segment.index,
         sequence: sequence,
         segmentID: String(format: "segment_%06d", offset),
         uploadID: String(format: "upload_segment_%06d", offset),
@@ -839,7 +853,9 @@ final class TacuaCaptureAdmissionCoordinator {
         contentDigest: media.digest,
         sidecarDigest: sidecar.digest,
         startMilliseconds: start,
-        endMilliseconds: end
+        endMilliseconds: end,
+        firstMediaPTSSeconds: segment.firstMediaPTSSeconds,
+        lastMediaPTSSeconds: segment.lastMediaPTSSeconds
       ))
       tracked.append(media.identity)
       tracked.append(sidecar.identity)
@@ -950,6 +966,25 @@ final class TacuaCaptureAdmissionCoordinator {
         "time_range": timeRange(start: 0, end: timeline.durationMilliseconds),
       ]))
     }
+    let diagnosticSource = try loadDiagnosticSource(
+      localSessionID: localSessionID,
+      bootSessionID: manifest.bootSessionId!,
+      sessionDescriptor: sessionDescriptor
+    )
+    if let diagnosticSource { tracked.append(diagnosticSource.identity) }
+    let manifestMarkerIDs = manifest.markers.map {
+      stableIdentifier(prefix: "m", source: $0.id)
+    }
+    let journalMarkerIDs = diagnosticSource?.snapshot.entries.compactMap {
+      entry -> String? in
+      if case .issueMark(let markerID, _) = entry.event { return markerID }
+      return nil
+    } ?? []
+    guard let processableIssueMarkCount = TacuaCapturePolicy.processableIssueMarkCount(
+      manifestMarkerIDs: manifestMarkerIDs,
+      journalMarkerIDs: journalMarkerIDs
+    ), TacuaCapturePolicy.isProcessableIssueMarkCountValid(processableIssueMarkCount)
+    else { throw TacuaCaptureAdmissionError.captureArtifactMismatch }
     let summary: TacuaJSONValue = .object([
       "app_audio_accounting_complete": .bool(
         manifest.schemaVersion == 4 && manifest.appAudioAppendAccountingComplete == true
@@ -966,17 +1001,11 @@ final class TacuaCaptureAdmissionCoordinator {
       "app_audio_available": .bool((manifest.appAudioSamplesObserved ?? 0) > 0),
       "error_count": .integer(Int64(manifest.errorCodes.count)),
       "gap_count": .integer(Int64(runtimeGaps.count)),
-      "marker_count": .integer(Int64(manifest.markers.count)),
+      "marker_count": .integer(Int64(processableIssueMarkCount)),
       "microphone_available": .bool(true),
       "segment_count": .integer(Int64(segmentPlans.count)),
     ])
     let summaryDigest = try TacuaCanonicalJSON.digest(summary)
-    let diagnosticSource = try loadDiagnosticSource(
-      localSessionID: localSessionID,
-      bootSessionID: manifest.bootSessionId!,
-      sessionDescriptor: sessionDescriptor
-    )
-    if let diagnosticSource { tracked.append(diagnosticSource.identity) }
     func finalizeDiagnosticEnvelope(
       _ projection: TacuaAdmissionDiagnosticProjection
     ) throws -> (envelope: TacuaJSONValue, data: Data, digest: String) {
@@ -1042,7 +1071,9 @@ final class TacuaCaptureAdmissionCoordinator {
     var diagnosticProjection = try projectDiagnosticEnvelope(
       source: diagnosticSource?.snapshot,
       markers: manifest.markers,
+      segmentPlans: segmentPlans,
       gaps: manifest.gaps,
+      captureState: manifest.state,
       startedHostUptimeSeconds: startedHostUptime,
       startedAt: timeline.startedAt,
       durationMilliseconds: timeline.durationMilliseconds,
@@ -1059,7 +1090,9 @@ final class TacuaCaptureAdmissionCoordinator {
       diagnosticProjection = try projectDiagnosticEnvelope(
         source: diagnosticSource?.snapshot,
         markers: manifest.markers,
+        segmentPlans: segmentPlans,
         gaps: manifest.gaps,
+        captureState: manifest.state,
         startedHostUptimeSeconds: startedHostUptime,
         startedAt: timeline.startedAt,
         durationMilliseconds: timeline.durationMilliseconds,
@@ -1445,10 +1478,68 @@ final class TacuaCaptureAdmissionCoordinator {
     )
   }
 
+  private func projectedMarkerElapsedMilliseconds(
+    _ marker: TacuaAdmissionLocalMarker,
+    segmentPlans: [TacuaAdmissionSegmentPlan],
+    captureState: String,
+    startedHostUptimeSeconds: Double,
+    durationMilliseconds: Int64
+  ) throws -> TacuaAdmissionMarkerProjection {
+    let hostElapsed = try relativeMilliseconds(
+      marker.hostUptimeSeconds,
+      origin: startedHostUptimeSeconds,
+      rounding: .down
+    )
+    guard hostElapsed <= durationMilliseconds + 1_000 else {
+      throw TacuaCaptureAdmissionError.captureArtifactMismatch
+    }
+    guard let provenance = marker.latestMediaPTSProvenance else {
+      guard marker.latestMediaSegmentIndex == nil else {
+        throw TacuaCaptureAdmissionError.captureArtifactMismatch
+      }
+      return .available(elapsedMilliseconds: min(durationMilliseconds, hostElapsed))
+    }
+    guard provenance == TacuaCapturePolicy.retainedMarkerPTSProvenance,
+      let markerPTS = marker.latestMediaPTSSeconds,
+      markerPTS.isFinite,
+      let markerSegmentIndex = marker.latestMediaSegmentIndex,
+      (0...TacuaCapturePolicy.maximumSegmentIndex).contains(markerSegmentIndex)
+    else { throw TacuaCaptureAdmissionError.captureArtifactMismatch }
+    guard let segment = segmentPlans.first(where: {
+      $0.sourceSegmentIndex == markerSegmentIndex
+    }) else {
+      guard captureState == "partial_ready_for_upload" else {
+        throw TacuaCaptureAdmissionError.captureArtifactMismatch
+      }
+      return .unavailable(elapsedMilliseconds: min(durationMilliseconds, hostElapsed))
+    }
+    guard segment.startMilliseconds <= hostElapsed + 1,
+      markerPTS >= segment.firstMediaPTSSeconds,
+      markerPTS <= segment.lastMediaPTSSeconds,
+      segment.endMilliseconds > segment.startMilliseconds
+    else { throw TacuaCaptureAdmissionError.captureArtifactMismatch }
+    let mediaOffset = try relativeMilliseconds(
+      markerPTS,
+      origin: segment.firstMediaPTSSeconds,
+      rounding: .down
+    )
+    let (rawElapsed, overflow) = segment.startMilliseconds.addingReportingOverflow(mediaOffset)
+    guard !overflow, rawElapsed <= segment.endMilliseconds + 1_000 else {
+      throw TacuaCaptureAdmissionError.captureArtifactMismatch
+    }
+    // Runtime segment ranges are half-open. The persisted writer index disambiguates a PTS shared
+    // by adjacent segments; a terminal frame is kept one millisecond inside that exact segment,
+    // matching the processor's existing seek clamp. Synthetic segment boundaries are projected
+    // onto the host clock from the real callback pair before their sidecars are written.
+    return .available(elapsedMilliseconds: min(rawElapsed, segment.endMilliseconds - 1))
+  }
+
   private func projectDiagnosticEnvelope(
     source: TacuaDiagnosticSnapshot?,
     markers: [TacuaAdmissionLocalMarker],
+    segmentPlans: [TacuaAdmissionSegmentPlan],
     gaps: [TacuaAdmissionLocalGap],
+    captureState: String,
     startedHostUptimeSeconds: Double,
     startedAt: String,
     durationMilliseconds: Int64,
@@ -1467,18 +1558,23 @@ final class TacuaCaptureAdmissionCoordinator {
     var journalMarkerIDs = Set<String>()
     var journalGapIDs = Set<String>()
     var priorJournalElapsed: Int64 = 0
+    var markerProjectionByJournalID: [String: TacuaAdmissionMarkerProjection] = [:]
 
-    // Validate every manifest marker before journal de-duplication so a matching journal record
-    // cannot conceal malformed persisted chronology from admission.
+    // Validate and project every manifest marker before journal de-duplication so a matching
+    // journal record cannot conceal malformed chronology or replace a retained-frame timestamp
+    // with the later time at which the diagnostic append completed.
     for marker in markers {
-      let elapsed = try relativeMilliseconds(
-        marker.hostUptimeSeconds,
-        origin: startedHostUptimeSeconds,
-        rounding: .down
-      )
-      guard elapsed <= durationMilliseconds + 1_000 else {
+      let markerID = stableIdentifier(prefix: "m", source: marker.id)
+      guard markerProjectionByJournalID[markerID] == nil else {
         throw TacuaCaptureAdmissionError.captureArtifactMismatch
       }
+      markerProjectionByJournalID[markerID] = try projectedMarkerElapsedMilliseconds(
+        marker,
+        segmentPlans: segmentPlans,
+        captureState: captureState,
+        startedHostUptimeSeconds: startedHostUptimeSeconds,
+        durationMilliseconds: durationMilliseconds
+      )
     }
 
     for entry in source?.entries ?? [] {
@@ -1497,6 +1593,7 @@ final class TacuaCaptureAdmissionCoordinator {
       let eventType: String
       let data: TacuaJSONValue
       let retentionPriority: TacuaAdmissionDiagnosticRetentionPriority
+      var candidateElapsed = elapsed
       switch entry.event {
       case .event(.routeTransition(let fromRoute, let toRoute, let trigger)):
         eventType = "route_transition"
@@ -1559,13 +1656,28 @@ final class TacuaCaptureAdmissionCoordinator {
         ])
       case .issueMark(let markerID, let kind):
         journalMarkerIDs.insert(markerID)
-        eventType = "issue_mark"
         retentionPriority = .journalCritical
-        data = .object([
-          "kind": .string(kind.rawValue),
-          "marker_id": .string(markerID),
-          "narration_elapsed_ms": .integer(elapsed),
-        ])
+        switch markerProjectionByJournalID[markerID] {
+        case .some(.available(let markerElapsed)):
+          candidateElapsed = markerElapsed
+          eventType = "issue_mark"
+          data = .object([
+            "kind": .string(kind.rawValue),
+            "marker_id": .string(markerID),
+            "narration_elapsed_ms": .integer(candidateElapsed),
+          ])
+        case .some(.unavailable(let markerElapsed)):
+          candidateElapsed = markerElapsed
+          eventType = "custom_state"
+          data = unavailableCustomState(providerID: "issue_mark_media_unavailable")
+        case nil:
+          eventType = "issue_mark"
+          data = .object([
+            "kind": .string(kind.rawValue),
+            "marker_id": .string(markerID),
+            "narration_elapsed_ms": .integer(candidateElapsed),
+          ])
+        }
       case .captureGap(let gapID, let streams):
         retentionPriority = .journalCritical
         if let binding = manifestGapByJournalID[gapID] {
@@ -1605,7 +1717,7 @@ final class TacuaCaptureAdmissionCoordinator {
       }
       candidates.append(TacuaAdmissionDiagnosticCandidate(
         eventID: entry.eventID,
-        elapsedMilliseconds: elapsed,
+        elapsedMilliseconds: candidateElapsed,
         stableOrder: entry.sequence,
         eventType: eventType,
         data: data,
@@ -1617,27 +1729,33 @@ final class TacuaCaptureAdmissionCoordinator {
     for (offset, marker) in markers.enumerated() {
       let markerID = stableIdentifier(prefix: "m", source: marker.id)
       guard !journalMarkerIDs.contains(markerID) else { continue }
-      let elapsed = try relativeMilliseconds(
-        marker.hostUptimeSeconds,
-        origin: startedHostUptimeSeconds,
-        rounding: .down
-      )
-      guard elapsed <= durationMilliseconds + 1_000 else {
+      guard let projection = markerProjectionByJournalID[markerID] else {
         throw TacuaCaptureAdmissionError.captureArtifactMismatch
       }
-      let boundedElapsed = min(durationMilliseconds, elapsed)
-      candidates.append(TacuaAdmissionDiagnosticCandidate(
-        eventID: stableIdentifier(prefix: "event", source: "marker:\(marker.id)"),
-        elapsedMilliseconds: boundedElapsed,
-        stableOrder: 1_000_000 + Int64(offset),
-        eventType: "issue_mark",
-        data: .object([
-          "kind": .string("manual"),
-          "marker_id": .string(markerID),
-          "narration_elapsed_ms": .integer(boundedElapsed),
-        ]),
-        retentionPriority: .manifestCritical
-      ))
+      switch projection {
+      case .available(let boundedElapsed):
+        candidates.append(TacuaAdmissionDiagnosticCandidate(
+          eventID: stableIdentifier(prefix: "event", source: "marker:\(marker.id)"),
+          elapsedMilliseconds: boundedElapsed,
+          stableOrder: 1_000_000 + Int64(offset),
+          eventType: "issue_mark",
+          data: .object([
+            "kind": .string("manual"),
+            "marker_id": .string(markerID),
+            "narration_elapsed_ms": .integer(boundedElapsed),
+          ]),
+          retentionPriority: .manifestCritical
+        ))
+      case .unavailable(let boundedElapsed):
+        candidates.append(TacuaAdmissionDiagnosticCandidate(
+          eventID: stableIdentifier(prefix: "event", source: "marker:\(marker.id)"),
+          elapsedMilliseconds: boundedElapsed,
+          stableOrder: 1_000_000 + Int64(offset),
+          eventType: "custom_state",
+          data: unavailableCustomState(providerID: "issue_mark_media_unavailable"),
+          retentionPriority: .manifestCritical
+        ))
+      }
     }
 
     for (offset, binding) in manifestGapBindings.enumerated() {

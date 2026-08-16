@@ -32,6 +32,9 @@ enum CapturePolicyTests {
     try sessionOriginSurvivesResume()
     try deadlineAndMicrophoneContinuity()
     try videoClockContinuity()
+    try retainedReplayKitVideoFrameSequence()
+    try retainedMarkerSegmentIndexesSurviveRecovery()
+    try issueMarkerPersistenceResolution()
     try segmentRotation()
     try crashWindowRecoverySource()
     try candidateHandoffValidation()
@@ -62,6 +65,61 @@ enum CapturePolicyTests {
     try expect(
       TacuaCapturePolicy.maximumManifestMarkers == 2_048,
       "The persisted capture marker cap drifted from the runtime contract"
+    )
+    try expect(
+      TacuaCapturePolicy.maximumProcessableIssueMarks == 12,
+      "The native issue-mark cap drifted from the processor contract"
+    )
+    try expect(
+      TacuaCapturePolicy.retainedMarkerPTSProvenance == "retained_replaykit_append_v1",
+      "The retained-frame marker provenance drifted from the admission contract"
+    )
+    try expect(
+      TacuaCapturePolicy.canAppendProcessableIssueMark(existingCount: 11),
+      "The final processor-supported issue-mark slot was rejected"
+    )
+    try expect(
+      !TacuaCapturePolicy.canAppendProcessableIssueMark(existingCount: 12),
+      "Native capture allowed a marker that would make the processor reject the capture"
+    )
+    try expect(
+      TacuaCapturePolicy.isProcessableIssueMarkCountValid(12),
+      "Recovery rejected the exact processor-supported issue-mark boundary"
+    )
+    try expect(
+      !TacuaCapturePolicy.isProcessableIssueMarkCountValid(13),
+      "Recovery accepted a capture that the processor must reject"
+    )
+    let manifestMarkerIDs = (0..<11).map { "m_\($0)" }
+    try expect(
+      TacuaCapturePolicy.processableIssueMarkCount(
+        manifestMarkerIDs: manifestMarkerIDs,
+        journalMarkerIDs: manifestMarkerIDs + ["m_journal_only"]
+      ) == 12,
+      "A recovered journal-only marker was omitted from the native capacity projection"
+    )
+    try expect(
+      !TacuaCapturePolicy.canAppendProcessableIssueMark(existingCount:
+        TacuaCapturePolicy.processableIssueMarkCount(
+          manifestMarkerIDs: manifestMarkerIDs,
+          journalMarkerIDs: manifestMarkerIDs + ["m_journal_only"]
+        ) ?? -1
+      ),
+      "Recovery reopened a thirteenth processor issue-mark slot"
+    )
+    try expect(
+      TacuaCapturePolicy.processableIssueMarkCount(
+        manifestMarkerIDs: ["m_manifest_only"],
+        journalMarkerIDs: ["m_journal", "m_journal"]
+      ) == 3,
+      "Duplicate journal records were undercounted relative to admission"
+    )
+    try expect(
+      TacuaCapturePolicy.processableIssueMarkCount(
+        manifestMarkerIDs: ["m_collision", "m_collision"],
+        journalMarkerIDs: []
+      ) == nil,
+      "Colliding manifest marker identifiers were accepted during recovery"
     )
     try expect(
       TacuaCapturePolicy.captureGapInsertionDisposition(
@@ -97,6 +155,141 @@ enum CapturePolicyTests {
         overflowSentinelPresent: false
       ) == nil,
       "An already-invalid gap collection was accepted"
+    )
+  }
+
+  private static func issueMarkerPersistenceResolution() throws {
+    var events: [String] = []
+    let durable = TacuaCapturePolicy.resolveIssueMarkerPersistence(
+      initialAttempt: .durable,
+      confirmPublishedManifest: { events.append("confirm"); return false },
+      removeMarker: { events.append("remove") },
+      persistMarkerFreeManifest: { events.append("rollback"); return .unpublished },
+      confirmPublishedRollback: { events.append("confirm_rollback"); return false }
+    )
+    try expect(durable == .committed, "A durable marker was not committed")
+    try expect(events.isEmpty, "A durable marker performed unnecessary recovery work")
+
+    events = []
+    let unpublished = TacuaCapturePolicy.resolveIssueMarkerPersistence(
+      initialAttempt: .unpublished,
+      confirmPublishedManifest: { events.append("confirm"); return false },
+      removeMarker: { events.append("remove") },
+      persistMarkerFreeManifest: { events.append("rollback"); return .unpublished },
+      confirmPublishedRollback: { events.append("confirm_rollback"); return false }
+    )
+    try expect(unpublished == .rejected, "An unpublished marker was not rejected")
+    try expect(events == ["remove"], "An unpublished marker was not rolled back in memory first")
+
+    events = []
+    let confirmed = TacuaCapturePolicy.resolveIssueMarkerPersistence(
+      initialAttempt: .publishedUnconfirmed,
+      confirmPublishedManifest: { events.append("confirm"); return true },
+      removeMarker: { events.append("remove") },
+      persistMarkerFreeManifest: { events.append("rollback"); return .unpublished },
+      confirmPublishedRollback: { events.append("confirm_rollback"); return false }
+    )
+    try expect(confirmed == .committed, "A confirmed marker publication was not committed")
+    try expect(events == ["confirm"], "Confirmation performed unrelated rollback work")
+
+    events = []
+    let rolledBack = TacuaCapturePolicy.resolveIssueMarkerPersistence(
+      initialAttempt: .publishedUnconfirmed,
+      confirmPublishedManifest: { events.append("confirm"); return false },
+      removeMarker: { events.append("remove") },
+      persistMarkerFreeManifest: { events.append("rollback"); return .publishedUnconfirmed },
+      confirmPublishedRollback: { events.append("confirm_rollback"); return true }
+    )
+    try expect(rolledBack == .rejected, "A confirmed marker rollback was not rejected cleanly")
+    try expect(
+      events == ["confirm", "remove", "rollback", "confirm_rollback"],
+      "The ambiguous marker rollback did not preserve safe ordering"
+    )
+
+    events = []
+    let durablyRolledBack = TacuaCapturePolicy.resolveIssueMarkerPersistence(
+      initialAttempt: .publishedUnconfirmed,
+      confirmPublishedManifest: { events.append("confirm"); return false },
+      removeMarker: { events.append("remove") },
+      persistMarkerFreeManifest: { events.append("rollback"); return .durable },
+      confirmPublishedRollback: { events.append("confirm_rollback"); return false }
+    )
+    try expect(
+      durablyRolledBack == .rejected,
+      "A durably replaced marker manifest was not rejected cleanly"
+    )
+    try expect(
+      events == ["confirm", "remove", "rollback"],
+      "A durable rollback performed an unnecessary confirmation"
+    )
+
+    events = []
+    let unknown = TacuaCapturePolicy.resolveIssueMarkerPersistence(
+      initialAttempt: .publishedUnconfirmed,
+      confirmPublishedManifest: { events.append("confirm"); return false },
+      removeMarker: { events.append("remove") },
+      persistMarkerFreeManifest: { events.append("rollback"); return .unpublished },
+      confirmPublishedRollback: { events.append("confirm_rollback"); return true }
+    )
+    try expect(unknown == .outcomeUnknown, "An ambiguous marker result claimed ordinary failure")
+    try expect(
+      events == ["confirm", "remove", "rollback"],
+      "The outcome-unknown path performed an invalid confirmation"
+    )
+
+    events = []
+    let unconfirmedRollback = TacuaCapturePolicy.resolveIssueMarkerPersistence(
+      initialAttempt: .publishedUnconfirmed,
+      confirmPublishedManifest: { events.append("confirm"); return false },
+      removeMarker: { events.append("remove") },
+      persistMarkerFreeManifest: { events.append("rollback"); return .publishedUnconfirmed },
+      confirmPublishedRollback: { events.append("confirm_rollback"); return false }
+    )
+    try expect(
+      unconfirmedRollback == .outcomeUnknown,
+      "An unconfirmed marker-free rollback claimed an ordinary failure"
+    )
+    try expect(
+      events == ["confirm", "remove", "rollback", "confirm_rollback"],
+      "The failed rollback confirmation did not preserve safe ordering"
+    )
+  }
+
+  private static func retainedMarkerSegmentIndexesSurviveRecovery() throws {
+    try expect(
+      TacuaCapturePolicy.nextSegmentIndexForRecovery(
+        committedSegmentIndexes: [],
+        retainedMarkerSegmentIndexes: []
+      ) == 0,
+      "A new session did not start with segment zero"
+    )
+    try expect(
+      TacuaCapturePolicy.nextSegmentIndexForRecovery(
+        committedSegmentIndexes: [0],
+        retainedMarkerSegmentIndexes: [1]
+      ) == 2,
+      "Recovery reused the failed writer index retained by a marker"
+    )
+    try expect(
+      TacuaCapturePolicy.nextSegmentIndexForRecovery(
+        committedSegmentIndexes: [0, 2],
+        retainedMarkerSegmentIndexes: [1]
+      ) == 3,
+      "Recovery did not advance past the complete reserved index set"
+    )
+    try expect(
+      TacuaCapturePolicy.nextSegmentIndexForRecovery(
+        committedSegmentIndexes: [-1],
+        retainedMarkerSegmentIndexes: []
+      ) == nil,
+      "Recovery accepted a negative committed segment index"
+    )
+    try expect(
+      TacuaCapturePolicy.nextSegmentIndexForRecovery(
+        committedSegmentIndexes: [],
+        retainedMarkerSegmentIndexes: [TacuaCapturePolicy.maximumSegmentIndex]
+      ) == nil,
+      "Recovery reused an exhausted retained-marker segment index"
     )
   }
 
@@ -219,7 +412,134 @@ enum CapturePolicyTests {
     )
   }
 
+  private static func retainedReplayKitVideoFrameSequence() throws {
+    var sequence = TacuaRetainedReplayKitVideoFrameClock()
+    try expect(sequence.value == 0, "The retained-video sequence must start at zero")
+    try expect(
+      sequence.latestPTSSeconds == nil,
+      "The marker clock must be unavailable before the first retained ReplayKit video frame"
+    )
+    try expect(sequence.latestSegmentIndex == nil, "The marker segment must start unavailable")
+    sequence.recordReplayKitAppend(ptsSeconds: 10, segmentIndex: 0, wasAppended: false)
+    try expect(
+      sequence.value == 0,
+      "An observed video callback rejected by the writer advanced the retained-video sequence"
+    )
+    try expect(
+      sequence.latestPTSSeconds == nil,
+      "An observed video callback rejected by the writer became the marker media clock"
+    )
+
+    sequence.recordReplayKitAppend(ptsSeconds: 11, segmentIndex: 0, wasAppended: true)
+    try expect(
+      sequence.value == 1,
+      "The first successfully appended ReplayKit video frame did not advance the sequence"
+    )
+    try expect(
+      sequence.latestPTSSeconds == 11,
+      "The marker media clock did not select the first retained ReplayKit frame"
+    )
+    try expect(
+      sequence.latestSegmentIndex == 0,
+      "The marker clock did not retain the writer segment that accepted its frame"
+    )
+
+    sequence.recordReplayKitAppend(ptsSeconds: 12, segmentIndex: 1, wasAppended: false)
+    try expect(
+      sequence.value == 1,
+      "A later dropped ReplayKit video frame changed the retained-video sequence"
+    )
+    try expect(
+      sequence.latestPTSSeconds == 11 && sequence.latestSegmentIndex == 0,
+      "A later dropped ReplayKit video frame replaced retained marker provenance"
+    )
+
+    sequence.recordReplayKitAppend(ptsSeconds: 13, segmentIndex: 1, wasAppended: true)
+    try expect(
+      sequence.value == 2,
+      "A later successfully appended ReplayKit video frame did not advance the sequence exactly once"
+    )
+    try expect(
+      sequence.latestPTSSeconds == 13 && sequence.latestSegmentIndex == 1,
+      "The marker media provenance did not advance to the later retained ReplayKit frame"
+    )
+
+    sequence.recordReplayKitAppend(ptsSeconds: .nan, segmentIndex: 2, wasAppended: true)
+    try expect(
+      sequence.value == 2
+        && sequence.latestPTSSeconds == 13
+        && sequence.latestSegmentIndex == 1,
+      "An invalid video timestamp changed retained-frame marker state"
+    )
+    sequence.recordReplayKitAppend(ptsSeconds: 14, segmentIndex: -1, wasAppended: true)
+    try expect(
+      sequence.value == 2
+        && sequence.latestPTSSeconds == 13
+        && sequence.latestSegmentIndex == 1,
+      "An invalid writer segment changed retained-frame marker state"
+    )
+  }
+
   private static func segmentRotation() throws {
+    try expect(
+      TacuaCapturePolicy.segmentBoundaryHostUptimeSeconds(
+        boundaryPTSSeconds: 10,
+        callbackPTSSeconds: 15,
+        callbackHostUptimeSeconds: 115
+      ) == 110,
+      "A sparse ReplayKit callback did not project its synthetic boundary onto the host clock"
+    )
+    try expect(
+      [10.0, 20.0, 30.0].compactMap {
+        TacuaCapturePolicy.segmentBoundaryHostUptimeSeconds(
+          boundaryPTSSeconds: $0,
+          callbackPTSSeconds: 35,
+          callbackHostUptimeSeconds: 135
+        )
+      } == [110, 120, 130],
+      "Catch-up rotation did not preserve monotonic media-to-host boundary spacing"
+    )
+    try expect(
+      TacuaCapturePolicy.segmentBoundaryHostUptimeSeconds(
+        boundaryPTSSeconds: 15,
+        callbackPTSSeconds: 15,
+        callbackHostUptimeSeconds: 115
+      ) == 115,
+      "An exact ReplayKit boundary changed its real callback host time"
+    )
+    try expect(
+      TacuaCapturePolicy.segmentBoundaryHostUptimeSeconds(
+        boundaryPTSSeconds: 16,
+        callbackPTSSeconds: 15,
+        callbackHostUptimeSeconds: 115
+      ) == nil,
+      "A boundary after its real callback received a fabricated host time"
+    )
+    try expect(
+      TacuaCapturePolicy.segmentBoundaryHostUptimeSeconds(
+        boundaryPTSSeconds: 10,
+        callbackPTSSeconds: 15,
+        callbackHostUptimeSeconds: 115,
+        minimumHostUptimeSeconds: 110.001
+      ) == nil,
+      "A boundary regressing behind the active writer host clock was accepted"
+    )
+    try expect(
+      TacuaCapturePolicy.segmentBoundaryHostUptimeSeconds(
+        boundaryPTSSeconds: .nan,
+        callbackPTSSeconds: 15,
+        callbackHostUptimeSeconds: 115
+      ) == nil,
+      "A non-finite boundary received a fabricated host time"
+    )
+    try expect(
+      TacuaCapturePolicy.segmentBoundaryHostUptimeSeconds(
+        boundaryPTSSeconds: 0,
+        callbackPTSSeconds: 20,
+        callbackHostUptimeSeconds: 10
+      ) == nil,
+      "A boundary before host-clock origin received a negative host time"
+    )
     try expect(
       TacuaCapturePolicy.segmentRotationBoundary(
         startedAtPTSSeconds: 100,

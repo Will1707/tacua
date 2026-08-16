@@ -60,6 +60,8 @@ type CaptureStatus = {
   readonly markerCount: number;
   readonly errorCodes: readonly string[];
   readonly latestMediaPTSSeconds?: number | null;
+  /** Real ReplayKit video frames successfully appended to this session's retained MOV. */
+  readonly appendedVideoFrameSequence: number;
   readonly recorderAvailable: boolean;
   readonly recorderRecording: boolean;
   readonly maximumDurationSeconds: number;
@@ -123,6 +125,8 @@ type CaptureMarker = {
   readonly label: string;
   readonly hostUptimeSeconds: number;
   readonly latestMediaPTSSeconds?: number | null;
+  readonly latestMediaSegmentIndex?: number | null;
+  readonly latestMediaPTSProvenance?: "retained_replaykit_append_v1" | null;
 };
 
 type DiagnosticEventReceipt = {

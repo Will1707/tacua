@@ -273,6 +273,16 @@ enum CaptureAdmissionTests {
     }
     let fixtures = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
     try admitsExactlyOnceAndSanitizes(fixtures)
+    try retainedMarkerPTSProjectsManifestFallback(fixtures)
+    try retainedMarkerPTSOverridesJournalTimestamp(fixtures)
+    try recoveredJournalOnlyMarkerCountsTowardSummary(fixtures)
+    try retainedMarkerPTSUsesLaterSegmentAtSharedBoundary(fixtures)
+    try retainedMarkerPTSDoesNotBindFutureOverlappingSegment(fixtures)
+    try retainedMarkerPTSUsesProjectedHeldOpeningBoundary(fixtures)
+    try missingRetainedMarkerSegmentBecomesUnavailable(fixtures)
+    try completedCaptureRejectsMissingRetainedMarkerSegment(fixtures)
+    try legacyMarkerWithoutRetainedPTSProvenanceUsesHostTimestamp(fixtures)
+    try rejectsMalformedRetainedMarkerPTS(fixtures)
     try admitsCompleteSchema4AppAudioAccounting(fixtures)
     try rejectsMalformedSchema4AppAudioAccounting(fixtures)
     try incompleteSchema4AccountingAllowsOnlyExplicitMissingRanges(fixtures)
@@ -722,6 +732,320 @@ enum CaptureAdmissionTests {
     let afterRotation = try harness.coordinator.admit(harness.input)
     try require(afterRotation.alreadyAdmitted, "Exact older-credential admission was rejected")
     try require(harness.queues.compareAndSwapCount == 1, "Rotation retry mutated the queue")
+  }
+
+  private static func retainedMarkerPTSProjectsManifestFallback(_ fixtures: URL) throws {
+    let harness = try makeHarness(fixtures: fixtures, suffix: "marker_pts_manifest")
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    try setFirstMarkerLatestMediaPTS(harness, value: 25.0)
+
+    _ = try harness.coordinator.admit(harness.input)
+    try assertIssueMarkElapsed(
+      harness,
+      expectedMilliseconds: 25_000,
+      message: "Manifest fallback used the later marker host uptime instead of retained video PTS"
+    )
+  }
+
+  private static func retainedMarkerPTSOverridesJournalTimestamp(_ fixtures: URL) throws {
+    let harness = try makeHarness(fixtures: fixtures, suffix: "marker_pts_journal")
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    try setFirstMarkerLatestMediaPTS(harness, value: 25.0)
+    let session = harness.root.appendingPathComponent(
+      harness.localSessionID,
+      isDirectory: true
+    )
+    let journal = try TacuaDiagnosticJournal(
+      rootDirectory: TacuaDiagnosticJournal.rootDirectory(sessionDirectory: session),
+      localSessionID: harness.localSessionID,
+      bootSessionID: harness.clock.bootSessionID,
+      maximumEvents: TacuaCapturePolicy.maximumDiagnosticJournalEvents,
+      monotonicClock: { 1_090_000 }
+    )
+    _ = try journal.appendSystemEvent(.issueMark(
+      markerID: stableTestIdentifier(prefix: "m", source: "LOCAL-MARKER-PRIVATE"),
+      kind: .manual
+    ))
+
+    _ = try harness.coordinator.admit(harness.input)
+    try assertIssueMarkElapsed(
+      harness,
+      expectedMilliseconds: 25_000,
+      message: "Journal issue mark replaced the retained-frame PTS with its 30-second append time"
+    )
+  }
+
+  private static func recoveredJournalOnlyMarkerCountsTowardSummary(
+    _ fixtures: URL
+  ) throws {
+    let harness = try makeHarness(fixtures: fixtures, suffix: "marker_journal_only_count")
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    try mutateManifest(harness) { $0["markers"] = [] }
+    let session = harness.root.appendingPathComponent(
+      harness.localSessionID,
+      isDirectory: true
+    )
+    let journal = try TacuaDiagnosticJournal(
+      rootDirectory: TacuaDiagnosticJournal.rootDirectory(sessionDirectory: session),
+      localSessionID: harness.localSessionID,
+      bootSessionID: harness.clock.bootSessionID,
+      maximumEvents: TacuaCapturePolicy.maximumDiagnosticJournalEvents,
+      monotonicClock: { 1_090_000 }
+    )
+    _ = try journal.appendSystemEvent(.issueMark(
+      markerID: stableTestIdentifier(prefix: "m", source: "LEGACY-JOURNAL-ONLY"),
+      kind: .manual
+    ))
+
+    _ = try harness.coordinator.admit(harness.input)
+    try assertIssueMarkElapsed(
+      harness,
+      expectedMilliseconds: 30_000,
+      message: "A recovered journal-only marker was not projected"
+    )
+    let sessionAdmission = try TacuaCanonicalJSON.parse(Data(contentsOf:
+      session.appendingPathComponent(TacuaCaptureAdmissionCoordinator.admissionFileName)
+    ))
+    let summary = try required(
+      sessionAdmission.objectValue?["capture_summary"]?.objectValue,
+      "Capture summary missing"
+    )
+    try require(
+      summary["marker_count"]?.integerValue == 1,
+      "Capture summary omitted the recovered journal-only marker"
+    )
+  }
+
+  private static func retainedMarkerPTSUsesLaterSegmentAtSharedBoundary(
+    _ fixtures: URL
+  ) throws {
+    let harness = try makeHarness(fixtures: fixtures, suffix: "marker_pts_boundary")
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    try rewriteCaptureWithTwoSegments(
+      harness,
+      firstLastMediaPTSSeconds: 30,
+      secondFirstMediaPTSSeconds: 30,
+      secondFirstHostUptimeSeconds: 1_090
+    )
+    try setFirstMarkerLatestMediaSegmentIndex(harness, value: 1)
+
+    _ = try harness.coordinator.admit(harness.input)
+    try assertIssueMarkElapsed(
+      harness,
+      expectedMilliseconds: 30_000,
+      message: "Shared-boundary marker did not bind to the later retained segment"
+    )
+  }
+
+  private static func retainedMarkerPTSDoesNotBindFutureOverlappingSegment(
+    _ fixtures: URL
+  ) throws {
+    let harness = try makeHarness(fixtures: fixtures, suffix: "marker_pts_overlap")
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    try rewriteCaptureWithTwoSegments(
+      harness,
+      firstLastMediaPTSSeconds: 30,
+      secondFirstMediaPTSSeconds: 10,
+      secondFirstHostUptimeSeconds: 1_100
+    )
+    try setFirstMarkerLatestMediaPTS(harness, value: 20.0)
+
+    _ = try harness.coordinator.admit(harness.input)
+    try assertIssueMarkElapsed(
+      harness,
+      expectedMilliseconds: 20_000,
+      message: "A future discontinuity segment stole an earlier overlapping marker PTS"
+    )
+  }
+
+  private static func missingRetainedMarkerSegmentBecomesUnavailable(
+    _ fixtures: URL
+  ) throws {
+    for journalBacked in [false, true] {
+      let suffix = journalBacked
+        ? "marker_segment_missing_journal"
+        : "marker_segment_missing_manifest"
+      let harness = try makeHarness(fixtures: fixtures, suffix: suffix)
+      defer { try? FileManager.default.removeItem(at: harness.root) }
+      try setManifestState(harness, value: "partial_ready_for_upload")
+      // PTS 20 overlaps committed segment 0, but the native marker records failed segment 1.
+      // Admission must not steal the frame from the wrong writer.
+      try setFirstMarkerLatestMediaPTS(harness, value: 20.0)
+      try setFirstMarkerLatestMediaSegmentIndex(harness, value: 1)
+      if journalBacked {
+        let session = harness.root.appendingPathComponent(
+          harness.localSessionID,
+          isDirectory: true
+        )
+        let journal = try TacuaDiagnosticJournal(
+          rootDirectory: TacuaDiagnosticJournal.rootDirectory(sessionDirectory: session),
+          localSessionID: harness.localSessionID,
+          bootSessionID: harness.clock.bootSessionID,
+          maximumEvents: TacuaCapturePolicy.maximumDiagnosticJournalEvents,
+          monotonicClock: { 1_090_000 }
+        )
+        _ = try journal.appendSystemEvent(.issueMark(
+          markerID: stableTestIdentifier(prefix: "m", source: "LOCAL-MARKER-PRIVATE"),
+          kind: .manual
+        ))
+      }
+
+      _ = try harness.coordinator.admit(harness.input)
+      try assertIssueMarkerUnavailable(
+        harness,
+        message: "A marker from an uncommitted writer became actionable issue evidence"
+      )
+    }
+  }
+
+  private static func completedCaptureRejectsMissingRetainedMarkerSegment(
+    _ fixtures: URL
+  ) throws {
+    let harness = try makeHarness(fixtures: fixtures, suffix: "marker_segment_missing_completed")
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    try setFirstMarkerLatestMediaSegmentIndex(harness, value: 1)
+    try expectMarkerPTSRejection(
+      harness,
+      message: "A completed capture referenced an uncommitted marker segment"
+    )
+  }
+
+  private static func retainedMarkerPTSUsesProjectedHeldOpeningBoundary(
+    _ fixtures: URL
+  ) throws {
+    for journalBacked in [false, true] {
+      let suffix = journalBacked
+        ? "marker_held_opening_journal"
+        : "marker_held_opening_manifest"
+      let harness = try makeHarness(fixtures: fixtures, suffix: suffix)
+      defer { try? FileManager.default.removeItem(at: harness.root) }
+      // A sparse real frame at capture elapsed/PTS 15 rotates at PTS 10. The synthetic
+      // opening frame is anchored at host elapsed 10, so the real annotated frame remains five
+      // seconds into segment 1 instead of being mistaken for its held boundary frame.
+      try rewriteCaptureWithTwoSegments(
+        harness,
+        firstLastMediaPTSSeconds: 10,
+        secondFirstMediaPTSSeconds: 10,
+        secondFirstHostUptimeSeconds: 1_070,
+        firstLastHostUptimeSeconds: 1_070,
+        secondLastHostUptimeSeconds: 1_076
+      )
+      try setFirstMarkerLatestMediaPTS(harness, value: 15.0)
+      try setFirstMarkerLatestMediaSegmentIndex(harness, value: 1)
+      if journalBacked {
+        let session = harness.root.appendingPathComponent(
+          harness.localSessionID,
+          isDirectory: true
+        )
+        let journal = try TacuaDiagnosticJournal(
+          rootDirectory: TacuaDiagnosticJournal.rootDirectory(sessionDirectory: session),
+          localSessionID: harness.localSessionID,
+          bootSessionID: harness.clock.bootSessionID,
+          maximumEvents: TacuaCapturePolicy.maximumDiagnosticJournalEvents,
+          monotonicClock: { 1_090_000 }
+        )
+        _ = try journal.appendSystemEvent(.issueMark(
+          markerID: stableTestIdentifier(prefix: "m", source: "LOCAL-MARKER-PRIVATE"),
+          kind: .manual
+        ))
+      }
+
+      _ = try harness.coordinator.admit(harness.input)
+      try assertIssueMarkElapsed(
+        harness,
+        expectedMilliseconds: 15_000,
+        message: "A held opening frame double-counted the sparse ReplayKit callback gap"
+      )
+      let session = harness.root.appendingPathComponent(
+        harness.localSessionID,
+        isDirectory: true
+      )
+      let admission = try TacuaCanonicalJSON.parse(Data(contentsOf:
+        session.appendingPathComponent(TacuaCaptureAdmissionCoordinator.admissionFileName)
+      ))
+      let seed = try required(
+        admission.objectValue?["capture_manifest_seed"]?.objectValue,
+        "Capture manifest seed missing"
+      )
+      let segments = try required(seed["segments"]?.arrayValue, "Runtime segments missing")
+      let secondRange = try required(
+        segments[1].objectValue?["time_range"]?.objectValue,
+        "Second segment time range missing"
+      )
+      let segmentStart = try required(
+        secondRange["start_ms"]?.integerValue,
+        "Second segment start missing"
+      )
+      try require(segmentStart == 10_000, "Held segment retained the late callback host time")
+      try require(
+        15_000 - segmentStart == 5_000,
+        "Processor seek offset no longer selects the real annotated frame"
+      )
+    }
+  }
+
+  private static func legacyMarkerWithoutRetainedPTSProvenanceUsesHostTimestamp(
+    _ fixtures: URL
+  ) throws {
+    let harness = try makeHarness(fixtures: fixtures, suffix: "marker_pts_legacy")
+    defer { try? FileManager.default.removeItem(at: harness.root) }
+    try setFirstMarkerLatestMediaPTS(harness, value: 61.0)
+    try removeFirstMarkerLatestMediaPTSProvenance(harness)
+
+    _ = try harness.coordinator.admit(harness.input)
+    try assertIssueMarkElapsed(
+      harness,
+      expectedMilliseconds: 30_000,
+      message: "Legacy observed PTS was mistaken for a retained frame instead of using host time"
+    )
+  }
+
+  private static func rejectsMalformedRetainedMarkerPTS(_ fixtures: URL) throws {
+    let unbound = try makeHarness(fixtures: fixtures, suffix: "marker_pts_unbound")
+    defer { try? FileManager.default.removeItem(at: unbound.root) }
+    try setFirstMarkerLatestMediaPTS(unbound, value: 61.0)
+    try expectMarkerPTSRejection(
+      unbound,
+      message: "Marker PTS outside every verified segment was admitted"
+    )
+
+    let nonFinite = try makeHarness(fixtures: fixtures, suffix: "marker_pts_nonfinite")
+    defer { try? FileManager.default.removeItem(at: nonFinite.root) }
+    try replaceFirstMarkerPTSWithRawNumber(nonFinite, rawNumber: "1e400")
+    try expectMarkerPTSRejection(
+      nonFinite,
+      message: "Non-finite marker PTS was admitted"
+    )
+
+    let unknownProvenance = try makeHarness(
+      fixtures: fixtures,
+      suffix: "marker_pts_unknown_provenance"
+    )
+    defer { try? FileManager.default.removeItem(at: unknownProvenance.root) }
+    try setFirstMarkerLatestMediaPTSProvenance(
+      unknownProvenance,
+      value: "observed_replaykit_callback_v0"
+    )
+    try expectMarkerPTSRejection(
+      unknownProvenance,
+      message: "Unknown retained-frame PTS provenance was admitted"
+    )
+
+    let missingIndex = try makeHarness(fixtures: fixtures, suffix: "marker_segment_missing_index")
+    defer { try? FileManager.default.removeItem(at: missingIndex.root) }
+    try removeFirstMarkerLatestMediaSegmentIndex(missingIndex)
+    try expectMarkerPTSRejection(
+      missingIndex,
+      message: "Retained-frame provenance without a writer segment was admitted"
+    )
+
+    let negativeIndex = try makeHarness(fixtures: fixtures, suffix: "marker_segment_negative")
+    defer { try? FileManager.default.removeItem(at: negativeIndex.root) }
+    try setFirstMarkerLatestMediaSegmentIndex(negativeIndex, value: -1)
+    try expectMarkerPTSRejection(
+      negativeIndex,
+      message: "Retained-frame provenance with a negative writer segment was admitted"
+    )
   }
 
   private static func configuredDiagnosticLimitFailsClosedBeforeAdmission(
@@ -2328,6 +2652,8 @@ enum CaptureAdmissionTests {
         "label": "PRIVATE_MARKER_LABEL",
         "hostUptimeSeconds": 1_090,
         "latestMediaPTSSeconds": 30,
+        "latestMediaSegmentIndex": 0,
+        "latestMediaPTSProvenance": TacuaCapturePolicy.retainedMarkerPTSProvenance,
       ]],
       "calibrations": [],
       "errorCodes": ["PRIVATE_ERROR_DETAIL"],
@@ -2475,6 +2801,241 @@ enum CaptureAdmissionTests {
       canonicalData: try TacuaCanonicalJSON.data(.object(object)),
       requestDigest: digest
     )
+  }
+
+  private static func assertIssueMarkElapsed(
+    _ harness: AdmissionHarness,
+    expectedMilliseconds: Int64,
+    message: String
+  ) throws {
+    let envelope = try TacuaCanonicalJSON.parse(diagnosticEnvelopeData(harness))
+    let events = try required(envelope.objectValue?["events"]?.arrayValue, "Events missing")
+    let issueMarks = events.filter {
+      $0.objectValue?["event_type"]?.stringValue == "issue_mark"
+    }
+    try require(issueMarks.count == 1, "Expected exactly one projected issue mark")
+    let event = try issueMarks[0].requiringObject(keys: [
+      "data", "elapsed_ms", "event_id", "event_type", "evidence_refs", "occurred_at",
+      "sequence", "source",
+    ])
+    let data = try required(event["data"]?.objectValue, "Issue-mark data missing")
+    try require(
+      event["elapsed_ms"]?.integerValue == expectedMilliseconds
+        && data["narration_elapsed_ms"]?.integerValue == expectedMilliseconds,
+      message
+    )
+  }
+
+  private static func assertIssueMarkerUnavailable(
+    _ harness: AdmissionHarness,
+    message: String
+  ) throws {
+    let envelope = try TacuaCanonicalJSON.parse(diagnosticEnvelopeData(harness))
+    let events = try required(envelope.objectValue?["events"]?.arrayValue, "Events missing")
+    try require(
+      !events.contains(where: {
+        $0.objectValue?["event_type"]?.stringValue == "issue_mark"
+      }),
+      message
+    )
+    let unavailable = events.filter { event in
+      guard event.objectValue?["event_type"]?.stringValue == "custom_state",
+        let data = event.objectValue?["data"]?.objectValue
+      else { return false }
+      return data["provider_id"]?.stringValue == "issue_mark_media_unavailable"
+        && data["collection_status"]?.stringValue == "unavailable"
+    }
+    try require(unavailable.count == 1, "Missing exact unavailable-marker diagnostic")
+  }
+
+  private static func rewriteCaptureWithTwoSegments(
+    _ harness: AdmissionHarness,
+    firstLastMediaPTSSeconds: Double,
+    secondFirstMediaPTSSeconds: Double,
+    secondFirstHostUptimeSeconds: Double,
+    firstLastHostUptimeSeconds: Double = 1_090,
+    secondLastHostUptimeSeconds: Double = 1_120
+  ) throws {
+    let session = harness.root.appendingPathComponent(harness.localSessionID, isDirectory: true)
+    let firstMediaURL = session.appendingPathComponent("segment-000000.mov")
+    let firstMedia = try Data(contentsOf: firstMediaURL)
+    let secondMedia = Data((0..<2_048).map { UInt8(($0 + 17) % 251) })
+    let secondMediaURL = session.appendingPathComponent("segment-000001.mov")
+    try secondMedia.write(to: secondMediaURL)
+    let digest: (Data) -> String = { data in
+      SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+    let first = AdmissionTestSegment(
+      index: 0,
+      fileName: firstMediaURL.lastPathComponent,
+      sha256: digest(firstMedia),
+      byteLength: Int64(firstMedia.count),
+      firstMediaPTSSeconds: 0,
+      lastMediaPTSSeconds: firstLastMediaPTSSeconds,
+      firstHostUptimeSeconds: 1_060,
+      lastHostUptimeSeconds: firstLastHostUptimeSeconds,
+      durationSeconds: firstLastMediaPTSSeconds,
+      videoSamples: 60,
+      heldVideoSamples: 1,
+      appAudioSamples: 300,
+      microphoneSamples: 300,
+      droppedVideoSamples: 0,
+      droppedAppAudioSamples: 0,
+      droppedMicrophoneSamples: 0
+    )
+    let secondLastMediaPTSSeconds = secondFirstMediaPTSSeconds
+      + (secondLastHostUptimeSeconds - secondFirstHostUptimeSeconds)
+    let second = AdmissionTestSegment(
+      index: 1,
+      fileName: secondMediaURL.lastPathComponent,
+      sha256: digest(secondMedia),
+      byteLength: Int64(secondMedia.count),
+      firstMediaPTSSeconds: secondFirstMediaPTSSeconds,
+      lastMediaPTSSeconds: secondLastMediaPTSSeconds,
+      firstHostUptimeSeconds: secondFirstHostUptimeSeconds,
+      lastHostUptimeSeconds: secondLastHostUptimeSeconds,
+      durationSeconds: secondLastMediaPTSSeconds - secondFirstMediaPTSSeconds,
+      videoSamples: 60,
+      heldVideoSamples: 1,
+      appAudioSamples: 300,
+      microphoneSamples: 300,
+      droppedVideoSamples: 0,
+      droppedAppAudioSamples: 0,
+      droppedMicrophoneSamples: 0
+    )
+    let encoder = JSONEncoder()
+    let firstData = try encoder.encode(first)
+    let secondData = try encoder.encode(second)
+    try firstData.write(to: session.appendingPathComponent("segment-000000.segment.json"))
+    try secondData.write(to: session.appendingPathComponent("segment-000001.segment.json"))
+    let segmentObjects = try [firstData, secondData].map {
+      try JSONSerialization.jsonObject(with: $0)
+    }
+    try mutateManifest(harness) { $0["segments"] = segmentObjects }
+  }
+
+  private static func setFirstMarkerLatestMediaPTS(
+    _ harness: AdmissionHarness,
+    value: Any
+  ) throws {
+    var changed = false
+    try mutateManifest(harness) { manifest in
+      guard var markers = manifest["markers"] as? [Any],
+        var marker = markers.first as? [String: Any]
+      else { return }
+      marker["latestMediaPTSSeconds"] = value
+      markers[0] = marker
+      manifest["markers"] = markers
+      changed = true
+    }
+    try require(changed, "Test manifest had no marker to mutate")
+  }
+
+  private static func setFirstMarkerLatestMediaSegmentIndex(
+    _ harness: AdmissionHarness,
+    value: Any
+  ) throws {
+    var changed = false
+    try mutateManifest(harness) { manifest in
+      guard var markers = manifest["markers"] as? [Any],
+        var marker = markers.first as? [String: Any]
+      else { return }
+      marker["latestMediaSegmentIndex"] = value
+      markers[0] = marker
+      manifest["markers"] = markers
+      changed = true
+    }
+    try require(changed, "Test manifest had no marker segment to mutate")
+  }
+
+  private static func removeFirstMarkerLatestMediaSegmentIndex(
+    _ harness: AdmissionHarness
+  ) throws {
+    var changed = false
+    try mutateManifest(harness) { manifest in
+      guard var markers = manifest["markers"] as? [Any],
+        var marker = markers.first as? [String: Any]
+      else { return }
+      changed = marker.removeValue(forKey: "latestMediaSegmentIndex") != nil
+      markers[0] = marker
+      manifest["markers"] = markers
+    }
+    try require(changed, "Test marker had no retained segment index to remove")
+  }
+
+  private static func setManifestState(
+    _ harness: AdmissionHarness,
+    value: String
+  ) throws {
+    try mutateManifest(harness) { $0["state"] = value }
+  }
+
+  private static func removeFirstMarkerLatestMediaPTSProvenance(
+    _ harness: AdmissionHarness
+  ) throws {
+    var changed = false
+    try mutateManifest(harness) { manifest in
+      guard var markers = manifest["markers"] as? [Any],
+        var marker = markers.first as? [String: Any]
+      else { return }
+      changed = marker.removeValue(forKey: "latestMediaPTSProvenance") != nil
+      marker.removeValue(forKey: "latestMediaSegmentIndex")
+      markers[0] = marker
+      manifest["markers"] = markers
+    }
+    try require(changed, "Test marker had no retained-PTS provenance to remove")
+  }
+
+  private static func setFirstMarkerLatestMediaPTSProvenance(
+    _ harness: AdmissionHarness,
+    value: String
+  ) throws {
+    var changed = false
+    try mutateManifest(harness) { manifest in
+      guard var markers = manifest["markers"] as? [Any],
+        var marker = markers.first as? [String: Any]
+      else { return }
+      marker["latestMediaPTSProvenance"] = value
+      markers[0] = marker
+      manifest["markers"] = markers
+      changed = true
+    }
+    try require(changed, "Test marker had no provenance field to mutate")
+  }
+
+  private static func replaceFirstMarkerPTSWithRawNumber(
+    _ harness: AdmissionHarness,
+    rawNumber: String
+  ) throws {
+    let url = harness.root.appendingPathComponent(harness.localSessionID, isDirectory: true)
+      .appendingPathComponent("manifest.json")
+    let data = try Data(contentsOf: url)
+    guard var text = String(data: data, encoding: .utf8),
+      let range = text.range(
+        of: "\"latestMediaPTSSeconds\"\\s*:\\s*[^,}]+",
+        options: .regularExpression
+      )
+    else { throw CaptureAdmissionTestFailure.assertion("Test marker PTS was missing") }
+    text.replaceSubrange(range, with: "\"latestMediaPTSSeconds\":\(rawNumber)")
+    try Data(text.utf8).write(to: url)
+  }
+
+  private static func expectMarkerPTSRejection(
+    _ harness: AdmissionHarness,
+    message: String
+  ) throws {
+    do {
+      _ = try harness.coordinator.admit(harness.input)
+      throw CaptureAdmissionTestFailure.assertion(message)
+    } catch let error as CaptureAdmissionTestFailure {
+      throw error
+    } catch let error as TacuaCaptureAdmissionError {
+      try require(
+        error == .captureArtifactMismatch,
+        "Malformed marker PTS surfaced \(error)"
+      )
+    }
+    try require(harness.queues.compareAndSwapCount == 0, "Rejected marker PTS mutated queue")
   }
 
   private static func mutateManifest(
