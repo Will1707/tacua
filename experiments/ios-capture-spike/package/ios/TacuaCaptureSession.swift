@@ -72,6 +72,7 @@ final class TacuaCaptureSession {
   private var trackedAppAudioDropCount = 0
   private var latestVideoPTS: CMTime?
   private var latestVideoHostUptimeSeconds: Double?
+  private var retainedReplayKitVideoFrameClock = TacuaRetainedReplayKitVideoFrameClock()
   private var latestMicrophonePTS: CMTime?
   private var latestMicrophoneHostUptimeSeconds: Double?
   private var isStopping = false
@@ -455,7 +456,7 @@ final class TacuaCaptureSession {
         id: UUID().uuidString,
         label: label,
         hostUptimeSeconds: ProcessInfo.processInfo.systemUptime,
-        latestMediaPTSSeconds: latestVideoPTS.map(CMTimeGetSeconds)
+        latestMediaPTSSeconds: retainedReplayKitVideoFrameClock.latestPTSSeconds
       )
       manifest.markers.append(marker)
       appendSystemDiagnosticBestEffort(.issueMark(
@@ -1298,6 +1299,17 @@ final class TacuaCaptureSession {
       hostUptimeSeconds: hostUptimeSeconds,
       appAudioAttemptIndex: appAudioAttemptIndex
     )
+    switch type {
+    case .video:
+      retainedReplayKitVideoFrameClock.recordReplayKitAppend(
+        ptsSeconds: incomingPTSSeconds,
+        wasAppended: appendResult.wasAppended
+      )
+    case .audioApp, .audioMic:
+      break
+    @unknown default:
+      break
+    }
     if appendResult.wasAppended {
       switch type {
       case .audioMic:
@@ -1919,6 +1931,7 @@ final class TacuaCaptureSession {
       "markerCount": manifest.markers.count,
       "errorCodes": manifest.errorCodes,
       "latestMediaPTSSeconds": jsonValue(latestVideoPTS.map(CMTimeGetSeconds)),
+      "appendedVideoFrameSequence": retainedReplayKitVideoFrameClock.value,
       "recorderAvailable": recorder.isAvailable,
       "recorderRecording": recorder.isRecording,
       "maximumDurationSeconds": manifest.maximumDurationSeconds

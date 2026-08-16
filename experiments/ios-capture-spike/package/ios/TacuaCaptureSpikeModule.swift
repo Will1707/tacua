@@ -518,6 +518,7 @@ public final class TacuaCaptureSpikeModule: Module {
         "gapCount": 0,
         "markerCount": 0,
         "errorCodes": [],
+        "appendedVideoFrameSequence": 0,
         "recorderAvailable": recorder.isAvailable && qaBuildEnabled,
         "recorderRecording": recorder.isRecording,
         "maximumDurationSeconds": TacuaCapturePolicy.maximumDurationSeconds,

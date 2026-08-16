@@ -250,7 +250,10 @@ export default function App(): React.JSX.Element {
         );
       }),
       TacuaCapture.subscribe('onGap', (event) => log(`Gap: ${event.reason}`)),
-      TacuaCapture.subscribe('onMarker', (event) => log(`Marker: ${event.label}`)),
+      TacuaCapture.subscribe('onMarker', (event) => {
+        setStatus(TacuaCapture.getStatus());
+        log(`Marker: ${event.label}`);
+      }),
       TacuaCapture.subscribe('onError', (event) => log(`${event.code}: ${event.reason}`)),
     ];
     return () => subscriptions.forEach((subscription) => subscription.remove());
@@ -680,6 +683,12 @@ export default function App(): React.JSX.Element {
           )}
         </View>
       </ScrollView>
+      <TacuaCapture.TacuaAnnotationOverlay
+        recording={recording}
+        sessionId={status?.sessionId ?? null}
+        issueMarkCount={status?.markerCount ?? 0}
+        onError={(error) => log(`Annotation failed: ${safeMessage(error)}`)}
+      />
     </SafeAreaView>
   );
 }

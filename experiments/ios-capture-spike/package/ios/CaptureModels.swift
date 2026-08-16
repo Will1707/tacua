@@ -186,6 +186,7 @@ struct CaptureMarker: Codable {
   let id: String
   let label: String
   let hostUptimeSeconds: Double
+  /// Latest real ReplayKit video PTS successfully appended to retained media at mark time.
   let latestMediaPTSSeconds: Double?
 }
 

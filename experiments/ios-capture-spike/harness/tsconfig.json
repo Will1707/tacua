@@ -4,6 +4,7 @@
     "allowImportingTsExtensions": true,
     "exactOptionalPropertyTypes": true,
     "noUncheckedIndexedAccess": true,
+    "preserveSymlinks": true,
     "paths": {
       "expo": ["./node_modules/expo"],
       "expo-modules-core": ["./node_modules/expo-modules-core"],

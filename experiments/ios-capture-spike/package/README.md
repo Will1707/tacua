@@ -745,6 +745,60 @@ substitution.
 The manifest and artifact may expose capture measurements; keep them private
 until the aggregate evidence has been reviewed.
 
+## In-app issue annotation
+
+QA builds may mount `TacuaAnnotationOverlay` as the last sibling above their
+navigation root. The touch-first floating control is visible only while the host
+reports an active ReplayKit recording. It offers pen, highlighter, and a
+non-drawing issue mark; pen/highlighter mode deliberately pauses interaction
+with the app beneath it and provides undo, clear, cancel, and Mark controls.
+
+Mark keeps only the strokes visible, waits until a later ReplayKit frame is
+successfully appended to the retained movie, writes one native
+`screen_annotation` issue mark, and holds the pixels briefly before clearing
+them. The isolated processor then extracts the visible annotated frame and
+narration window through the existing issue-mark evidence path. Vector points
+remain ephemeral and are never added to diagnostics or the upload contract.
+
+```tsx
+import * as TacuaCapture from '@tacua/mobile-sdk';
+import { useEffect, useState } from 'react';
+import { View } from 'react-native';
+
+export function QARoot() {
+  const [status, setStatus] = useState(() => TacuaCapture.getStatus());
+
+  useEffect(() => {
+    const state = TacuaCapture.subscribe('onState', setStatus);
+    const marker = TacuaCapture.subscribe('onMarker', () => {
+      setStatus(TacuaCapture.getStatus());
+    });
+    return () => {
+      state.remove();
+      marker.remove();
+    };
+  }, []);
+
+  return (
+    <View style={{ flex: 1 }}>
+      <AppNavigator />
+      <TacuaCapture.TacuaAnnotationOverlay
+        recording={status.recorderRecording}
+        sessionId={status.sessionId ?? null}
+        issueMarkCount={status.markerCount}
+      />
+    </View>
+  );
+}
+```
+
+Mount this only in the authorized SDK-enabled QA target. A separate Tacua
+reviewer app cannot overlay or record another iOS application. The current
+offline processor accepts at most twelve marks in one capture, so the component
+uses twelve as its default UI limit. Marks less than twelve seconds apart still
+produce annotated screenshots, but the processor suppresses their overlapping
+automatic narration.
+
 ## Example
 
 ```ts

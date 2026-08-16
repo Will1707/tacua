@@ -9,6 +9,19 @@ enum TacuaCaptureGapInsertionDisposition: Equatable {
   case replaceLastWithOverflowSentinel
 }
 
+/// Process-local sequence for real ReplayKit video callbacks accepted by the active writer.
+/// Synthetic held frames used at segment boundaries never pass through this counter.
+struct TacuaRetainedReplayKitVideoFrameClock {
+  private(set) var value = 0
+  private(set) var latestPTSSeconds: Double?
+
+  mutating func recordReplayKitAppend(ptsSeconds: Double, wasAppended: Bool) {
+    guard wasAppended, ptsSeconds.isFinite else { return }
+    value += 1
+    latestPTSSeconds = ptsSeconds
+  }
+}
+
 enum TacuaCapturePolicy {
   static let maximumDurationSeconds: Double = 1_800
   /// Admission timestamps are persisted after ReplayKit stop and writer-finalization callbacks.

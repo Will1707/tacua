@@ -32,6 +32,7 @@ enum CapturePolicyTests {
     try sessionOriginSurvivesResume()
     try deadlineAndMicrophoneContinuity()
     try videoClockContinuity()
+    try retainedReplayKitVideoFrameSequence()
     try segmentRotation()
     try crashWindowRecoverySource()
     try candidateHandoffValidation()
@@ -216,6 +217,61 @@ enum CapturePolicyTests {
         currentHostUptimeSeconds: 111
       ),
       "A regressing media clock must create a gap"
+    )
+  }
+
+  private static func retainedReplayKitVideoFrameSequence() throws {
+    var sequence = TacuaRetainedReplayKitVideoFrameClock()
+    try expect(sequence.value == 0, "The retained-video sequence must start at zero")
+    try expect(
+      sequence.latestPTSSeconds == nil,
+      "The marker clock must be unavailable before the first retained ReplayKit video frame"
+    )
+
+    sequence.recordReplayKitAppend(ptsSeconds: 10, wasAppended: false)
+    try expect(
+      sequence.value == 0,
+      "An observed video callback rejected by the writer advanced the retained-video sequence"
+    )
+    try expect(
+      sequence.latestPTSSeconds == nil,
+      "An observed video callback rejected by the writer became the marker media clock"
+    )
+
+    sequence.recordReplayKitAppend(ptsSeconds: 11, wasAppended: true)
+    try expect(
+      sequence.value == 1,
+      "The first successfully appended ReplayKit video frame did not advance the sequence"
+    )
+    try expect(
+      sequence.latestPTSSeconds == 11,
+      "The marker media clock did not select the first retained ReplayKit frame"
+    )
+
+    sequence.recordReplayKitAppend(ptsSeconds: 12, wasAppended: false)
+    try expect(
+      sequence.value == 1,
+      "A later dropped ReplayKit video frame changed the retained-video sequence"
+    )
+    try expect(
+      sequence.latestPTSSeconds == 11,
+      "A later dropped ReplayKit video frame replaced the retained marker media clock"
+    )
+
+    sequence.recordReplayKitAppend(ptsSeconds: 13, wasAppended: true)
+    try expect(
+      sequence.value == 2,
+      "A later successfully appended ReplayKit video frame did not advance the sequence exactly once"
+    )
+    try expect(
+      sequence.latestPTSSeconds == 13,
+      "The marker media clock did not advance to the later retained ReplayKit frame"
+    )
+
+    sequence.recordReplayKitAppend(ptsSeconds: .nan, wasAppended: true)
+    try expect(
+      sequence.value == 2 && sequence.latestPTSSeconds == 13,
+      "An invalid video timestamp changed retained-frame marker state"
     )
   }
 
