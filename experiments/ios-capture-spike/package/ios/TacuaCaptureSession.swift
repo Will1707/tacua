@@ -282,24 +282,6 @@ final class TacuaCaptureSession {
       if let lastPTS = manifest.segments.last?.lastMediaPTSSeconds {
         latestVideoPTS = CMTime(seconds: lastPTS, preferredTimescale: 1_000_000_000)
       }
-      manifest.handoffTokenIdentifier = handoff.handoffTokenIdentifier
-      manifest.expiresAt = handoff.expiresAt
-      manifest.state = "prepared"
-      manifest.stoppedHostUptimeSeconds = nil
-      manifest.stopReason = nil
-      manifest.resumeCount = (manifest.resumeCount ?? 0) + 1
-      manifest.lastResumedAt = Self.iso8601(Date())
-      let resumeGap = CaptureGap(
-        id: UUID().uuidString,
-        reason: "process_resume",
-        openedHostUptimeSeconds: ProcessInfo.processInfo.systemUptime,
-        closedHostUptimeSeconds: nil,
-        priorMediaPTSSeconds: latestVideoPTS.map(CMTimeGetSeconds),
-        nextMediaPTSSeconds: nil
-      )
-      let boundedResumeGap = Self.appendBoundedGap(resumeGap, to: &manifest)
-      pendingResumeGapId = boundedResumeGap.id
-      try persistManifest()
     } else {
       let bootSessionID = TacuaSystemMonotonicClock().bootSessionID
       guard !bootSessionID.isEmpty else {
@@ -403,6 +385,26 @@ final class TacuaCaptureSession {
         : TacuaCaptureSpikeError.storageIO(
           "Tacua could not create the private diagnostic journal."
         )
+    }
+    if resuming {
+      manifest.handoffTokenIdentifier = handoff.handoffTokenIdentifier
+      manifest.expiresAt = handoff.expiresAt
+      manifest.state = "prepared"
+      manifest.stoppedHostUptimeSeconds = nil
+      manifest.stopReason = nil
+      manifest.resumeCount = (manifest.resumeCount ?? 0) + 1
+      manifest.lastResumedAt = Self.iso8601(Date())
+      let resumeGap = CaptureGap(
+        id: UUID().uuidString,
+        reason: "process_resume",
+        openedHostUptimeSeconds: ProcessInfo.processInfo.systemUptime,
+        closedHostUptimeSeconds: nil,
+        priorMediaPTSSeconds: latestVideoPTS.map(CMTimeGetSeconds),
+        nextMediaPTSSeconds: nil
+      )
+      let boundedResumeGap = Self.appendBoundedGap(resumeGap, to: &manifest)
+      pendingResumeGapId = boundedResumeGap.id
+      try persistManifest()
     }
     initializationCompleted = true
   }
