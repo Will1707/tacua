@@ -205,6 +205,33 @@ test("rejects export replacement after all validated content was read", (context
   );
 });
 
+test("requires at least one export asset for every wildcard COPY", (context) => {
+  const temporary = mkdtempSync(path.join(tmpdir(), "tacua-reviewer-assets-"));
+  context.after(() => rmSync(temporary, { recursive: true, force: true }));
+  const assetDirectories = [
+    "assets/node_modules/expo-router/assets",
+    "assets/node_modules/expo-router/assets/react-navigation/elements",
+  ];
+
+  for (const [index, assetDirectory] of assetDirectories.entries()) {
+    const fixture = path.join(temporary, `fixture-${index}`);
+    cpSync(exportRoot, fixture, { recursive: true });
+    const absoluteAssetDirectory = path.join(fixture, assetDirectory);
+    for (const entry of readdirSync(absoluteAssetDirectory, {
+      withFileTypes: true,
+    })) {
+      if (entry.isFile() && entry.name.endsWith(".png")) {
+        unlinkSync(path.join(absoluteAssetDirectory, entry.name));
+      }
+    }
+
+    assert.throws(
+      () => validateReviewerExport(fixture),
+      /every Docker-copied asset family/u,
+    );
+  }
+});
+
 test("stops the healthy reviewer before normal verification cleanup", () => {
   const stop = 'docker container stop --time 10 "$container" >/dev/null';
   const remove = 'docker container rm "$container" >/dev/null';

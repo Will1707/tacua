@@ -119,6 +119,10 @@ const allowedDirectories = new Set([
 ]);
 const entryBundle = /^_expo\/static\/js\/web\/entry-([a-f0-9]{32})\.js$/u;
 const allowedAsset = /^(?:assets\/node_modules\/expo-router\/assets\/(?:[^/]+\.png|react-navigation\/elements\/[^/]+\.png))$/u;
+const requiredAssetFamilies = Object.freeze([
+  /^assets\/node_modules\/expo-router\/assets\/[^/]+\.png$/u,
+  /^assets\/node_modules\/expo-router\/assets\/react-navigation\/elements\/[^/]+\.png$/u,
+]);
 const forbiddenBundleText = [
   "localStorage",
   "expo-file-system",
@@ -435,8 +439,13 @@ function snapshotReviewerExport(root) {
     bundles.length !== 1
     || !files.has("index.html")
     || !files.has("metadata.json")
+    || requiredAssetFamilies.some(
+      (family) => !names.some((name) => family.test(name)),
+    )
   ) {
-    fail("reviewer export must contain one SPA shell, metadata file, and entry bundle");
+    fail(
+      "reviewer export must contain one SPA shell, metadata file, entry bundle, and every Docker-copied asset family",
+    );
   }
   for (const name of names) {
     const permitted = name === "index.html"
