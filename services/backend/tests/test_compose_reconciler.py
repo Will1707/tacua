@@ -48,6 +48,31 @@ SYNTHETIC_RUNTIME = {
 }
 
 
+def _processing_socket_size(parent: Path, project: str) -> int:
+    return len(
+        os.fsencode(
+            parent
+            / f"{RECONCILER.PROCESSING_OPERATION_DIRECTORY_PREFIX}{project}"
+            / RECONCILER.PROCESSING_BRIDGE_SOCKET_NAME
+        )
+    )
+
+
+def _operation_parent_for_socket_size(
+    root: Path,
+    project: str,
+    size: int,
+) -> Path:
+    one_character = root / "a"
+    remaining = size - _processing_socket_size(one_character, project)
+    if remaining < 0:
+        raise ValueError("root is too long for requested socket size")
+    parent = root / ("a" * (remaining + 1))
+    if _processing_socket_size(parent, project) != size:
+        raise AssertionError("failed to derive requested socket size")
+    return parent
+
+
 class ComposeReconcilerTests(unittest.TestCase):
     def _fixture(self, root: Path, *, desired_state: str = "maintenance") -> Path:
         root = root.resolve()
@@ -331,6 +356,30 @@ class ComposeReconcilerTests(unittest.TestCase):
         anchor_path.write_bytes(RECONCILER._canonical(anchor))
         anchor_path.chmod(0o600)
         return anchor
+
+    def _rewrite_bound_operation_directory(
+        self,
+        state: Path,
+        operation_directory: str,
+    ) -> None:
+        generation = state / "generations" / "generation-1"
+        manifest_path = generation / RECONCILER.MANIFEST_FILE
+        manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+        manifest["operation_directory"] = operation_directory
+        manifest["manifest_digest"] = RECONCILER._document_digest(
+            manifest,
+            "manifest_digest",
+        )
+        manifest_path.write_bytes(RECONCILER._canonical(manifest))
+
+        desired_path = state / RECONCILER.DESIRED_FILE
+        desired = json.loads(desired_path.read_text(encoding="ascii"))
+        desired["manifest_digest"] = manifest["manifest_digest"]
+        desired["state_digest"] = RECONCILER._document_digest(
+            desired,
+            "state_digest",
+        )
+        desired_path.write_bytes(RECONCILER._canonical(desired))
 
     def test_maintenance_reconcile_has_no_subprocess_or_lock_side_effect(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1599,6 +1648,213 @@ class ComposeReconcilerTests(unittest.TestCase):
         self.assertIsNone(RECONCILER.UNIT.fullmatch("-evil.service"))
         self.assertIsNotNone(RECONCILER.UNIT.fullmatch("docker.service"))
 
+    def test_processing_bridge_socket_path_accepts_103_bytes_and_rejects_104(
+        self,
+    ) -> None:
+        project = "test"
+        accepted = _operation_parent_for_socket_size(
+            Path("/"),
+            project,
+            RECONCILER.MAX_UNIX_SOCKET_PATH_BYTES,
+        )
+        rejected = _operation_parent_for_socket_size(
+            Path("/"),
+            project,
+            RECONCILER.MAX_UNIX_SOCKET_PATH_BYTES + 1,
+        )
+
+        self.assertEqual(103, _processing_socket_size(accepted, project))
+        self.assertEqual(104, _processing_socket_size(rejected, project))
+        self.assertTrue(
+            RECONCILER._processing_bridge_socket_path_valid(
+                str(accepted),
+                project,
+            )
+        )
+        self.assertFalse(
+            RECONCILER._processing_bridge_socket_path_valid(
+                rejected,
+                project,
+            )
+        )
+
+    def test_processing_bridge_socket_path_counts_multibyte_filesystem_bytes(
+        self,
+    ) -> None:
+        project = "test"
+        ascii_boundary = _operation_parent_for_socket_size(
+            Path("/"),
+            project,
+            RECONCILER.MAX_UNIX_SOCKET_PATH_BYTES,
+        )
+        accepted = ascii_boundary.with_name(
+            ascii_boundary.name[:-2] + "é"
+        )
+        rejected = ascii_boundary.with_name(
+            ascii_boundary.name[:-1] + "é"
+        )
+
+        self.assertEqual(103, _processing_socket_size(accepted, project))
+        self.assertEqual(104, _processing_socket_size(rejected, project))
+        self.assertTrue(
+            RECONCILER._processing_bridge_socket_path_valid(
+                accepted,
+                project,
+            )
+        )
+        self.assertFalse(
+            RECONCILER._processing_bridge_socket_path_valid(
+                rejected,
+                project,
+            )
+        )
+
+    def test_processing_bridge_socket_path_rejects_bridge_delimiters(
+        self,
+    ) -> None:
+        project = "test"
+        for name, character in (
+            ("comma", ","),
+            ("line-feed", "\n"),
+            ("carriage-return", "\r"),
+        ):
+            with self.subTest(character=name):
+                self.assertFalse(
+                    RECONCILER._processing_bridge_socket_path_valid(
+                        f"/private/unsafe{character}operation",
+                        project,
+                    )
+                )
+
+        with mock.patch.object(
+            RECONCILER.os,
+            "fsencode",
+            side_effect=AssertionError("NUL path reached encoding"),
+        ) as fsencode:
+            self.assertFalse(
+                RECONCILER._processing_bridge_socket_path_valid(
+                    "/private/unsafe\x00operation",
+                    project,
+                )
+            )
+        fsencode.assert_not_called()
+
+    def test_seal_rejects_oversized_processing_socket_before_generation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = Path(directory).resolve()
+            args, _deployment = self._seal_candidate(
+                root,
+                maintenance=True,
+            )
+            operation = _operation_parent_for_socket_size(
+                root,
+                args.project,
+                RECONCILER.MAX_UNIX_SOCKET_PATH_BYTES + 1,
+            )
+            operation.mkdir(mode=0o700)
+            args.operation_directory = operation
+
+            with mock.patch.object(
+                RECONCILER,
+                "deployment_preflight",
+                side_effect=AssertionError("live preflight was reached"),
+            ) as preflight, self.assertRaisesRegex(
+                RECONCILER.ReconcileError,
+                "RECONCILE_INPUT_INVALID",
+            ):
+                RECONCILER.seal(args, runner=mock.Mock())
+
+            preflight.assert_not_called()
+            self.assertTrue(args.state_directory.is_dir())
+            self.assertEqual([], list(args.state_directory.iterdir()))
+            self.assertFalse(
+                (args.state_directory / "generations").exists()
+            )
+            self.assertFalse(
+                (args.state_directory / RECONCILER.DESIRED_FILE).exists()
+            )
+
+    def test_seal_rejects_bridge_delimiters_before_generation(self) -> None:
+        for name, character in (
+            ("comma", ","),
+            ("line-feed", "\n"),
+            ("carriage-return", "\r"),
+        ):
+            with self.subTest(character=name), tempfile.TemporaryDirectory(
+                dir="/tmp"
+            ) as directory:
+                root = Path(directory).resolve()
+                args, _deployment = self._seal_candidate(
+                    root,
+                    maintenance=True,
+                )
+                operation = root / f"unsafe{character}operation"
+                operation.mkdir(mode=0o700)
+                args.operation_directory = operation
+
+                with mock.patch.object(
+                    RECONCILER,
+                    "deployment_preflight",
+                    side_effect=AssertionError("live preflight was reached"),
+                ) as preflight, self.assertRaisesRegex(
+                    RECONCILER.ReconcileError,
+                    "RECONCILE_INPUT_INVALID",
+                ):
+                    RECONCILER.seal(args, runner=mock.Mock())
+
+                preflight.assert_not_called()
+                self.assertEqual([], list(args.state_directory.iterdir()))
+                self.assertFalse(
+                    (args.state_directory / "generations").exists()
+                )
+
+    def test_bound_state_rejects_oversized_processing_socket_path(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            state = self._fixture(Path(directory))
+            manifest_path = (
+                state
+                / "generations"
+                / "generation-1"
+                / RECONCILER.MANIFEST_FILE
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+            operation = _operation_parent_for_socket_size(
+                Path("/"),
+                manifest["project"],
+                RECONCILER.MAX_UNIX_SOCKET_PATH_BYTES + 1,
+            )
+            self._rewrite_bound_operation_directory(state, str(operation))
+
+            with self.assertRaisesRegex(
+                RECONCILER.ReconcileError,
+                "RECONCILE_STATE_INVALID",
+            ):
+                RECONCILER._load_bound_state(state)
+
+    def test_bound_state_rejects_rebound_bridge_delimiters(self) -> None:
+        for name, character in (
+            ("comma", ","),
+            ("line-feed", "\n"),
+            ("carriage-return", "\r"),
+            ("nul", "\x00"),
+        ):
+            with self.subTest(character=name), tempfile.TemporaryDirectory(
+                dir="/tmp"
+            ) as directory:
+                state = self._fixture(Path(directory))
+                self._rewrite_bound_operation_directory(
+                    state,
+                    f"/private/unsafe{character}operation",
+                )
+
+                with self.assertRaisesRegex(
+                    RECONCILER.ReconcileError,
+                    "RECONCILE_STATE_INVALID",
+                ):
+                    RECONCILER._load_bound_state(state)
+
     def test_crash_after_running_publish_keeps_activation_recoverable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = self._fixture(Path(directory), desired_state="maintenance")
@@ -1837,7 +2093,7 @@ class ComposeReconcilerTests(unittest.TestCase):
                 Path(directory),
                 maintenance=True,
             )
-            with self._borrowed_host_lock("seal-success") as (
+            with self._borrowed_host_lock("ss") as (
                 project,
                 path,
                 descriptor,
@@ -1920,7 +2176,7 @@ class ComposeReconcilerTests(unittest.TestCase):
                 Path(directory),
                 maintenance=True,
             )
-            with self._borrowed_host_lock("seal-failure") as (
+            with self._borrowed_host_lock("sf") as (
                 project,
                 path,
                 descriptor,
