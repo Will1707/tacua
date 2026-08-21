@@ -17,7 +17,11 @@ from typing import Any, Sequence
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_ROOT / "src"))
 
-from tacua_backend.config import ConfigError, load_public_config  # noqa: E402
+from tacua_backend.config import (  # noqa: E402
+    ConfigError,
+    TAILSCALE_CAPABILITY_NAME_PATTERN,
+    load_public_config,
+)
 from tacua_backend.operator_tool import (  # noqa: E402
     OperatorError,
     deployment_preflight,
@@ -28,6 +32,10 @@ from tacua_backend.operator_tool import (  # noqa: E402
 MAX_STATUS_BYTES = 2 * 1024 * 1024
 EXPECTED_PROXY = "http://127.0.0.1:8080"
 DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+TAILSCALE_VERSION = re.compile(
+    r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:[-+][A-Za-z0-9.-]+)?$"
+)
+MINIMUM_APP_CAPABILITY_VERSION = (1, 92, 0)
 
 
 class TailnetPilotError(ValueError):
@@ -270,9 +278,63 @@ def _validate_tailnet_status(status_document: dict[str, Any]) -> str:
     return dns_name
 
 
+def _reviewer_app_capability(config: Any) -> str | None:
+    """Return the one capability Serve must forward for reviewer auth.
+
+    Legacy deployments have no reviewer-auth profile and keep the historical
+    identity-only Serve shape.  The capability profile deliberately accepts
+    only the header-shaped singleton configured by the backend contract; this
+    keeps Serve, the backend parser, and the tailnet policy bound to one value.
+    """
+
+    reviewer_auth = getattr(config, "reviewer_auth", None)
+    if reviewer_auth is None:
+        return None
+    mode = getattr(reviewer_auth, "mode", None)
+    capabilities = getattr(
+        reviewer_auth,
+        "tailscale_app_capabilities",
+        None,
+    )
+    if mode in {"legacy_admin", "pairing"} and capabilities is None:
+        return None
+    _require(
+        mode == "tailscale_capability_or_pairing"
+        and isinstance(capabilities, dict)
+        and len(capabilities) == 1,
+        "reviewer auth must configure exactly one Tailscale app capability",
+    )
+    capability, parameters = next(iter(capabilities.items()))
+    _require(
+        isinstance(capability, str)
+        and TAILSCALE_CAPABILITY_NAME_PATTERN.fullmatch(capability) is not None
+        and isinstance(parameters, list)
+        and 1 <= len(parameters) <= 8
+        and all(isinstance(item, dict) for item in parameters),
+        "reviewer Tailscale app capability must be one normalized capability",
+    )
+    return capability
+
+
+def _validate_app_capability_version(status_document: dict[str, Any]) -> None:
+    version = status_document.get("Version")
+    _require(
+        isinstance(version, str) and TAILSCALE_VERSION.fullmatch(version) is not None,
+        "Tailscale version must be available for reviewer app capability forwarding",
+    )
+    match = TAILSCALE_VERSION.fullmatch(version)
+    assert match is not None
+    observed = tuple(int(part) for part in match.groups()[:3])
+    _require(
+        observed >= MINIMUM_APP_CAPABILITY_VERSION,
+        "Tailscale 1.92.0 or newer is required for reviewer app capabilities",
+    )
+
+
 def _validate_serve_status(
     serve_document: dict[str, Any],
     dns_name: str,
+    reviewer_app_capability: str | None = None,
 ) -> None:
     if serve_document.get("AllowFunnel") is True:
         raise TailnetPilotError("Tailscale Funnel must remain disabled")
@@ -284,15 +346,14 @@ def _validate_serve_status(
         serve_document.get("TCP") == {"443": {"HTTPS": True}},
         "Serve must expose one HTTPS listener on port 443",
     )
+    handler: dict[str, Any] = {"Proxy": EXPECTED_PROXY}
+    if reviewer_app_capability is not None:
+        handler["AcceptAppCaps"] = [reviewer_app_capability]
     _require(
         serve_document.get("Web")
         == {
             f"{dns_name}:443": {
-                "Handlers": {
-                    "/": {
-                        "Proxy": EXPECTED_PROXY,
-                    }
-                }
+                "Handlers": {"/": handler}
             }
         },
         "Serve must proxy only the root path to Tacua on host loopback",
@@ -338,6 +399,8 @@ def _validate_private_pilot_base(
         "private-pilot services must use the locally verified images and builds",
     )
     dns_name = _validate_tailnet_status(tailscale_status)
+    if _reviewer_app_capability(config) is not None:
+        _validate_app_capability_version(tailscale_status)
     expected_origin = f"https://{dns_name}"
     _require(
         config.backend_origin == expected_origin,
@@ -401,7 +464,12 @@ def validate_tailnet_private_pilot(
         tailscale_status,
     )
     dns_name = expected_origin.removeprefix("https://")
-    _validate_serve_status(serve_status, dns_name)
+    reviewer_app_capability = _reviewer_app_capability(config)
+    _validate_serve_status(
+        serve_status,
+        dns_name,
+        reviewer_app_capability,
+    )
     return {
         "origin": expected_origin,
         "proxy": EXPECTED_PROXY,

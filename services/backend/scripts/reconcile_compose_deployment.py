@@ -2413,9 +2413,16 @@ def _tailnet_state(manifest: Mapping[str, Any], compose: Path, runner: Callable[
             raise tailnet_gate.TailnetPilotError(
                 "sealed backend origin differs from the tailnet node"
             )
+        reviewer_app_capability = tailnet_gate._reviewer_app_capability(config)
+        if reviewer_app_capability is not None:
+            tailnet_gate._validate_app_capability_version(status)
         if serve == {}:
             return status, False
-        tailnet_gate._validate_serve_status(serve, dns_name)
+        tailnet_gate._validate_serve_status(
+            serve,
+            dns_name,
+            reviewer_app_capability,
+        )
         return status, True
     except (ConfigError, OperatorError, tailnet_gate.TailnetPilotError) as error:
         raise ReconcileError("RECONCILE_TAILNET_FAILED") from error
@@ -2448,7 +2455,13 @@ def _disable_serve(manifest: Mapping[str, Any], runner: Callable[..., bytes]) ->
 
 def _enable_serve(manifest: Mapping[str, Any], compose: Path, runner: Callable[..., bytes]) -> None:
     tailscale = manifest["commands"]["tailscale"]
-    runner([tailscale, "serve", "--bg", "--yes", "http://127.0.0.1:8080"], timeout=30)
+    config = load_public_config(Path(manifest["config"]["path"]))
+    reviewer_app_capability = tailnet_gate._reviewer_app_capability(config)
+    command = [tailscale, "serve", "--bg", "--yes"]
+    if reviewer_app_capability is not None:
+        command.append(f"--accept-app-caps={reviewer_app_capability}")
+    command.append("http://127.0.0.1:8080")
+    runner(command, timeout=30)
     _status, active = _tailnet_state(manifest, compose, runner)
     if not active:
         raise ReconcileError("RECONCILE_TAILNET_FAILED")

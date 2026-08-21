@@ -90,7 +90,11 @@ health, smoke, or Serve gates can succeed. A subset on an already healthy
 deployment, any extra consumer, or any other drift remains a hard failure.
 
 Tailscale Serve is part of that transaction. The current Serve state must be
-either the exact Tacua listener or empty. Before Docker or container recovery,
+either the exact Tacua listener or empty. For the explicit
+`tailscale_capability_or_pairing` reviewer-auth profile, "exact" includes the
+handler's singleton `AcceptAppCaps` name derived from the digest-bound public
+config; the legacy profile retains the historical handler shape without that
+field. Before Docker or container recovery,
 the reconciler disables an active listener and proves Serve is exactly `{}`.
 It restores Serve only after all three same-ID containers are healthy and both
 backend and reviewer loopback smokes pass. It then repeats exact tailnet/Serve
@@ -99,6 +103,17 @@ again and proves it empty; failure to prove that emits only
 `RECONCILE_PUBLIC_PATH_CRITICAL` and requires immediate operator attention.
 An unknown or additional Serve configuration is never mutated and blocks
 recovery.
+
+The capability profile enables Serve with
+`--accept-app-caps=<configured-capability>`. Serve strips an incoming
+`Tailscale-App-Capabilities` value and injects the policy-derived JSON header,
+which the ingress preserves for API requests and strips before the static
+reviewer container. This private-pilot topology still trusts local host
+processes: one can bypass Serve by reaching the loopback-published ingress and
+forge the header. Run no untrusted workload under this profile and do not treat
+it as a shared-host or production authorization boundary. The required tailnet
+grant and matching credential-free config are documented in
+[TAILNET_PRIVATE_PILOT.md](TAILNET_PRIVATE_PILOT.md#reviewer-authorization-profile).
 
 For initial installation, `seal --maintenance` is the preferred staged path.
 It accepts only an exactly empty Serve configuration, proves that condition

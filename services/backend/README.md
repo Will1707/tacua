@@ -10,7 +10,8 @@ The implementation is Apache-2.0, dependency-free Python using SQLite and the
 filesystem. It is intentionally one organization per deployment and does not
 implement cross-customer multi-tenancy. Each current pilot deployment also
 pins exactly one project, application, tested build, reviewer identity, and
-administrator credential. Those are current implementation limits, not a
+administrator credential. Reviewer traffic can use separately scoped,
+revocable authentication as described below. Those are current implementation limits, not a
 narrowing of the [product boundary](../../docs/PRODUCT.md), which permits future
 multiple projects and members. Put a bounded TLS reverse proxy in front of it
 outside loopback development; authenticated SDK routes and launch exchange
@@ -178,6 +179,69 @@ admin-token rotation. The mounted value must be 32–4096 ASCII bytes in the RFC
 7235 `token68` alphabet (`A-Z`, `a-z`, `0-9`, `.`, `_`, `~`, `+`, `/`, `-`,
 with at most two trailing `=` padding characters); Unicode, controls,
 whitespace, and embedded padding are rejected before startup.
+
+## Reviewer authentication
+
+`reviewer_auth` is optional public configuration and is deliberately excluded
+from the persisted deployment pin. Omission selects the transitional
+`legacy_admin` mode, preserving existing `/v1/admin/*` behavior and allowing
+the same bearer on the strictly whitelisted `/v1/reviewer/*` aliases. New
+deployments should select either:
+
+- `{"mode":"pairing"}` for one-use ten-minute pairing requests and revocable
+  thirty-day reviewer sessions; or
+- `{"mode":"tailscale_capability_or_pairing","tailscale_app_capabilities":{"owned.example/cap/tacua-reviewer":[{}]}}`
+  for one exact Serve-injected application capability with pairing fallback.
+
+The Tailscale policy contains exactly one controlled-domain capability and
+one through eight non-secret object parameters. The backend accepts only a
+bounded, duplicate-free ASCII JSON header whose canonical value equals that
+configured object; ordinary tailnet identity headers do not authorize a
+reviewer. Web pairing exchange returns only a
+`__Host-tacua-reviewer` `Secure`, `HttpOnly`, `SameSite=Strict`, path-rooted
+cookie. Native exchange returns the scoped bearer once. SQLite stores only
+domain-separated HMAC verifiers. Unsafe reviewer operations require both the
+exact configured backend `Origin` and the CSRF token returned by
+`GET /v1/reviewer/session`.
+
+The store permits at most 64 active reviewer sessions. A valid approved pairing
+exchange beyond that bound fails with `429 REVIEWER_SESSION_CAPACITY_REACHED`
+without consuming the pairing token. Revocation removes the session verifier
+and consumed pairing row in the same transaction; expired rows are removed by
+the next reviewer-auth transaction. `GET /v1/admin/reviewer-sessions` therefore
+returns only the bounded active set, and a subsequently requested pruned session
+returns `404 REVIEWER_SESSION_NOT_FOUND`.
+
+When a pairing-capable client creates a request and displays its code, approve
+that one-use request on the backend host within ten minutes. The command reads
+the administrator secret from its protected file, sends it only to the
+configured HTTPS origin, and prints no pairing, device, or credential metadata:
+
+```sh
+PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool \
+  approve-reviewer-pairing \
+  --config-file services/backend/local/config.json \
+  --admin-secret-file services/backend/local/admin-secret \
+  --code ABCD-EFGH
+```
+
+Reviewer aliases expose only bootstrap/build/capture-session/job/audit/candidate
+reads, launch creation, and candidate transitions/replacements. Capture-session
+deletion remains administrator-only. A reviewer may revoke only its current
+pairing-issued session through `DELETE /v1/reviewer/session`; pairing approval,
+active-session listing, and arbitrary reviewer-session revocation remain under
+`/v1/admin/reviewer-pairing-approvals` and `/v1/admin/reviewer-sessions`.
+
+Transport 1.2 reviewers should create launches through
+`POST /v1/reviewer/launch-links`. After scoped authentication, exact Origin,
+and CSRF checks, the backend atomically returns
+`{"contract_version":"tacua.reviewer-launch-link@1.0.0","launch_url":"<sealed-scheme>://tacua/start?...","grant":{...}}`.
+`grant` is the unchanged launch-code response. Resume links append the exact
+grant-bound `session_id`. A deployment without a sealed launch scheme fails
+with `409 REVIEWER_LAUNCH_SCHEME_UNAVAILABLE` before minting a grant. The
+The administrator `/v1/admin/launch-codes` route remains unchanged;
+`/v1/reviewer/launch-codes` exposes the same grant contract for scoped
+compatibility.
 
 For a single-owner test deployment that should be reachable only from an
 existing Tailscale network, follow the
@@ -414,6 +478,15 @@ validated constants but are never used without the complete machine binding.
 | `GET` | `/v1/admin/reviewer-binding` | admin bearer plus `Tacua-Reviewer-ID` | Verify the claimed reviewer identity and return status only |
 | `GET` | `/v1/admin/reviewer-bootstrap` | admin bearer | Read the exact versioned reviewer identity and per-build launch metadata |
 | `POST` | `/v1/admin/launch-codes` | admin bearer | Create a start or resume grant |
+| `POST` | `/v1/reviewer/pairing-requests` | public, exact web Origin when applicable | Create one ten-minute reviewer pairing request |
+| `POST` | `/v1/reviewer/pairing-exchanges` | one-use pairing token | Exchange an approved request for a scoped web cookie or native bearer |
+| `GET` | `/v1/reviewer/session` | reviewer session or configured app capability | Read the authenticated reviewer principal and CSRF token |
+| `DELETE` | `/v1/reviewer/session` | pairing-issued reviewer session, exact Origin and CSRF | Revoke the caller's current reviewer session |
+| `GET` | `/v1/reviewer/bootstrap` | reviewer read scope | Read the authoritative reviewer/build/launch metadata |
+| `POST` | `/v1/reviewer/launch-links` | reviewer launch scope, exact Origin and CSRF | Atomically create a grant and its sealed app launch URL |
+| `POST` | `/v1/admin/reviewer-pairing-approvals` | admin bearer | Approve one displayed pairing code |
+| `GET` | `/v1/admin/reviewer-sessions` | admin bearer | List the bounded active reviewer sessions |
+| `DELETE` | `/v1/admin/reviewer-sessions/{session}` | admin bearer | Revoke one pairing-issued reviewer session |
 | `POST` | `/v1/sdk/launch-exchanges` | launch code in body | Start/resume and issue the client-owned credential |
 | `PUT` | `/v1/sdk/sessions/{session}/segments/{sequence}/{segment}` | SDK bearer | Upload/recover media |
 | `PUT` | `/v1/sdk/sessions/{session}/diagnostics/{upload}` | SDK bearer | Upload/recover diagnostics |
@@ -434,6 +507,10 @@ validated constants but are never used without the complete machine binding.
 | `GET` | `/v1/admin/candidates/{candidate}/versions/{version}/handoff.{json,md}` | admin bearer | Download one immutable approved handoff version |
 | `GET` | `/v1/admin/audit-events` | admin bearer | List one bounded page of content-free audit events |
 | `DELETE` | `/v1/admin/sessions/{session}` | admin bearer | Operator-requested scoped erasure |
+
+The explicitly whitelisted operational `/v1/reviewer/*` aliases mirror the
+corresponding admin response contracts under reviewer scopes. Unsafe reviewer
+aliases additionally require the exact configured Origin and CSRF token.
 
 `GET /v1/admin/reviewer-bootstrap` is the transitional administrator-authenticated
 bootstrap used while reviewer-scoped authentication is introduced. Its exact

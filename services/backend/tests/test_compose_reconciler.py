@@ -1625,7 +1625,122 @@ class ComposeReconcilerTests(unittest.TestCase):
             )
         self.assertTrue(active)
         serve_validator.assert_called_once_with(
-            serve, "node.example-tail.ts.net"
+            serve, "node.example-tail.ts.net", None
+        )
+
+    def test_tailnet_gate_binds_serve_status_to_reviewer_capability(self) -> None:
+        capability = "auth.example.invalid/cap/tacua-reviewer"
+        status = {"Version": "1.102.2"}
+        serve = {"synthetic": "serve"}
+        runner = mock.Mock(
+            side_effect=[
+                RECONCILER._canonical(serve),
+                RECONCILER._canonical(status),
+            ]
+        )
+        manifest = {
+            "commands": {"tailscale": "/usr/bin/tailscale"},
+            "config": {"path": "/private/config"},
+        }
+        config = SimpleNamespace(
+            backend_origin="https://node.example-tail.ts.net",
+            reviewer_auth=SimpleNamespace(
+                mode="tailscale_capability_or_pairing",
+                tailscale_app_capabilities={capability: [{}]},
+            ),
+        )
+        with mock.patch.object(
+            RECONCILER,
+            "load_public_config",
+            return_value=config,
+        ), mock.patch.object(
+            RECONCILER.tailnet_gate,
+            "_validate_tailnet_status",
+            return_value="node.example-tail.ts.net",
+        ), mock.patch.object(
+            RECONCILER.tailnet_gate,
+            "_validate_serve_status",
+        ) as serve_validator:
+            _status, active = RECONCILER._tailnet_state(
+                manifest,
+                Path("/sealed/immutable-compose.json"),
+                runner,
+            )
+        self.assertTrue(active)
+        serve_validator.assert_called_once_with(
+            serve,
+            "node.example-tail.ts.net",
+            capability,
+        )
+
+    def test_serve_enable_forwards_only_the_configured_app_capability(self) -> None:
+        manifest = {
+            "commands": {"tailscale": "/usr/bin/tailscale"},
+            "config": {"path": "/private/config"},
+        }
+        capability = "auth.example.invalid/cap/tacua-reviewer"
+        config = SimpleNamespace(
+            reviewer_auth=SimpleNamespace(
+                mode="tailscale_capability_or_pairing",
+                tailscale_app_capabilities={capability: [{}]},
+            )
+        )
+        runner = mock.Mock()
+        with mock.patch.object(
+            RECONCILER,
+            "load_public_config",
+            return_value=config,
+        ), mock.patch.object(
+            RECONCILER,
+            "_tailnet_state",
+            return_value=({}, True),
+        ):
+            RECONCILER._enable_serve(
+                manifest,
+                Path("/sealed/immutable-compose.json"),
+                runner,
+            )
+        runner.assert_called_once_with(
+            [
+                "/usr/bin/tailscale",
+                "serve",
+                "--bg",
+                "--yes",
+                f"--accept-app-caps={capability}",
+                "http://127.0.0.1:8080",
+            ],
+            timeout=30,
+        )
+
+    def test_serve_enable_keeps_legacy_profile_backward_compatible(self) -> None:
+        manifest = {
+            "commands": {"tailscale": "/usr/bin/tailscale"},
+            "config": {"path": "/private/config"},
+        }
+        runner = mock.Mock()
+        with mock.patch.object(
+            RECONCILER,
+            "load_public_config",
+            return_value=SimpleNamespace(),
+        ), mock.patch.object(
+            RECONCILER,
+            "_tailnet_state",
+            return_value=({}, True),
+        ):
+            RECONCILER._enable_serve(
+                manifest,
+                Path("/sealed/immutable-compose.json"),
+                runner,
+            )
+        runner.assert_called_once_with(
+            [
+                "/usr/bin/tailscale",
+                "serve",
+                "--bg",
+                "--yes",
+                "http://127.0.0.1:8080",
+            ],
+            timeout=30,
         )
 
     def test_systemd_unit_uses_exact_shared_lock_exception(self) -> None:

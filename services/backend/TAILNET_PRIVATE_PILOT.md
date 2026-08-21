@@ -17,6 +17,8 @@ Tailscale's control plane, that image registry, and the public certificate
 authority used for the `*.ts.net` certificate remain external dependencies.
 
 Require Docker Engine 28.0.0 or newer and Docker Compose 2.24.4 or newer.
+The app-capability reviewer profile also requires Tailscale 1.92.0 or newer;
+the checked verifier binds that minimum to the installed status document.
 Docker documents that [localhost-published ports could be reached by hosts on
 the same layer-2 segment before Engine
 28](https://docs.docker.com/engine/network/port-publishing/#publishing-ports).
@@ -27,6 +29,7 @@ is reviewed. Record both versions before setup:
 ```sh
 docker version --format '{{.Server.Version}}'
 docker compose version --short
+tailscale version
 ```
 
 This is a **private-pilot/test profile, not the production ingress described in
@@ -61,14 +64,75 @@ logging contract. Do not use this profile as production-promotion evidence.
 - [Tailscale Serve injects identity
   headers](https://tailscale.com/docs/features/tailscale-serve#identity-headers)
   containing the tailnet user's login, display name, and profile-picture URL.
-  Tacua does not use those headers as authorization. Treat them as transient
-  PII visible to Serve, the ingress, and backend request handling; never add
-  them to logs, tickets, or evidence. The ingress removes these headers before
-  forwarding static reviewer requests.
+  Tacua does not use those identity headers as authorization. In the explicit
+  reviewer-auth profile below, Serve instead forwards one configured app
+  capability in `Tailscale-App-Capabilities`. Treat all Tailscale headers as
+  transient metadata visible to Serve, the ingress, and backend request
+  handling; never add them to logs, tickets, or evidence. The ingress preserves
+  the app-capability header only for fixed API paths and removes every
+  Tailscale header before forwarding static reviewer requests.
+- Serve removes an inbound `Tailscale-App-Capabilities` header before injecting
+  its own policy-derived value. That protection applies only when traffic
+  actually traverses Serve. A local host process can connect directly to
+  `127.0.0.1:8080` and forge the header, so this single-owner profile explicitly
+  trusts the mini-PC host and runs no untrusted local workloads. The ingress,
+  backend, and reviewer remain inaccessible from the LAN and tailnet except
+  through Serve. Do not use this header-auth profile on a shared host without a
+  stronger proxy-to-backend authenticity boundary.
 - The tested app's SDK profile pins the exact HTTPS origin at native build time.
   A TestFlight or preview build cannot switch origins through JavaScript or an
-  OTA update. The reviewer app can change its HTTPS origin in Settings without
-  rebuilding.
+  OTA update. This backend revision exposes reviewer-scoped session, bootstrap,
+  and launch APIs on that origin. The reviewer UI in this revision still uses
+  its Settings form and administrator-authenticated `/v1/admin/*` client;
+  automatic capability and pairing consumption lands with the companion client
+  change.
+
+## Reviewer authorization profile
+
+For the capability-scoped backend profile, choose one app-capability name below
+a domain you control. Replace every angle-bracket placeholder; do not copy a
+sample or third-party domain into a live policy. The same exact capability name
+appears in the tailnet policy and public Tacua config.
+
+Add a narrowly scoped grant to the tailnet policy. Select only the reviewer
+user/group as `src` and this mini-PC (or its dedicated tag) as `dst`:
+
+```json
+{
+  "grants": [
+    {
+      "src": ["<reviewer-user-or-group-selector>"],
+      "dst": ["<mini-pc-user-or-tag-selector>"],
+      "ip": ["tcp:443"],
+      "app": {
+        "<your-owned-domain>/cap/tacua-reviewer": [{}]
+      }
+    }
+  ]
+}
+```
+
+Configure the matching public, credential-free backend policy in
+`services/backend/local/config.template.json` before compiling the live config:
+
+```json
+{
+  "reviewer_auth": {
+    "mode": "tailscale_capability_or_pairing",
+    "tailscale_app_capabilities": {
+      "<your-owned-domain>/cap/tacua-reviewer": [{}]
+    }
+  }
+}
+```
+
+The empty parameter object means possession of this grant authorizes the
+current reviewer role. Tacua compares the complete JSON parameter array, not
+merely the capability name. Tailnet selector changes that preserve this payload
+require no Tacua secret rotation; changing the payload also requires the
+matching public Tacua configuration. `legacy_admin` remains available during
+migration. The backend capability mode is ready for compatible clients, but the
+reviewer UI in this revision does not yet consume it automatically.
 
 ## 1. Verify the candidate before creating live inputs
 
@@ -371,7 +435,20 @@ rollback_serve() {
   fi
 }
 trap 'rollback_serve' ERR
-tailscale serve --bg --yes http://127.0.0.1:8080
+reviewer_app_capability="$(
+  PYTHONPATH=services/backend/src python3 -B -c '
+from pathlib import Path
+from tacua_backend.config import load_public_config
+config = load_public_config(Path("services/backend/local/config.json"))
+capabilities = config.reviewer_auth.tailscale_app_capabilities or {}
+print(next(iter(capabilities), ""))
+'
+)"
+serve_arguments=(--bg --yes)
+if [ -n "$reviewer_app_capability" ]; then
+  serve_arguments+=("--accept-app-caps=$reviewer_app_capability")
+fi
+tailscale serve "${serve_arguments[@]}" http://127.0.0.1:8080
 tailscale status --json > "$runtime_directory/tailscale-status.json"
 tailscale serve status --json > "$runtime_directory/serve-status.json"
 python3 -B services/backend/scripts/verify_tailnet_private_pilot.py \
@@ -405,7 +482,10 @@ the stop workflow creates a fresh one rather than retaining tailnet metadata.
 
 The final command verifies that the sealed origin, base Compose topology,
 Tailscale identity, certificate domain, listener, handler, and loopback target
-agree exactly.
+agree exactly. In the capability profile it also requires the handler's sole
+`AcceptAppCaps` value to equal the singleton capability name in the sealed
+public config; missing, additional, or substituted forwarded capabilities fail
+closed. The reconciler derives and applies the same flag automatically.
 
 The verifier fails closed on Funnel, extra ports or handlers, origin drift,
 offline/MagicDNS/certificate drift, a non-loopback target, direct backend
@@ -429,20 +509,39 @@ PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool \
   --admin-secret-file services/backend/local/admin-secret
 ```
 
+The backend accepts the configured app capability on reviewer-scoped endpoints
+without pairing. A pairing-capable client may instead create a ten-minute
+request and display its code; approve that request on this Docker host with the
+command below. The reviewer UI in this revision does not yet initiate either
+flow, so loading that UI does not prove scoped authentication. Do not copy the
+administrator secret into the browser or phone:
+
+```sh
+PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool \
+  approve-reviewer-pairing \
+  --config-file services/backend/local/config.json \
+  --admin-secret-file services/backend/local/admin-secret \
+  --code ABCD-EFGH
+```
+
 Then verify from the physical iPhone:
 
 1. Tailscale is connected.
-2. The reviewer saves the exact HTTPS origin and passes its `/version` probe.
-3. The reviewer launches the dedicated QA build through its configured custom
-   scheme.
+2. The static reviewer shell loads at the exact HTTPS origin. Its current
+   Settings form is the legacy administrator-authenticated client and is not
+   proof of scoped authentication.
+3. Exercise the capability and pairing endpoints with the backend integration
+   tests or a compatible client. Defer the zero-form reviewer launch and
+   evidence acceptance steps until the companion reviewer-client change is
+   deployed.
 4. Consent, capture, stop, foreground upload, completion, recovery, deletion,
    and reviewer evidence access work through the tailnet address.
 5. A maximum configured segment uploads successfully through Serve without a
    redirect, whole-request timeout, body transformation, or truncated receipt.
 
 The normal backend smoke is necessary but does not prove Serve's behavior for a
-maximum-duration upload. Never copy the administrator secret to the phone;
-normal device tests use the launch and SDK credentials issued by the backend.
+maximum-duration upload. Do not copy the administrator secret to the phone
+under this scoped-auth profile.
 
 ## Stop and recover
 

@@ -5,15 +5,17 @@
 from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hmac
 import json
 import re
-from typing import Any
+from typing import Any, NoReturn
 from urllib.parse import urlsplit
 
 from . import __version__
 from .config import DIAGNOSTIC_REQUEST_OVERHEAD_ALLOWANCE_BYTES
 from .contracts import PROTOCOL_VERSION, canonical_json
 from .service import (
+    AuthenticatedReviewer,
     ApiError,
     DuplicateJSONKey,
     InvalidJSONValue,
@@ -30,6 +32,87 @@ from .service import (
 ID = r"[a-z][a-z0-9_-]{2,63}"
 SEQUENCE = r"(?:0|[1-9][0-9]{0,3})"
 VERSION = r"[1-9][0-9]{0,15}"
+REVIEWER_COOKIE_NAME = "__Host-tacua-reviewer"
+REVIEWER_CSRF_HEADER = "Tacua-CSRF-Token"
+REVIEWER_SESSION_COOKIE_MAX_AGE = 2_592_000
+REVIEWER_READ_SCOPE = "reviewer.read"
+REVIEWER_LAUNCH_SCOPE = "reviewer.launch"
+REVIEWER_WRITE_SCOPE = "reviewer.write"
+
+
+def _reviewer_route_alias(
+    method: str,
+    path: str,
+) -> tuple[str, str, bool] | None:
+    """Map only explicitly reviewer-safe routes onto legacy service handlers."""
+
+    if method == "GET":
+        exact = {
+            "/v1/reviewer/bootstrap": "/v1/admin/reviewer-bootstrap",
+            "/v1/reviewer/builds": "/v1/admin/builds",
+            "/v1/reviewer/sessions": "/v1/admin/sessions",
+            "/v1/reviewer/jobs": "/v1/admin/jobs",
+            "/v1/reviewer/audit-events": "/v1/admin/audit-events",
+        }
+        if path in exact:
+            return exact[path], REVIEWER_READ_SCOPE, False
+        patterns = (
+            rf"/v1/reviewer/sessions/{ID}",
+            rf"/v1/reviewer/sessions/{ID}/candidates",
+            rf"/v1/reviewer/jobs/{ID}",
+            rf"/v1/reviewer/candidates/{ID}",
+            rf"/v1/reviewer/candidates/{ID}/supersession",
+            rf"/v1/reviewer/candidates/{ID}/versions/{VERSION}/evidence",
+            rf"/v1/reviewer/candidates/{ID}/versions/{VERSION}/evidence/{ID}/preview",
+            rf"/v1/reviewer/candidates/{ID}(?:/versions/{VERSION})?/handoff\.(?:json|md)",
+        )
+        if any(re.fullmatch(pattern, path) for pattern in patterns):
+            return path.replace("/v1/reviewer/", "/v1/admin/", 1), REVIEWER_READ_SCOPE, False
+    elif method == "POST":
+        if path == "/v1/reviewer/launch-codes":
+            return "/v1/admin/launch-codes", REVIEWER_LAUNCH_SCOPE, True
+        if path == "/v1/reviewer/candidate-replacements" or re.fullmatch(
+            rf"/v1/reviewer/candidates/{ID}/transitions", path
+        ):
+            return path.replace("/v1/reviewer/", "/v1/admin/", 1), REVIEWER_WRITE_SCOPE, True
+    return None
+
+
+def _pairing_request_document(pairing: Any) -> dict[str, Any]:
+    return {
+        "pairing_id": pairing.pairing_id,
+        "pairing_token": pairing.pairing_token,
+        "human_code": pairing.human_code,
+        "device_label": pairing.device_label,
+        "client_kind": pairing.client_kind,
+        "created_at": pairing.created_at,
+        "expires_at": pairing.expires_at,
+    }
+
+
+def _approved_pairing_document(pairing: Any) -> dict[str, Any]:
+    return {
+        "pairing_id": pairing.pairing_id,
+        "device_label": pairing.device_label,
+        "client_kind": pairing.client_kind,
+        "scopes": list(pairing.scopes),
+        "created_at": pairing.created_at,
+        "approved_at": pairing.approved_at,
+        "expires_at": pairing.expires_at,
+    }
+
+
+def _reviewer_session_document(session: Any) -> dict[str, Any]:
+    return {
+        "session_id": session.session_id,
+        "reviewer_id": session.reviewer_id,
+        "device_label": session.device_label,
+        "client_kind": session.client_kind,
+        "scopes": list(session.scopes),
+        "created_at": session.created_at,
+        "expires_at": session.expires_at,
+        "revoked_at": session.revoked_at,
+    }
 
 
 class PilotHTTPServer(ThreadingHTTPServer):
@@ -136,6 +219,8 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
         return value
 
     def _admin(self) -> None:
+        if getattr(self, "_reviewer_alias_authorized", False):
+            return
         self.backend.authenticate_admin(self._bearer())
 
     def _reviewer_id(self) -> str:
@@ -155,6 +240,149 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
             )
         return reviewer_id
 
+    @staticmethod
+    def _reviewer_authentication_failed() -> NoReturn:
+        raise ApiError(
+            401,
+            "REVIEWER_AUTHENTICATION_FAILED",
+            "reviewer authentication failed",
+        )
+
+    def _reviewer_cookie(self) -> str | None:
+        values = self.headers.get_all("Cookie") or []
+        if not values:
+            return None
+        if len(values) != 1 or not values[0] or len(values[0]) > 8_192:
+            self._reviewer_authentication_failed()
+        found: str | None = None
+        for item in values[0].split(";"):
+            pair = item.strip()
+            if not pair or "=" not in pair:
+                self._reviewer_authentication_failed()
+            name, value = pair.split("=", 1)
+            if re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}", name) is None:
+                self._reviewer_authentication_failed()
+            if name != REVIEWER_COOKIE_NAME:
+                continue
+            if (
+                found is not None
+                or not value
+                or len(value) > 256
+                or re.fullmatch(r"[A-Za-z0-9_.-]+", value) is None
+            ):
+                self._reviewer_authentication_failed()
+            found = value
+        return found
+
+    def _reviewer(
+        self,
+        required_scope: str,
+    ) -> AuthenticatedReviewer:
+        authorization_values = self.headers.get_all("Authorization") or []
+        cookie = self._reviewer_cookie()
+        if authorization_values and cookie is not None:
+            self._reviewer_authentication_failed()
+        bearer = self._bearer()
+        if authorization_values and bearer is None:
+            self._reviewer_authentication_failed()
+
+        capabilities = tuple(
+            self.headers.get_all("Tailscale-App-Capabilities") or []
+        )
+        capability_principal = self.backend.authenticate_tailscale_reviewer(
+            capabilities,
+            required_scope=required_scope,
+        )
+        fallback = bearer if authorization_values else cookie
+
+        if self.backend.config.reviewer_auth.mode == "legacy_admin":
+            return self.backend.authenticate_legacy_reviewer(
+                fallback,
+                required_scope=required_scope,
+            )
+        if fallback is not None:
+            try:
+                return self.backend.authenticate_reviewer_session(
+                    fallback,
+                    required_scope=required_scope,
+                )
+            except ApiError as error:
+                if (
+                    authorization_values
+                    or capability_principal is None
+                    or error.status != 401
+                ):
+                    raise
+        if capability_principal is not None:
+            return capability_principal
+        self._reviewer_authentication_failed()
+
+    def _reviewer_origin(self) -> None:
+        values = self.headers.get_all("Origin") or []
+        if len(values) != 1 or values[0] != self.backend.config.backend_origin:
+            raise ApiError(
+                403,
+                "REVIEWER_ORIGIN_FORBIDDEN",
+                "reviewer request origin is not authorized",
+            )
+
+    def _optional_native_origin(self) -> None:
+        values = self.headers.get_all("Origin") or []
+        if not values:
+            return
+        if len(values) != 1 or values[0] != self.backend.config.backend_origin:
+            raise ApiError(
+                403,
+                "REVIEWER_ORIGIN_FORBIDDEN",
+                "reviewer request origin is not authorized",
+            )
+
+    def _reviewer_csrf(self, principal: AuthenticatedReviewer) -> None:
+        self._reviewer_origin()
+        values = self.headers.get_all(REVIEWER_CSRF_HEADER) or []
+        expected = self.backend.reviewer_csrf_token(principal)
+        if (
+            len(values) != 1
+            or not values[0]
+            or len(values[0]) > 128
+            or not hmac.compare_digest(values[0], expected)
+        ):
+            raise ApiError(
+                403,
+                "REVIEWER_CSRF_FORBIDDEN",
+                "reviewer request CSRF token is not authorized",
+            )
+
+    def _reviewer_principal_document(
+        self,
+        principal: AuthenticatedReviewer,
+    ) -> dict[str, Any]:
+        return {
+            "reviewer_id": principal.reviewer_id,
+            "auth_kind": principal.auth_kind,
+            "session_id": principal.session_id,
+            "device_label": principal.device_label,
+            "client_kind": principal.client_kind,
+            "scopes": list(principal.scopes),
+            "expires_at": principal.expires_at,
+            "csrf_token": self.backend.reviewer_csrf_token(principal),
+        }
+
+    @staticmethod
+    def _set_reviewer_cookie(token: str) -> str:
+        if not token or len(token) > 256 or re.fullmatch(r"[A-Za-z0-9_.-]+", token) is None:
+            raise RuntimeError("unsafe internal reviewer session token")
+        return (
+            f"{REVIEWER_COOKIE_NAME}={token}; Path=/; Secure; HttpOnly; "
+            f"SameSite=Strict; Max-Age={REVIEWER_SESSION_COOKIE_MAX_AGE}"
+        )
+
+    @staticmethod
+    def _clear_reviewer_cookie() -> str:
+        return (
+            f"{REVIEWER_COOKIE_NAME}=; Path=/; Secure; HttpOnly; "
+            "SameSite=Strict; Max-Age=0"
+        )
     def _entity_tag(self) -> str:
         value = self._single_header("If-Match", "CANDIDATE_ETAG_REQUIRED", 80)
         match = re.fullmatch(r'"(sha256:[a-f0-9]{64})"', value)
@@ -239,8 +467,18 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def _send_json(self, status: int, body: Any) -> None:
-        self._send_bytes(status, canonical_json(body).encode("utf-8"))
+    def _send_json(
+        self,
+        status: int,
+        body: Any,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self._send_bytes(
+            status,
+            canonical_json(body).encode("utf-8"),
+            headers=headers,
+        )
 
     def _send_protocol(self, response: StoredResponse) -> None:
         self._send_bytes(response.status, response.body)
@@ -278,6 +516,8 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
         self._send_bytes(error.status, payload, SDK_BACKEND_ERROR_MEDIA_TYPE)
 
     def _dispatch(self) -> None:
+        self._reviewer_alias_authorized = False
+        self._reviewer_alias_principal: AuthenticatedReviewer | None = None
         path = self._path()
         if self.command in {"GET", "DELETE"} and (
             self.headers.get("Transfer-Encoding") is not None
@@ -299,6 +539,144 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if self.command == "POST" and path == "/v1/reviewer/pairing-requests":
+            self._optional_native_origin()
+            body = self._read_json(16_384)
+            if (
+                not isinstance(body, dict)
+                or set(body) != {"device_label", "client_kind"}
+                or body.get("client_kind") not in {"web", "native"}
+            ):
+                raise ApiError(
+                    400,
+                    "INVALID_PAIRING_REQUEST",
+                    "pairing request metadata is invalid",
+                )
+            if body["client_kind"] == "web":
+                self._reviewer_origin()
+            else:
+                self._optional_native_origin()
+            pairing = self.backend.create_reviewer_pairing(
+                device_label=body["device_label"],
+                client_kind=body["client_kind"],
+            )
+            self._send_json(201, _pairing_request_document(pairing))
+            return
+
+        if self.command == "POST" and path == "/v1/reviewer/pairing-exchanges":
+            self._optional_native_origin()
+            body = self._read_json(16_384)
+            if (
+                not isinstance(body, dict)
+                or set(body) != {"pairing_token", "client_kind"}
+                or body.get("client_kind") not in {"web", "native"}
+            ):
+                raise ApiError(
+                    401,
+                    "REVIEWER_AUTHENTICATION_FAILED",
+                    "reviewer authentication failed",
+                )
+            if body["client_kind"] == "web":
+                self._reviewer_origin()
+            else:
+                self._optional_native_origin()
+            issued = self.backend.exchange_reviewer_pairing(
+                body["pairing_token"],
+                expected_client_kind=body["client_kind"],
+            )
+            principal = self.backend.authenticate_reviewer_session(
+                issued.session_token,
+                required_scope=REVIEWER_READ_SCOPE,
+            )
+            response = self._reviewer_principal_document(principal)
+            headers: dict[str, str] | None = None
+            if issued.session.client_kind == "web":
+                headers = {
+                    "Set-Cookie": self._set_reviewer_cookie(issued.session_token)
+                }
+            else:
+                response["session_token"] = issued.session_token
+            self._send_json(201, response, headers=headers)
+            return
+
+        if self.command == "GET" and path == "/v1/reviewer/session":
+            principal = self._reviewer(REVIEWER_READ_SCOPE)
+            self._send_json(200, self._reviewer_principal_document(principal))
+            return
+
+        if self.command == "DELETE" and path == "/v1/reviewer/session":
+            principal = self._reviewer(REVIEWER_READ_SCOPE)
+            self._reviewer_csrf(principal)
+            if principal.session_id is None:
+                raise ApiError(
+                    409,
+                    "REVIEWER_SESSION_NOT_REVOCABLE",
+                    "this reviewer authentication method is not a revocable session",
+                )
+            revoked = self.backend.revoke_reviewer_session(principal.session_id)
+            self._send_json(
+                200,
+                {"session": _reviewer_session_document(revoked)},
+                headers={"Set-Cookie": self._clear_reviewer_cookie()},
+            )
+            return
+
+        if self.command == "POST" and path == "/v1/reviewer/launch-links":
+            principal = self._reviewer(REVIEWER_LAUNCH_SCOPE)
+            self._reviewer_csrf(principal)
+            response = self.backend.create_reviewer_launch_link(
+                self._read_json(2_097_152),
+                reviewer=principal,
+            )
+            self._send_json(201, response)
+            return
+
+        if (
+            self.command == "POST"
+            and path == "/v1/admin/reviewer-pairing-approvals"
+        ):
+            self._admin()
+            body = self._read_json(16_384)
+            if not isinstance(body, dict) or set(body) != {"human_code"}:
+                raise ApiError(
+                    404,
+                    "PAIRING_APPROVAL_INVALID",
+                    "pairing approval code is invalid or unavailable",
+                )
+            approved = self.backend.approve_reviewer_pairing(body["human_code"])
+            self._send_json(200, _approved_pairing_document(approved))
+            return
+
+        if self.command == "GET" and path == "/v1/admin/reviewer-sessions":
+            self._admin()
+            sessions = self.backend.list_reviewer_sessions()
+            self._send_json(
+                200,
+                {"sessions": [_reviewer_session_document(item) for item in sessions]},
+            )
+            return
+
+        reviewer_admin_session = re.fullmatch(
+            rf"/v1/admin/reviewer-sessions/(?P<session_id>{ID})", path
+        )
+        if reviewer_admin_session and self.command == "DELETE":
+            self._admin()
+            revoked = self.backend.revoke_reviewer_session(
+                reviewer_admin_session.group("session_id")
+            )
+            self._send_json(200, {"session": _reviewer_session_document(revoked)})
+            return
+
+        reviewer_alias = _reviewer_route_alias(self.command, path)
+        if reviewer_alias is not None:
+            target_path, required_scope, unsafe = reviewer_alias
+            principal = self._reviewer(required_scope)
+            if unsafe:
+                self._reviewer_csrf(principal)
+            self._reviewer_alias_authorized = True
+            self._reviewer_alias_principal = principal
+            path = target_path
+
         if self.command == "GET" and path == "/v1/admin/builds":
             self._admin()
             self._send_json(200, {"builds": self.backend.list_builds()})
@@ -318,7 +696,13 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
             return
         if self.command == "POST" and path == "/v1/admin/launch-codes":
             self._admin()
-            self._send_json(201, self.backend.create_launch_code(self._read_json(2_097_152)))
+            self._send_json(
+                201,
+                self.backend.create_launch_code(
+                    self._read_json(2_097_152),
+                    reviewer=self._reviewer_alias_principal,
+                ),
+            )
             return
         if self.command == "POST" and path == "/v1/sdk/launch-exchanges":
             self._send_protocol(self.backend.exchange_launch_code(self._read_json(2_097_152)))
