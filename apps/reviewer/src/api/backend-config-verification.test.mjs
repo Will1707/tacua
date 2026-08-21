@@ -136,19 +136,65 @@ test("uses the manual transport 1.1 fields only when the additive endpoint is ab
   assert.equal(verified.targetScheme, "tacua-qa-app");
 });
 
-test("rejects an ambiguous reviewer bootstrap before persistence", async () => {
-  let persisted = 0;
-  await assert.rejects(() => verifyAndPersistBackendConfig(candidate(), {
+test("keeps the normalized manual scheme for a bootstrapped transport 1.1 build", async () => {
+  const verified = await verifyBackendConfig(candidate({
+    reviewerId: "reviewer_typo",
+    targetScheme: "manual-legacy-qa",
+  }), {
     async probeBackend() {},
     createClient() {
       return {
-        async getReviewerBootstrap() { return bootstrap({ builds: [] }); },
-        async verifyReviewerIdentity() { assert.fail("identity binding followed an ambiguous bootstrap"); },
+        async getReviewerBootstrap() {
+          const document = bootstrap();
+          document.builds[0].launch_scheme = null;
+          return document;
+        },
+        async verifyReviewerIdentity() {},
         async listBuilds() { throw new Error("unexpected legacy fallback"); },
       };
     },
+  });
+
+  assert.equal(verified.reviewerId, "reviewer_owner");
+  assert.equal(verified.targetScheme, "manual-legacy-qa");
+});
+
+test("rejects an ambiguous reviewer bootstrap before persistence", async () => {
+  const oneBuild = bootstrap().builds[0];
+  for (const builds of [[], [oneBuild, { ...oneBuild, build_id: "build_second" }]]) {
+    let persisted = 0;
+    await assert.rejects(() => verifyAndPersistBackendConfig(candidate(), {
+      async probeBackend() {},
+      createClient() {
+        return {
+          async getReviewerBootstrap() { return bootstrap({ builds }); },
+          async verifyReviewerIdentity() { assert.fail("identity binding followed an ambiguous bootstrap"); },
+          async listBuilds() { throw new Error("unexpected legacy fallback"); },
+        };
+      },
+      async persistConfig() { persisted += 1; },
+    }), /exactly one reviewer build/);
+    assert.equal(persisted, 0);
+  }
+});
+
+test("does not persist when the bootstrap-derived reviewer binding fails", async () => {
+  let clients = 0;
+  let persisted = 0;
+  await assert.rejects(() => verifyAndPersistBackendConfig(candidate({
+    reviewerId: "reviewer_typo",
+  }), {
+    async probeBackend() {},
+    createClient() {
+      clients += 1;
+      if (clients === 1) return authenticatedClient();
+      return authenticatedClient({
+        onIdentityBinding: () => { throw new Error("authoritative identity rejected"); },
+      });
+    },
     async persistConfig() { persisted += 1; },
-  }), /exactly one reviewer build/);
+  }), /authoritative identity rejected/);
+  assert.equal(clients, 2);
   assert.equal(persisted, 0);
 });
 

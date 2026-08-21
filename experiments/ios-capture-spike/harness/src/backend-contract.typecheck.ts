@@ -189,6 +189,8 @@ export async function typecheckBackendContract(): Promise<void> {
   const maxSegmentBytes: number = transport.maxSegmentBytes;
   const maxDiagnosticBytes: number = transport.maxDiagnosticBytes;
   const maxCompletionBytes: number = transport.maxCompletionBytes;
+  const launchScheme: string = transport.launchScheme;
+  void launchScheme;
   const discovered: readonly TacuaCapture.BackendSessionDiscoveryRecord[] =
     await TacuaCapture.listBackendSessions();
   for (const record of discovered) {

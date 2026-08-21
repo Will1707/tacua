@@ -261,6 +261,7 @@ type BackendTransportConfiguration = {
   readonly credentialStorage: "ios_keychain_when_unlocked_this_device_only";
   readonly launchCodePersistence: "transient_only";
   readonly redirectPolicy: "reject_all";
+  readonly launchScheme: string;
   readonly launchURLTemplate: string;
 };
 

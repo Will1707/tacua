@@ -102,6 +102,7 @@ public final class TacuaCaptureSpikeModule: Module {
         "credentialStorage": "ios_keychain_when_unlocked_this_device_only",
         "launchCodePersistence": "transient_only",
         "redirectPolicy": "reject_all",
+        "launchScheme": launchConfiguration.scheme,
         "launchURLTemplate": "\(launchConfiguration.scheme)://tacua/start?launch_code=<opaque>",
       ]
     }
