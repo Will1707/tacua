@@ -93,6 +93,8 @@ enum TacuaBackendConfigurationError: Error, Equatable {
   case insecureOrigin
   case loopbackDevelopmentOnly
   case invalidTransportLimit
+  case invalidTransportPolicy
+  case invalidLaunchScheme
   case invalidPathSegment
   case buildIdentityMismatch
 }
@@ -103,7 +105,10 @@ struct TacuaBackendConfiguration: Equatable {
   static let maxSegmentBytesInfoPlistKey = "TacuaMaxSegmentBytes"
   static let maxDiagnosticBytesInfoPlistKey = "TacuaMaxDiagnosticBytes"
   static let maxCompletionBytesInfoPlistKey = "TacuaMaxCompletionBytes"
-  static let policyVersion = "tacua.sdk-transport@1.1.0"
+  static let transportPolicyVersionInfoPlistKey = "TacuaTransportPolicyVersion"
+  static let launchSchemeInfoPlistKey = "TacuaLaunchScheme"
+  static let legacyPolicyVersion = "tacua.sdk-transport@1.1.0"
+  static let launchSchemePolicyVersion = "tacua.sdk-transport@1.2.0"
   static let maxSegmentBytesUpperBound = 1_073_741_824
   static let maxDiagnosticBytesUpperBound = 3_145_728
   static let maxCompletionBytesUpperBound = 4_194_304
@@ -116,6 +121,8 @@ struct TacuaBackendConfiguration: Equatable {
   let maxSegmentBytes: Int
   let maxDiagnosticBytes: Int
   let maxCompletionBytes: Int
+  let policyVersion: String
+  let launchScheme: String?
   let configurationDigest: String
   /// Present for the real app-bundle configuration path. Direct construction is retained for
   /// isolated protocol tests and non-bundle tooling, which do not have an Info.plist authority.
@@ -128,12 +135,29 @@ struct TacuaBackendConfiguration: Equatable {
     maxSegmentBytes: Int = Self.defaultMaxSegmentBytes,
     maxDiagnosticBytes: Int = Self.defaultMaxDiagnosticBytes,
     maxCompletionBytes: Int = Self.defaultMaxCompletionBytes,
+    transportPolicyVersion: String = Self.legacyPolicyVersion,
+    launchScheme: String? = nil,
     qaBuildConfiguration: TacuaQABuildConfiguration? = nil
   ) throws {
     guard (1...Self.maxSegmentBytesUpperBound).contains(maxSegmentBytes),
       (1_024...Self.maxDiagnosticBytesUpperBound).contains(maxDiagnosticBytes),
       (1_024...Self.maxCompletionBytesUpperBound).contains(maxCompletionBytes)
     else { throw TacuaBackendConfigurationError.invalidTransportLimit }
+    let validatedLaunchScheme: String?
+    switch transportPolicyVersion {
+    case Self.legacyPolicyVersion:
+      guard launchScheme == nil else {
+        throw TacuaBackendConfigurationError.invalidLaunchScheme
+      }
+      validatedLaunchScheme = nil
+    case Self.launchSchemePolicyVersion:
+      guard let launchScheme, Self.validLaunchScheme(launchScheme) else {
+        throw TacuaBackendConfigurationError.invalidLaunchScheme
+      }
+      validatedLaunchScheme = launchScheme
+    default:
+      throw TacuaBackendConfigurationError.invalidTransportPolicy
+    }
     guard var components = URLComponents(string: buildConfiguredOrigin),
       let rawScheme = components.scheme,
       let rawHost = components.host,
@@ -184,16 +208,20 @@ struct TacuaBackendConfiguration: Equatable {
     self.maxSegmentBytes = maxSegmentBytes
     self.maxDiagnosticBytes = maxDiagnosticBytes
     self.maxCompletionBytes = maxCompletionBytes
+    policyVersion = transportPolicyVersion
+    self.launchScheme = validatedLaunchScheme
     self.qaBuildConfiguration = qaBuildConfiguration
-    configurationDigest = try TacuaCanonicalJSON.digest(
-      .object([
-        "backend_origin": .string(normalized),
-        "max_completion_bytes": .integer(Int64(maxCompletionBytes)),
-        "max_diagnostic_bytes": .integer(Int64(maxDiagnosticBytes)),
-        "max_segment_bytes": .integer(Int64(maxSegmentBytes)),
-        "transport_policy_version": .string(Self.policyVersion),
-      ])
-    )
+    var transportConfiguration: [String: TacuaJSONValue] = [
+      "backend_origin": .string(normalized),
+      "max_completion_bytes": .integer(Int64(maxCompletionBytes)),
+      "max_diagnostic_bytes": .integer(Int64(maxDiagnosticBytes)),
+      "max_segment_bytes": .integer(Int64(maxSegmentBytes)),
+      "transport_policy_version": .string(transportPolicyVersion),
+    ]
+    if let validatedLaunchScheme {
+      transportConfiguration["launch_scheme"] = .string(validatedLaunchScheme)
+    }
+    configurationDigest = try TacuaCanonicalJSON.digest(.object(transportConfiguration))
   }
 
   static func fromBuildConfiguration(
@@ -211,6 +239,28 @@ struct TacuaBackendConfiguration: Equatable {
     }
     let allowInsecureLoopback =
       bundle.object(forInfoDictionaryKey: insecureLoopbackInfoPlistKey) as? Bool ?? false
+    let rawTransportPolicyVersion = bundle.object(
+      forInfoDictionaryKey: transportPolicyVersionInfoPlistKey
+    )
+    let transportPolicyVersion: String
+    if rawTransportPolicyVersion == nil {
+      transportPolicyVersion = Self.legacyPolicyVersion
+    } else if let configuredVersion = rawTransportPolicyVersion as? String {
+      transportPolicyVersion = configuredVersion
+    } else {
+      throw TacuaBackendConfigurationError.invalidTransportPolicy
+    }
+    let launchScheme: String?
+    if transportPolicyVersion == Self.launchSchemePolicyVersion {
+      guard let configuredScheme = bundle.object(
+        forInfoDictionaryKey: launchSchemeInfoPlistKey
+      ) as? String else {
+        throw TacuaBackendConfigurationError.invalidLaunchScheme
+      }
+      launchScheme = configuredScheme
+    } else {
+      launchScheme = nil
+    }
     guard let maxSegmentBytes = Self.infoPlistInteger(
       bundle: bundle,
       key: maxSegmentBytesInfoPlistKey
@@ -228,6 +278,8 @@ struct TacuaBackendConfiguration: Equatable {
       maxSegmentBytes: maxSegmentBytes,
       maxDiagnosticBytes: maxDiagnosticBytes,
       maxCompletionBytes: maxCompletionBytes,
+      transportPolicyVersion: transportPolicyVersion,
+      launchScheme: launchScheme,
       qaBuildConfiguration: qaBuildConfiguration
     )
   }
@@ -271,6 +323,17 @@ struct TacuaBackendConfiguration: Equatable {
 
   private static func isLoopback(_ host: String) -> Bool {
     host == "localhost" || host == "127.0.0.1" || host == "::1"
+  }
+
+  private static func validLaunchScheme(_ value: String) -> Bool {
+    let reserved: Set<String> = [
+      "about", "blob", "data", "facetime", "facetime-audio", "file", "ftp", "ftps",
+      "http", "https", "itms", "itms-apps", "javascript", "mailto", "sms", "tacua",
+      "tel", "webcal", "ws", "wss",
+    ]
+    return value == value.precomposedStringWithCanonicalMapping
+      && value.range(of: "^[a-z][a-z0-9+.-]{1,63}$", options: .regularExpression) != nil
+      && !reserved.contains(value)
   }
 
   private static func infoPlistInteger(bundle: Bundle, key: String) -> Int? {

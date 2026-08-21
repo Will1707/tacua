@@ -17,7 +17,9 @@ private func expectConfigurationError(
   debugBuild: Bool = false,
   maxSegmentBytes: Int = TacuaBackendConfiguration.defaultMaxSegmentBytes,
   maxDiagnosticBytes: Int = TacuaBackendConfiguration.defaultMaxDiagnosticBytes,
-  maxCompletionBytes: Int = TacuaBackendConfiguration.defaultMaxCompletionBytes
+  maxCompletionBytes: Int = TacuaBackendConfiguration.defaultMaxCompletionBytes,
+  transportPolicyVersion: String = TacuaBackendConfiguration.legacyPolicyVersion,
+  launchScheme: String? = nil
 ) throws {
   do {
     _ = try TacuaBackendConfiguration(
@@ -26,7 +28,9 @@ private func expectConfigurationError(
       debugBuild: debugBuild,
       maxSegmentBytes: maxSegmentBytes,
       maxDiagnosticBytes: maxDiagnosticBytes,
-      maxCompletionBytes: maxCompletionBytes
+      maxCompletionBytes: maxCompletionBytes,
+      transportPolicyVersion: transportPolicyVersion,
+      launchScheme: launchScheme
     )
     throw BackendConfigurationTestFailure.assertion("Expected \(expected), but origin was accepted")
   } catch let error as TacuaBackendConfigurationError {
@@ -40,6 +44,7 @@ enum BackendConfigurationTests {
     try qaBuildGateRejectsProductionAndMalformedConfiguration()
     try buildIdentityMustMatchNativeQABuildAuthority()
     try normalizesBuildConfiguredHTTPSOrigin()
+    try transportV12SealsTheDedicatedLaunchScheme()
     try transportLimitsAreExactNativeConfiguration()
     try bundleConfigurationReadsExactTransportLimits()
     try rejectsRuntimeOverrideShapes()
@@ -136,6 +141,11 @@ enum BackendConfigurationTests {
     )
     try require(config.normalizedOrigin == "https://qa.example.com", "Origin was not normalized")
     try require(
+      config.policyVersion == TacuaBackendConfiguration.legacyPolicyVersion
+        && config.launchScheme == nil,
+      "Legacy transport defaults changed"
+    )
+    try require(
       config.configurationDigest
         == "sha256:edb112f00c2dfd730be887ac981f0bf6eeaaec72180506cfbf1541fb25652ac2",
       "Configuration digest does not match the protocol subject"
@@ -149,6 +159,55 @@ enum BackendConfigurationTests {
     try require(
       slashConfig.configurationDigest == config.configurationDigest,
       "Equivalent origins produced different configuration digests"
+    )
+  }
+
+  private static func transportV12SealsTheDedicatedLaunchScheme() throws {
+    let configuration = try TacuaBackendConfiguration(
+      buildConfiguredOrigin: "https://qa.example.com",
+      allowInsecureLoopback: false,
+      debugBuild: false,
+      transportPolicyVersion: TacuaBackendConfiguration.launchSchemePolicyVersion,
+      launchScheme: "example-tacua-qa"
+    )
+    try require(
+      configuration.policyVersion == "tacua.sdk-transport@1.2.0",
+      "Wrong V1.2 policy"
+    )
+    try require(configuration.launchScheme == "example-tacua-qa", "Launch scheme was lost")
+    let expectedDigest = try TacuaCanonicalJSON.digest(
+      .object([
+        "backend_origin": .string("https://qa.example.com"),
+        "launch_scheme": .string("example-tacua-qa"),
+        "max_completion_bytes": .integer(4_194_304),
+        "max_diagnostic_bytes": .integer(3_145_728),
+        "max_segment_bytes": .integer(268_435_456),
+        "transport_policy_version": .string("tacua.sdk-transport@1.2.0"),
+      ])
+    )
+    try require(configuration.configurationDigest == expectedDigest, "Wrong V1.2 digest")
+
+    try expectConfigurationError(
+      .invalidLaunchScheme,
+      origin: "https://qa.example.com",
+      transportPolicyVersion: TacuaBackendConfiguration.launchSchemePolicyVersion
+    )
+    try expectConfigurationError(
+      .invalidLaunchScheme,
+      origin: "https://qa.example.com",
+      transportPolicyVersion: TacuaBackendConfiguration.launchSchemePolicyVersion,
+      launchScheme: "https"
+    )
+    try expectConfigurationError(
+      .invalidLaunchScheme,
+      origin: "https://qa.example.com",
+      transportPolicyVersion: TacuaBackendConfiguration.legacyPolicyVersion,
+      launchScheme: "example-tacua-qa"
+    )
+    try expectConfigurationError(
+      .invalidTransportPolicy,
+      origin: "https://qa.example.com",
+      transportPolicyVersion: "tacua.sdk-transport@2.0.0"
     )
   }
 
@@ -215,6 +274,9 @@ enum BackendConfigurationTests {
       TacuaBackendConfiguration.maxSegmentBytesInfoPlistKey: 8_388_608,
       TacuaBackendConfiguration.maxDiagnosticBytesInfoPlistKey: 2_097_152,
       TacuaBackendConfiguration.maxCompletionBytesInfoPlistKey: 4_194_304,
+      TacuaBackendConfiguration.transportPolicyVersionInfoPlistKey:
+        TacuaBackendConfiguration.launchSchemePolicyVersion,
+      TacuaBackendConfiguration.launchSchemeInfoPlistKey: "example-tacua-qa",
     ]
     let plistBytes = try PropertyListSerialization.data(
       fromPropertyList: plist,
@@ -232,6 +294,11 @@ enum BackendConfigurationTests {
     try require(configuration.maxSegmentBytes == 8_388_608, "Bundle segment pin was lost")
     try require(configuration.maxDiagnosticBytes == 2_097_152, "Bundle diagnostic pin was lost")
     try require(configuration.maxCompletionBytes == 4_194_304, "Bundle completion pin was lost")
+    try require(
+      configuration.policyVersion == TacuaBackendConfiguration.launchSchemePolicyVersion
+        && configuration.launchScheme == "example-tacua-qa",
+      "Bundle V1.2 launch pin was lost"
+    )
   }
 
   private static func rejectsRuntimeOverrideShapes() throws {

@@ -312,6 +312,10 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
                 self.backend.verify_reviewer_identity(self._reviewer_id()),
             )
             return
+        if self.command == "GET" and path == "/v1/admin/reviewer-bootstrap":
+            self._admin()
+            self._send_json(200, self.backend.reviewer_bootstrap())
+            return
         if self.command == "POST" and path == "/v1/admin/launch-codes":
             self._admin()
             self._send_json(201, self.backend.create_launch_code(self._read_json(2_097_152)))

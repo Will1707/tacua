@@ -1478,6 +1478,24 @@ class OperatorToolTests(unittest.TestCase):
                             }
                         ]
                     },
+                    "/v1/admin/reviewer-bootstrap": {
+                        "contract_version": "tacua.reviewer-bootstrap@1.0.0",
+                        "reviewer_id": config.reviewer_id,
+                        "builds": [
+                            {
+                                "build_id": config.build_id,
+                                "application_id": config.application_id,
+                                "bundle_identifier": config.bundle_identifier,
+                                "native_version": config.build_identity[
+                                    "native_version"
+                                ],
+                                "native_build": config.build_identity["native_build"],
+                                "distribution": config.build_identity["distribution"],
+                                "build_identity_digest": config.build_identity_digest,
+                                "launch_scheme": config.launch_scheme,
+                            }
+                        ],
+                    },
                 }
             )
             result = smoke_deployment(
@@ -1489,7 +1507,12 @@ class OperatorToolTests(unittest.TestCase):
             )
             self.assertEqual("ok", result["status"])
             self.assertEqual(
-                [None, None, f"Bearer {secret.decode('utf-8')}"],
+                [
+                    None,
+                    None,
+                    f"Bearer {secret.decode('utf-8')}",
+                    f"Bearer {secret.decode('utf-8')}",
+                ],
                 [authorization for _url, authorization in opener.requests],
             )
 

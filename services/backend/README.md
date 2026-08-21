@@ -412,6 +412,7 @@ validated constants but are never used without the complete machine binding.
 | `GET` | `/version` | public | Service and protocol version |
 | `GET` | `/v1/admin/builds` | admin bearer | List the registered reviewer build projection |
 | `GET` | `/v1/admin/reviewer-binding` | admin bearer plus `Tacua-Reviewer-ID` | Verify the claimed reviewer identity and return status only |
+| `GET` | `/v1/admin/reviewer-bootstrap` | admin bearer | Read the exact versioned reviewer identity and per-build launch metadata |
 | `POST` | `/v1/admin/launch-codes` | admin bearer | Create a start or resume grant |
 | `POST` | `/v1/sdk/launch-exchanges` | launch code in body | Start/resume and issue the client-owned credential |
 | `PUT` | `/v1/sdk/sessions/{session}/segments/{sequence}/{segment}` | SDK bearer | Upload/recover media |
@@ -433,6 +434,36 @@ validated constants but are never used without the complete machine binding.
 | `GET` | `/v1/admin/candidates/{candidate}/versions/{version}/handoff.{json,md}` | admin bearer | Download one immutable approved handoff version |
 | `GET` | `/v1/admin/audit-events` | admin bearer | List one bounded page of content-free audit events |
 | `DELETE` | `/v1/admin/sessions/{session}` | admin bearer | Operator-requested scoped erasure |
+
+`GET /v1/admin/reviewer-bootstrap` is the transitional administrator-authenticated
+bootstrap used while reviewer-scoped authentication is introduced. Its exact
+`tacua.reviewer-bootstrap@1.0.0` response is:
+
+```json
+{
+  "contract_version": "tacua.reviewer-bootstrap@1.0.0",
+  "reviewer_id": "reviewer_owner",
+  "builds": [
+    {
+      "build_id": "build_...",
+      "application_id": "application_...",
+      "bundle_identifier": "com.example.qa",
+      "native_version": "1.0.0",
+      "native_build": "1",
+      "distribution": "internal",
+      "build_identity_digest": "sha256:...",
+      "launch_scheme": "example-qa"
+    }
+  ]
+}
+```
+
+The object and every build use exact keys. `reviewer_id` is the deployment-pinned
+reviewer actor. `launch_scheme` is the scheme sealed into that build's transport
+1.2 configuration. A legacy transport 1.1 build is represented without changing
+the response shape by the single exception `"launch_scheme": null`; clients must
+not construct a launch URL from that value. The older `/v1/admin/builds` response
+remains unchanged for compatibility and never gains these fields.
 
 Candidate evidence and preview reads require one quoted candidate digest in
 `If-Match` and the exact `Tacua-Evidence-Manifest-Digest`. Candidate transitions

@@ -29,6 +29,7 @@ sys.path.insert(0, str(SOURCE))
 from tacua_backend.config import (  # noqa: E402
     ConfigError,
     PilotConfig,
+    TRANSPORT_POLICY_VERSION_1_2,
     load_config,
     normalize_backend_origin,
     parse_admin_secret,
@@ -71,6 +72,7 @@ from tacua_backend.service import (  # noqa: E402
     MAX_SESSION_CREDENTIALS,
     OPERATION_NOT_AUTHORIZED_MESSAGE,
     PilotBackend,
+    REVIEWER_BOOTSTRAP_CONTRACT,
     SDK_BACKEND_ERROR_CONTRACT,
     SDK_BACKEND_ERROR_MEDIA_TYPE,
     SDKReconciliationBinding,
@@ -2820,6 +2822,62 @@ class StrictJSONAndConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "transport configuration"):
                 PilotBackend(config, b"x" * 32)
 
+    def test_backend_accepts_only_a_valid_transport_1_2_launch_scheme(self) -> None:
+        build = fixture("build-identity")
+        scope = fixture("capture-scope")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            draft = PilotConfig(
+                organization_id=scope["organization_id"],
+                project_id=scope["project_id"],
+                application_id=scope["application_id"],
+                build_identity=build,
+                consent_contract=scope["consent"]["policy_version"],
+                backend_origin="https://qa.tacua.example",
+                state_directory=root / "v12",
+                transport_policy_version=TRANSPORT_POLICY_VERSION_1_2,
+                launch_scheme="tacua-synthetic-qa",
+            )
+            transport_1_2_build = copy.deepcopy(build)
+            transport_1_2_build["transport_configuration_digest"] = (
+                draft.transport_configuration_digest
+            )
+            transport_1_2_build = seal(transport_1_2_build)
+            config = PilotConfig(
+                **{
+                    **draft.__dict__,
+                    "build_identity": transport_1_2_build,
+                    "approved_handoff": approved_handoff_config(
+                        transport_1_2_build, scope
+                    ),
+                }
+            )
+            backend = PilotBackend(config, b"x" * 32)
+            self.assertEqual(
+                "tacua-synthetic-qa",
+                backend.reviewer_bootstrap()["builds"][0]["launch_scheme"],
+            )
+
+            with self.assertRaisesRegex(ValueError, "transport 1.2 launch_scheme"):
+                PilotBackend(
+                    PilotConfig(**{**config.__dict__, "launch_scheme": None}),
+                    b"x" * 32,
+                )
+
+            legacy_with_scheme = PilotConfig(
+                organization_id=scope["organization_id"],
+                project_id=scope["project_id"],
+                application_id=scope["application_id"],
+                build_identity=build,
+                approved_handoff=approved_handoff_config(build, scope),
+                consent_contract=scope["consent"]["policy_version"],
+                backend_origin="https://qa.tacua.example",
+                state_directory=root / "legacy",
+                launch_scheme="tacua-synthetic-qa",
+            )
+            with self.assertRaisesRegex(ValueError, "legacy transport"):
+                PilotBackend(legacy_with_scheme, b"x" * 32)
+
     def test_schema_one_state_is_rejected_with_explicit_reset_policy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -3061,6 +3119,55 @@ class HTTPAdapterTests(BackendHarness):
         self.assertEqual(401, captured.exception.status)
         self.assertEqual("ADMIN_AUTHENTICATION_FAILED", captured.exception.code)
         self.assertEqual(database_before, self.backend.db_path.read_bytes())
+
+    def test_reviewer_bootstrap_requires_admin_and_is_exact_for_legacy_transport(self) -> None:
+        unauthenticated = self.handler("/v1/admin/reviewer-bootstrap")
+        with self.assertRaises(ApiError) as captured:
+            unauthenticated._dispatch()
+        self.assertEqual(401, captured.exception.status)
+
+        with_body = self.handler(
+            "/v1/admin/reviewer-bootstrap",
+            authorization="Bearer " + self.admin_secret.decode("ascii"),
+            body=b"x",
+        )
+        with self.assertRaises(ApiError) as captured:
+            with_body._dispatch()
+        self.assertEqual("UNEXPECTED_BODY", captured.exception.code)
+
+        handler = self.handler(
+            "/v1/admin/reviewer-bootstrap",
+            authorization="Bearer " + self.admin_secret.decode("ascii"),
+        )
+        sent: list[tuple[int, dict]] = []
+        handler._send_json = lambda status, body: sent.append((status, body))
+        handler._dispatch()
+        self.assertEqual(
+            [
+                (
+                    200,
+                    {
+                        "contract_version": REVIEWER_BOOTSTRAP_CONTRACT,
+                        "reviewer_id": self.config.reviewer_id,
+                        "builds": [
+                            {
+                                "build_id": self.build["build_id"],
+                                "application_id": self.scope["application_id"],
+                                "bundle_identifier": self.build["bundle_identifier"],
+                                "native_version": self.build["native_version"],
+                                "native_build": self.build["native_build"],
+                                "distribution": self.build["distribution"],
+                                "build_identity_digest": self.build[
+                                    "build_identity_digest"
+                                ],
+                                "launch_scheme": None,
+                            }
+                        ],
+                    },
+                )
+            ],
+            sent,
+        )
 
     def test_candidate_routes_preserve_exact_etag_and_evidence_bindings(self) -> None:
         lifecycle = self.full_completed_session()

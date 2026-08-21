@@ -2082,6 +2082,20 @@ def smoke_deployment(
         or builds["builds"][0] != expected_build
     ):
         raise OperatorError("authenticated smoke did not return the pinned build")
+    bootstrap = _read_smoke_json(
+        opener,
+        f"{origin}/v1/admin/reviewer-bootstrap",
+        authorization=secret.decode("utf-8"),
+    )
+    expected_bootstrap_build = {**expected_build, "launch_scheme": config.launch_scheme}
+    if bootstrap != {
+        "contract_version": "tacua.reviewer-bootstrap@1.0.0",
+        "reviewer_id": config.reviewer_id,
+        "builds": [expected_bootstrap_build],
+    }:
+        raise OperatorError(
+            "authenticated smoke did not return the pinned reviewer bootstrap"
+        )
     return {
         "status": "ok",
         "origin": origin,

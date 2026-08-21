@@ -34,11 +34,15 @@ from .candidate_store import (
 )
 from .config import (
     BUNDLE_ID_PATTERN,
+    ConfigError,
     DIGEST_PATTERN,
     ID_PATTERN,
+    SUPPORTED_TRANSPORT_POLICY_VERSIONS,
     TRANSPORT_POLICY_VERSION,
+    TRANSPORT_POLICY_VERSION_1_2,
     PilotConfig,
     normalize_backend_origin,
+    validate_launch_scheme,
     validate_approved_handoff_config,
 )
 from .contracts import (
@@ -101,6 +105,7 @@ SCOPE_POLICY_CONTRACT = "tacua.capture-scope-policy@1.0.0"
 RETENTION_POLICY_VERSION = "tacua.retention-v1"
 MANIFEST_RETENTION_POLICY_VERSION = "tacua.retention@1.0.0"
 SDK_BACKEND_ERROR_CONTRACT = "tacua.sdk-backend-error@1.0.0"
+REVIEWER_BOOTSTRAP_CONTRACT = "tacua.reviewer-bootstrap@1.0.0"
 SDK_BACKEND_ERROR_MEDIA_TYPE = (
     "application/vnd.tacua.sdk-backend-error+json;version=1.0.0"
 )
@@ -496,8 +501,16 @@ class PilotBackend:
             raise ValueError("build_identity_digest is invalid")
         if normalize_backend_origin(config.backend_origin) != config.backend_origin:
             raise ValueError("backend_origin is not normalized")
-        if config.transport_policy_version != TRANSPORT_POLICY_VERSION:
+        if config.transport_policy_version not in SUPPORTED_TRANSPORT_POLICY_VERSIONS:
             raise ValueError("transport_policy_version is unsupported")
+        if config.transport_policy_version == TRANSPORT_POLICY_VERSION:
+            if config.launch_scheme is not None:
+                raise ValueError("legacy transport must not configure a launch_scheme")
+        elif config.transport_policy_version == TRANSPORT_POLICY_VERSION_1_2:
+            try:
+                validate_launch_scheme(config.launch_scheme)
+            except ConfigError as exc:
+                raise ValueError("transport 1.2 launch_scheme is invalid") from exc
         if (
             config.build_identity["transport_configuration_digest"]
             != config.transport_configuration_digest
@@ -3693,7 +3706,7 @@ class PilotBackend:
         }
 
     def list_builds(self) -> list[dict[str, Any]]:
-        """Return the non-sensitive reviewer bootstrap projection."""
+        """Return the legacy registered-build projection unchanged."""
 
         build = self._registered_build_identity
         return [
@@ -3707,6 +3720,24 @@ class PilotBackend:
                 "build_identity_digest": build["build_identity_digest"],
             }
         ]
+
+    def reviewer_bootstrap(self) -> dict[str, Any]:
+        """Return the exact reviewer bootstrap projection for this deployment."""
+
+        return {
+            "contract_version": REVIEWER_BOOTSTRAP_CONTRACT,
+            "reviewer_id": self.config.reviewer_id,
+            "builds": [
+                {
+                    **build,
+                    # Transport 1.1 deployments did not seal a launch scheme.
+                    # They remain readable during the transport 1.2 migration,
+                    # but cannot be launched without the legacy UI fallback.
+                    "launch_scheme": self.config.launch_scheme,
+                }
+                for build in self.list_builds()
+            ],
+        }
 
     @staticmethod
     def _raise_candidate_error(error: CandidateStoreError) -> None:

@@ -16,6 +16,7 @@ import type {
   JobPage,
   ProcessingJob,
   RegisteredBuild,
+  ReviewerBootstrap,
   ResumeLaunchGrant,
   SessionPage,
   StartLaunchGrant,
@@ -78,6 +79,11 @@ import {
   validateCandidateSupersessionResponse,
 } from "@/api/candidate-replacement";
 import { serializedCandidateTransitionRequest } from "@/api/candidate-transition";
+import {
+  maximumReviewerBootstrapResponseBytes,
+  ReviewerBootstrapValidationError,
+  validateReviewerBootstrap,
+} from "@/api/reviewer-bootstrap-validation";
 
 const maximumJsonResponseBytes = 2 * 1_024 * 1_024;
 const maximumCandidateBytes = 1_048_576;
@@ -457,6 +463,26 @@ export class TacuaApiClient {
         "INVALID_REVIEWER_BINDING_STATUS",
         "The backend returned an invalid reviewer binding status.",
       );
+    }
+  }
+
+  async getReviewerBootstrap(): Promise<ReviewerBootstrap> {
+    const response = await this.request<unknown>(
+      "/v1/admin/reviewer-bootstrap",
+      undefined,
+      { expectedStatuses: [200], maximumBytes: maximumReviewerBootstrapResponseBytes },
+    );
+    try {
+      return validateReviewerBootstrap(response);
+    } catch (error) {
+      if (error instanceof ReviewerBootstrapValidationError) {
+        throw new TacuaApiError(
+          502,
+          error.code,
+          "The backend returned an invalid reviewer bootstrap projection.",
+        );
+      }
+      throw error;
     }
   }
 

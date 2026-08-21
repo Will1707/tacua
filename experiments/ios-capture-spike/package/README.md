@@ -89,9 +89,11 @@ operation. `stop()` remains intentionally local and never enqueues or transmits
 evidence by itself.
 
 The backend compiler seals `max_segment_bytes`, `max_diagnostic_bytes`, and
-`max_completion_bytes` into `tacua.sdk-transport@1.1.0`. The Expo plugin copies
-those exact integers into the QA app's Info.plist and the native profile parser
-requires both authorities to agree. Oversized segment media, canonical
+`max_completion_bytes` into `tacua.sdk-transport@1.1.0` or
+`tacua.sdk-transport@1.2.0`; V1.2 also seals the dedicated QA-app launch scheme.
+The Expo plugin copies those exact pins into the QA app's Info.plist and the
+native profile parser requires both authorities to agree. V1.1 retains its
+manual launch-scheme compatibility option. Oversized segment media, canonical
 diagnostic envelopes, and canonical completion requests fail locally before any
 network request and before the queue records an outcome-unknown attempt.
 The generated profile defaults to 256 MiB segment media, a 3 MiB canonical

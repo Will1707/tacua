@@ -19,11 +19,14 @@ from .config import (
     DEFAULT_MAX_DIAGNOSTIC_BYTES,
     DEFAULT_MAX_SEGMENT_BYTES,
     MAX_CONFIG_BYTES,
+    SUPPORTED_TRANSPORT_POLICY_VERSIONS,
     TRANSPORT_POLICY_VERSION,
+    TRANSPORT_POLICY_VERSION_1_2,
     ConfigError,
     _parse_config_json,
     normalize_backend_origin,
     parse_config_text,
+    validate_launch_scheme,
 )
 from .contracts import ContractError, canonical_json, digest, seal
 
@@ -182,25 +185,38 @@ def compile_config_template(serialized: str) -> str:
     normalized_origin = normalize_backend_origin(backend_origin)
     document["backend_origin"] = normalized_origin
     policy = document.get("transport_policy_version", TRANSPORT_POLICY_VERSION)
-    if policy != TRANSPORT_POLICY_VERSION:
+    if (
+        not isinstance(policy, str)
+        or policy not in SUPPORTED_TRANSPORT_POLICY_VERSIONS
+    ):
         raise ConfigToolError(
-            f"transport_policy_version must be {TRANSPORT_POLICY_VERSION}"
+            "transport_policy_version must be a supported Tacua SDK transport policy"
         )
-    transport_digest = digest(
-        {
-            "backend_origin": normalized_origin,
-            "max_completion_bytes": document.get(
-                "max_completion_bytes", DEFAULT_MAX_COMPLETION_BYTES
-            ),
-            "max_diagnostic_bytes": document.get(
-                "max_diagnostic_bytes", DEFAULT_MAX_DIAGNOSTIC_BYTES
-            ),
-            "max_segment_bytes": document.get(
-                "max_segment_bytes", DEFAULT_MAX_SEGMENT_BYTES
-            ),
-            "transport_policy_version": policy,
-        }
-    )
+    transport_configuration = {
+        "backend_origin": normalized_origin,
+        "max_completion_bytes": document.get(
+            "max_completion_bytes", DEFAULT_MAX_COMPLETION_BYTES
+        ),
+        "max_diagnostic_bytes": document.get(
+            "max_diagnostic_bytes", DEFAULT_MAX_DIAGNOSTIC_BYTES
+        ),
+        "max_segment_bytes": document.get(
+            "max_segment_bytes", DEFAULT_MAX_SEGMENT_BYTES
+        ),
+        "transport_policy_version": policy,
+    }
+    if policy == TRANSPORT_POLICY_VERSION_1_2:
+        try:
+            launch_scheme = validate_launch_scheme(document.get("launch_scheme"))
+        except ConfigError as exc:
+            raise ConfigToolError(str(exc)) from exc
+        document["launch_scheme"] = launch_scheme
+        transport_configuration["launch_scheme"] = launch_scheme
+    elif "launch_scheme" in document:
+        raise ConfigToolError(
+            "launch_scheme is allowed only with tacua.sdk-transport@1.2.0"
+        )
+    transport_digest = digest(transport_configuration)
 
     build_identity = document.get("build_identity")
     approved_handoff = document.get("approved_handoff")

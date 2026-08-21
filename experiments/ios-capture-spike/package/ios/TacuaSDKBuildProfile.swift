@@ -99,13 +99,21 @@ struct TacuaSDKBuildProfile: Equatable {
       let scopePolicy = object["capture_scope_policy"]
     else { throw TacuaSDKBuildProfileError.transportConfigurationMismatch }
     do {
-      let transportObject = try transport.requiringObject(keys: [
-        "backend_origin", "max_completion_bytes", "max_diagnostic_bytes",
-        "max_segment_bytes", "transport_policy_version",
-      ])
+      let transportKeys: Set<String> = configuration.policyVersion
+        == TacuaBackendConfiguration.launchSchemePolicyVersion
+        ? [
+          "backend_origin", "launch_scheme", "max_completion_bytes",
+          "max_diagnostic_bytes", "max_segment_bytes", "transport_policy_version",
+        ]
+        : [
+          "backend_origin", "max_completion_bytes", "max_diagnostic_bytes",
+          "max_segment_bytes", "transport_policy_version",
+        ]
+      let transportObject = try transport.requiringObject(keys: transportKeys)
       guard transportObject["backend_origin"]?.stringValue == configuration.normalizedOrigin,
         transportObject["transport_policy_version"]?.stringValue
-          == TacuaBackendConfiguration.policyVersion,
+          == configuration.policyVersion,
+        transportObject["launch_scheme"]?.stringValue == configuration.launchScheme,
         transportObject["max_segment_bytes"]?.integerValue
           == Int64(configuration.maxSegmentBytes),
         transportObject["max_diagnostic_bytes"]?.integerValue

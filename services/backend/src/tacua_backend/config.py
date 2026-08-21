@@ -24,6 +24,35 @@ BUNDLE_ID_PATTERN = re.compile(
 )
 DIGEST_PATTERN = re.compile(r"^sha256:[a-f0-9]{64}$")
 TRANSPORT_POLICY_VERSION = "tacua.sdk-transport@1.1.0"
+TRANSPORT_POLICY_VERSION_1_2 = "tacua.sdk-transport@1.2.0"
+SUPPORTED_TRANSPORT_POLICY_VERSIONS = frozenset(
+    {TRANSPORT_POLICY_VERSION, TRANSPORT_POLICY_VERSION_1_2}
+)
+LAUNCH_SCHEME_PATTERN = re.compile(r"^[a-z][a-z0-9+.-]{1,63}$")
+RESERVED_LAUNCH_SCHEMES = frozenset(
+    {
+        "about",
+        "blob",
+        "data",
+        "facetime",
+        "facetime-audio",
+        "file",
+        "ftp",
+        "ftps",
+        "http",
+        "https",
+        "itms",
+        "itms-apps",
+        "javascript",
+        "mailto",
+        "sms",
+        "tacua",
+        "tel",
+        "webcal",
+        "ws",
+        "wss",
+    }
+)
 MAX_SEGMENT_BYTES = 1_073_741_824
 MAX_DIAGNOSTIC_BYTES = 3_145_728
 MAX_COMPLETION_BYTES = 4_194_304
@@ -135,6 +164,7 @@ class PilotConfig:
     tombstone_retention_days: int = 30
     retention_sweep_interval_seconds: int = 300
     transport_policy_version: str = TRANSPORT_POLICY_VERSION
+    launch_scheme: str | None = None
     approved_handoff: dict[str, Any] | None = None
 
     @property
@@ -154,13 +184,16 @@ class PilotConfig:
 
     @property
     def transport_configuration(self) -> dict[str, Any]:
-        return {
+        configuration: dict[str, Any] = {
             "backend_origin": self.backend_origin,
             "max_completion_bytes": self.max_completion_bytes,
             "max_diagnostic_bytes": self.max_diagnostic_bytes,
             "max_segment_bytes": self.max_segment_bytes,
             "transport_policy_version": self.transport_policy_version,
         }
+        if self.transport_policy_version == TRANSPORT_POLICY_VERSION_1_2:
+            configuration["launch_scheme"] = self.launch_scheme
+        return configuration
 
     @property
     def transport_configuration_digest(self) -> str:
@@ -199,6 +232,21 @@ def _required_text(data: dict[str, Any], key: str, maximum: int = 128) -> str:
         raise ConfigError(f"{key} must be non-empty text no longer than {maximum} characters")
     if unicodedata.normalize("NFC", value) != value:
         raise ConfigError(f"{key} must be NFC-normalized")
+    return value
+
+
+def validate_launch_scheme(value: Any) -> str:
+    """Validate the dedicated QA-app URL scheme sealed by transport V1.2."""
+
+    if (
+        not isinstance(value, str)
+        or unicodedata.normalize("NFC", value) != value
+        or LAUNCH_SCHEME_PATTERN.fullmatch(value) is None
+        or value in RESERVED_LAUNCH_SCHEMES
+    ):
+        raise ConfigError(
+            "launch_scheme must be a dedicated normalized lowercase QA-app URL scheme"
+        )
     return value
 
 
@@ -363,6 +411,7 @@ def _config_from_document(raw: dict[str, Any]) -> PilotConfig:
         "consent_contract",
         "backend_origin",
         "transport_policy_version",
+        "launch_scheme",
         "state_directory",
         "listen_host",
         "listen_port",
@@ -395,8 +444,18 @@ def _config_from_document(raw: dict[str, Any]) -> PilotConfig:
     if not isinstance(approved_handoff, dict):
         raise ConfigError("approved_handoff must be an object")
     policy = str(raw.get("transport_policy_version", TRANSPORT_POLICY_VERSION))
-    if policy != TRANSPORT_POLICY_VERSION:
-        raise ConfigError(f"transport_policy_version must be {TRANSPORT_POLICY_VERSION}")
+    if policy not in SUPPORTED_TRANSPORT_POLICY_VERSIONS:
+        raise ConfigError(
+            "transport_policy_version must be a supported Tacua SDK transport policy"
+        )
+    if policy == TRANSPORT_POLICY_VERSION_1_2:
+        launch_scheme = validate_launch_scheme(raw.get("launch_scheme"))
+    else:
+        if "launch_scheme" in raw:
+            raise ConfigError(
+                "launch_scheme is allowed only with tacua.sdk-transport@1.2.0"
+            )
+        launch_scheme = None
 
     state_directory = Path(_required_text(raw, "state_directory", 4096))
     if not state_directory.is_absolute() or state_directory == Path(state_directory.anchor):
@@ -446,6 +505,7 @@ def _config_from_document(raw: dict[str, Any]) -> PilotConfig:
         tombstone_retention_days=_bounded_int(raw, "tombstone_retention_days", 30, 1, 30),
         retention_sweep_interval_seconds=_bounded_int(raw, "retention_sweep_interval_seconds", 300, 30, 3600),
         transport_policy_version=policy,
+        launch_scheme=launch_scheme,
     )
     validate_approved_handoff_config(config)
     return config

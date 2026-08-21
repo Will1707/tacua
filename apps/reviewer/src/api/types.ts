@@ -149,6 +149,16 @@ export type RegisteredBuild = {
   readonly build_identity_digest: string;
 };
 
+export type ReviewerBootstrapBuild = RegisteredBuild & {
+  readonly launch_scheme: string | null;
+};
+
+export type ReviewerBootstrap = {
+  readonly contract_version: "tacua.reviewer-bootstrap@1.0.0";
+  readonly reviewer_id: string;
+  readonly builds: readonly ReviewerBootstrapBuild[];
+};
+
 type LaunchGrantBase = {
   readonly launch_id: string;
   readonly launch_code: string;
