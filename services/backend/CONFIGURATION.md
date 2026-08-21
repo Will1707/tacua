@@ -10,8 +10,9 @@ four `__TACUA_DERIVE_SHA256__` values are mandatory markers, not placeholders
 to fill by hand. The dependency-free compiler derives and seals:
 
 - `build_identity.transport_configuration_digest` from the normalized backend
-  origin, frozen transport policy, and exact segment, diagnostic-envelope, and
-  completion-request byte limits;
+  origin, versioned transport policy, and exact segment, diagnostic-envelope,
+  and completion-request byte limits. Transport V1.2 also seals the dedicated
+  QA-app launch scheme into this digest;
 - the SDK protocol `build_identity.build_identity_digest`;
 - `approved_handoff.build_identity.sdk.configuration_digest` from that same
   transport pin; and
@@ -24,6 +25,23 @@ transport digest, and the static
 capture-scope policy: organization/project/application/build pins, required
 consent contract, and raw/derived retention. It contains no launch code,
 credential, administrator secret, or provider key.
+
+The checked-in template remains a byte-regression example for
+`tacua.sdk-transport@1.1.0`. New SDK-enabled QA builds should opt into V1.2 by
+changing the policy and adding the dedicated scheme next to it:
+
+```json
+"backend_origin": "https://qa.example.com",
+"transport_policy_version": "tacua.sdk-transport@1.2.0",
+"launch_scheme": "example-tacua-qa"
+```
+
+V1.1 forbids `launch_scheme` and retains its historical transport JSON and
+digests byte for byte. V1.2 requires a normalized lowercase 2–64 character
+scheme and rejects browser, OS-service, and Tacua reviewer schemes. The scheme
+is public build metadata, is included in the transport/build/handoff/profile
+digest chain, and is consumed by the Expo plugin; do not also provide the
+legacy `launchScheme` plugin option for a V1.2 profile.
 
 The current pilot configuration pins exactly one project, application, tested
 build, reviewer identity, and administrator credential per deployment. Run a
@@ -165,8 +183,9 @@ The compiler cannot measure or safely infer these values:
 - the installed SDK package version and source revision;
 - backend image, deployment, and source-repository identity when marked
   available (otherwise retain the contract's explicit unavailable form);
-- the public HTTPS backend origin, organization/project/application/build
-  identifiers, versions, distribution, and state/listener settings;
+- the public HTTPS backend origin, dedicated QA-app launch scheme,
+  organization/project/application/build identifiers, versions, distribution,
+  and state/listener settings;
 - the exact authority repository allow-list and registry revision; and
 - retention periods and operational byte/time limits.
 

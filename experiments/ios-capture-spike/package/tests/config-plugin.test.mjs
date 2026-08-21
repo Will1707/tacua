@@ -78,6 +78,7 @@ test("seals one explicit non-production QA plugin configuration from the backend
   assert.equal(infoPlist.TacuaCaptureDistribution, "testflight");
   assert.equal(infoPlist.TacuaSDKProfileJSON, profileText.trimEnd());
   assert.equal(infoPlist.TacuaSDKProfileDigest, options.sdkProfile.profile_digest);
+  assert.equal(infoPlist.TacuaTransportPolicyVersion, "tacua.sdk-transport@1.1.0");
   assert.equal(infoPlist.TacuaMaxSegmentBytes, 268_435_456);
   assert.equal(infoPlist.TacuaMaxDiagnosticBytes, 3_145_728);
   assert.equal(infoPlist.TacuaMaxCompletionBytes, 4_194_304);
@@ -169,6 +170,34 @@ test("uses one 2-64 character dedicated QA launch-scheme policy", () => {
   }
 });
 
+test("derives the v1.2 launch scheme exclusively from the sealed profile", () => {
+  const profile = JSON.parse(profileText);
+  profile.transport_configuration.transport_policy_version = "tacua.sdk-transport@1.2.0";
+  profile.transport_configuration.launch_scheme = "example-sealed-qa";
+  const temporary = temporaryProfile(resealProfile(profile));
+  const v12Options = {
+    ...valid,
+    launchScheme: undefined,
+    sdkProfilePath: temporary.file,
+  };
+  try {
+    const options = validateOptions(v12Options);
+    assert.equal(options.launchScheme, "example-sealed-qa");
+    const infoPlist = applyInfoPlist({}, options);
+    assert.equal(infoPlist.TacuaLaunchScheme, "example-sealed-qa");
+    assert.equal(infoPlist.TacuaTransportPolicyVersion, "tacua.sdk-transport@1.2.0");
+    assert.deepEqual(infoPlist.CFBundleURLTypes, [
+      { CFBundleURLSchemes: ["example-sealed-qa"] },
+    ]);
+    assert.throws(
+      () => validateOptions({ ...v12Options, launchScheme: "example-sealed-qa" }),
+      /must be omitted/,
+    );
+  } finally {
+    fs.rmSync(temporary.directory, { recursive: true, force: true });
+  }
+});
+
 test("ships privacy, Apache license, and NOTICE resources with the iOS SDK", () => {
   const packageRoot = path.resolve(testDirectory, "..");
   const privacy = fs.readFileSync(path.join(packageRoot, "ios", "PrivacyInfo.xcprivacy"), "utf8");
@@ -208,7 +237,7 @@ test("maps malformed native transport limits to the closed build-gate reason", (
 
   assert.match(
     moduleSource,
-    /case \.invalidTransportLimit, \.invalidPathSegment, \.buildIdentityMismatch:\s*return \(nil, "invalid_qa_build_configuration"\)/,
+    /case \.invalidTransportLimit, \.invalidTransportPolicy, \.invalidLaunchScheme,\s*\.invalidPathSegment, \.buildIdentityMismatch:\s*return \(nil, "invalid_qa_build_configuration"\)/,
   );
 });
 
@@ -219,6 +248,14 @@ test("rejects tampering even when an attacker recomputes the outer profile diges
     (profile) => { profile.capture_scope_policy.retention.raw_media_days = 31; },
     (profile) => { profile.build_identity.build_identity_digest = `sha256:${"0".repeat(64)}`; },
     (profile) => { profile.transport_configuration.transport_policy_version = "tacua.sdk-transport@2.0.0"; },
+    (profile) => {
+      profile.transport_configuration.transport_policy_version = "tacua.sdk-transport@1.2.0";
+    },
+    (profile) => { profile.transport_configuration.launch_scheme = "unexpected-on-v1-1"; },
+    (profile) => {
+      profile.transport_configuration.transport_policy_version = "tacua.sdk-transport@1.2.0";
+      profile.transport_configuration.launch_scheme = "https";
+    },
     (profile) => { profile.transport_configuration.max_segment_bytes = 0; },
     (profile) => { profile.transport_configuration.max_diagnostic_bytes = 3_145_729; },
     (profile) => { profile.transport_configuration.max_completion_bytes = 4_194_305; },

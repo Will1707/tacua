@@ -3,9 +3,12 @@
 import {
   type BackendConfig,
   validateBackendConfig,
+  validateBackendConnectionConfig,
 } from "../config/backend-config-validation.ts";
+import type { ReviewerBootstrap } from "./types.ts";
 
 export type BackendConfigurationClient = {
+  readonly getReviewerBootstrap: () => Promise<ReviewerBootstrap>;
   readonly listBuilds: () => Promise<unknown>;
   readonly verifyReviewerIdentity: () => Promise<void>;
 };
@@ -33,16 +36,55 @@ export type ActiveBackendConfig<
   readonly client: Client;
 };
 
+async function authenticateBackendConfig<Client extends BackendConfigurationClient>(
+  candidate: BackendConfig,
+  createClient: (config: BackendConfig) => Client,
+): Promise<ActiveBackendConfig<Client>> {
+  // Only origin and administrator credential are trusted before bootstrap.
+  // The provisional client uses the supplied identity/scheme solely to call
+  // the admin-authenticated additive endpoint; no identity-bound operation is
+  // performed through it.
+  const provisional = validateBackendConnectionConfig(candidate);
+  const bootstrapClient = createClient(provisional);
+  let bootstrap: ReviewerBootstrap;
+  try {
+    bootstrap = await bootstrapClient.getReviewerBootstrap();
+  } catch (error) {
+    if (
+      error === null
+      || typeof error !== "object"
+      || !("status" in error)
+      || error.status !== 404
+    ) throw error;
+    // A pre-bootstrap backend cannot prove either manual field. Validate both
+    // only now, then bind them before any legacy registry read.
+    const legacyConfig = validateBackendConfig(provisional);
+    const legacyClient = createClient(legacyConfig);
+    await legacyClient.verifyReviewerIdentity();
+    await legacyClient.listBuilds();
+    return { config: legacyConfig, client: legacyClient };
+  }
+  const [build] = bootstrap.builds;
+  if (!build || bootstrap.builds.length !== 1) {
+    throw new Error("The Tacua deployment must register exactly one reviewer build.");
+  }
+  const verifiedConfig = validateBackendConfig({
+    ...provisional,
+    reviewerId: bootstrap.reviewer_id,
+    targetScheme: build.launch_scheme ?? provisional.targetScheme,
+  });
+  const verifiedClient = createClient(verifiedConfig);
+  await verifiedClient.verifyReviewerIdentity();
+  return { config: verifiedConfig, client: verifiedClient };
+}
+
 export async function verifyBackendConfig(
   candidate: BackendConfig,
   dependencies: BackendConfigVerificationDependencies,
 ): Promise<BackendConfig> {
-  const config = validateBackendConfig(candidate);
-  await dependencies.probeBackend(config.baseUrl);
-  const client = dependencies.createClient(config);
-  await client.verifyReviewerIdentity();
-  await client.listBuilds();
-  return config;
+  const connection = validateBackendConnectionConfig(candidate);
+  await dependencies.probeBackend(connection.baseUrl);
+  return (await authenticateBackendConfig(connection, dependencies.createClient)).config;
 }
 
 export async function verifyAndPersistBackendConfig(
@@ -59,8 +101,5 @@ export async function loadVerifiedBackendConfig<Client extends BackendConfigurat
 ): Promise<ActiveBackendConfig<Client> | null> {
   const candidate = await dependencies.loadConfig();
   if (candidate === null) return null;
-  const config = validateBackendConfig(candidate);
-  const client = dependencies.createClient(config);
-  await client.verifyReviewerIdentity();
-  return { config, client };
+  return authenticateBackendConfig(candidate, dependencies.createClient);
 }

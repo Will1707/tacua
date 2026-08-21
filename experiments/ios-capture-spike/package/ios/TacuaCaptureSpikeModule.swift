@@ -91,7 +91,7 @@ public final class TacuaCaptureSpikeModule: Module {
       return [
         "backendOrigin": configuration.normalizedOrigin,
         "transportConfigurationDigest": configuration.configurationDigest,
-        "transportPolicyVersion": TacuaBackendConfiguration.policyVersion,
+        "transportPolicyVersion": configuration.policyVersion,
         "maxSegmentBytes": configuration.maxSegmentBytes,
         "maxDiagnosticBytes": configuration.maxDiagnosticBytes,
         "maxCompletionBytes": configuration.maxCompletionBytes,
@@ -102,6 +102,7 @@ public final class TacuaCaptureSpikeModule: Module {
         "credentialStorage": "ios_keychain_when_unlocked_this_device_only",
         "launchCodePersistence": "transient_only",
         "redirectPolicy": "reject_all",
+        "launchScheme": launchConfiguration.scheme,
         "launchURLTemplate": "\(launchConfiguration.scheme)://tacua/start?launch_code=<opaque>",
       ]
     }
@@ -937,7 +938,8 @@ public final class TacuaCaptureSpikeModule: Module {
       case .invalidOrigin: return (nil, "backend_origin_invalid")
       case .insecureOrigin: return (nil, "backend_origin_insecure")
       case .loopbackDevelopmentOnly: return (nil, "loopback_requires_debug_build")
-      case .invalidTransportLimit, .invalidPathSegment, .buildIdentityMismatch:
+      case .invalidTransportLimit, .invalidTransportPolicy, .invalidLaunchScheme,
+        .invalidPathSegment, .buildIdentityMismatch:
         return (nil, "invalid_qa_build_configuration")
       }
     } catch let error as TacuaSDKBuildProfileError {

@@ -156,6 +156,79 @@ class ConfigToolTests(unittest.TestCase):
         )
         parse_config_text(self.render(changed))
 
+    def test_transport_v1_2_seals_one_authoritative_launch_scheme(self) -> None:
+        legacy_config_text, legacy_profile_text = compile_config_artifacts(
+            self.template_text()
+        )
+        legacy_config = json.loads(legacy_config_text)
+        legacy_profile = json.loads(legacy_profile_text)
+        self.assertNotIn("launch_scheme", legacy_config)
+        self.assertNotIn("launch_scheme", legacy_profile["transport_configuration"])
+        self.assertIsNone(parse_config_text(legacy_config_text).launch_scheme)
+
+        document = self.template_document()
+        document["transport_policy_version"] = "tacua.sdk-transport@1.2.0"
+        document["launch_scheme"] = "example-tacua-qa"
+        config_text, profile_text = compile_config_artifacts(self.render(document))
+        config_document = json.loads(config_text)
+        profile = json.loads(profile_text)
+        config = parse_config_text(config_text)
+
+        self.assertEqual("example-tacua-qa", config.launch_scheme)
+        self.assertEqual(
+            {
+                "backend_origin": "https://qa.example.com",
+                "launch_scheme": "example-tacua-qa",
+                "max_completion_bytes": 4_194_304,
+                "max_diagnostic_bytes": 3_145_728,
+                "max_segment_bytes": 268_435_456,
+                "transport_policy_version": "tacua.sdk-transport@1.2.0",
+            },
+            config.transport_configuration,
+        )
+        self.assertEqual(config.transport_configuration, profile["transport_configuration"])
+        self.assertEqual(
+            config.transport_configuration_digest,
+            profile["transport_configuration_digest"],
+        )
+        self.assertEqual(
+            config.transport_configuration_digest,
+            config_document["build_identity"]["transport_configuration_digest"],
+        )
+        self.assertNotEqual(
+            legacy_config["build_identity"]["transport_configuration_digest"],
+            config.transport_configuration_digest,
+        )
+        self.assertNotEqual(
+            legacy_profile["profile_digest"],
+            profile["profile_digest"],
+        )
+
+    def test_transport_versions_enforce_their_exact_launch_scheme_shape(self) -> None:
+        missing = self.template_document()
+        missing["transport_policy_version"] = "tacua.sdk-transport@1.2.0"
+        legacy_with_scheme = self.template_document()
+        legacy_with_scheme["launch_scheme"] = "example-tacua-qa"
+
+        invalid_schemes = [
+            "Tacua-QA",
+            "https",
+            "a",
+            "a" + "b" * 64,
+            "cafe\u0301",
+            12,
+        ]
+        rejected = [missing, legacy_with_scheme]
+        for launch_scheme in invalid_schemes:
+            document = self.template_document()
+            document["transport_policy_version"] = "tacua.sdk-transport@1.2.0"
+            document["launch_scheme"] = launch_scheme
+            rejected.append(document)
+
+        for document in rejected:
+            with self.subTest(document=document), self.assertRaises(ConfigError):
+                compile_config_artifacts(self.render(document))
+
     def test_each_transport_limit_reseals_the_build_handoff_and_sdk_profile(self) -> None:
         original_config_text, original_profile_text = compile_config_artifacts(
             self.template_text()

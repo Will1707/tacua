@@ -248,7 +248,9 @@ type CaptureErrorEvent = {
 type BackendTransportConfiguration = {
   readonly backendOrigin: string;
   readonly transportConfigurationDigest: string;
-  readonly transportPolicyVersion: "tacua.sdk-transport@1.1.0";
+  readonly transportPolicyVersion:
+    | "tacua.sdk-transport@1.1.0"
+    | "tacua.sdk-transport@1.2.0";
   readonly maxSegmentBytes: number;
   readonly maxDiagnosticBytes: number;
   readonly maxCompletionBytes: number;
@@ -259,6 +261,7 @@ type BackendTransportConfiguration = {
   readonly credentialStorage: "ios_keychain_when_unlocked_this_device_only";
   readonly launchCodePersistence: "transient_only";
   readonly redirectPolicy: "reject_all";
+  readonly launchScheme: string;
   readonly launchURLTemplate: string;
 };
 

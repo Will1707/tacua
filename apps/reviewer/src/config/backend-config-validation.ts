@@ -18,16 +18,46 @@ function requireIdentifier(value: string, field: string): string {
   return normalized;
 }
 
-export function validateBackendConfig(config: BackendConfig): BackendConfig {
-  const baseUrl = normalizeBaseUrl(config.baseUrl);
-  const reviewerId = requireIdentifier(config.reviewerId, "Reviewer ID");
-  const targetScheme = normalizeTargetScheme(config.targetScheme);
+function validateAdministratorToken(value: unknown): string {
   if (
-    config.adminToken.length < 32
-    || config.adminToken.length > 4_096
-    || !/^[A-Za-z0-9._~+/-]+={0,2}$/.test(config.adminToken)
+    typeof value !== "string"
+    || value.length < 32
+    || value.length > 4_096
+    || !/^[A-Za-z0-9._~+/-]+={0,2}$/.test(value)
   ) {
     throw new Error("Administrator token is invalid.");
   }
-  return { baseUrl, adminToken: config.adminToken, reviewerId, targetScheme };
+  return value;
+}
+
+/** Validate only fields needed for the authenticated bootstrap request. */
+export function validateBackendConnectionConfig(config: BackendConfig): BackendConfig {
+  if (
+    config === null
+    || typeof config !== "object"
+    || typeof config.baseUrl !== "string"
+    || typeof config.reviewerId !== "string"
+    || typeof config.targetScheme !== "string"
+    || config.reviewerId.length > 256
+    || config.targetScheme.length > 256
+  ) {
+    throw new Error("Backend configuration is invalid.");
+  }
+  const baseUrl = normalizeBaseUrl(config.baseUrl);
+  const adminToken = validateAdministratorToken(config.adminToken);
+  return {
+    baseUrl,
+    adminToken,
+    reviewerId: config.reviewerId.trim(),
+    targetScheme: config.targetScheme.trim(),
+  };
+}
+
+export function validateBackendConfig(config: BackendConfig): BackendConfig {
+  const connection = validateBackendConnectionConfig(config);
+  return {
+    ...connection,
+    reviewerId: requireIdentifier(connection.reviewerId, "Reviewer ID"),
+    targetScheme: normalizeTargetScheme(connection.targetScheme),
+  };
 }

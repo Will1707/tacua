@@ -16,7 +16,6 @@ plugin to that build's Expo configuration:
     "buildVariant": "preview",
     "captureEnabled": true,
     "distribution": "testflight",
-    "launchScheme": "example-tacua-qa",
     "microphonePermission": "Example QA records your narration and this app's screen only after you approve a review session.",
     "sdkProfilePath": "./config/tacua-sdk-profile.json"
   }
@@ -29,6 +28,13 @@ one exact canonical JSON line, the frozen profile shape, valid nested build and
 scope-policy pins, and valid build/transport/profile digests. It rejects
 duplicate keys, floats, unsafe integers, BOMs, unknown fields, secret-bearing
 field names, non-NFC/control-character text, and any post-generation edit.
+
+This example assumes the profile uses `tacua.sdk-transport@1.2.0` and contains
+`"launch_scheme":"example-tacua-qa"`. The plugin derives the native launch
+scheme exclusively from that sealed transport object. A legacy V1.1 profile
+has no sealed scheme and therefore still requires the explicit
+`"launchScheme":"example-tacua-qa"` compatibility option; V1.2 rejects that
+manual option.
 
 `backendOrigin`, `buildVariant`, and `distribution` remain explicit so a typo or
 wrong EAS profile cannot silently select another registered build; each must
@@ -43,6 +49,7 @@ different value:
 - `TacuaBackendOrigin`;
 - `TacuaAllowInsecureLoopback`;
 - `TacuaLaunchScheme`;
+- `TacuaTransportPolicyVersion`;
 - `TacuaCaptureBuildVariant`;
 - `TacuaCaptureDistribution`;
 - `TacuaSDKProfileJSON` (the canonical profile without its file LF);
@@ -52,16 +59,18 @@ different value:
 - `TacuaMaxCompletionBytes`; and
 - `NSMicrophoneUsageDescription`.
 
-It also registers `launchScheme` in `CFBundleURLTypes`. Use a dedicated 2–64
-character scheme. Browser, OS-service, and Tacua reviewer schemes are rejected
-so an opaque launch code cannot be routed outside the QA app. The reviewer app
-must be configured with that same scheme.
+It also registers the sealed V1.2 scheme (or the explicit legacy V1.1 scheme)
+in `CFBundleURLTypes`. Browser, OS-service, and Tacua reviewer schemes are
+rejected so an opaque launch code cannot be routed outside the QA app. V1.2
+binds that scheme to the exact registered build so another consumer does not
+need to copy it independently.
 
 The complete SDK profile, `backendOrigin`, the three transport byte limits, the
 variant, and the distribution are public build metadata. The native SDK requires
-the three integer plist pins to match the sealed `tacua.sdk-transport@1.1.0`
-configuration and rejects oversized segment bytes, diagnostic-envelope bytes,
-or completion-request bytes before opening the network. The generated profile
+the policy, scheme (for V1.2), and three integer plist pins to match the sealed
+`tacua.sdk-transport@1.1.0` or `tacua.sdk-transport@1.2.0` configuration and
+rejects oversized segment bytes, diagnostic-envelope bytes, or
+completion-request bytes before opening the network. The generated profile
 uses 3 MiB and 4 MiB as the diagnostic and completion maxima respectively;
 these are also the native canonical-parser and durable-queue admission bounds,
 not independently expandable server-only allowances.

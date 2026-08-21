@@ -10,7 +10,8 @@ const { TextDecoder } = require("node:util");
 const MAX_SDK_PROFILE_BYTES = 64 * 1024;
 const PROFILE_CONTRACT = "tacua.sdk-profile@1.1.0";
 const PROTOCOL_VERSION = "tacua.sdk-backend@1.0.0";
-const TRANSPORT_POLICY_VERSION = "tacua.sdk-transport@1.1.0";
+const TRANSPORT_POLICY_VERSION_1_1 = "tacua.sdk-transport@1.1.0";
+const TRANSPORT_POLICY_VERSION_1_2 = "tacua.sdk-transport@1.2.0";
 const MAX_SEGMENT_BYTES_RANGE = Object.freeze([1, 1_073_741_824]);
 const MAX_DIAGNOSTIC_BYTES_RANGE = Object.freeze([1_024, 3_145_728]);
 const MAX_COMPLETION_BYTES_RANGE = Object.freeze([1_024, 4_194_304]);
@@ -152,6 +153,17 @@ function requireBoundedInteger(value, range, field) {
   );
 }
 
+function validateLaunchScheme(value, field = "launchScheme") {
+  const launchScheme = requireNfcText(value, field, 2, 64);
+  if (!/^[a-z][a-z0-9+.-]{1,63}$/u.test(launchScheme)) {
+    throw new Error(`${field} must be a normalized lowercase URL scheme.`);
+  }
+  if (reservedLaunchSchemes.has(launchScheme)) {
+    throw new Error(`${field} must be a dedicated QA-app URL scheme, not a browser, OS-service, or Tacua reviewer scheme.`);
+  }
+  return launchScheme;
+}
+
 function isCanonicalTimestamp(value) {
   if (typeof value !== "string" || !TIMESTAMP_PATTERN.test(value)) return false;
   const milliseconds = Date.parse(value);
@@ -237,11 +249,24 @@ function validateSdkProfile(profile, serialized) {
   requireValue(digest(subject) === profile.profile_digest, "sdkProfile.profile_digest");
   validateBuildIdentity(profile.build_identity);
   validateScopePolicy(profile.capture_scope_policy, profile);
-  requireExactKeys(profile.transport_configuration, [
-    "backend_origin", "max_completion_bytes", "max_diagnostic_bytes", "max_segment_bytes",
-    "transport_policy_version",
-  ], "sdkProfile.transport_configuration");
-  requireValue(profile.transport_configuration.transport_policy_version === TRANSPORT_POLICY_VERSION, "sdkProfile.transport_configuration.transport_policy_version");
+  const transportPolicyVersion = profile.transport_configuration?.transport_policy_version;
+  if (transportPolicyVersion === TRANSPORT_POLICY_VERSION_1_1) {
+    requireExactKeys(profile.transport_configuration, [
+      "backend_origin", "max_completion_bytes", "max_diagnostic_bytes", "max_segment_bytes",
+      "transport_policy_version",
+    ], "sdkProfile.transport_configuration");
+  } else if (transportPolicyVersion === TRANSPORT_POLICY_VERSION_1_2) {
+    requireExactKeys(profile.transport_configuration, [
+      "backend_origin", "launch_scheme", "max_completion_bytes", "max_diagnostic_bytes",
+      "max_segment_bytes", "transport_policy_version",
+    ], "sdkProfile.transport_configuration");
+    validateLaunchScheme(
+      profile.transport_configuration.launch_scheme,
+      "sdkProfile.transport_configuration.launch_scheme",
+    );
+  } else {
+    throw new Error("sdkProfile.transport_configuration.transport_policy_version is invalid.");
+  }
   requireValue(profile.transport_configuration.backend_origin === profile.backend_origin, "sdkProfile.transport_configuration.backend_origin pin");
   requireBoundedInteger(profile.transport_configuration.max_segment_bytes, MAX_SEGMENT_BYTES_RANGE, "sdkProfile.transport_configuration.max_segment_bytes");
   requireBoundedInteger(profile.transport_configuration.max_diagnostic_bytes, MAX_DIAGNOSTIC_BYTES_RANGE, "sdkProfile.transport_configuration.max_diagnostic_bytes");
@@ -331,9 +356,16 @@ function validateOptions(rawOptions, projectRoot = process.cwd()) {
   if (allowInsecureLoopback && (buildVariant !== "development" || distribution !== "local")) {
     throw new Error("Insecure loopback is allowed only for a local development build.");
   }
-  const launchScheme = requireNfcText(rawOptions.launchScheme, "launchScheme", 2, 64);
-  if (!/^[a-z][a-z0-9+.-]{1,63}$/u.test(launchScheme)) throw new Error("launchScheme must be a normalized lowercase URL scheme.");
-  if (reservedLaunchSchemes.has(launchScheme)) throw new Error("launchScheme must be a dedicated QA-app URL scheme, not a browser, OS-service, or Tacua reviewer scheme.");
+  const transportPolicyVersion = profile.transport_configuration.transport_policy_version;
+  let launchScheme;
+  if (transportPolicyVersion === TRANSPORT_POLICY_VERSION_1_2) {
+    if (rawOptions.launchScheme !== undefined) {
+      throw new Error("launchScheme must be omitted when it is sealed by sdkProfilePath.");
+    }
+    launchScheme = profile.transport_configuration.launch_scheme;
+  } else {
+    launchScheme = validateLaunchScheme(rawOptions.launchScheme);
+  }
   const microphonePermission = requireNfcText(rawOptions.microphonePermission ?? defaultMicrophonePermission, "microphonePermission", 24, 512);
   return Object.freeze({
     allowInsecureLoopback,
@@ -373,6 +405,11 @@ function applyInfoPlist(rawInfoPlist, options) {
   setExact(infoPlist, "TacuaBackendOrigin", options.backendOrigin);
   setExact(infoPlist, "TacuaAllowInsecureLoopback", options.allowInsecureLoopback);
   setExact(infoPlist, "TacuaLaunchScheme", options.launchScheme);
+  setExact(
+    infoPlist,
+    "TacuaTransportPolicyVersion",
+    options.sdkProfile.transport_configuration.transport_policy_version,
+  );
   setExact(infoPlist, "TacuaCaptureBuildVariant", options.buildVariant);
   setExact(infoPlist, "TacuaCaptureDistribution", options.distribution);
   setExact(infoPlist, "TacuaSDKProfileJSON", options.sdkProfileCanonicalJSON);
