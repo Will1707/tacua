@@ -147,7 +147,10 @@ bash .github/scripts/verify-backend-container.sh
 The package-dependency-free browser smoke drives the production export through
 Chrome or Chromium and uses OpenSSL for an ephemeral loopback certificate. It
 fails CI when no browser is available; on an operator workstation without a
-browser it reports an explicit skip.
+browser it reports an explicit skip. It permits one fresh-Chrome retry only
+when initial DevTools target creation exceeds its fixed startup bound;
+application, protocol, assertion, and post-startup browser failures are never
+retried.
 
 The final command runs authenticated backend and static-shell smoke tests
 through the exact same-origin ingress.
