@@ -120,7 +120,7 @@ SCOPE_POLICY_CONTRACT = "tacua.capture-scope-policy@1.0.0"
 RETENTION_POLICY_VERSION = "tacua.retention-v1"
 MANIFEST_RETENTION_POLICY_VERSION = "tacua.retention@1.0.0"
 SDK_BACKEND_ERROR_CONTRACT = "tacua.sdk-backend-error@1.0.0"
-REVIEWER_BOOTSTRAP_CONTRACT = "tacua.reviewer-bootstrap@1.0.0"
+REVIEWER_BOOTSTRAP_CONTRACT = "tacua.reviewer-bootstrap@1.1.0"
 REVIEWER_LAUNCH_LINK_CONTRACT = "tacua.reviewer-launch-link@1.0.0"
 SDK_BACKEND_ERROR_MEDIA_TYPE = (
     "application/vnd.tacua.sdk-backend-error+json;version=1.0.0"
@@ -4081,7 +4081,6 @@ class PilotBackend:
 
         return {
             "contract_version": REVIEWER_BOOTSTRAP_CONTRACT,
-            "reviewer_id": self.config.reviewer_id,
             "builds": [
                 {
                     **build,

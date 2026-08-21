@@ -487,7 +487,7 @@ validated constants but are never used without the complete machine binding.
 | `GET` | `/version` | public | Service and protocol version |
 | `GET` | `/v1/admin/builds` | admin bearer | List the registered reviewer build projection |
 | `GET` | `/v1/admin/reviewer-binding` | admin bearer plus `Tacua-Reviewer-ID` | Verify the claimed reviewer identity and return status only |
-| `GET` | `/v1/admin/reviewer-bootstrap` | admin bearer | Read the exact versioned reviewer identity and per-build launch metadata |
+| `GET` | `/v1/admin/reviewer-bootstrap` | admin bearer | Read exact versioned per-build launch metadata without reviewer identity |
 | `POST` | `/v1/admin/launch-codes` | admin bearer | Create a start or resume grant |
 | `POST` | `/v1/reviewer/pairing-requests` | public, exact web Origin when applicable | Create one ten-minute reviewer pairing request |
 | `POST` | `/v1/reviewer/pairing-exchanges` | one-use pairing token | Exchange an approved request for a scoped web cookie or native bearer |
@@ -526,12 +526,11 @@ aliases additionally require the exact configured Origin and CSRF token.
 
 `GET /v1/admin/reviewer-bootstrap` is the transitional administrator-authenticated
 bootstrap used while reviewer-scoped authentication is introduced. Its exact
-`tacua.reviewer-bootstrap@1.0.0` response is:
+`tacua.reviewer-bootstrap@1.1.0` response is:
 
 ```json
 {
-  "contract_version": "tacua.reviewer-bootstrap@1.0.0",
-  "reviewer_id": "reviewer_owner",
+  "contract_version": "tacua.reviewer-bootstrap@1.1.0",
   "builds": [
     {
       "build_id": "build_...",
@@ -547,12 +546,23 @@ bootstrap used while reviewer-scoped authentication is introduced. Its exact
 }
 ```
 
-The object and every build use exact keys. `reviewer_id` is the deployment-pinned
-reviewer actor. `launch_scheme` is the scheme sealed into that build's transport
-1.2 configuration. A legacy transport 1.1 build is represented without changing
-the response shape by the single exception `"launch_scheme": null`; clients must
-not construct a launch URL from that value. The older `/v1/admin/builds` response
-remains unchanged for compatibility and never gains these fields.
+The object and every build use exact keys. The response deliberately omits the
+deployment-pinned reviewer actor: clients must first prove their locally entered
+identity through `/v1/admin/reviewer-binding`, whose status-only result remains
+the identity boundary. `launch_scheme` is the scheme sealed into that build's
+transport 1.2 configuration. A legacy transport 1.1 build is represented without
+changing the response shape by the single exception `"launch_scheme": null`;
+clients must not construct a launch URL from that value. The older
+`/v1/admin/builds` response remains unchanged for compatibility and never gains
+these fields.
+
+During a staggered upgrade, clients and operator smoke may also read the exact
+already-deployed `tacua.reviewer-bootstrap@1.0.0` shape. They accept it only
+after the status-only reviewer binding succeeds and only when its legacy
+`reviewer_id` exactly matches the operator-declared/deployment-sealed identity.
+That field is a consistency check, never a source of reviewer configuration.
+New backends emit only the identity-free 1.1 shape; a 1.0 response with any
+missing, additional, or mismatched field fails closed.
 
 Candidate evidence and preview reads require one quoted candidate digest in
 `If-Match` and the exact `Tacua-Evidence-Manifest-Digest`. Candidate transitions

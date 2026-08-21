@@ -6,7 +6,8 @@ import type {
 } from "./types.ts";
 import { isSafeTargetScheme } from "../config/target-scheme.ts";
 
-const reviewerBootstrapContract = "tacua.reviewer-bootstrap@1.0.0";
+const reviewerBootstrapContract = "tacua.reviewer-bootstrap@1.1.0";
+const legacyReviewerBootstrapContract = "tacua.reviewer-bootstrap@1.0.0";
 const maximumBootstrapBuilds = 100;
 
 // The closed projection is smaller than 100 KiB at all field maxima. Keep a
@@ -104,17 +105,26 @@ function build(value: unknown): ReviewerBootstrapBuild {
 }
 
 export function validateReviewerBootstrap(value: unknown): ReviewerBootstrap {
-  const envelope = exact(value, ["contract_version", "reviewer_id", "builds"]);
-  if (envelope.contract_version !== reviewerBootstrapContract) fail();
+  if (value === null || typeof value !== "object" || Array.isArray(value)) fail();
+  const contractVersion = (value as Record<string, unknown>).contract_version;
+  const legacy = contractVersion === legacyReviewerBootstrapContract;
+  if (!legacy && contractVersion !== reviewerBootstrapContract) fail();
+  const envelope = exact(
+    value,
+    legacy ? ["contract_version", "reviewer_id", "builds"] : ["contract_version", "builds"],
+  );
   if (!Array.isArray(envelope.builds) || envelope.builds.length > maximumBootstrapBuilds) fail();
   const builds = envelope.builds.map(build);
   if (
     new Set(builds.map((item) => item.build_id)).size !== builds.length
     || new Set(builds.map((item) => item.build_identity_digest)).size !== builds.length
   ) fail();
-  return {
-    contract_version: reviewerBootstrapContract,
-    reviewer_id: identifier(envelope.reviewer_id),
-    builds,
-  };
+  if (legacy) {
+    return {
+      contract_version: legacyReviewerBootstrapContract,
+      reviewer_id: identifier(envelope.reviewer_id),
+      builds,
+    };
+  }
+  return { contract_version: reviewerBootstrapContract, builds };
 }

@@ -298,8 +298,7 @@ async function createFixtureServer(temporaryDirectory) {
         }
         if (pathname === "/v1/admin/reviewer-bootstrap") {
           sendCanonicalJson(response, 200, {
-            contract_version: "tacua.reviewer-bootstrap@1.0.0",
-            reviewer_id: reviewerId,
+            contract_version: "tacua.reviewer-bootstrap@1.1.0",
             builds: [
               {
                 build_id: "build_browser_smoke",

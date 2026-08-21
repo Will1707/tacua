@@ -280,10 +280,17 @@ PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool \
 The smoke command uses the configured origin, rejects redirects, performs
 normal certificate/hostname verification with TLS 1.2 minimum, bounds every
 response, checks the frozen protocol and schema, checks the retention worker's
-latest sweep, and authenticates `/v1/admin/builds` with the supplied secret.
-The secret is sent only to that exact origin and is never printed. The
-`--origin http://127.0.0.1:8080 --allow-loopback-http` escape hatch exists only
-for a local container smoke test.
+latest sweep, and authenticates `/v1/admin/builds` with the supplied secret. It
+also exact-validates the build-only reviewer bootstrap when the running backend
+supports that additive endpoint. An exact `404` remains acceptable during an
+upgrade, including for a candidate transport 1.2 configuration with a sealed
+launch scheme. During the corrective stagger it accepts either the exact
+identity-free bootstrap 1.1 response or the exact old 1.0 response whose legacy
+reviewer identity matches the sealed deployment value; every other status,
+shape, or mismatch fails closed. New backends emit only 1.1.
+The secret is sent only to that exact origin and is never printed. The `--origin
+http://127.0.0.1:8080 --allow-loopback-http` escape hatch exists only for a
+local container smoke test.
 
 ## 4. Start and monitor
 

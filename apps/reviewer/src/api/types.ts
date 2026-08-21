@@ -154,6 +154,10 @@ export type ReviewerBootstrapBuild = RegisteredBuild & {
 };
 
 export type ReviewerBootstrap = {
+  readonly contract_version: "tacua.reviewer-bootstrap@1.1.0";
+  readonly builds: readonly ReviewerBootstrapBuild[];
+} | {
+  /** Read-only compatibility with the already-deployed bootstrap shape. */
   readonly contract_version: "tacua.reviewer-bootstrap@1.0.0";
   readonly reviewer_id: string;
   readonly builds: readonly ReviewerBootstrapBuild[];

@@ -2228,18 +2228,27 @@ def smoke_deployment(
         opener,
         f"{origin}/v1/admin/reviewer-bootstrap",
         authorization=secret.decode("utf-8"),
-        allow_not_found=config.launch_scheme is None,
+        # This endpoint is additive and may be absent on the running side of
+        # an upgrade even when the candidate V1.2 config seals a launch scheme.
+        allow_not_found=True,
     )
     if bootstrap is not None:
         expected_bootstrap_build = {
             **expected_build,
             "launch_scheme": config.launch_scheme,
         }
-        if bootstrap != {
-            "contract_version": "tacua.reviewer-bootstrap@1.0.0",
-            "reviewer_id": config.reviewer_id,
-            "builds": [expected_bootstrap_build],
-        }:
+        supported_bootstraps = (
+            {
+                "contract_version": "tacua.reviewer-bootstrap@1.1.0",
+                "builds": [expected_bootstrap_build],
+            },
+            {
+                "contract_version": "tacua.reviewer-bootstrap@1.0.0",
+                "reviewer_id": config.reviewer_id,
+                "builds": [expected_bootstrap_build],
+            },
+        )
+        if bootstrap not in supported_bootstraps:
             raise OperatorError(
                 "authenticated smoke did not return the pinned reviewer bootstrap"
             )

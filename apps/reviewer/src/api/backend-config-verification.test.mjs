@@ -21,8 +21,7 @@ function candidate(overrides = {}) {
 
 function bootstrap(overrides = {}) {
   return {
-    contract_version: "tacua.reviewer-bootstrap@1.0.0",
-    reviewer_id: "reviewer_owner",
+    contract_version: "tacua.reviewer-bootstrap@1.1.0",
     builds: [{
       build_id: "build_kuzaba_qa",
       application_id: "application_kuzaba_qa",
@@ -33,6 +32,15 @@ function bootstrap(overrides = {}) {
       build_identity_digest: `sha256:${"a".repeat(64)}`,
       launch_scheme: "tacua-qa-app",
     }],
+    ...overrides,
+  };
+}
+
+function legacyBootstrap(overrides = {}) {
+  return {
+    ...bootstrap(),
+    contract_version: "tacua.reviewer-bootstrap@1.0.0",
+    reviewer_id: "reviewer_owner",
     ...overrides,
   };
 }
@@ -55,7 +63,7 @@ function authenticatedClient({
   };
 }
 
-test("normalizes locally, reads the authoritative bootstrap, then verifies its reviewer binding", async () => {
+test("normalizes locally and verifies the declared reviewer before reading build metadata", async () => {
   const calls = [];
   const clientConfigs = [];
   const verified = await verifyBackendConfig(candidate(), {
@@ -82,17 +90,16 @@ test("normalizes locally, reads the authoritative bootstrap, then verifies its r
   assert.deepEqual(calls, [
     "probe:https://tacua.example",
     "client",
+    "identity-binding",
     "authenticated-read",
     "client",
-    "identity-binding",
   ]);
 });
 
-test("derives reviewer identity and launch scheme from the authoritative bootstrap", async () => {
+test("derives only the launch scheme from the authoritative bootstrap", async () => {
   const clientReviewerIds = [];
   const identityBindings = [];
   const verified = await verifyBackendConfig(candidate({
-    reviewerId: "reviewer_typo",
     targetScheme: "wrong-but-safe-qa",
   }), {
     async probeBackend() {},
@@ -106,8 +113,90 @@ test("derives reviewer identity and launch scheme from the authoritative bootstr
 
   assert.equal(verified.reviewerId, "reviewer_owner");
   assert.equal(verified.targetScheme, "tacua-qa-app");
-  assert.deepEqual(clientReviewerIds, ["reviewer_typo", "reviewer_owner"]);
+  assert.deepEqual(clientReviewerIds, ["reviewer_owner", "reviewer_owner"]);
   assert.deepEqual(identityBindings, ["reviewer_owner"]);
+});
+
+test("accepts exact staggered 1.0 metadata only after binding the supplied identity", async () => {
+  const calls = [];
+  const verified = await verifyBackendConfig(candidate({
+    targetScheme: "stale-qa-app",
+  }), {
+    async probeBackend() { calls.push("probe"); },
+    createClient(config) {
+      calls.push(`client:${config.reviewerId}`);
+      return {
+        async verifyReviewerIdentity() { calls.push("identity-binding"); },
+        async getReviewerBootstrap() { calls.push("bootstrap-1.0"); return legacyBootstrap(); },
+        async listBuilds() { assert.fail("legacy registry fallback was unexpected"); },
+      };
+    },
+  });
+  assert.deepEqual(calls, [
+    "probe",
+    "client:reviewer_owner",
+    "identity-binding",
+    "bootstrap-1.0",
+    "client:reviewer_owner",
+  ]);
+  assert.equal(verified.reviewerId, "reviewer_owner");
+  assert.equal(verified.targetScheme, "tacua-qa-app");
+});
+
+test("rejects inconsistent staggered 1.0 identity without deriving or persisting it", async () => {
+  const suppliedId = "reviewer_owner";
+  const legacyId = "reviewer_other";
+  const adminToken = "a".repeat(32);
+  let persisted = 0;
+  let clients = 0;
+  let caught;
+  await assert.rejects(() => verifyAndPersistBackendConfig(candidate({
+    adminToken,
+    reviewerId: suppliedId,
+  }), {
+    async probeBackend() {},
+    createClient() {
+      clients += 1;
+      return {
+        async verifyReviewerIdentity() {},
+        async getReviewerBootstrap() {
+          return legacyBootstrap({ reviewer_id: legacyId });
+        },
+        async listBuilds() { assert.fail("legacy registry fallback was unexpected"); },
+      };
+    },
+    async persistConfig() { persisted += 1; },
+  }), (error) => {
+    caught = error;
+    return error instanceof Error && /does not match this deployment/u.test(error.message);
+  });
+  assert.equal(clients, 1);
+  assert.equal(persisted, 0);
+  assert.doesNotMatch(caught.message, new RegExp(`${suppliedId}|${legacyId}|${adminToken}`, "u"));
+});
+
+test("rejects a wrong declared reviewer before bootstrap or persistence", async () => {
+  const calls = [];
+  let persisted = 0;
+  await assert.rejects(() => verifyAndPersistBackendConfig(candidate({
+    reviewerId: "reviewer_typo",
+  }), {
+    async probeBackend() { calls.push("probe"); },
+    createClient(config) {
+      calls.push(`client:${config.reviewerId}`);
+      return {
+        async verifyReviewerIdentity() {
+          calls.push("identity-binding");
+          throw new Error("The reviewer identity does not match this deployment.");
+        },
+        async getReviewerBootstrap() { assert.fail("bootstrap followed a rejected identity"); },
+        async listBuilds() { assert.fail("registry read followed a rejected identity"); },
+      };
+    },
+    async persistConfig() { persisted += 1; },
+  }), /does not match this deployment/u);
+  assert.deepEqual(calls, ["probe", "client:reviewer_typo", "identity-binding"]);
+  assert.equal(persisted, 0);
 });
 
 test("uses the manual transport 1.1 fields only when the additive endpoint is absent", async () => {
@@ -116,12 +205,12 @@ test("uses the manual transport 1.1 fields only when the additive endpoint is ab
     async probeBackend() {},
     createClient() {
       return {
+        async verifyReviewerIdentity() {
+          calls.push("identity-binding");
+        },
         async getReviewerBootstrap() {
           calls.push("bootstrap");
           throw { status: 404 };
-        },
-        async verifyReviewerIdentity() {
-          calls.push("identity-binding");
         },
         async listBuilds() {
           calls.push("legacy-builds");
@@ -131,14 +220,13 @@ test("uses the manual transport 1.1 fields only when the additive endpoint is ab
     },
   });
 
-  assert.deepEqual(calls, ["bootstrap", "identity-binding", "legacy-builds"]);
+  assert.deepEqual(calls, ["identity-binding", "bootstrap", "legacy-builds"]);
   assert.equal(verified.reviewerId, "reviewer_owner");
   assert.equal(verified.targetScheme, "tacua-qa-app");
 });
 
 test("keeps the normalized manual scheme for a bootstrapped transport 1.1 build", async () => {
   const verified = await verifyBackendConfig(candidate({
-    reviewerId: "reviewer_typo",
     targetScheme: "manual-legacy-qa",
   }), {
     async probeBackend() {},
@@ -168,7 +256,7 @@ test("rejects an ambiguous reviewer bootstrap before persistence", async () => {
       createClient() {
         return {
           async getReviewerBootstrap() { return bootstrap({ builds }); },
-          async verifyReviewerIdentity() { assert.fail("identity binding followed an ambiguous bootstrap"); },
+          async verifyReviewerIdentity() {},
           async listBuilds() { throw new Error("unexpected legacy fallback"); },
         };
       },
@@ -178,23 +266,23 @@ test("rejects an ambiguous reviewer bootstrap before persistence", async () => {
   }
 });
 
-test("does not persist when the bootstrap-derived reviewer binding fails", async () => {
-  let clients = 0;
+test("does not bootstrap or persist when the declared reviewer binding fails", async () => {
+  let bootstraps = 0;
   let persisted = 0;
   await assert.rejects(() => verifyAndPersistBackendConfig(candidate({
     reviewerId: "reviewer_typo",
   }), {
     async probeBackend() {},
     createClient() {
-      clients += 1;
-      if (clients === 1) return authenticatedClient();
-      return authenticatedClient({
-        onIdentityBinding: () => { throw new Error("authoritative identity rejected"); },
-      });
+      return {
+        async verifyReviewerIdentity() { throw new Error("declared identity rejected"); },
+        async getReviewerBootstrap() { bootstraps += 1; return bootstrap(); },
+        async listBuilds() { assert.fail("registry read followed a rejected identity"); },
+      };
     },
     async persistConfig() { persisted += 1; },
-  }), /authoritative identity rejected/);
-  assert.equal(clients, 2);
+  }), /declared identity rejected/);
+  assert.equal(bootstraps, 0);
   assert.equal(persisted, 0);
 });
 
@@ -251,10 +339,9 @@ test("rejects administrator tokens outside the bounded ASCII token68 grammar loc
   });
 });
 
-test("authoritative bootstrap replaces blank or unsafe manual identity and scheme fields", async () => {
+test("authoritative bootstrap replaces only unsafe manual scheme fields", async () => {
   for (const targetScheme of ["", "http", "https", "file", "mailto", "tacua", "wss"]) {
     const verified = await verifyBackendConfig(candidate({
-      reviewerId: "",
       targetScheme,
     }), {
       async probeBackend() {},
@@ -265,41 +352,48 @@ test("authoritative bootstrap replaces blank or unsafe manual identity and schem
   }
 });
 
-test("legacy fallback validates manual identity and scheme only after bootstrap 404", async () => {
-  for (const [overrides, pattern] of [
-    [{ reviewerId: "" }, /Reviewer ID must be a Tacua identifier/u],
-    [{ targetScheme: "https" }, /custom scheme owned by the SDK-enabled QA app/u],
-  ]) {
+test("rejects a missing or malformed reviewer locally before probing or creating a client", async () => {
+  for (const reviewerId of ["", "ab", "Reviewer_owner", "reviewer.owner"]) {
     let probes = 0;
     let clients = 0;
-    let persisted = 0;
-    await assert.rejects(() => verifyAndPersistBackendConfig(candidate(overrides), {
+    await assert.rejects(() => verifyBackendConfig(candidate({ reviewerId }), {
       async probeBackend() { probes += 1; },
-      createClient() {
-        clients += 1;
-        return {
-          async getReviewerBootstrap() { throw { status: 404 }; },
-          async verifyReviewerIdentity() { assert.fail("invalid legacy fields reached identity binding"); },
-          async listBuilds() { assert.fail("invalid legacy fields reached the registry"); },
-        };
-      },
-      async persistConfig() { persisted += 1; },
-    }), pattern);
-    assert.deepEqual({ probes, clients, persisted }, { probes: 1, clients: 1, persisted: 0 });
+      createClient() { clients += 1; return authenticatedClient(); },
+    }), /Reviewer ID must be a Tacua identifier/u);
+    assert.deepEqual({ probes, clients }, { probes: 0, clients: 0 });
   }
 });
 
-test("does not persist a typoed, expired, or insufficiently scoped administrator token", async () => {
+test("legacy fallback validates the manual scheme only after identity binding and bootstrap 404", async () => {
+  const calls = [];
+  let persisted = 0;
+  await assert.rejects(() => verifyAndPersistBackendConfig(candidate({ targetScheme: "https" }), {
+    async probeBackend() { calls.push("probe"); },
+    createClient() {
+      calls.push("client");
+      return {
+        async verifyReviewerIdentity() { calls.push("identity-binding"); },
+        async getReviewerBootstrap() { calls.push("bootstrap"); throw { status: 404 }; },
+        async listBuilds() { assert.fail("invalid legacy scheme reached the registry"); },
+      };
+    },
+    async persistConfig() { persisted += 1; },
+  }), /custom scheme owned by the SDK-enabled QA app/u);
+  assert.deepEqual(calls, ["probe", "client", "identity-binding", "bootstrap"]);
+  assert.equal(persisted, 0);
+});
+
+test("does not persist an expired or insufficiently scoped administrator token", async () => {
   for (const failure of ["unauthorized", "expired", "scope denied"]) {
     let persisted = 0;
     await assert.rejects(() => verifyAndPersistBackendConfig(candidate(), {
       async probeBackend() {},
       createClient() {
         return {
-          async getReviewerBootstrap() {
+          async verifyReviewerIdentity() {
             throw new Error(failure);
           },
-          async verifyReviewerIdentity() { assert.fail("identity binding followed a failed bootstrap read"); },
+          async getReviewerBootstrap() { assert.fail("bootstrap followed failed authentication"); },
           async listBuilds() { throw new Error("unexpected legacy fallback"); },
         };
       },
@@ -330,7 +424,7 @@ test("persists exactly once and only after both public and authenticated checks 
     },
   });
 
-  assert.deepEqual(calls, ["probe", "authenticated-read", "identity-binding", "persist"]);
+  assert.deepEqual(calls, ["probe", "identity-binding", "authenticated-read", "persist"]);
   assert.deepEqual(persisted, verified);
 });
 
@@ -370,11 +464,11 @@ test("legacy fallback rejects an incorrect reviewer ID before persistence withou
   assert.doesNotMatch(caught.message, new RegExp(`${suppliedId}|${configuredId}|${adminToken}`, "u"));
 });
 
-test("provider activation re-bootstraps saved metadata before exposing a client", async () => {
+test("provider activation verifies saved identity before refreshing launch metadata", async () => {
   const calls = [];
   const loaded = candidate({
     baseUrl: "https://tacua.example",
-    reviewerId: "reviewer_previous",
+    reviewerId: "reviewer_owner",
     targetScheme: "stale-qa-app",
   });
   const clients = [];
@@ -400,10 +494,10 @@ test("provider activation re-bootstraps saved metadata before exposing a client"
 
   assert.deepEqual(calls, [
     "load",
-    "client:reviewer_previous",
-    "bootstrap",
     "client:reviewer_owner",
     "identity-binding",
+    "bootstrap",
+    "client:reviewer_owner",
   ]);
   assert.equal(active.client, clients[1]);
   assert.equal(active.config.reviewerId, "reviewer_owner");
@@ -442,12 +536,10 @@ test("provider activation keeps missing and identity-rejected settings unexposed
     createClient() {
       clientCount += 1;
       return {
-        async getReviewerBootstrap() { return bootstrap(); },
         async verifyReviewerIdentity() {
-          if (clientCount === 2) {
-            throw new Error("The reviewer identity does not match this deployment.");
-          }
+          throw new Error("The reviewer identity does not match this deployment.");
         },
+        async getReviewerBootstrap() { assert.fail("bootstrap followed a stale identity"); },
         async listBuilds() { throw new Error("unexpected legacy fallback"); },
       };
     },
@@ -456,5 +548,6 @@ test("provider activation keeps missing and identity-rejected settings unexposed
     return true;
   });
   assert.ok(caught instanceof Error);
+  assert.equal(clientCount, 1);
   assert.doesNotMatch(caught.message, new RegExp(`${staleId}|${configuredId}|${adminToken}`, "u"));
 });

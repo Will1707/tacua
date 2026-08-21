@@ -25,6 +25,14 @@ function registeredBuild(overrides = {}) {
 
 function bootstrap(overrides = {}) {
   return {
+    contract_version: "tacua.reviewer-bootstrap@1.1.0",
+    builds: [registeredBuild()],
+    ...overrides,
+  };
+}
+
+function legacyBootstrap(overrides = {}) {
+  return {
     contract_version: "tacua.reviewer-bootstrap@1.0.0",
     reviewer_id: "reviewer_owner_qa",
     builds: [registeredBuild()],
@@ -40,26 +48,29 @@ function rejects(value) {
   );
 }
 
-test("accepts exact current and legacy reviewer bootstrap projections", () => {
+test("accepts exact current, staggered 1.0, and transport 1.1 projections", () => {
   assert.deepEqual(validateReviewerBootstrap(bootstrap()), bootstrap());
-  const legacy = bootstrap({ builds: [registeredBuild({ launch_scheme: null })] });
-  assert.deepEqual(validateReviewerBootstrap(legacy), legacy);
+  assert.deepEqual(validateReviewerBootstrap(legacyBootstrap()), legacyBootstrap());
+  const legacyTransport = bootstrap({ builds: [registeredBuild({ launch_scheme: null })] });
+  assert.deepEqual(validateReviewerBootstrap(legacyTransport), legacyTransport);
   assert.ok(maximumReviewerBootstrapResponseBytes <= 128 * 1_024);
 });
 
 test("rejects contract drift and non-exact envelope or build shapes", () => {
   rejects(bootstrap({ contract_version: "tacua.reviewer-bootstrap@2.0.0" }));
   rejects({ ...bootstrap(), debug: true });
-  const { reviewer_id: _reviewerId, ...missingReviewer } = bootstrap();
+  rejects({ ...bootstrap(), reviewer_id: "reviewer_owner_qa" });
+  const { reviewer_id: _reviewerId, ...missingReviewer } = legacyBootstrap();
   rejects(missingReviewer);
+  rejects({ ...legacyBootstrap(), debug: true });
   rejects(bootstrap({ builds: [{ ...registeredBuild(), debug: true }] }));
   const { launch_scheme: _launchScheme, ...missingScheme } = registeredBuild();
   rejects(bootstrap({ builds: [missingScheme] }));
 });
 
-test("rejects invalid reviewer identities and unsafe launch schemes", () => {
+test("rejects invalid legacy identities and unsafe launch schemes", () => {
   for (const reviewer_id of ["Reviewer_owner", "ab", "reviewer.owner", "reviewer_e\u0301"]) {
-    rejects(bootstrap({ reviewer_id }));
+    rejects(legacyBootstrap({ reviewer_id }));
   }
   for (const launch_scheme of ["https", "tacua", "TACUA-KUZABA-QA", "x", `${"x".repeat(65)}`]) {
     rejects(bootstrap({ builds: [registeredBuild({ launch_scheme })] }));
