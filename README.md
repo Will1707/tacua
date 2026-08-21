@@ -73,6 +73,9 @@ python3 -B -m unittest discover -s experiments/eval-harness/tests -v
 PYTHONWARNINGS=error python3 -B -m unittest discover \
   -s experiments/ios-capture-spike/tests \
   -p 'test_pilot_diagnostics*.py' -v
+PYTHONWARNINGS=error python3 -B -m unittest discover \
+  -s experiments/ios-capture-spike/harness/tests -v
+bash experiments/ios-capture-spike/harness/scripts/test_physical_harness_state.sh
 node --test experiments/security-harness/test/harness.test.mjs
 node --test .github/scripts/validate-processor-image-inputs.test.mjs
 node --test .github/scripts/verify-processor-container.test.mjs
