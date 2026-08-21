@@ -251,19 +251,41 @@ test("rejects administrator tokens outside the bounded ASCII token68 grammar loc
   });
 });
 
-test("rejects system, network, and reviewer-owned launch schemes before any request", async () => {
-  for (const targetScheme of ["http", "https", "file", "mailto", "tacua", "wss"]) {
+test("authoritative bootstrap replaces blank or unsafe manual identity and scheme fields", async () => {
+  for (const targetScheme of ["", "http", "https", "file", "mailto", "tacua", "wss"]) {
+    const verified = await verifyBackendConfig(candidate({
+      reviewerId: "",
+      targetScheme,
+    }), {
+      async probeBackend() {},
+      createClient() { return authenticatedClient(); },
+    });
+    assert.equal(verified.reviewerId, "reviewer_owner");
+    assert.equal(verified.targetScheme, "tacua-qa-app");
+  }
+});
+
+test("legacy fallback validates manual identity and scheme only after bootstrap 404", async () => {
+  for (const [overrides, pattern] of [
+    [{ reviewerId: "" }, /Reviewer ID must be a Tacua identifier/u],
+    [{ targetScheme: "https" }, /custom scheme owned by the SDK-enabled QA app/u],
+  ]) {
     let probes = 0;
     let clients = 0;
-    await assert.rejects(() => verifyBackendConfig(candidate({ targetScheme }), {
+    let persisted = 0;
+    await assert.rejects(() => verifyAndPersistBackendConfig(candidate(overrides), {
       async probeBackend() { probes += 1; },
       createClient() {
         clients += 1;
-        return authenticatedClient();
+        return {
+          async getReviewerBootstrap() { throw { status: 404 }; },
+          async verifyReviewerIdentity() { assert.fail("invalid legacy fields reached identity binding"); },
+          async listBuilds() { assert.fail("invalid legacy fields reached the registry"); },
+        };
       },
-    }), /custom scheme owned by the SDK-enabled QA app/);
-    assert.equal(probes, 0);
-    assert.equal(clients, 0);
+      async persistConfig() { persisted += 1; },
+    }), pattern);
+    assert.deepEqual({ probes, clients, persisted }, { probes: 1, clients: 1, persisted: 0 });
   }
 });
 
@@ -348,38 +370,14 @@ test("legacy fallback rejects an incorrect reviewer ID before persistence withou
   assert.doesNotMatch(caught.message, new RegExp(`${suppliedId}|${configuredId}|${adminToken}`, "u"));
 });
 
-test("rejects a missing reviewer ID before any request or persistence", async () => {
-  let probes = 0;
-  let clients = 0;
-  let persisted = 0;
-  await assert.rejects(() => verifyAndPersistBackendConfig(
-    candidate({ reviewerId: "" }),
-    {
-      async probeBackend() { probes += 1; },
-      createClient() {
-        clients += 1;
-        return {
-          async verifyReviewerIdentity() {},
-          async listBuilds() { return []; },
-        };
-      },
-      async persistConfig() { persisted += 1; },
-    },
-  ), /Reviewer ID must be a Tacua identifier/u);
-  assert.deepEqual({ probes, clients, persisted }, { probes: 0, clients: 0, persisted: 0 });
-});
-
-test("provider activation exposes correct settings only after live identity verification", async () => {
+test("provider activation re-bootstraps saved metadata before exposing a client", async () => {
   const calls = [];
   const loaded = candidate({
     baseUrl: "https://tacua.example",
-    reviewerId: "reviewer_owner",
-    targetScheme: "tacua-qa-app",
+    reviewerId: "reviewer_previous",
+    targetScheme: "stale-qa-app",
   });
-  const client = {
-    async verifyReviewerIdentity() { calls.push("identity-binding"); },
-    async listBuilds() { return []; },
-  };
+  const clients = [];
   const active = await loadVerifiedBackendConfig({
     async loadConfig() {
       calls.push("load");
@@ -387,22 +385,39 @@ test("provider activation exposes correct settings only after live identity veri
     },
     createClient(config) {
       calls.push(`client:${config.reviewerId}`);
+      const client = {
+        async getReviewerBootstrap() {
+          calls.push("bootstrap");
+          return bootstrap();
+        },
+        async verifyReviewerIdentity() { calls.push("identity-binding"); },
+        async listBuilds() { throw new Error("unexpected legacy fallback"); },
+      };
+      clients.push(client);
       return client;
     },
   });
 
-  assert.deepEqual(calls, ["load", "client:reviewer_owner", "identity-binding"]);
-  assert.equal(active.client, client);
-  assert.deepEqual(active.config, loaded);
+  assert.deepEqual(calls, [
+    "load",
+    "client:reviewer_previous",
+    "bootstrap",
+    "client:reviewer_owner",
+    "identity-binding",
+  ]);
+  assert.equal(active.client, clients[1]);
+  assert.equal(active.config.reviewerId, "reviewer_owner");
+  assert.equal(active.config.targetScheme, "tacua-qa-app");
 });
 
-test("provider activation keeps missing and stale settings unexposed", async () => {
+test("provider activation keeps missing and identity-rejected settings unexposed", async () => {
   let clients = 0;
   assert.equal(await loadVerifiedBackendConfig({
     async loadConfig() { return null; },
     createClient() {
       clients += 1;
       return {
+        async getReviewerBootstrap() { return bootstrap(); },
         async verifyReviewerIdentity() {},
         async listBuilds() { return []; },
       };
@@ -411,8 +426,9 @@ test("provider activation keeps missing and stale settings unexposed", async () 
   assert.equal(clients, 0);
 
   const staleId = "reviewer_previous";
-  const configuredId = "reviewer_current";
+  const configuredId = "reviewer_owner";
   const adminToken = "StalePrivateToken-1234567890-abcdef";
+  let clientCount = 0;
   let caught;
   await assert.rejects(() => loadVerifiedBackendConfig({
     async loadConfig() {
@@ -424,11 +440,15 @@ test("provider activation keeps missing and stale settings unexposed", async () 
       });
     },
     createClient() {
+      clientCount += 1;
       return {
+        async getReviewerBootstrap() { return bootstrap(); },
         async verifyReviewerIdentity() {
-          throw new Error("The reviewer identity does not match this deployment.");
+          if (clientCount === 2) {
+            throw new Error("The reviewer identity does not match this deployment.");
+          }
         },
-        async listBuilds() { return []; },
+        async listBuilds() { throw new Error("unexpected legacy fallback"); },
       };
     },
   }), (error) => {
