@@ -192,6 +192,12 @@ jobs:
         working-directory: experiments/ios-capture-spike/package
         run: sh tests/run-core-tests.sh
 
+      - name: Verify physical-harness safety state and private-result boundaries
+        run: |
+          PYTHONWARNINGS=error python3 -B -m unittest discover \
+            -s experiments/ios-capture-spike/harness/tests -v
+          bash experiments/ios-capture-spike/harness/scripts/test_physical_harness_state.sh
+
       - name: Exercise the real SDK-to-backend loopback boundary
         run: python3 -B experiments/ios-capture-spike/package/tests/sdk_backend_loopback_e2e.py
 
@@ -217,6 +223,18 @@ jobs:
             -destination 'generic/platform=iOS Simulator' \
             CODE_SIGNING_ALLOWED=NO \
             build
+          cd ..
+          ./scripts/add_physical_ui_test_target.sh \
+            --development-team AAAAAAAAAA
+          cd ios
+          xcodebuild -quiet \
+            -workspace TacuaCaptureLab.xcworkspace \
+            -scheme TacuaCaptureLabAutomation \
+            -configuration Debug \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            build-for-testing
 
       - name: Compile the ReplayKit API boundary
         run: |

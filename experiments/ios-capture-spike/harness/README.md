@@ -90,6 +90,98 @@ or locale remains an operator decision. Physical lock/background actions also
 remain manual. Delete local sessions after evidence has been minimized and
 recorded.
 
+### Reusable handoff safety support
+
+The UI-test target also compiles the pure
+[`TacuaPhysicalHarnessState.swift`](physical-tests/TacuaPhysicalHarnessState.swift)
+contracts and their
+[`TacuaPhysicalHarnessSupport.swift`](physical-tests/TacuaPhysicalHarnessSupport.swift)
+XCUIAutomation adapter.
+It is generic test infrastructure, not a product journey or evidence fixture.
+An adopting maintainer must supply exact, reviewed accessibility labels for the
+app and OS locale. In particular:
+
+- a Safari-to-app handoff accepts only one alert or sheet containing a complete
+  allowlisted prompt label that names the configured app, exactly one
+  configured Open action, exactly one configured Cancel action, and no other
+  buttons; duplicate elements and components from separate containers are
+  rejected, the full prompt-owner set is freshly revalidated before a tap, and
+  prompts are scanned before foreground success;
+- the handoff waiter never calls `launch()` or `activate()` on the target after
+  Safari, so foreground success cannot be manufactured by a fallback;
+- the post-handoff classifier observes the full bounded window and permits
+  success only at its final priority-ordered snapshot; a stable pre-existing
+  dashboard is only a final diagnostic, never early success;
+- generic failure, build-binding failure, recovery, attention, foreground loss,
+  and unexpected system prompts are the explicit terminal fail-fast outcomes;
+- every timeout, stability window, poll interval, and post-sample wait must be
+  finite and positive and is evaluated against monotonic uptime; and
+- the app-audio helper proves the exact playback state was initially absent,
+  became active after the tap, then disappeared while the exact control became
+  ready, before completing a positive configurable post-sample recording wait.
+
+The optional quiescence override is XCTest-only and must be selected only for a
+reviewed Xcode/XCUIAutomation build. It resolves the runtime getter and setter,
+requires their exact Objective-C signatures, sets the exact `UInt32` mask `3`,
+reads the value back, and fails closed. Use the application controller for
+every target, Safari, and SpringBoard owner, including before and after each
+launch or activation. The platform-default mode does not call the private API.
+The host-executable support assertions freeze the state-machine, exact runtime
+signatures and readback, and pre/post transition-binding contracts. Run
+`./scripts/test_physical_harness_state.sh`; it does not contact a simulator or
+device. CI separately compiles the XCUIAutomation adapter for
+`generic/platform=iOS` without executing it.
+
+### Maintainer-only private runner
+
+[`run_private_physical_ui_test.sh`](scripts/run_private_physical_ui_test.sh) is
+an opt-in wrapper for one already-built, exact UI test. Invoking it contacts the
+configured physical device, so it is never a CI command and requires the
+explicit `--confirm-physical-device` flag. Device identifiers and forbidden
+runtime values are read from owner-private files. One-time forbidden values are
+never accepted as command-line values. The device identifier is the narrow
+exception: after it is read locally, `xcodebuild` necessarily receives it in
+the child process's `-destination` argument. It is never printed or logged, and
+the exact identifier is added to the forbidden-value scan before any result can
+be retained. The runner starts `xcodebuild` in a tracked process group, forwards
+`INT`, `HUP`, and `TERM`, and verifies that the entire group—not only its
+leader—has exited. Surviving descendants receive `SIGKILL` after a finite grace
+period. Once shutdown starts, repeated termination signals are ignored until
+the group is gone and the unsealed result has been deleted. Raw stdout and
+stderr go directly to `/dev/null`; no persistent raw log is created.
+
+Before a result is retained, [`xcresult_safety.py`](scripts/xcresult_safety.py)
+walks every hidden and nested entry without following links. It accepts only
+owner-controlled regular files and directories, rejects symlinks, special
+files, hard links, traversal, mutation races, read failures, forbidden values
+in names or contents, and empty results, then applies `0700`/`0600` permissions
+and rescans. Its dedicated statuses are `40` for a leak, `41` for clean/sealed,
+and `42` when cleanliness cannot be proved, including every non-help command
+line parse failure (`--help` alone remains status `0`). The runner destroys an
+unsealed result on any scan, permission, process, interrupt, hangup, or
+termination failure. It retains even a failed XCTest result only when that
+result completed the safety seal.
+
+Prepare a mode-`0600`, newline-delimited forbidden-values file containing every
+exact one-time URL, code, private origin, or other runtime value that must not
+be retained. The device identifier file is scanned as an additional exact
+forbidden-value source, so a result that embeds it is destroyed. Keep the result
+root owner-only and outside the repository. A generic invocation shape is:
+
+```sh
+./scripts/run_private_physical_ui_test.sh \
+  --xctestrun /private/owner/build/PhysicalTests.xctestrun \
+  --only-testing PhysicalTests/ExactUITests/testExactJourney \
+  --device-id-file /private/owner/runtime/device-id \
+  --result-root /private/owner/results \
+  --forbidden-values-file /private/owner/runtime/forbidden-values \
+  --confirm-physical-device
+```
+
+Never place result bundles, the private value file, device identifiers, launch
+URLs, private origins, or raw evidence in the repository. The scanner operates
+directly on files and deliberately does not invoke `xcresulttool`.
+
 Sanitized experiment observations live in
 [`../PHYSICAL-DEVICE-RESULTS.md`](../PHYSICAL-DEVICE-RESULTS.md). Raw media and
 stable device identifiers must never be added to that file or committed.
