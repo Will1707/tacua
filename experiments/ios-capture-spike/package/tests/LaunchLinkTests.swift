@@ -78,6 +78,29 @@ enum LaunchLinkTests {
       }
     }
 
+    let inbox = TacuaLaunchURLInbox(maximumPendingURLs: 2)
+    try require(
+      !inbox.capture(rawURL: invalid[0], configuration: configuration),
+      "The native inbox must reject links outside the exact build-pinned parser"
+    )
+    try require(
+      inbox.capture(rawURL: valid, configuration: configuration),
+      "The native inbox must retain a valid cold launch"
+    )
+    try require(
+      inbox.capture(rawURL: resume, configuration: configuration),
+      "The native inbox must retain a valid warm launch"
+    )
+    try require(
+      !inbox.capture(rawURL: valid, configuration: configuration),
+      "The native inbox must fail closed at its fixed capacity"
+    )
+    try require(
+      inbox.drain() == [valid, resume],
+      "Inbox drain must atomically preserve launch arrival order"
+    )
+    try require(inbox.drain().isEmpty, "Inbox values must be consumed exactly once")
+
     let gate = TacuaLaunchConsentGate()
     let pending = try gate.prepare(rawURL: valid, configuration: configuration)
     try expectLaunchError {

@@ -227,11 +227,18 @@ const processed = await TacuaCapture.processAdmittedCapture({
 ### Backend-managed host lifecycle adapter
 
 `createBackendManagedHostLifecycleAdapter()` creates the existing finite-state
-controller and owns its React Native host lifecycle. It installs `Linking` and
-`AppState` listeners before startup work, performs authoritative native
-discovery, privately delivers `Linking.getInitialURL()`, serializes later URL
-and foreground work, and disposes the controller with both listeners. It is not
-a React hook and does not create a second app:
+controller and owns its React Native host lifecycle. The SDK's Expo
+AppDelegate subscriber first validates dedicated Tacua URLs against the exact
+build-pinned parser, then mirrors them into a bounded process-local inbox. It
+returns `false`, so the app's existing Expo and React Native URL handlers keep
+their normal behavior. The adapter installs a content-free inbox signal plus
+`Linking` and `AppState` listeners before startup work, performs authoritative
+native discovery, atomically drains the inbox, and privately samples
+`Linking.getInitialURL()` behind a fixed 1.5-second bound. A native URL cannot
+therefore be lost just because Expo Router or React Native subscribes after the
+AppDelegate callback. The inbox is also drained on foreground, and all sources
+join the same serialized fingerprint-deduplicated queue. It is not a React hook
+and does not create a second app:
 
 ```ts
 import * as TacuaCapture from '@tacua/mobile-sdk';
@@ -250,6 +257,14 @@ const unsubscribe = host.controller.subscribe((snapshot) => {
   // actions is empty so a UI cannot start an overlapping native mutation.
   renderCaptureState(snapshot);
 });
+
+// If a router has its own native-intent URL source, feed that source through
+// this method rather than calling controller.prepareLaunch directly. It joins
+// the adapter's same serialized, bounded-fingerprint dedupe queue, so a URL
+// also observed by React Native Linking is delivered only once.
+const removeRouterLaunchListener = subscribeRouterLaunchURLs(
+  host.deliverLaunchURL,
+);
 
 // Resolves after initial discovery and any initial launch URL have been delivered.
 // A rejection is BackendManagedHostLifecycleAdapterError and contains no source error.
@@ -276,14 +291,17 @@ await controller.stopCapture();
 await controller.admitAndDrain();
 
 unsubscribe();
+removeRouterLaunchListener();
 host.dispose();
 ```
 
-The adapter ignores an exact duplicate launch URL after its first delivery
-attempt, without retaining the URL itself. Only an
+The native inbox is memory-only, bounded to 32 validated URLs, atomically
+consumed, and never logged or written to storage. Its wake-up event contains no
+URL, code, or user content. The adapter ignores an exact duplicate launch URL
+after its first delivery attempt, without retaining the URL itself. Only an
 `inactive`/`background`-to-`active` transition invokes `notifyForeground()`;
 bursts are coalesced while preserving a transition that arrives during native
-work. `dispose()` is idempotent, removes both host listeners immediately,
+work. `dispose()` is idempotent, removes all three host listeners immediately,
 suppresses queued callbacks, and disposes its owned controller. Results that
 arrive after teardown cannot trigger initial-URL reads, URL delivery, discovery,
 or state publication; an in-flight RESUME match also cancels its newly prepared

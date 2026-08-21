@@ -241,6 +241,15 @@ export function createBackendManagedHostLifecycleAdapter(
     controller,
     {
       getInitialURL: () => Linking.getInitialURL(),
+      drainPendingLaunchURLs: () =>
+        TacuaCaptureSpikeModule.drainPendingBackendLaunchURLs(),
+      subscribePendingLaunchURL: (listener) => {
+        const subscription = TacuaCaptureSpikeModule.addListener(
+          "onPendingBackendLaunchURL",
+          () => listener(),
+        );
+        return () => subscription.remove();
+      },
       getCurrentAppState: () => normalizeAppState(AppState.currentState),
       subscribeIncomingURL: (listener) => {
         const subscription = Linking.addEventListener("url", ({ url }) => {

@@ -99,6 +99,7 @@ swiftc \
   -module-cache-path "$TEST_TMP_DIR/module-cache" \
   ios/CapturePolicy.swift \
   ios/TacuaLaunchLink.swift \
+  ios/TacuaLaunchURLInbox.swift \
   tests/LaunchLinkTests.swift \
   -o "$TEST_TMP_DIR/tacua-launch-link-tests"
 

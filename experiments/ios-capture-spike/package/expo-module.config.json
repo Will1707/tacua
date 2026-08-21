@@ -1,6 +1,7 @@
 {
   "platforms": ["apple"],
   "apple": {
-    "modules": ["TacuaCaptureSpikeModule"]
+    "modules": ["TacuaCaptureSpikeModule"],
+    "appDelegateSubscribers": ["TacuaLaunchURLAppDelegateSubscriber"]
   }
 }

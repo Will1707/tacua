@@ -62,6 +62,8 @@ test("release paths are closed to an audited runtime file set", () => {
     "ios/AppAudioAppendAccounting.swift",
     "ios/CaptureModels.swift",
     "ios/TacuaLocalHarnessPolicy.swift",
+    "ios/TacuaLaunchURLAppDelegateSubscriber.swift",
+    "ios/TacuaLaunchURLInbox.swift",
     "ios/PrivacyInfo.xcprivacy",
     "ios/TacuaSDKLocalRetention.swift",
     "ios/TacuaCaptureSpike.podspec",
@@ -89,6 +91,30 @@ test("release paths are closed to an audited runtime file set", () => {
       /non-runtime path entered the SDK tarball/,
     );
   }
+});
+
+test("release registers content-preserving cold and warm native launch capture", () => {
+  const packageRoot = path.join(
+    repositoryRoot,
+    "experiments/ios-capture-spike/package",
+  );
+  const moduleConfig = JSON.parse(
+    readFileSync(path.join(packageRoot, "expo-module.config.json"), "utf8"),
+  );
+  const subscriber = readFileSync(
+    path.join(packageRoot, "ios/TacuaLaunchURLAppDelegateSubscriber.swift"),
+    "utf8",
+  );
+
+  assert.deepEqual(moduleConfig.apple.appDelegateSubscribers, [
+    "TacuaLaunchURLAppDelegateSubscriber",
+  ]);
+  assert.match(subscriber, /didFinishLaunchingWithOptions launchOptions:/);
+  assert.match(subscriber, /launchOptions\?\[\.url\] as\? URL/);
+  assert.match(subscriber, /open url: URL/);
+  assert.match(subscriber, /TacuaLaunchURLInbox\.shared\.capture/);
+  assert.equal(subscriber.match(/return false/g)?.length, 2);
+  assert.doesNotMatch(subscriber, /(?:print|NSLog|os_log)\s*\(/);
 });
 
 test("release inputs must be strict text without private-key material", () => {

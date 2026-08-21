@@ -51,6 +51,17 @@ The normal launch flow is:
    tested app's sandbox.
 7. The reviewer returns to Tacua to review and approve generated candidates.
 
+Launch preservation is SDK-owned. The primary path validates both cold-launch
+and warm-open callbacks in an Expo AppDelegate subscriber, then mirrors only
+accepted Tacua URLs into a bounded, process-local native inbox. React Native
+linking and a host- or router-owned mailbox may deliver the same URL through the
+lifecycle adapter's manual delivery seam as compatibility fallbacks; every
+source joins the same serialized, fingerprint-deduplicated queue. URLs and
+launch codes remain volatile: they are neither logged nor persisted nor
+projected into public state, and inbox wakeups and lifecycle errors contain no
+URL, code, or underlying platform error. Preservation alone grants no authority;
+the SDK must still enforce the consent and one-shot exchange steps above.
+
 Raw upload credentials must not be persisted in capture manifests, emitted to
 logs, or embedded in exported tickets. Offline retries may retain only the
 minimum scoped credential material in platform secure storage, with expiry and
