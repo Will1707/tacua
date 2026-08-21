@@ -852,6 +852,15 @@ sys.stdout.write(json.dumps(result, ensure_ascii=False, allow_nan=False, separat
             drain=False,
             max_stages=1,
         )
+
+        def backend_at_fixture_time(config, admin_secret, *, processing_engine):
+            return PilotBackend(
+                config,
+                admin_secret,
+                clock=self.clock,
+                processing_engine=processing_engine,
+            )
+
         patches = (
             patch(
                 "tacua_backend.processing_worker.load_public_config",
@@ -865,8 +874,12 @@ sys.stdout.write(json.dumps(result, ensure_ascii=False, allow_nan=False, separat
                 "tacua_backend.processing_worker.load_local_processor_command",
                 return_value=command,
             ),
+            patch(
+                "tacua_backend.processing_worker.PilotBackend",
+                side_effect=backend_at_fixture_time,
+            ),
         )
-        with patches[0], patches[1], patches[2]:
+        with patches[0], patches[1], patches[2], patches[3]:
             once = run_worker(args)
             args.run_once = False
             args.drain = True
