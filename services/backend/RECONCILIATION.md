@@ -179,6 +179,14 @@ state is a command-free no-op. The final proof, immutable generation rename,
 directory `fsync`, and desired-state linearization point all remain under the
 same processing/reconciler host lock.
 
+Before generating state or inspecting the live deployment, `seal` also derives
+the final
+`<operation-directory>/tacua-compose-processing-<project>/processing-bridge.sock`
+host path, rejects comma, line-feed, carriage-return, or NUL delimiters, and
+requires its filesystem encoding to be at most 103 bytes. Sealed generations
+are checked against the same constraints when loaded, while the bridge retains
+its own matching bootstrap check as defense in depth.
+
 `--allow-mutable-image` exists only for the documented local private pilot. A
 production seal requires immutable backend and reviewer image references.
 `seal` requires an entirely fresh state directory and refuses every entry,

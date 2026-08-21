@@ -61,6 +61,9 @@ UPGRADE_INHIBITOR_FILE = "reviewer-upgrade-inhibitor.json"
 SERVICES = ("backend", "reviewer", "ingress")
 MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
 MAX_COMMAND_BYTES = 2 * 1024 * 1024
+MAX_UNIX_SOCKET_PATH_BYTES = 103
+PROCESSING_OPERATION_DIRECTORY_PREFIX = "tacua-compose-processing-"
+PROCESSING_BRIDGE_SOCKET_NAME = "processing-bridge.sock"
 PROJECT = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 GENERATION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 DIGEST = re.compile(r"^sha256:[a-f0-9]{64}$")
@@ -552,6 +555,29 @@ def _canonical_absolute_path(value: Any) -> Path | None:
     ):
         return None
     return path
+
+
+def _processing_bridge_socket_path_valid(
+    operation_directory: str | Path,
+    project: str,
+) -> bool:
+    """Validate the bridge's final derived Unix-socket path without I/O."""
+
+    try:
+        operation = (
+            Path(operation_directory)
+            / f"{PROCESSING_OPERATION_DIRECTORY_PREFIX}{project}"
+        )
+        socket_path = operation / PROCESSING_BRIDGE_SOCKET_NAME
+        return (
+            not any(
+                character in str(operation)
+                for character in {",", "\n", "\r", "\x00"}
+            )
+            and len(os.fsencode(socket_path)) <= MAX_UNIX_SOCKET_PATH_BYTES
+        )
+    except (TypeError, UnicodeError):
+        return False
 
 
 def _passwd_home() -> Path:
@@ -1945,6 +1971,10 @@ def _load_bound_state(
         or not 1 <= manifest["published_port"] <= 65_535
         or not isinstance(manifest["operation_directory"], str)
         or not Path(manifest["operation_directory"]).is_absolute()
+        or not _processing_bridge_socket_path_valid(
+            manifest["operation_directory"],
+            manifest["project"],
+        )
     ):
         raise ReconcileError("RECONCILE_STATE_INVALID")
     daemon = manifest["daemon"]
@@ -3112,6 +3142,11 @@ def seal(
     if PROJECT.fullmatch(args.project) is None or GENERATION.fullmatch(args.generation) is None or UNIT.fullmatch(args.docker_service) is None:
         raise ReconcileError("RECONCILE_INPUT_INVALID")
     operation_directory = _safe_directory(args.operation_directory)
+    if not _processing_bridge_socket_path_valid(
+        operation_directory,
+        args.project,
+    ):
+        raise ReconcileError("RECONCILE_INPUT_INVALID")
     compose_payload = _read_private(args.compose_json, mode=0o600, code="RECONCILE_INPUT_INVALID")
     compose_document = _parse_json(compose_payload, "RECONCILE_INPUT_INVALID")
     try:
