@@ -56,40 +56,76 @@ const {
   saveBackendConfig,
 } = require(path.join(__dirname, "backend-config.ts"));
 
-test("native V3 requires explicit reconfirmation and retires older stores", async () => {
+const sessionToken = `rsess_${"a".repeat(32)}.${"B".repeat(43)}`;
+
+test("native V4 stores only the endpoint and scoped reviewer bearer", async () => {
   values.clear();
   reads.length = 0;
   const config = {
     baseUrl: "https://reviewer.example",
-    adminToken: "a".repeat(32),
-    reviewerId: "reviewer_owner",
-    targetScheme: "legitimate-existing-scheme",
+    sessionToken,
   };
-  const currentKey = "tacua.backend.configuration.v3";
-  const oldAtomicKey = "tacua.backend.configuration.v2";
-  const oldSplitKeys = [
+  const currentKey = "tacua.backend.configuration.v4";
+  const retiredKeys = [
+    "tacua.backend.configuration.v3",
+    "tacua.backend.configuration.v2",
     "tacua.backend.base-url.v1",
     "tacua.backend.admin-token.v1",
     "tacua.reviewer.id.v1",
     "tacua.target.scheme.v1",
   ];
-  values.set(oldAtomicKey, JSON.stringify({ storageVersion: 2, ...config }));
-  for (const key of oldSplitKeys) values.set(key, "legacy-value");
+  for (const key of retiredKeys) values.set(key, "legacy-secret");
 
   assert.equal(await loadBackendConfig(), null);
   assert.deepEqual(reads, [currentKey]);
+  assert.equal(retiredKeys.some((key) => values.has(key)), false);
 
   await saveBackendConfig(config);
-  assert.equal(values.has(oldAtomicKey), false);
-  assert.equal(oldSplitKeys.some((key) => values.has(key)), false);
+  assert.equal(retiredKeys.some((key) => values.has(key)), false);
   assert.deepEqual(JSON.parse(values.get(currentKey)), {
-    storageVersion: 3,
-    ...config,
+    storageVersion: 4,
+    baseUrl: "https://reviewer.example",
+    sessionToken,
   });
   assert.deepEqual(await loadBackendConfig(), config);
 
+  await saveBackendConfig({ baseUrl: config.baseUrl, sessionToken: null });
+  assert.deepEqual(await loadBackendConfig(), {
+    baseUrl: "https://reviewer.example",
+    sessionToken: null,
+  });
   await clearBackendConfig();
   assert.equal(values.size, 0);
+});
+
+test("native rejects an administrator token or malformed scoped bearer", async () => {
+  await assert.rejects(
+    saveBackendConfig({
+      baseUrl: "https://reviewer.example",
+      sessionToken: "administrator-secret",
+    }),
+    /Reviewer session credential is invalid/u,
+  );
+  await assert.rejects(
+    saveBackendConfig({
+      baseUrl: "https://reviewer.example",
+      sessionToken: null,
+      adminToken: "a".repeat(32),
+    }),
+    /Backend configuration is invalid/u,
+  );
+});
+
+test("native removes an invalid current document instead of retaining a secret", async () => {
+  const currentKey = "tacua.backend.configuration.v4";
+  values.clear();
+  values.set(currentKey, JSON.stringify({
+    storageVersion: 4,
+    baseUrl: "https://reviewer.example",
+    sessionToken: "legacy-administrator-secret",
+  }));
+  assert.equal(await loadBackendConfig(), null);
+  assert.equal(values.has(currentKey), false);
 });
 
 test.after(() => {

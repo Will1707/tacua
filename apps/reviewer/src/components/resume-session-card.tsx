@@ -1,77 +1,101 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Linking, Pressable, Text, View } from "react-native";
+import { Linking, Platform, Pressable, Text, View } from "react-native";
 
 import { TacuaApiError, type TacuaApiClient } from "@/api/client";
 import { launchCodeRetentionMilliseconds } from "@/api/launch-code-retention";
-import { buildLaunchURL } from "@/api/launch-grant-validation";
-import type { CaptureSession, ResumeLaunchGrant } from "@/api/types";
+import type {
+  CaptureSession,
+  ReviewerBootstrap,
+  ReviewerResumeLaunchLink,
+} from "@/api/types";
 import { ActionButton } from "@/components/action-button";
+import { LaunchQRCode } from "@/components/launch-qr-code";
 import { SectionCard } from "@/components/section-card";
 import { colors } from "@/theme/colors";
 import { formatDate } from "@/utils/format";
+import { shouldAttemptSameDeviceLaunch } from "@/utils/launch-device";
 
 type Props = {
+  readonly bootstrap: ReviewerBootstrap;
   readonly client: TacuaApiClient;
   readonly disabled?: boolean;
   readonly session: CaptureSession;
-  readonly targetScheme: string;
 };
 
-export function ResumeSessionCard({ client, disabled = false, session, targetScheme }: Props) {
-  const [grant, setGrant] = useState<ResumeLaunchGrant | null>(null);
+export function ResumeSessionCard({ bootstrap, client, disabled = false, session }: Props) {
+  const [sameDeviceLaunch] = useState(shouldAttemptSameDeviceLaunch);
+  const build = bootstrap.builds.find((item) => item.build_id === session.build_id) ?? null;
+  const buildMatches = build?.build_identity_digest === session.build_identity_digest;
+  const launchScheme = buildMatches ? build?.launch_scheme ?? null : null;
+  const unavailableReason = build === null
+    ? "This session's QA build is not present in the sealed reviewer bootstrap, so recovery is locked."
+    : !buildMatches
+      ? "This session's build identity does not match the sealed reviewer bootstrap, so recovery is locked."
+      : launchScheme === null
+        ? "This legacy QA build does not seal its launch scheme. Rebuild it with Tacua SDK transport 1.2 before using recovery."
+        : null;
+  const [launchLink, setLaunchLink] = useState<ReviewerResumeLaunchLink | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const requestSequence = useRef(0);
   const requestInFlightRef = useRef(false);
   const bindingRef = useRef({
+    bootstrap,
     client,
     disabled,
     sessionId: session.session_id,
     buildIdentityDigest: session.build_identity_digest,
     scopeDigest: session.scope_digest,
-    targetScheme,
+    launchScheme,
   });
   bindingRef.current = {
+    bootstrap,
     client,
     disabled,
     sessionId: session.session_id,
     buildIdentityDigest: session.build_identity_digest,
     scopeDigest: session.scope_digest,
-    targetScheme,
+    launchScheme,
   };
 
   useEffect(() => {
-    // A recovery code is valid only for this exact backend, app scheme, and
-    // immutable session binding. A refresh/configuration change releases it.
+    // A recovery code is valid only for this exact reviewer session, sealed
+    // bootstrap, app scheme, and immutable capture-session binding.
     requestSequence.current += 1;
     requestInFlightRef.current = false;
     setLoading(false);
-    setGrant(null);
+    setLaunchLink(null);
     setError(null);
-  }, [client, disabled, session.build_identity_digest, session.scope_digest, session.session_id, targetScheme]);
+  }, [
+    bootstrap,
+    client,
+    disabled,
+    launchScheme,
+    session.build_identity_digest,
+    session.scope_digest,
+    session.session_id,
+  ]);
   useEffect(() => () => {
     requestSequence.current += 1;
     requestInFlightRef.current = false;
   }, []);
 
   useEffect(() => {
-    if (!grant) return;
+    if (!launchLink) return;
     const timer = setTimeout(
-      () => setGrant(null),
-      launchCodeRetentionMilliseconds(grant.expires_at),
+      () => setLaunchLink(null),
+      launchCodeRetentionMilliseconds(launchLink.grant.expires_at),
     );
     return () => clearTimeout(timer);
-  }, [grant]);
+  }, [launchLink]);
 
-  const openGrant = useCallback(async (nextGrant: ResumeLaunchGrant) => {
+  const openLaunchLink = useCallback(async (nextLink: ReviewerResumeLaunchLink) => {
     try {
-      await Linking.openURL(buildLaunchURL(
-        targetScheme,
-        nextGrant.launch_code,
-        nextGrant.session_id,
-      ));
+      // Open the exact backend-validated URL. The reviewer never reconstructs
+      // or guesses a custom app scheme locally.
+      await Linking.openURL(nextLink.launch_url);
     } catch {
       throw new TacuaApiError(
         0,
@@ -79,19 +103,21 @@ export function ResumeSessionCard({ client, disabled = false, session, targetSch
         "The QA app holding this session could not be opened on this device.",
       );
     }
-  }, [targetScheme]);
+  }, []);
 
   const openRecovery = useCallback(async () => {
     const currentBinding = bindingRef.current;
     if (
       disabled
+      || launchScheme === null
       || requestInFlightRef.current
       || currentBinding.client !== client
+      || currentBinding.bootstrap !== bootstrap
       || currentBinding.disabled
       || currentBinding.sessionId !== session.session_id
       || currentBinding.buildIdentityDigest !== session.build_identity_digest
       || currentBinding.scopeDigest !== session.scope_digest
-      || currentBinding.targetScheme !== targetScheme
+      || currentBinding.launchScheme !== launchScheme
     ) return;
     requestInFlightRef.current = true;
     const requestId = requestSequence.current + 1;
@@ -102,33 +128,40 @@ export function ResumeSessionCard({ client, disabled = false, session, targetSch
       return requestId === requestSequence.current
         && !current.disabled
         && current.client === requestBinding.client
+        && current.bootstrap === requestBinding.bootstrap
         && current.sessionId === requestBinding.sessionId
         && current.buildIdentityDigest === requestBinding.buildIdentityDigest
         && current.scopeDigest === requestBinding.scopeDigest
-        && current.targetScheme === requestBinding.targetScheme;
+        && current.launchScheme === requestBinding.launchScheme;
     };
     setLoading(true);
-    setGrant(null);
+    setLaunchLink(null);
     setError(null);
     try {
-      const nextGrant = await requestBinding.client.createResumeGrant(requestBinding.sessionId);
+      const nextLink = await requestBinding.client.createResumeLaunchLink(
+        requestBinding.sessionId,
+        launchScheme,
+        requestBinding.buildIdentityDigest,
+      );
       if (!isCurrentRequest()) return;
-      if (nextGrant.build_identity_digest !== requestBinding.buildIdentityDigest) {
+      if (nextLink.grant.build_identity_digest !== requestBinding.buildIdentityDigest) {
         throw new TacuaApiError(
           502,
           "BUILD_BINDING_MISMATCH",
-          "The recovery grant was issued for another QA build.",
+          "The recovery link was issued for another QA build.",
         );
       }
-      if (nextGrant.scope_digest !== requestBinding.scopeDigest) {
+      if (nextLink.grant.scope_digest !== requestBinding.scopeDigest) {
         throw new TacuaApiError(
           502,
           "SCOPE_BINDING_MISMATCH",
-          "The recovery grant was issued for another capture scope.",
+          "The recovery link was issued for another capture scope.",
         );
       }
-      setGrant(nextGrant);
-      await openGrant(nextGrant);
+      setLaunchLink(nextLink);
+      // Preserve transient browser activation by requiring a second explicit
+      // tap after the asynchronous request settles.
+      if (Platform.OS !== "web") await openLaunchLink(nextLink);
     } catch (caught) {
       if (isCurrentRequest()) {
         setError(
@@ -146,20 +179,32 @@ export function ResumeSessionCard({ client, disabled = false, session, targetSch
         setLoading(false);
       }
     }
-  }, [client, disabled, openGrant, session.build_identity_digest, session.scope_digest, session.session_id, targetScheme]);
+  }, [
+    bootstrap,
+    client,
+    disabled,
+    launchScheme,
+    openLaunchLink,
+    session.build_identity_digest,
+    session.scope_digest,
+    session.session_id,
+  ]);
 
-  const retryGrant = useCallback(async (nextGrant: ResumeLaunchGrant) => {
+  const retryLaunchLink = useCallback(async (nextLink: ReviewerResumeLaunchLink) => {
     const currentBinding = bindingRef.current;
     if (
       disabled
+      || launchScheme === null
       || requestInFlightRef.current
       || currentBinding.client !== client
+      || currentBinding.bootstrap !== bootstrap
       || currentBinding.disabled
       || currentBinding.sessionId !== session.session_id
       || currentBinding.buildIdentityDigest !== session.build_identity_digest
       || currentBinding.scopeDigest !== session.scope_digest
-      || currentBinding.targetScheme !== targetScheme
-      || grant?.launch_id !== nextGrant.launch_id
+      || currentBinding.launchScheme !== launchScheme
+      || launchLink?.grant.launch_id !== nextLink.grant.launch_id
+      || launchLink.launch_url !== nextLink.launch_url
     ) return;
     requestInFlightRef.current = true;
     const requestId = requestSequence.current + 1;
@@ -170,15 +215,16 @@ export function ResumeSessionCard({ client, disabled = false, session, targetSch
       return requestId === requestSequence.current
         && !current.disabled
         && current.client === requestBinding.client
+        && current.bootstrap === requestBinding.bootstrap
         && current.sessionId === requestBinding.sessionId
         && current.buildIdentityDigest === requestBinding.buildIdentityDigest
         && current.scopeDigest === requestBinding.scopeDigest
-        && current.targetScheme === requestBinding.targetScheme;
+        && current.launchScheme === requestBinding.launchScheme;
     };
     setLoading(true);
     setError(null);
     try {
-      await openGrant(nextGrant);
+      await openLaunchLink(nextLink);
     } catch (caught) {
       if (isCurrentRequest()) {
         setError(caught instanceof Error ? caught.message : "The QA app could not be opened.");
@@ -189,37 +235,72 @@ export function ResumeSessionCard({ client, disabled = false, session, targetSch
         setLoading(false);
       }
     }
-  }, [client, disabled, grant?.launch_id, openGrant, session.build_identity_digest, session.scope_digest, session.session_id, targetScheme]);
+  }, [
+    bootstrap,
+    client,
+    disabled,
+    launchLink,
+    launchScheme,
+    openLaunchLink,
+    session.build_identity_digest,
+    session.scope_digest,
+    session.session_id,
+  ]);
 
+  const recoveryDisabled = disabled || launchScheme === null;
   return (
-    <SectionCard title="Continue on this device">
+    <SectionCard title={sameDeviceLaunch ? "Continue on this device" : "Continue this session"}>
       <Text selectable style={{ color: colors.secondaryLabel, lineHeight: 20 }}>
-        Open the QA build to retry an interrupted upload, submit verified partial capture,
-        complete this session, or delete its local evidence. The one-time link is bound to
-        this exact backend session.
+        {sameDeviceLaunch
+          ? "Open the QA build to retry an interrupted upload, submit verified partial capture, complete this session, or delete its local evidence. The one-time link is bound to this exact backend session."
+          : "Create a private one-time recovery QR, then scan it with the iPhone that holds this session. The link is bound to this exact backend session."}
       </Text>
       <ActionButton
-        label="Open QA build recovery"
+        label={sameDeviceLaunch
+          ? Platform.OS === "web" ? "Prepare QA build recovery" : "Open QA build recovery"
+          : "Create recovery QR code"}
         onPress={() => void openRecovery()}
-        disabled={disabled}
+        disabled={recoveryDisabled}
         loading={loading}
       />
-      {grant ? (
+      {unavailableReason ? (
+        <Text selectable accessibilityRole="alert" style={{ color: colors.orange, lineHeight: 20 }}>
+          {unavailableReason}
+        </Text>
+      ) : null}
+      {launchLink ? (
         <View style={{ backgroundColor: colors.groupedBackground, borderRadius: 12, borderCurve: "continuous", padding: 12, gap: 7 }}>
           <Text selectable style={{ color: colors.label, fontWeight: "700" }}>
-            One-time recovery link ready
+            {sameDeviceLaunch ? "One-time recovery link ready" : "Scan on the QA iPhone"}
           </Text>
           <Text selectable style={{ color: colors.secondaryLabel, fontSize: 13 }}>
-            Expires {formatDate(grant.expires_at)}. It contains no recording or reusable upload credential.
+            Expires {formatDate(launchLink.grant.expires_at)}. It contains no recording or reusable upload credential.
           </Text>
+          {!sameDeviceLaunch ? (
+            <>
+              <LaunchQRCode launchUrl={launchLink.launch_url} />
+              <Text selectable style={{ color: colors.secondaryLabel, fontSize: 13, lineHeight: 18 }}>
+                Keep this QR private until it expires. Tacua generates it locally and never sends it to a QR service.
+              </Text>
+            </>
+          ) : null}
           <Pressable
+            accessibilityLabel={sameDeviceLaunch
+              ? Platform.OS === "web"
+                ? "Open prepared QA build recovery"
+                : "Try opening QA build recovery again"
+              : "Open QA build recovery on this device instead"}
             accessibilityRole="button"
-            accessibilityState={{ disabled: disabled || loading }}
-            disabled={disabled || loading}
-            onPress={() => void retryGrant(grant)}
-            style={{ minHeight: 44, justifyContent: "center", opacity: disabled || loading ? 0.5 : 1 }}
+            accessibilityState={{ disabled: recoveryDisabled || loading }}
+            disabled={recoveryDisabled || loading}
+            onPress={() => void retryLaunchLink(launchLink)}
+            style={{ minHeight: 44, justifyContent: "center", opacity: recoveryDisabled || loading ? 0.5 : 1 }}
           >
-            <Text style={{ color: colors.primary, fontWeight: "800" }}>Try opening again</Text>
+            <Text style={{ color: colors.primary, fontWeight: "800" }}>
+              {sameDeviceLaunch
+                ? Platform.OS === "web" ? "Open the QA build" : "Try opening again"
+                : "Open on this device instead"}
+            </Text>
           </Pressable>
         </View>
       ) : null}

@@ -77,6 +77,7 @@ const preview = {
 let inspectionReady = false;
 let supersession = null;
 let replacementCalls = 0;
+let transitionCalls = [];
 let evidenceFailure = false;
 let evidenceCalls = 0;
 const client = {
@@ -98,8 +99,18 @@ const client = {
     replacementCalls += 1;
     throw new Error("not exercised past confirmation");
   },
+  async transitionCandidate(requestedCandidate, body) {
+    assert.equal(requestedCandidate.candidate_digest, candidate.candidate_digest);
+    transitionCalls.push(body);
+    return candidate;
+  },
 };
-const config = { reviewerId: "reviewer_owner" };
+const bootstrap = {
+  contract_version: "tacua.reviewer-bootstrap@1.0.0",
+  reviewer_id: "reviewer_owner",
+  builds: [],
+};
+let backendContext = { bootstrap, client };
 const alerts = [];
 let randomSequence = 0;
 
@@ -169,7 +180,7 @@ Module._load = function load(request, parent, isMain) {
     };
   }
   if (request === "@/hooks/use-backend") {
-    return { useBackend: () => ({ client, config }) };
+    return { useBackend: () => backendContext };
   }
   if (request === "@/hooks/use-candidate-keyframe-previews") {
     return {
@@ -201,8 +212,12 @@ function nodeText(node) {
   if (typeof node === "string" || typeof node === "number") return String(node);
   if (!node) return "";
   if (Array.isArray(node)) return node.map(nodeText).join("");
-  return nodeText(node.props?.children);
+  return nodeText(node.props?.children ?? node.children);
 }
+
+test.beforeEach(() => {
+  backendContext = { bootstrap, client };
+});
 
 async function settle() {
   for (let index = 0; index < 4; index += 1) {
@@ -272,6 +287,34 @@ test("unlocks the exact-version action only after the screenshot inspection gate
     assert.equal(approval.props.disabled, false);
     const texts = renderer.root.findAllByType("Text").map(nodeText).join("\n");
     assert.doesNotMatch(texts, /Approval unlocks after/u);
+  } finally {
+    await TestRenderer.act(async () => renderer.unmount());
+  }
+});
+
+test("candidate mutations use the authoritative bootstrap reviewer identity", async () => {
+  inspectionReady = true;
+  supersession = null;
+  evidenceFailure = false;
+  alerts.length = 0;
+  transitionCalls = [];
+  let renderer;
+  await TestRenderer.act(async () => {
+    renderer = TestRenderer.create(React.createElement(CandidateRoute));
+  });
+  try {
+    await settle();
+    const approval = renderer.root.findAllByType("Pressable").find(
+      (node) => node.props.accessibilityLabel === "Approve exact version",
+    );
+    assert.ok(approval);
+    await TestRenderer.act(async () => approval.props.onPress());
+    assert.equal(alerts.length, 1);
+    await TestRenderer.act(async () => alerts[0][2][1].onPress());
+    await settle();
+    assert.equal(transitionCalls.length, 1);
+    assert.equal(transitionCalls[0].actor_id, bootstrap.reviewer_id);
+    assert.equal(transitionCalls[0].action, "approve");
   } finally {
     await TestRenderer.act(async () => renderer.unmount());
   }
@@ -417,6 +460,57 @@ test("renders exact ordered merge history and keeps superseded evidence retryabl
     await TestRenderer.act(async () => renderer.unmount());
     supersession = null;
     evidenceFailure = false;
+  }
+});
+
+test("candidate details and evidence disappear across backend replacement and auth loss", async () => {
+  inspectionReady = true;
+  supersession = null;
+  replacementCalls = 0;
+  evidenceFailure = false;
+  let renderer;
+  await TestRenderer.act(async () => {
+    renderer = TestRenderer.create(React.createElement(CandidateRoute));
+  });
+  try {
+    await settle();
+    assert.match(nodeText(renderer.toJSON()), /Profile action uses the wrong label/u);
+    assert.equal(renderer.root.findAllByType("Image").length, 1);
+
+    let replacementLoads = 0;
+    const replacementClient = {
+      async getCandidate() {
+        replacementLoads += 1;
+        throw new Error("replacement backend did not verify this candidate");
+      },
+    };
+    backendContext = {
+      bootstrap: { ...bootstrap, reviewer_id: "reviewer_replacement" },
+      client: replacementClient,
+    };
+    await TestRenderer.act(async () => {
+      renderer.update(React.createElement(CandidateRoute));
+    });
+    await settle();
+
+    assert.equal(replacementLoads, 1);
+    const replacementText = nodeText(renderer.toJSON());
+    assert.doesNotMatch(replacementText, /Profile action uses the wrong label/u);
+    assert.doesNotMatch(replacementText, /Save draft instead of the approved Save profile copy/u);
+    assert.match(replacementText, /Candidate unavailable/u);
+    assert.equal(renderer.root.findAllByType("Image").length, 0);
+    assert.equal(renderer.root.findAllByType("Pressable").some(
+      (node) => node.props.accessibilityLabel === "Approve exact version",
+    ), false);
+
+    backendContext = { bootstrap: null, client: null };
+    await TestRenderer.act(async () => {
+      renderer.update(React.createElement(CandidateRoute));
+    });
+    assert.doesNotMatch(nodeText(renderer.toJSON()), /Profile action uses the wrong label/u);
+    assert.equal(renderer.root.findAllByType("Image").length, 0);
+  } finally {
+    await TestRenderer.act(async () => renderer.unmount());
   }
 });
 

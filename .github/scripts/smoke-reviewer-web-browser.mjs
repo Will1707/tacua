@@ -23,11 +23,19 @@ const handoffPath = path.join(
   repositoryRoot,
   "contracts/approved-handoff/fixtures/positive/approved-handoff.json",
 );
-const configurationKey = "tacua.backend.configuration.web-session.v2";
-const adminToken =
-  "tacua-browser-smoke-admin-token-0123456789abcdef0123456789";
+const obsoleteConfigurationKeys = [
+  "tacua.backend.configuration.web-session.v2",
+  "tacua.backend.configuration.web-session.v1",
+  "tacua.backend.admin-token.v1",
+  "tacua.reviewer.id.v1",
+  "tacua.target.scheme.v1",
+];
 const reviewerId = "reviewer_browser";
 const targetScheme = "tacua-smoke-app";
+const reviewerCsrfToken = "C".repeat(43);
+const reviewerSessionId = `rsess_${"a".repeat(32)}`;
+const reviewerSessionCookieValue = `${reviewerSessionId}.${"B".repeat(43)}`;
+const reviewerCookie = `__Host-tacua-reviewer=${reviewerSessionCookieValue}`;
 const commandTimeoutMilliseconds = 15_000;
 const browserStartupTimeoutMilliseconds = 30_000;
 const smokeTimeoutMilliseconds = 20_000;
@@ -222,22 +230,56 @@ async function createFixtureServer(temporaryDirectory) {
   const handoffBodyDigest = sha256(handoffBytes);
   const protocolErrors = [];
   const requests = [];
+  let fixtureOrigin = null;
+  let reviewerAuthMode = "capability";
   const expectedCandidatePath =
-    `/v1/admin/candidates/${encodeURIComponent(candidate.candidate_id)}`;
+    `/v1/reviewer/candidates/${encodeURIComponent(candidate.candidate_id)}`;
   const expectedVersionPath =
     `${expectedCandidatePath}/versions/${candidate.candidate_version}`;
 
-  function requireAdministratorRequest(request) {
+  function requireScopedReviewerRequest(request, unsafe = false) {
+    if (request.headers.authorization !== undefined) {
+      protocolErrors.push(
+        `${request.method} ${request.url} exposed an authorization bearer`,
+      );
+      return false;
+    }
     if (
-      request.headers.authorization !== `Bearer ${adminToken}`
-      || request.headers.cookie !== undefined
+      (reviewerAuthMode === "capability" && request.headers.cookie !== undefined)
+      || (reviewerAuthMode === "session" && request.headers.cookie !== reviewerCookie)
     ) {
       protocolErrors.push(
-        `${request.method} ${request.url} did not use the bounded administrator request`,
+        `${request.method} ${request.url} did not use the expected scoped reviewer authentication`,
+      );
+      return false;
+    }
+    if (
+      unsafe
+      && (
+        request.headers.origin !== fixtureOrigin
+        || request.headers["tacua-csrf-token"] !== reviewerCsrfToken
+      )
+    ) {
+      protocolErrors.push(
+        `${request.method} ${request.url} did not bind its exact origin and CSRF token`,
       );
       return false;
     }
     return true;
+  }
+
+  function reviewerPrincipal() {
+    const paired = reviewerAuthMode === "session";
+    return {
+      reviewer_id: reviewerId,
+      auth_kind: paired ? "session" : "tailscale_capability",
+      session_id: paired ? reviewerSessionId : null,
+      device_label: paired ? "Tacua browser smoke" : null,
+      client_kind: paired ? "web" : "tailscale_web",
+      scopes: ["reviewer.launch", "reviewer.read", "reviewer.write"],
+      expires_at: paired ? "2026-09-20T12:00:00Z" : null,
+      csrf_token: reviewerCsrfToken,
+    };
   }
 
   const server = https.createServer(
@@ -246,6 +288,37 @@ async function createFixtureServer(temporaryDirectory) {
       const requestUrl = new URL(request.url ?? "/", "https://localhost");
       const pathname = requestUrl.pathname;
       requests.push(`${request.method} ${pathname}`);
+
+      if (
+        request.method === "DELETE"
+        && pathname === "/v1/reviewer/session"
+      ) {
+        if (!requireScopedReviewerRequest(request, true)) {
+          sendCanonicalJson(response, 403, {
+            error: {
+              code: "REVIEWER_CSRF_FORBIDDEN",
+              message: "The browser smoke fixture rejected reviewer CSRF.",
+            },
+          });
+          return;
+        }
+        reviewerAuthMode = "capability";
+        sendCanonicalJson(response, 200, {
+          session: {
+            session_id: reviewerSessionId,
+            reviewer_id: reviewerId,
+            device_label: "Tacua browser smoke",
+            client_kind: "web",
+            scopes: ["reviewer.launch", "reviewer.read", "reviewer.write"],
+            created_at: "2026-08-21T12:00:00Z",
+            expires_at: "2026-09-20T12:00:00Z",
+            revoked_at: "2026-08-21T12:05:00Z",
+          },
+        }, {
+          "Set-Cookie": "__Host-tacua-reviewer=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0",
+        });
+        return;
+      }
 
       if (request.method !== "GET" && request.method !== "HEAD") {
         sendCanonicalJson(response, 405, {
@@ -266,37 +339,21 @@ async function createFixtureServer(temporaryDirectory) {
         return;
       }
 
-      if (pathname.startsWith("/v1/admin/")) {
-        if (!requireAdministratorRequest(request)) {
+      if (pathname.startsWith("/v1/reviewer/")) {
+        if (!requireScopedReviewerRequest(request)) {
           sendCanonicalJson(response, 401, {
             error: {
-              code: "UNAUTHORIZED",
-              message: "The browser smoke fixture rejected the credential.",
+              code: "REVIEWER_AUTHENTICATION_FAILED",
+              message: "reviewer authentication failed",
             },
           });
           return;
         }
-        if (pathname === "/v1/admin/builds") {
-          sendCanonicalJson(response, 200, { builds: [] });
+        if (pathname === "/v1/reviewer/session") {
+          sendCanonicalJson(response, 200, reviewerPrincipal());
           return;
         }
-        if (pathname === "/v1/admin/reviewer-binding") {
-          if (request.headers["tacua-reviewer-id"] !== reviewerId) {
-            protocolErrors.push(
-              `${request.method} ${request.url} did not bind the configured reviewer`,
-            );
-            sendCanonicalJson(response, 403, {
-              error: {
-                code: "REVIEWER_MISMATCH",
-                message: "The reviewer identity does not match this deployment.",
-              },
-            });
-            return;
-          }
-          sendCanonicalJson(response, 200, { status: "verified" });
-          return;
-        }
-        if (pathname === "/v1/admin/reviewer-bootstrap") {
+        if (pathname === "/v1/reviewer/bootstrap") {
           sendCanonicalJson(response, 200, {
             contract_version: "tacua.reviewer-bootstrap@1.0.0",
             reviewer_id: reviewerId,
@@ -315,7 +372,7 @@ async function createFixtureServer(temporaryDirectory) {
           });
           return;
         }
-        if (pathname === "/v1/admin/sessions") {
+        if (pathname === "/v1/reviewer/sessions") {
           sendCanonicalJson(response, 200, {
             next_cursor: null,
             sessions: [],
@@ -439,6 +496,7 @@ async function createFixtureServer(temporaryDirectory) {
   });
   const address = server.address();
   assert.ok(address && typeof address === "object");
+  fixtureOrigin = `https://localhost:${address.port}`;
   return {
     candidate,
     close: () => new Promise((resolve, reject) => {
@@ -447,9 +505,12 @@ async function createFixtureServer(temporaryDirectory) {
     }),
     handoff,
     handoffBytes,
-    origin: `https://localhost:${address.port}`,
+    origin: fixtureOrigin,
     protocolErrors,
     requests,
+    usePairedSession: () => {
+      reviewerAuthMode = "session";
+    },
   };
 }
 
@@ -708,7 +769,7 @@ async function runBrowserSmokeAttempt(
     ) {
       const expectedSupersessionMiss = `${
         fixture.origin
-      }/v1/admin/candidates/${
+      }/v1/reviewer/candidates/${
         encodeURIComponent(fixture.candidate.candidate_id)
       }/supersession`;
       if (
@@ -819,109 +880,88 @@ async function runBrowserSmokeAttempt(
       );
       assert.equal(result, "clicked", `${label} was not clickable`);
     };
-    const replaceInput = async (label, value) => {
-      const focused = await evaluate(
-        `(() => {
-          const element = document.querySelector('[aria-label=${JSON.stringify(label)}]');
-          if (!(element instanceof HTMLInputElement)) return false;
-          element.focus();
-          element.setSelectionRange(0, element.value.length);
-          return true;
-        })()`,
-      );
-      assert.equal(focused, true, `${label} input was unavailable`);
-      await devtools.send("Input.insertText", { text: value }, sessionId);
-      await waitFor(`${label} value`, async () => (
-        await evaluate(
-          `document.querySelector('[aria-label=${JSON.stringify(label)}]')?.value`,
-        )
-      ) === value);
-    };
-
     await navigate("/settings");
-    await waitFor("the settings form", () => hasLabel("Administrator token"));
-    assert.equal(
-      await evaluate(
-        "document.querySelector('[aria-label=\"Backend URL\"]')?.value",
-      ),
-      fixture.origin,
-      "the production web reviewer did not bind settings to its own HTTPS origin",
-    );
-    await replaceInput("Administrator token", adminToken);
-    await replaceInput("Reviewer ID", reviewerId);
-    await replaceInput("QA app URL scheme", targetScheme);
-    await clickLabel("Save and connect");
-    await waitFor("settings persistence", async () => {
-      const value = await evaluate(
-        `sessionStorage.getItem(${JSON.stringify(configurationKey)})`,
-      );
-      if (typeof value !== "string") return false;
-      const parsed = JSON.parse(value);
-      return parsed.storageVersion === 2
-        && parsed.baseUrl === fixture.origin
-        && parsed.adminToken === adminToken
-        && parsed.reviewerId === reviewerId
-        && parsed.targetScheme === targetScheme;
+    await waitFor("zero-entry capability connection", async () => {
+      const text = await evaluate("document.body.innerText");
+      return text.includes("Tailscale app capability")
+        && text.includes(reviewerId)
+        && text.includes(fixture.origin);
     });
-
-    await navigate("/settings");
-    await waitFor("the persisted settings form", () => hasLabel("Administrator token"));
-    for (const [label, expected] of [
-      ["Backend URL", fixture.origin],
-      ["Administrator token", adminToken],
-      ["Reviewer ID", reviewerId],
-      ["QA app URL scheme", targetScheme],
+    for (const removedLabel of [
+      "Administrator token",
+      "Reviewer ID",
+      "QA app URL scheme",
+      "Save and connect",
     ]) {
       assert.equal(
-        await evaluate(
-          `document.querySelector('[aria-label=${JSON.stringify(label)}]')?.value`,
-        ),
-        expected,
-        `${label} did not survive a real browser navigation`,
+        await hasLabel(removedLabel),
+        false,
+        `${removedLabel} unexpectedly survived in the zero-entry web reviewer`,
       );
     }
-
-    await clickLabel("Forget this backend");
-    await waitFor(
-      "the forget confirmation",
-      () => hasLabel("Forget backend configuration?"),
-    );
-    await clickLabel("Cancel");
-    await waitFor("the cancelled modal to close", async () => (
-      !(await hasLabel("Forget backend configuration?"))
-    ));
     assert.equal(
-      await evaluate(
-        `sessionStorage.getItem(${JSON.stringify(configurationKey)}) !== null`,
-      ),
-      true,
-      "cancelling the modal removed the backend configuration",
+      await evaluate("Object.keys(sessionStorage).filter((key) => key.startsWith('tacua.')).length"),
+      0,
+      "the zero-entry web reviewer persisted Tacua configuration",
     );
 
-    await clickLabel("Forget this backend");
-    await waitFor(
-      "the second forget confirmation",
-      () => hasLabel("Forget backend configuration?"),
-    );
-    await clickLabel("Forget");
-    await waitFor("the confirmed configuration removal", async () => (
+    await evaluate(`(() => {
+      for (const key of ${JSON.stringify(obsoleteConfigurationKeys)}) {
+        sessionStorage.setItem(key, "legacy-administrator-secret");
+      }
+    })()`);
+    await navigate("/settings");
+    await waitFor("legacy browser secret cleanup", async () => (
       await evaluate(
-        `sessionStorage.getItem(${JSON.stringify(configurationKey)}) === null`,
+        `${JSON.stringify(obsoleteConfigurationKeys)}.every((key) => sessionStorage.getItem(key) === null)`,
       )
     ));
+    await waitFor("capability reconnection after cleanup", async () => (
+      (await evaluate("document.body.innerText")).includes("Tailscale app capability")
+    ));
 
-    await evaluate(
-      `sessionStorage.setItem(
-        ${JSON.stringify(configurationKey)},
-        ${JSON.stringify(JSON.stringify({
-          storageVersion: 2,
-          baseUrl: fixture.origin,
-          adminToken,
-          reviewerId,
-          targetScheme,
-        }))}
-      )`,
+    fixture.usePairedSession();
+    const cookieResult = await devtools.send("Network.setCookie", {
+      name: "__Host-tacua-reviewer",
+      value: reviewerSessionCookieValue,
+      url: fixture.origin,
+      path: "/",
+      secure: true,
+      httpOnly: true,
+      sameSite: "Strict",
+    }, sessionId);
+    assert.notEqual(cookieResult.success, false, "Chrome rejected the scoped reviewer cookie");
+    await navigate("/settings");
+    await waitFor("the paired reviewer controls", () => labelEnabled("Disconnect paired reviewer"));
+    const deletesBeforeModal = fixture.requests.filter(
+      (entry) => entry === "DELETE /v1/reviewer/session",
+    ).length;
+    await clickLabel("Disconnect paired reviewer");
+    await waitFor("the disconnect confirmation", () => hasLabel("Disconnect this reviewer?"));
+    await clickLabel("Cancel");
+    await waitFor("the cancelled modal to close", async () => (
+      !(await hasLabel("Disconnect this reviewer?"))
+    ));
+    assert.equal(
+      fixture.requests.filter(
+        (entry) => entry === "DELETE /v1/reviewer/session",
+      ).length,
+      deletesBeforeModal,
+      "cancelling the modal revoked the reviewer session",
     );
+
+    await clickLabel("Disconnect paired reviewer");
+    await waitFor("the second disconnect confirmation", () => hasLabel("Disconnect this reviewer?"));
+    await clickLabel("Disconnect");
+    await waitFor("the CSRF-bound reviewer revocation", () => (
+      fixture.requests.filter(
+        (entry) => entry === "DELETE /v1/reviewer/session",
+      ).length === deletesBeforeModal + 1
+    ));
+    await waitFor("capability reconnection after revocation", async () => (
+      (await evaluate("document.body.innerText")).includes("Tailscale app capability")
+    ));
+
     await navigate(
       `/candidates/${encodeURIComponent(fixture.candidate.candidate_id)}`,
     );
@@ -929,6 +969,11 @@ async function runBrowserSmokeAttempt(
       "the approved candidate handoff action",
       () => labelEnabled("Export JSON handoff"),
     );
+    await waitFor("the bound candidate evidence", async () => {
+      const text = await evaluate("document.body.innerText");
+      return text.includes("Evidence sources")
+        && text.includes("No candidate-scoped SDK events were retained.");
+    });
     await clickLabel("Export JSON handoff");
 
     const expectedDownload = path.join(
@@ -952,15 +997,30 @@ async function runBrowserSmokeAttempt(
     assert.deepEqual(
       fixture.protocolErrors,
       [],
-      "the reviewer escaped the bounded same-origin administrator protocol",
+      "the reviewer escaped the bounded same-origin scoped protocol",
     );
     assert.ok(
-      fixture.requests.includes("GET /v1/admin/reviewer-binding"),
-      "the real reviewer did not verify its configured reviewer identity",
+      fixture.requests.includes("GET /v1/reviewer/session"),
+      "the real reviewer did not discover its scoped reviewer session",
+    );
+    assert.ok(
+      fixture.requests.includes("GET /v1/reviewer/bootstrap"),
+      "the real reviewer did not load its authoritative bootstrap identity",
+    );
+    assert.equal(
+      fixture.requests.some((entry) => entry.includes("/v1/admin/")),
+      false,
+      "the real reviewer called a legacy administrator route",
     );
     assert.ok(
       fixture.requests.includes(
-        `GET /v1/admin/candidates/${fixture.candidate.candidate_id}/versions/${fixture.candidate.candidate_version}/handoff.json`,
+        `GET /v1/reviewer/candidates/${fixture.candidate.candidate_id}/versions/${fixture.candidate.candidate_version}/evidence`,
+      ),
+      "the real reviewer did not load its bound candidate evidence",
+    );
+    assert.ok(
+      fixture.requests.includes(
+        `GET /v1/reviewer/candidates/${fixture.candidate.candidate_id}/versions/${fixture.candidate.candidate_version}/handoff.json`,
       ),
       "the real reviewer did not request the approved JSON handoff",
     );
@@ -1037,9 +1097,11 @@ export async function main() {
       browser,
       checks: [
         "startup-errors",
-        "settings-persistence",
+        "zero-entry-capability",
+        "legacy-secret-cleanup",
+        "scoped-session-bootstrap",
         "modal-cancel",
-        "modal-confirm",
+        "csrf-modal-confirm",
         "approved-handoff-download",
       ],
     })}\n`);

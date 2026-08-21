@@ -21,90 +21,52 @@ function createSessionStorage() {
   };
 }
 
-test("web configuration is one atomic document scoped to session storage", async (context) => {
+function installBrowser(context, origin = "https://reviewer.example") {
   const storage = createSessionStorage();
-  Object.defineProperty(globalThis, "sessionStorage", {
-    configurable: true,
-    value: storage,
-  });
-  Object.defineProperty(globalThis, "location", {
-    configurable: true,
-    value: { origin: "https://reviewer.example" },
-  });
+  Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: storage });
+  Object.defineProperty(globalThis, "location", { configurable: true, value: { origin } });
   context.after(() => {
     delete globalThis.sessionStorage;
     delete globalThis.location;
   });
+  return storage;
+}
 
-  const config = {
-    baseUrl: "https://reviewer.example",
-    adminToken: "a".repeat(32),
-    reviewerId: "reviewer_owner",
-    targetScheme: "tacua-qa-app",
-  };
-  assert.equal(await loadBackendConfig(), null);
-  await saveBackendConfig(config);
+test("web derives its backend from the exact origin and stores no configuration", async (context) => {
+  const storage = installBrowser(context);
+  storage.setItem("unrelated", "kept");
+  storage.setItem("tacua.backend.configuration.web-session.v2", "legacy-admin-secret");
+  storage.setItem("tacua.backend.admin-token.v1", "legacy-admin-secret");
+
+  const expected = { baseUrl: "https://reviewer.example", sessionToken: null };
+  assert.deepEqual(await loadBackendConfig(), expected);
+  assert.equal(storage.getItem("unrelated"), "kept");
+  assert.equal(storage.getItem("tacua.backend.configuration.web-session.v2"), null);
+  assert.equal(storage.getItem("tacua.backend.admin-token.v1"), null);
+
+  await saveBackendConfig(expected);
   assert.equal(storage.length, 1);
-  assert.deepEqual(await loadBackendConfig(), config);
   await clearBackendConfig();
-  assert.equal(storage.length, 0);
-  assert.equal(await loadBackendConfig(), null);
+  assert.equal(storage.length, 1);
 });
 
-test("web configuration rejects a cross-origin backend before storage", async (context) => {
-  const storage = createSessionStorage();
-  Object.defineProperty(globalThis, "sessionStorage", {
-    configurable: true,
-    value: storage,
-  });
-  Object.defineProperty(globalThis, "location", {
-    configurable: true,
-    value: { origin: "https://reviewer.example" },
-  });
-  context.after(() => {
-    delete globalThis.sessionStorage;
-    delete globalThis.location;
-  });
-
+test("web rejects cross-origin endpoints and bearer persistence", async (context) => {
+  const storage = installBrowser(context);
+  await assert.rejects(
+    saveBackendConfig({ baseUrl: "https://api.example", sessionToken: null }),
+    /must use its own HTTPS origin/u,
+  );
   await assert.rejects(
     saveBackendConfig({
-      baseUrl: "https://api.example",
-      adminToken: "a".repeat(32),
-      reviewerId: "reviewer_owner",
-      targetScheme: "tacua-qa-app",
+      baseUrl: "https://reviewer.example",
+      sessionToken: `rsess_${"a".repeat(32)}.${"B".repeat(43)}`,
     }),
-    /must use its own HTTPS origin/u,
+    /cannot store a bearer credential/u,
   );
   assert.equal(storage.length, 0);
 });
 
-test("web configuration requires explicit scheme reconfirmation after V1", async (context) => {
-  const storage = createSessionStorage();
-  Object.defineProperty(globalThis, "sessionStorage", {
-    configurable: true,
-    value: storage,
-  });
-  Object.defineProperty(globalThis, "location", {
-    configurable: true,
-    value: { origin: "https://reviewer.example" },
-  });
-  context.after(() => {
-    delete globalThis.sessionStorage;
-    delete globalThis.location;
-  });
-
-  const config = {
-    baseUrl: "https://reviewer.example",
-    adminToken: "a".repeat(32),
-    reviewerId: "reviewer_owner",
-    targetScheme: "legitimate-existing-scheme",
-  };
-  const oldKey = "tacua.backend.configuration.web-session.v1";
-  storage.setItem(oldKey, JSON.stringify({ storageVersion: 1, ...config }));
-
-  assert.equal(await loadBackendConfig(), null);
-  await saveBackendConfig(config);
-  assert.equal(storage.getItem(oldKey), null);
-  assert.equal(storage.length, 1);
-  assert.deepEqual(await loadBackendConfig(), config);
+test("web fails closed without a valid browser origin", async (context) => {
+  installBrowser(context, "not-an-origin");
+  await assert.rejects(loadBackendConfig(), /valid URL|HTTPS/u);
 });

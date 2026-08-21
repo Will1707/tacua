@@ -9,58 +9,48 @@ export { normalizeBaseUrl } from "./base-url.ts";
 export { validateBackendConfig } from "./backend-config-validation.ts";
 export type { BackendConfig } from "./backend-config-validation.ts";
 
-const configurationKey = "tacua.backend.configuration.web-session.v2";
-const supersededConfigurationKey = "tacua.backend.configuration.web-session.v1";
+// Web authentication is an HttpOnly same-origin cookie or a header injected by
+// Tailscale Serve. No endpoint, identity, launch scheme, or bearer credential is
+// persisted in browser storage.
+const obsoleteSessionKeys = [
+  "tacua.backend.configuration.web-session.v2",
+  "tacua.backend.configuration.web-session.v1",
+  "tacua.backend.configuration.v4",
+  "tacua.backend.configuration.v3",
+  "tacua.backend.configuration.v2",
+  "tacua.backend.base-url.v1",
+  "tacua.backend.admin-token.v1",
+  "tacua.reviewer.id.v1",
+  "tacua.target.scheme.v1",
+] as const;
 
-type PersistedBackendConfig = BackendConfig & { readonly storageVersion: 2 };
-
-function browserSessionStorage(): Storage {
-  if (typeof globalThis.sessionStorage === "undefined") {
-    throw new Error("Browser session storage is unavailable.");
+function exactBrowserOrigin(): string {
+  if (typeof globalThis.location?.origin !== "string") {
+    throw new Error("The reviewer browser origin is unavailable.");
   }
-  return globalThis.sessionStorage;
+  return globalThis.location.origin;
 }
 
-function parsePersistedConfig(value: string): BackendConfig | null {
-  try {
-    const parsed = JSON.parse(value) as Partial<PersistedBackendConfig>;
-    if (
-      !parsed
-      || typeof parsed !== "object"
-      || parsed.storageVersion !== 2
-      || typeof parsed.baseUrl !== "string"
-      || typeof parsed.adminToken !== "string"
-      || typeof parsed.reviewerId !== "string"
-      || typeof parsed.targetScheme !== "string"
-      || Object.keys(parsed).some((key) => ![
-        "storageVersion",
-        "baseUrl",
-        "adminToken",
-        "reviewerId",
-        "targetScheme",
-      ].includes(key))
-    ) {
-      return null;
-    }
-    return validateBackendConfig(parsed as BackendConfig);
-  } catch {
-    return null;
-  }
+function forgetObsoleteBrowserConfiguration(): void {
+  if (typeof globalThis.sessionStorage === "undefined") return;
+  for (const key of obsoleteSessionKeys) globalThis.sessionStorage.removeItem(key);
 }
 
-export async function loadBackendConfig(): Promise<BackendConfig | null> {
-  const persisted = browserSessionStorage().getItem(configurationKey);
-  return persisted === null ? null : parsePersistedConfig(persisted);
+export async function loadBackendConfig(): Promise<BackendConfig> {
+  forgetObsoleteBrowserConfiguration();
+  const origin = exactBrowserOrigin();
+  return validateBackendConfig({ baseUrl: origin, sessionToken: null }, origin);
 }
 
 export async function saveBackendConfig(config: BackendConfig): Promise<void> {
-  const validated = validateBackendConfig(config);
-  const persisted: PersistedBackendConfig = { storageVersion: 2, ...validated };
-  browserSessionStorage().setItem(configurationKey, JSON.stringify(persisted));
-  browserSessionStorage().removeItem(supersededConfigurationKey);
+  const origin = exactBrowserOrigin();
+  const validated = validateBackendConfig(config, origin);
+  if (validated.sessionToken !== null) {
+    throw new Error("The web reviewer cannot store a bearer credential.");
+  }
+  forgetObsoleteBrowserConfiguration();
 }
 
 export async function clearBackendConfig(): Promise<void> {
-  browserSessionStorage().removeItem(configurationKey);
-  browserSessionStorage().removeItem(supersededConfigurationKey);
+  forgetObsoleteBrowserConfiguration();
 }

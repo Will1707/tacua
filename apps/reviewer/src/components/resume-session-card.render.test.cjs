@@ -22,7 +22,7 @@ const build = {
   build_identity_digest: `sha256:${"a".repeat(64)}`,
   bundle_identifier: "com.kuzaba.app",
   distribution: "local",
-  launch_scheme: "tacua-qa-app",
+  launch_scheme: "tacua-kuzaba-qa",
   native_build: "2",
   native_version: "0.1.0",
 };
@@ -31,41 +31,46 @@ const bootstrap = {
   reviewer_id: "reviewer_owner",
   builds: [build],
 };
-const grant = {
+const session = {
+  build_id: build.build_id,
   build_identity_digest: build.build_identity_digest,
-  exchange_kind: "start_session",
-  expires_at: "2099-08-03T21:08:00Z",
-  launch_code: "Private_launch_code_1234567890ABCDEFGHijklmn",
-  launch_id: "launch_example_001",
-  scope_policy_digest: `sha256:${"b".repeat(64)}`,
-  session_id: null,
+  scope_digest: `sha256:${"b".repeat(64)}`,
+  session_id: "session_kuzaba_001",
 };
-const expectedLaunchUrl = `tacua-qa-app://tacua/start?launch_code=${grant.launch_code}`;
+const grant = {
+  build_identity_digest: session.build_identity_digest,
+  exchange_kind: "resume_session",
+  expires_at: "2099-08-03T21:08:00Z",
+  launch_code: "Private_resume_code_1234567890ABCDEFGHijklmn",
+  launch_id: "launch_resume_001",
+  scope_digest: session.scope_digest,
+  session_id: session.session_id,
+};
+const expectedLaunchUrl = `${build.launch_scheme}://tacua/start?launch_code=${grant.launch_code}&session_id=${session.session_id}`;
 const link = {
   contract_version: "tacua.reviewer-launch-link@1.0.0",
   launch_url: expectedLaunchUrl,
   grant,
 };
 const openedUrls = [];
-const encodedUrls = [];
-let sameDeviceLaunch = false;
-let createGrantCalls = 0;
+let createLinkCalls = 0;
 let returnedLink = link;
+let sameDeviceLaunch = true;
 
 const client = {
-  async createLaunchLink(buildId, expectedScheme, expectedBuildIdentityDigest) {
-    createGrantCalls += 1;
-    assert.equal(buildId, build.build_id);
+  async createResumeLaunchLink(sessionId, expectedScheme, expectedBuildIdentityDigest) {
+    createLinkCalls += 1;
+    assert.equal(sessionId, session.session_id);
     assert.equal(expectedScheme, build.launch_scheme);
-    assert.equal(expectedBuildIdentityDigest, build.build_identity_digest);
+    assert.equal(expectedBuildIdentityDigest, session.build_identity_digest);
     return returnedLink;
   },
 };
 const reactNative = {
+  ActivityIndicator: "ActivityIndicator",
   DynamicColorIOS: ({ light }) => light,
-  Image: "Image",
   Linking: { openURL: async (url) => { openedUrls.push(url); } },
-  Platform: { OS: "web" },
+  Platform: { OS: "ios" },
   Pressable: "Pressable",
   Text: "Text",
   View: "View",
@@ -94,25 +99,15 @@ function compileTypeScript(module, filename) {
 Module._extensions[".ts"] = compileTypeScript;
 Module._extensions[".tsx"] = compileTypeScript;
 Module._resolveFilename = function resolveFilename(request, parent, isMain, options) {
-  const resolvedRequest = request === "@/components/launch-qr-code"
-    ? path.join(reviewerSourceRoot, "components/launch-qr-code.web.tsx")
-    : request.startsWith("@/")
-      ? path.join(reviewerSourceRoot, request.slice(2))
-      : request;
+  const resolvedRequest = request.startsWith("@/")
+    ? path.join(reviewerSourceRoot, request.slice(2))
+    : request;
   return originalResolveFilename.call(this, resolvedRequest, parent, isMain, options);
 };
 Module._load = function load(request, parent, isMain) {
   if (request === "react-native") return reactNative;
   if (request === "expo-router/react-navigation") {
     return { DarkTheme: { colors: {} }, DefaultTheme: { colors: {} } };
-  }
-  if (request === "@/utils/launch-qr-data-uri") {
-    return {
-      launchQRCodeDataUri(url) {
-        encodedUrls.push(url);
-        return "data:image/svg+xml;charset=utf-8,%3Csvg%2F%3E";
-      },
-    };
   }
   if (request === "@/api/client") {
     return {
@@ -125,15 +120,20 @@ Module._load = function load(request, parent, isMain) {
       },
     };
   }
+  if (request === "@/components/launch-qr-code") {
+    return {
+      LaunchQRCode: (props) => React.createElement("LaunchQRCodeMock", props),
+    };
+  }
   if (request === "@/utils/launch-device") {
     return { shouldAttemptSameDeviceLaunch: () => sameDeviceLaunch };
   }
   return originalLoad.call(this, request, parent, isMain);
 };
 
-const { LaunchReviewCard } = require(path.join(
+const { ResumeSessionCard } = require(path.join(
   reviewerSourceRoot,
-  "components/launch-review-card.tsx",
+  "components/resume-session-card.tsx",
 ));
 
 function nodeText(node) {
@@ -155,186 +155,160 @@ function press(renderer, label) {
   );
 }
 
-test("desktop creates a local private QR without navigating the computer", async () => {
-  sameDeviceLaunch = false;
-  createGrantCalls = 0;
-  returnedLink = link;
+test("native recovery opens the exact server-provided URL", async () => {
+  reactNative.Platform.OS = "ios";
+  createLinkCalls = 0;
   openedUrls.length = 0;
-  encodedUrls.length = 0;
+  returnedLink = link;
+  sameDeviceLaunch = true;
   let renderer;
   await TestRenderer.act(async () => {
-    renderer = TestRenderer.create(React.createElement(LaunchReviewCard, {
+    renderer = TestRenderer.create(React.createElement(ResumeSessionCard, {
       bootstrap,
       client,
+      session,
     }));
   });
   try {
     await settle();
-    let texts = renderer.root.findAllByType("Text").map(nodeText).join("\n");
-    assert.match(texts, /reviewer is open on a computer/u);
-    assert.match(texts, /Create QR/u);
-
-    const create = press(renderer, "Create iPhone launch QR code for app_kuzaba_ios");
-    assert.ok(create);
-    await TestRenderer.act(async () => create.props.onPress());
+    const open = press(renderer, "Open QA build recovery");
+    assert.ok(open);
+    await TestRenderer.act(async () => open.props.onPress());
     await settle();
-
-    assert.deepEqual(openedUrls, []);
-    assert.deepEqual(encodedUrls, [expectedLaunchUrl]);
-    texts = renderer.root.findAllByType("Text").map(nodeText).join("\n");
-    assert.match(texts, /Scan on the QA iPhone/u);
-    assert.match(texts, /Custom URL schemes are not exclusive/u);
-    assert.doesNotMatch(texts, /can launch only/u);
-    assert.match(texts, /never sends it to a QR service/u);
-    assert.doesNotMatch(texts, new RegExp(grant.launch_code, "u"));
-    const image = renderer.root.findByType("Image");
-    assert.match(image.props.accessibilityLabel, /One-time QR code/u);
-
-    const fallback = press(renderer, "Open on this device instead");
-    assert.ok(fallback);
-    await TestRenderer.act(async () => fallback.props.onPress());
-    await settle();
+    assert.equal(createLinkCalls, 1);
     assert.deepEqual(openedUrls, [expectedLaunchUrl]);
-
-    const createAnother = press(renderer, "Create iPhone launch QR code for app_kuzaba_ios");
-    assert.ok(createAnother);
-    assert.equal(createAnother.props.disabled, true);
-    await TestRenderer.act(async () => createAnother.props.onPress());
-    await settle();
-    assert.equal(createGrantCalls, 1);
   } finally {
     await TestRenderer.act(async () => renderer.unmount());
   }
 });
 
-test("iPhone browser requires a fresh user tap after the asynchronous grant", async () => {
+test("web recovery requires a second tap and reuses the server URL verbatim", async () => {
   reactNative.Platform.OS = "web";
-  sameDeviceLaunch = true;
-  createGrantCalls = 0;
+  createLinkCalls = 0;
   openedUrls.length = 0;
-  encodedUrls.length = 0;
   returnedLink = link;
+  sameDeviceLaunch = true;
   let renderer;
   await TestRenderer.act(async () => {
-    renderer = TestRenderer.create(React.createElement(LaunchReviewCard, {
+    renderer = TestRenderer.create(React.createElement(ResumeSessionCard, {
       bootstrap,
       client,
+      session,
     }));
   });
   try {
     await settle();
-    const prepare = press(renderer, "Prepare app_kuzaba_ios QA build launch on this device");
+    const prepare = press(renderer, "Prepare QA build recovery");
     assert.ok(prepare);
     await TestRenderer.act(async () => prepare.props.onPress());
     await settle();
     assert.deepEqual(openedUrls, []);
-    assert.deepEqual(encodedUrls, []);
-    assert.equal(renderer.root.findAllByType("Image").length, 0);
-
-    const explicitOpen = press(renderer, "Open the QA build");
+    const explicitOpen = press(renderer, "Open prepared QA build recovery");
     assert.ok(explicitOpen);
     await TestRenderer.act(async () => explicitOpen.props.onPress());
     await settle();
     assert.deepEqual(openedUrls, [expectedLaunchUrl]);
   } finally {
     await TestRenderer.act(async () => renderer.unmount());
+    reactNative.Platform.OS = "ios";
   }
 });
 
-test("native reviewer opens the QA build immediately after grant creation", async () => {
+test("a recovery link with another scope fails closed", async () => {
   reactNative.Platform.OS = "ios";
-  sameDeviceLaunch = true;
-  createGrantCalls = 0;
-  returnedLink = link;
+  createLinkCalls = 0;
   openedUrls.length = 0;
-  encodedUrls.length = 0;
+  sameDeviceLaunch = true;
+  returnedLink = {
+    ...link,
+    grant: { ...grant, scope_digest: `sha256:${"f".repeat(64)}` },
+  };
   let renderer;
   await TestRenderer.act(async () => {
-    renderer = TestRenderer.create(React.createElement(LaunchReviewCard, {
+    renderer = TestRenderer.create(React.createElement(ResumeSessionCard, {
       bootstrap,
       client,
+      session,
     }));
   });
   try {
     await settle();
-    const open = press(renderer, "Open app_kuzaba_ios QA build on this device");
-    assert.ok(open);
+    const open = press(renderer, "Open QA build recovery");
     await TestRenderer.act(async () => open.props.onPress());
     await settle();
-    assert.deepEqual(openedUrls, [expectedLaunchUrl]);
-    assert.deepEqual(encodedUrls, []);
+    assert.deepEqual(openedUrls, []);
+    const texts = renderer.root.findAllByType("Text").map(nodeText).join("\n");
+    assert.match(texts, /another capture scope/u);
   } finally {
     await TestRenderer.act(async () => renderer.unmount());
-    reactNative.Platform.OS = "web";
+    returnedLink = link;
   }
 });
 
-test("legacy transport stays readable but cannot mint a guessed launch URL", async () => {
-  reactNative.Platform.OS = "web";
-  sameDeviceLaunch = true;
-  createGrantCalls = 0;
+test("a legacy bootstrap disables recovery without minting a link", async () => {
+  createLinkCalls = 0;
   openedUrls.length = 0;
-  encodedUrls.length = 0;
-  returnedLink = link;
+  sameDeviceLaunch = true;
   const legacyBootstrap = {
     ...bootstrap,
     builds: [{ ...build, launch_scheme: null }],
   };
   let renderer;
   await TestRenderer.act(async () => {
-    renderer = TestRenderer.create(React.createElement(LaunchReviewCard, {
+    renderer = TestRenderer.create(React.createElement(ResumeSessionCard, {
       bootstrap: legacyBootstrap,
       client,
+      session,
     }));
   });
   try {
     await settle();
-    const unavailable = press(renderer, "app_kuzaba_ios QA build launch unavailable");
-    assert.ok(unavailable);
-    assert.equal(unavailable.props.disabled, true);
-    await TestRenderer.act(async () => unavailable.props.onPress());
+    const open = press(renderer, "Open QA build recovery");
+    assert.ok(open);
+    assert.equal(open.props.disabled, true);
+    await TestRenderer.act(async () => open.props.onPress());
     await settle();
-    assert.equal(createGrantCalls, 0);
+    assert.equal(createLinkCalls, 0);
     assert.deepEqual(openedUrls, []);
     const texts = renderer.root.findAllByType("Text").map(nodeText).join("\n");
     assert.match(texts, /SDK transport 1\.2/u);
-    assert.match(texts, /existing sessions remain readable/u);
   } finally {
     await TestRenderer.act(async () => renderer.unmount());
   }
 });
 
-test("a launch link for another build fails closed before open or QR", async () => {
-  reactNative.Platform.OS = "ios";
-  sameDeviceLaunch = true;
-  createGrantCalls = 0;
+test("desktop recovery QR encodes the exact server-provided URL", async () => {
+  reactNative.Platform.OS = "web";
+  createLinkCalls = 0;
   openedUrls.length = 0;
-  encodedUrls.length = 0;
-  returnedLink = {
-    ...link,
-    grant: { ...grant, build_identity_digest: `sha256:${"f".repeat(64)}` },
-  };
+  returnedLink = link;
+  sameDeviceLaunch = false;
   let renderer;
   await TestRenderer.act(async () => {
-    renderer = TestRenderer.create(React.createElement(LaunchReviewCard, {
+    renderer = TestRenderer.create(React.createElement(ResumeSessionCard, {
       bootstrap,
       client,
+      session,
     }));
   });
   try {
     await settle();
-    const open = press(renderer, "Open app_kuzaba_ios QA build on this device");
-    assert.ok(open);
-    await TestRenderer.act(async () => open.props.onPress());
+    const create = press(renderer, "Create recovery QR code");
+    assert.ok(create);
+    await TestRenderer.act(async () => create.props.onPress());
     await settle();
     assert.deepEqual(openedUrls, []);
-    assert.deepEqual(encodedUrls, []);
-    const texts = renderer.root.findAllByType("Text").map(nodeText).join("\n");
-    assert.match(texts, /issued for another build/u);
+    const qr = renderer.root.findByType("LaunchQRCodeMock");
+    assert.equal(qr.props.launchUrl, expectedLaunchUrl);
+    const fallback = press(renderer, "Open QA build recovery on this device instead");
+    assert.ok(fallback);
+    await TestRenderer.act(async () => fallback.props.onPress());
+    await settle();
+    assert.deepEqual(openedUrls, [expectedLaunchUrl]);
   } finally {
     await TestRenderer.act(async () => renderer.unmount());
-    reactNative.Platform.OS = "web";
-    returnedLink = link;
+    reactNative.Platform.OS = "ios";
+    sameDeviceLaunch = true;
   }
 });
 

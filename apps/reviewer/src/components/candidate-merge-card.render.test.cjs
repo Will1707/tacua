@@ -273,6 +273,55 @@ test("merge completion never updates or refreshes a changed context", async () =
   }
 });
 
+test("a confirmation prepared by an old bootstrap identity cannot submit", async () => {
+  alerts.length = 0;
+  replacementCalls = 0;
+  const onCompleted = async () => undefined;
+  let renderer;
+  await TestRenderer.act(async () => {
+    renderer = TestRenderer.create(React.createElement(CandidateMergeCard, {
+      candidates: summaries,
+      client,
+      disabled: false,
+      reviewerId: "reviewer_owner",
+      onCompleted,
+    }));
+  });
+  try {
+    for (const source of sources) {
+      const selector = renderer.root.findAllByType("Pressable").find(
+        (node) => node.props.accessibilityLabel === `Select ${source.content.title} for merge`,
+      );
+      await TestRenderer.act(async () => selector.props.onPress());
+    }
+    const prepare = renderer.root.findAllByType("Pressable").find(
+      (node) => node.props.accessibilityLabel === "Prepare combined draft",
+    );
+    await TestRenderer.act(async () => prepare.props.onPress());
+    await settle();
+    const review = renderer.root.findAllByType("Pressable").find(
+      (node) => node.props.accessibilityLabel === "Review and create combined draft",
+    );
+    await TestRenderer.act(async () => review.props.onPress());
+    const oldConfirmation = alerts.at(-1);
+
+    await TestRenderer.act(async () => {
+      renderer.update(React.createElement(CandidateMergeCard, {
+        candidates: summaries,
+        client,
+        disabled: false,
+        reviewerId: "reviewer_replacement",
+        onCompleted,
+      }));
+    });
+    await TestRenderer.act(async () => oldConfirmation[2][1].onPress());
+    await settle();
+    assert.equal(replacementCalls, 0);
+  } finally {
+    await TestRenderer.act(async () => renderer.unmount());
+  }
+});
+
 test("merge completion is inert after unmount", async () => {
   alerts.length = 0;
   const pending = deferred();

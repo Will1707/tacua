@@ -11,16 +11,19 @@ export { normalizeBaseUrl } from "./base-url";
 export { validateBackendConfig } from "./backend-config-validation";
 export type { BackendConfig } from "./backend-config-validation";
 
-const configurationKey = "tacua.backend.configuration.v3";
-const supersededConfigurationKey = "tacua.backend.configuration.v2";
-const legacyKeys = {
-  baseUrl: "tacua.backend.base-url.v1",
-  adminToken: "tacua.backend.admin-token.v1",
-  reviewerId: "tacua.reviewer.id.v1",
-  targetScheme: "tacua.target.scheme.v1",
-} as const;
+const configurationKey = "tacua.backend.configuration.v4";
+const supersededConfigurationKeys = [
+  "tacua.backend.configuration.v3",
+  "tacua.backend.configuration.v2",
+] as const;
+const legacyKeys = [
+  "tacua.backend.base-url.v1",
+  "tacua.backend.admin-token.v1",
+  "tacua.reviewer.id.v1",
+  "tacua.target.scheme.v1",
+] as const;
 
-type PersistedBackendConfig = BackendConfig & { readonly storageVersion: 3 };
+type PersistedBackendConfig = BackendConfig & { readonly storageVersion: 4 };
 
 function parsePersistedConfig(value: string): BackendConfig | null {
   try {
@@ -28,51 +31,52 @@ function parsePersistedConfig(value: string): BackendConfig | null {
     if (
       !parsed
       || typeof parsed !== "object"
-      || parsed.storageVersion !== 3
+      || parsed.storageVersion !== 4
       || typeof parsed.baseUrl !== "string"
-      || typeof parsed.adminToken !== "string"
-      || typeof parsed.reviewerId !== "string"
-      || typeof parsed.targetScheme !== "string"
-      || Object.keys(parsed).some((key) => !["storageVersion", "baseUrl", "adminToken", "reviewerId", "targetScheme"].includes(key))
+      || (parsed.sessionToken !== null && typeof parsed.sessionToken !== "string")
+      || Object.keys(parsed).length !== 3
+      || Object.keys(parsed).some((key) => !["storageVersion", "baseUrl", "sessionToken"].includes(key))
     ) {
       return null;
     }
-    return validateBackendConfig(parsed as BackendConfig);
+    return validateBackendConfig({
+      baseUrl: parsed.baseUrl,
+      sessionToken: parsed.sessionToken ?? null,
+    });
   } catch {
     return null;
   }
 }
 
-async function persistBackendConfig(config: BackendConfig): Promise<void> {
-  const persisted: PersistedBackendConfig = { storageVersion: 3, ...config };
-  await SecureStore.setItemAsync(configurationKey, JSON.stringify(persisted), {
-    keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
-  });
+async function removeSupersededConfiguration(): Promise<void> {
+  await Promise.all([
+    ...supersededConfigurationKeys.map((key) => SecureStore.deleteItemAsync(key)),
+    ...legacyKeys.map((key) => SecureStore.deleteItemAsync(key)),
+  ]);
 }
 
 export async function loadBackendConfig(): Promise<BackendConfig | null> {
   const persisted = await SecureStore.getItemAsync(configurationKey);
-  if (persisted !== null) return parsePersistedConfig(persisted);
-  // V3 intentionally does not migrate any earlier configuration. Earlier
-  // releases prefilled a plausible generic target scheme, so preserving a
-  // syntactically valid value could send a live grant to the wrong handler.
-  // Require the operator to re-enter and explicitly confirm the exact scheme.
-  return null;
+  await removeSupersededConfiguration();
+  if (persisted === null) return null;
+  const parsed = parsePersistedConfig(persisted);
+  if (parsed === null) await SecureStore.deleteItemAsync(configurationKey);
+  return parsed;
 }
 
 export async function saveBackendConfig(config: BackendConfig): Promise<void> {
   const validated = validateBackendConfig(config);
-  await persistBackendConfig(validated);
-  await Promise.allSettled([
-    SecureStore.deleteItemAsync(supersededConfigurationKey),
-    ...Object.values(legacyKeys).map((key) => SecureStore.deleteItemAsync(key)),
-  ]);
+  const persisted: PersistedBackendConfig = { storageVersion: 4, ...validated };
+  await SecureStore.setItemAsync(configurationKey, JSON.stringify(persisted), {
+    keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+  });
+  await removeSupersededConfiguration();
 }
 
 export async function clearBackendConfig(): Promise<void> {
   await Promise.all([
     SecureStore.deleteItemAsync(configurationKey),
-    SecureStore.deleteItemAsync(supersededConfigurationKey),
-    ...Object.values(legacyKeys).map((key) => SecureStore.deleteItemAsync(key)),
+    ...supersededConfigurationKeys.map((key) => SecureStore.deleteItemAsync(key)),
+    ...legacyKeys.map((key) => SecureStore.deleteItemAsync(key)),
   ]);
 }

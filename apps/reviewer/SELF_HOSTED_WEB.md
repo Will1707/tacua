@@ -32,30 +32,30 @@ override that bypasses these checks.
 ## Why there is no CORS mode
 
 The backend intentionally has no `OPTIONS` handler or
-`Access-Control-Allow-Origin` response. The browser reviewer sends a shared
-administrator bearer plus non-simple integrity and idempotency headers. A
-second origin would therefore need a broad, security-sensitive CORS policy and
-would increase the credential-exfiltration surface.
+`Access-Control-Allow-Origin` response. Unsafe reviewer operations use a
+same-origin `HttpOnly` session cookie (or a Serve-injected capability), exact
+`Origin`, and a scoped CSRF header. A second origin would therefore need a
+broad, security-sensitive CORS policy and would increase the authentication
+surface.
 
-Same-origin routing needs no CORS. The browser build also rejects a configured
-backend origin that differs from `window.location.origin`. Keep redirects
-disabled and preserve the client's response-origin checks.
+Same-origin routing needs no CORS. The browser client derives its only backend
+origin from `window.location.origin`; it has no alternate-origin setting. Keep
+redirects disabled and preserve the client's response-origin checks.
 
 ## Browser credential boundary
 
-Native builds keep the atomic endpoint-and-credential document in device-only,
-when-unlocked secure storage. Browsers cannot provide that guarantee. The web
-build uses `sessionStorage`, never `localStorage`, so configuration is scoped
-to one browser tab session. The administrator bearer is still readable by
-JavaScript in that origin while the tab is open. Saving configuration and
-activating a stored client each require the backend's authenticated,
-non-mutating reviewer-binding status check before any build-metadata bootstrap;
-stale reviewer IDs are not exposed to transition code. The status response
-does not return the configured identity.
-
-The reader accepts the exact bootstrap 1.0 shape after that status check, but
-treats its matching identity field only as a consistency assertion. It never
-derives browser configuration from that field.
+The web reviewer derives the backend from `window.location.origin` and stores
+no endpoint, bearer, reviewer identity, or launch scheme in browser storage. It
+also deletes superseded session-storage configuration left by older builds.
+Tailscale capability access needs no pairing. Otherwise, the reviewer creates
+a ten-minute pairing request, keeps its opaque exchange token only in memory,
+and displays the short human approval code. Successful exchange installs a
+`__Host-tacua-reviewer` `Secure`, `HttpOnly`, `SameSite=Strict` cookie;
+JavaScript never receives the credential. The app then binds the authenticated
+reviewer principal to the exact bootstrap 1.0 compatibility identity before
+exposing any operational client. The bootstrap field must match the principal,
+is otherwise rejected, and is used only as a consistency assertion rather than
+as browser configuration.
 
 For the single-owner private pilot:
 
@@ -72,39 +72,34 @@ For the single-owner private pilot:
 - set `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
   `Permissions-Policy: camera=(), geolocation=()`, and
   `Cache-Control: no-store` on the SPA shell;
-- clear the reviewer configuration before handing the browser/device to
-  another person.
+- revoke any paired reviewer session before handing the browser/device to
+  another person; capability access is removed in the tailnet policy.
 
-A multi-user or public deployment needs per-human authentication and a
-backend-for-frontend session design. It must not reuse this shared bearer in
-browser storage.
+A multi-user or public deployment needs a stronger per-human identity and
+authorization design. This remains a single-owner private-pilot profile.
 
 ## Device-launch limitation
 
-The first-run `QA app URL scheme` setting must exactly match the dedicated
-`launchScheme` installed by the Tacua config plugin in the SDK-enabled QA
-build. It is intentionally blank rather than prefilled with a plausible
-generic value: the browser cannot derive or verify scheme ownership from a
-bundle identifier. Correcting this setting clears any retained one-time grant;
-create a new launch after saving the correction.
-
-The release that introduced this requirement also increments the browser and
-native configuration storage contracts without migrating earlier values. Every
-existing reviewer must reconnect once and explicitly enter the exact scheme;
-Tacua does not special-case the old placeholder because another self-hoster may
-legitimately own that scheme.
+Transport policy 1.2 seals the dedicated QA `launch_scheme` into the SDK build
+profile. The backend returns a versioned bootstrap binding and atomically
+creates the complete custom-scheme URL through `/v1/reviewer/launch-links`.
+The reviewer checks that URL against the selected build and grant, then opens
+or renders those exact server bytes; it never accepts a manually entered scheme
+or composes a launch URL. Transport 1.1 deployments remain readable but launch
+and recovery controls stay disabled until the backend and QA binary are
+resealed for 1.2.
 
 Ticket inspection, editing, approval, and handoff download work from a desktop
 browser. When starting a review from a desktop, the reviewer renders the QA
 app's custom-scheme launch link as a QR code for the test iPhone. The QR is
 generated locally in the tab without a third-party service and contains only
-the fixed custom-scheme route plus the one-use, short-lived launch code: never
-the backend origin, administrator credential, or recording data. It is still a
-bearer until use or expiry, and custom URL schemes are not exclusive to one
-installed handler, so do not screenshot, copy, or share it. While a grant is
+the server-issued custom-scheme route plus the one-use, short-lived launch
+code: never the backend origin, reviewer credential, or recording data. It is
+still a bearer until use or expiry, and custom URL schemes are not exclusive to
+one installed handler, so do not screenshot, copy, or share it. While a grant is
 live, the reviewer disables creation of another one rather than leave multiple
-valid QRs in circulation. Changing
-reviewer configuration or reaching the stated expiry or five-minute local
+valid QRs in circulation. Changing the authenticated reviewer/build binding or
+reaching the stated expiry or five-minute local
 retention cap removes the retained grant and QR from the UI.
 
 On an iPhone, creating a grant and opening the custom scheme are deliberately

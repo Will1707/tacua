@@ -5,8 +5,11 @@ import { Linking, Platform, Pressable, Text, View } from "react-native";
 
 import { TacuaApiError, type TacuaApiClient } from "@/api/client";
 import { launchCodeRetentionMilliseconds } from "@/api/launch-code-retention";
-import { buildLaunchURL } from "@/api/launch-grant-validation";
-import type { RegisteredBuild, StartLaunchGrant } from "@/api/types";
+import type {
+  ReviewerBootstrap,
+  ReviewerBootstrapBuild,
+  ReviewerStartLaunchLink,
+} from "@/api/types";
 import { LaunchQRCode } from "@/components/launch-qr-code";
 import { SectionCard } from "@/components/section-card";
 import { colors } from "@/theme/colors";
@@ -14,108 +17,89 @@ import { formatDate } from "@/utils/format";
 import { shouldAttemptSameDeviceLaunch } from "@/utils/launch-device";
 
 type Props = {
+  readonly bootstrap: ReviewerBootstrap;
   readonly client: TacuaApiClient;
-  readonly targetScheme: string;
 };
 
-export function LaunchReviewCard({ client, targetScheme }: Props) {
+export function LaunchReviewCard({ bootstrap, client }: Props) {
   const [sameDeviceLaunch] = useState(shouldAttemptSameDeviceLaunch);
-  const [builds, setBuilds] = useState<readonly RegisteredBuild[]>([]);
-  const [loading, setLoading] = useState(true);
   const [launchingBuildId, setLaunchingBuildId] = useState<string | null>(null);
-  const [grant, setGrant] = useState<StartLaunchGrant | null>(null);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const [launchLink, setLaunchLink] = useState<ReviewerStartLaunchLink | null>(null);
   const [launchError, setLaunchError] = useState<string | null>(null);
-  const loadRequestSequence = useRef(0);
   const launchRequestSequence = useRef(0);
   const launchInFlightRef = useRef(false);
-  const bindingRef = useRef({ client, targetScheme });
-  bindingRef.current = { client, targetScheme };
-
-  const loadBuilds = useCallback(async () => {
-    const requestId = loadRequestSequence.current + 1;
-    loadRequestSequence.current = requestId;
-    setLoading(true);
-    setLoadError(null);
-    try {
-      const loaded = await client.listBuilds();
-      if (requestId !== loadRequestSequence.current || bindingRef.current.client !== client) return;
-      setBuilds(loaded);
-    } catch (caught) {
-      if (requestId !== loadRequestSequence.current || bindingRef.current.client !== client) return;
-      setBuilds([]);
-      setLoadError(caught instanceof Error ? caught.message : "Tacua could not load the registered QA build.");
-    } finally {
-      if (requestId === loadRequestSequence.current && bindingRef.current.client === client) setLoading(false);
-    }
-  }, [client]);
+  const bindingRef = useRef({ bootstrap, client });
+  bindingRef.current = { bootstrap, client };
 
   useEffect(() => {
-    // A live code is bound to both the issuing backend client and the target
-    // application scheme. Never carry it across either configuration change.
+    // A live code is bound to the issuing reviewer session and the exact
+    // sealed bootstrap projection. Never carry it across either change.
     launchRequestSequence.current += 1;
     launchInFlightRef.current = false;
     setLaunchingBuildId(null);
-    setGrant(null);
+    setLaunchLink(null);
     setLaunchError(null);
-  }, [client, targetScheme]);
+  }, [bootstrap, client]);
   useEffect(() => () => {
-    loadRequestSequence.current += 1;
     launchRequestSequence.current += 1;
     launchInFlightRef.current = false;
   }, []);
-  useEffect(() => { void loadBuilds(); }, [loadBuilds]);
   useEffect(() => {
-    if (!grant) return;
+    if (!launchLink) return;
     // State supplies either the immediate same-device retry or the desktop QR.
     // This timer bounds how long either affordance retains the live code.
     const timer = setTimeout(
-      () => setGrant(null),
-      launchCodeRetentionMilliseconds(grant.expires_at),
+      () => setLaunchLink(null),
+      launchCodeRetentionMilliseconds(launchLink.grant.expires_at),
     );
     return () => clearTimeout(timer);
-  }, [grant]);
+  }, [launchLink]);
 
-  const openGrant = useCallback(async (nextGrant: StartLaunchGrant) => {
-    const launchUrl = buildLaunchURL(targetScheme, nextGrant.launch_code);
+  const openLaunchLink = useCallback(async (nextLink: ReviewerStartLaunchLink) => {
     try {
-      await Linking.openURL(launchUrl);
+      // Open the exact backend-validated URL. The reviewer never reconstructs
+      // or guesses a custom app scheme locally.
+      await Linking.openURL(nextLink.launch_url);
     } catch {
       throw new TacuaApiError(0, "QA_BUILD_UNAVAILABLE", "The registered QA app could not be opened on this device.");
     }
-  }, [targetScheme]);
+  }, []);
 
-  async function start(build: RegisteredBuild) {
+  async function start(build: ReviewerBootstrapBuild) {
+    const launchScheme = build.launch_scheme;
     if (
-      launchInFlightRef.current
-      || grant !== null
+      launchScheme === null
+      || launchInFlightRef.current
+      || launchLink !== null
       || bindingRef.current.client !== client
-      || bindingRef.current.targetScheme !== targetScheme
+      || bindingRef.current.bootstrap !== bootstrap
     ) return;
     launchInFlightRef.current = true;
     const requestId = launchRequestSequence.current + 1;
     launchRequestSequence.current = requestId;
-    const requestClient = client;
-    const requestScheme = targetScheme;
+    const requestBinding = bindingRef.current;
     const isCurrentRequest = () => (
       requestId === launchRequestSequence.current
-      && bindingRef.current.client === requestClient
-      && bindingRef.current.targetScheme === requestScheme
+      && bindingRef.current.client === requestBinding.client
+      && bindingRef.current.bootstrap === requestBinding.bootstrap
     );
     setLaunchingBuildId(build.build_id);
-    setGrant(null);
+    setLaunchLink(null);
     setLaunchError(null);
     try {
-      const nextGrant = await requestClient.createLaunchGrant(build.build_id);
+      const nextLink = await requestBinding.client.createLaunchLink(
+        build.build_id,
+        launchScheme,
+        build.build_identity_digest,
+      );
       if (!isCurrentRequest()) return;
-      if (nextGrant.build_identity_digest !== build.build_identity_digest) {
-        throw new TacuaApiError(502, "BUILD_BINDING_MISMATCH", "The launch grant was issued for another build.");
+      if (nextLink.grant.build_identity_digest !== build.build_identity_digest) {
+        throw new TacuaApiError(502, "BUILD_BINDING_MISMATCH", "The launch link was issued for another build.");
       }
-      setGrant(nextGrant);
+      setLaunchLink(nextLink);
       // Browser URL handlers require a second, synchronous user gesture after
-      // this asynchronous grant request. Native Linking does not have that
-      // transient-activation boundary and may open immediately.
-      if (Platform.OS !== "web") await openGrant(nextGrant);
+      // this asynchronous request. Native Linking may open immediately.
+      if (Platform.OS !== "web") await openLaunchLink(nextLink);
     } catch (caught) {
       if (isCurrentRequest()) {
         setLaunchError(caught instanceof Error ? caught.message : "Tacua could not start this review.");
@@ -128,27 +112,27 @@ export function LaunchReviewCard({ client, targetScheme }: Props) {
     }
   }
 
-  async function retryGrant(nextGrant: StartLaunchGrant) {
+  async function retryLaunchLink(nextLink: ReviewerStartLaunchLink) {
     if (
       launchInFlightRef.current
       || bindingRef.current.client !== client
-      || bindingRef.current.targetScheme !== targetScheme
-      || grant?.launch_id !== nextGrant.launch_id
+      || bindingRef.current.bootstrap !== bootstrap
+      || launchLink?.grant.launch_id !== nextLink.grant.launch_id
+      || launchLink.launch_url !== nextLink.launch_url
     ) return;
     launchInFlightRef.current = true;
     const requestId = launchRequestSequence.current + 1;
     launchRequestSequence.current = requestId;
-    const requestClient = client;
-    const requestScheme = targetScheme;
+    const requestBinding = bindingRef.current;
     const isCurrentRequest = () => (
       requestId === launchRequestSequence.current
-      && bindingRef.current.client === requestClient
-      && bindingRef.current.targetScheme === requestScheme
+      && bindingRef.current.client === requestBinding.client
+      && bindingRef.current.bootstrap === requestBinding.bootstrap
     );
-    setLaunchingBuildId(nextGrant.launch_id);
+    setLaunchingBuildId(nextLink.grant.launch_id);
     setLaunchError(null);
     try {
-      await openGrant(nextGrant);
+      await openLaunchLink(nextLink);
     } catch (caught) {
       if (isCurrentRequest()) {
         setLaunchError(caught instanceof Error ? caught.message : "The QA app could not be opened.");
@@ -170,67 +154,77 @@ export function LaunchReviewCard({ client, targetScheme }: Props) {
             : "Choose the registered QA build to open it on this device. The app shows the exact consent screen before app-only recording or upload begins, and capture stops after 30 minutes."
           : "This reviewer is open on a computer. Choose the registered QA build to create a private one-time QR code, then scan it with the iPhone that has the QA build."}
       </Text>
-      {loading ? <Text selectable style={{ color: colors.tertiaryLabel }}>Loading registered builds…</Text> : null}
-      {!loading && builds.length === 0 && !loadError ? (
+      {bootstrap.builds.length === 0 ? (
         <Text selectable style={{ color: colors.orange }}>This deployment has no registered iOS QA build.</Text>
       ) : null}
-      {builds.map((build) => {
+      {bootstrap.builds.map((build) => {
         const launching = launchingBuildId === build.build_id;
-        const launchUnavailable = launchingBuildId !== null || grant !== null;
+        const legacyBuild = build.launch_scheme === null;
+        const launchUnavailable = launchingBuildId !== null || launchLink !== null || legacyBuild;
         return (
-          <Pressable
-            key={build.build_id}
-            accessibilityLabel={sameDeviceLaunch
-              ? Platform.OS === "web"
-                ? `Prepare ${build.application_id} QA build launch on this device`
-                : `Open ${build.application_id} QA build on this device`
-              : `Create iPhone launch QR code for ${build.application_id}`}
-            accessibilityRole="button"
-            accessibilityState={{ busy: launching, disabled: launchUnavailable }}
-            disabled={launchUnavailable}
-            onPress={() => void start(build)}
-            style={({ pressed }) => ({
-              borderColor: colors.separator,
-              borderWidth: 1,
-              borderRadius: 14,
-              borderCurve: "continuous",
-              padding: 13,
-              gap: 5,
-              opacity: launchUnavailable ? 0.55 : pressed ? 0.7 : 1,
-            })}
-          >
-            <View style={{ flexDirection: "row", alignItems: "flex-start", gap: 10 }}>
-              <View style={{ flex: 1, gap: 3 }}>
-                <Text selectable style={{ color: colors.label, fontWeight: "800", fontSize: 16 }}>{build.application_id}</Text>
-                <Text selectable style={{ color: colors.secondaryLabel }}>
-                  {build.native_version} ({build.native_build}) · {build.distribution}
+          <View key={build.build_id} style={{ gap: 6 }}>
+            <Pressable
+              accessibilityLabel={legacyBuild
+                ? `${build.application_id} QA build launch unavailable`
+                : sameDeviceLaunch
+                  ? Platform.OS === "web"
+                    ? `Prepare ${build.application_id} QA build launch on this device`
+                    : `Open ${build.application_id} QA build on this device`
+                  : `Create iPhone launch QR code for ${build.application_id}`}
+              accessibilityRole="button"
+              accessibilityState={{ busy: launching, disabled: launchUnavailable }}
+              disabled={launchUnavailable}
+              onPress={() => void start(build)}
+              style={({ pressed }) => ({
+                borderColor: colors.separator,
+                borderWidth: 1,
+                borderRadius: 14,
+                borderCurve: "continuous",
+                padding: 13,
+                gap: 5,
+                opacity: launchUnavailable ? 0.55 : pressed ? 0.7 : 1,
+              })}
+            >
+              <View style={{ flexDirection: "row", alignItems: "flex-start", gap: 10 }}>
+                <View style={{ flex: 1, gap: 3 }}>
+                  <Text selectable style={{ color: colors.label, fontWeight: "800", fontSize: 16 }}>{build.application_id}</Text>
+                  <Text selectable style={{ color: colors.secondaryLabel }}>
+                    {build.native_version} ({build.native_build}) · {build.distribution}
+                  </Text>
+                  <Text selectable style={{ color: colors.tertiaryLabel, fontSize: 12 }}>{build.bundle_identifier}</Text>
+                </View>
+                <Text style={{ color: legacyBuild ? colors.orange : colors.primary, fontWeight: "800" }}>
+                  {legacyBuild
+                    ? "Upgrade required"
+                    : launching
+                      ? "Preparing…"
+                      : sameDeviceLaunch
+                        ? Platform.OS === "web" ? "Prepare" : "Open"
+                        : "Create QR"}
                 </Text>
-                <Text selectable style={{ color: colors.tertiaryLabel, fontSize: 12 }}>{build.bundle_identifier}</Text>
               </View>
-              <Text style={{ color: colors.primary, fontWeight: "800" }}>
-                {launching
-                  ? "Preparing…"
-                  : sameDeviceLaunch
-                    ? Platform.OS === "web" ? "Prepare" : "Open"
-                    : "Create QR"}
+            </Pressable>
+            {legacyBuild ? (
+              <Text selectable accessibilityRole="alert" style={{ color: colors.orange, fontSize: 13, lineHeight: 18 }}>
+                This legacy QA build does not seal its launch scheme. Rebuild it with Tacua SDK transport 1.2 before launching; existing sessions remain readable.
               </Text>
-            </View>
-          </Pressable>
+            ) : null}
+          </View>
         );
       })}
-      {grant ? (
+      {launchLink ? (
         <View accessibilityLiveRegion="polite" style={{ backgroundColor: colors.groupedBackground, borderRadius: 12, borderCurve: "continuous", padding: 12, gap: 7 }}>
           <Text selectable style={{ color: colors.label, fontWeight: "700" }}>
             {sameDeviceLaunch ? "One-time launch ready" : "Scan on the QA iPhone"}
           </Text>
           <Text selectable style={{ color: colors.secondaryLabel, fontSize: 13, lineHeight: 18 }}>
             {sameDeviceLaunch
-              ? `Expires ${formatDate(grant.expires_at)}. The link contains only the short-lived launch code.`
-              : `Open Camera on the iPhone and scan this code. It expires ${formatDate(grant.expires_at)}. Custom URL schemes are not exclusive, so keep the QR private until it is used or expires.`}
+              ? `Expires ${formatDate(launchLink.grant.expires_at)}. The server-provided link contains only the short-lived launch code.`
+              : `Open Camera on the iPhone and scan this code. It expires ${formatDate(launchLink.grant.expires_at)}. Custom URL schemes are not exclusive, so keep the QR private until it is used or expires.`}
           </Text>
           {!sameDeviceLaunch ? (
             <>
-              <LaunchQRCode launchUrl={buildLaunchURL(targetScheme, grant.launch_code)} />
+              <LaunchQRCode launchUrl={launchLink.launch_url} />
               <Text selectable style={{ color: colors.secondaryLabel, fontSize: 13, lineHeight: 18 }}>
                 Keep this QR private until it expires. Tacua generates it in this browser and never sends it to a QR service; it contains no administrator credential or backend address.
               </Text>
@@ -248,7 +242,7 @@ export function LaunchReviewCard({ client, targetScheme }: Props) {
             accessibilityRole="button"
             accessibilityState={{ disabled: launchingBuildId !== null }}
             disabled={launchingBuildId !== null}
-            onPress={() => void retryGrant(grant)}
+            onPress={() => void retryLaunchLink(launchLink)}
             style={{ minHeight: 44, justifyContent: "center", opacity: launchingBuildId !== null ? 0.5 : 1 }}
           >
             <Text style={{ color: colors.primary, fontWeight: "800" }}>
@@ -258,14 +252,6 @@ export function LaunchReviewCard({ client, targetScheme }: Props) {
                   : "Try opening the QA build again"
                 : "Open on this device instead"}
             </Text>
-          </Pressable>
-        </View>
-      ) : null}
-      {loadError ? (
-        <View style={{ gap: 7 }}>
-          <Text selectable accessibilityRole="alert" style={{ color: colors.orange, lineHeight: 20 }}>{loadError}</Text>
-          <Pressable accessibilityRole="button" accessibilityState={{ disabled: loading }} disabled={loading} onPress={() => void loadBuilds()} style={{ minHeight: 44, justifyContent: "center" }}>
-            <Text style={{ color: colors.primary, fontWeight: "800" }}>Reload registered builds</Text>
           </Pressable>
         </View>
       ) : null}
