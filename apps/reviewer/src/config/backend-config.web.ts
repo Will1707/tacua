@@ -32,8 +32,24 @@ function exactBrowserOrigin(): string {
 }
 
 function forgetObsoleteBrowserConfiguration(): void {
-  if (typeof globalThis.sessionStorage === "undefined") return;
-  for (const key of obsoleteSessionKeys) globalThis.sessionStorage.removeItem(key);
+  let storage: Storage | undefined;
+  try {
+    storage = globalThis.sessionStorage;
+  } catch {
+    // Access to browser storage can be denied even though the same-origin
+    // reviewer itself needs no storage. Removing legacy secrets is best-effort
+    // and must not block cookie- or capability-based authentication.
+    return;
+  }
+  if (storage === undefined) return;
+  for (const key of obsoleteSessionKeys) {
+    try {
+      storage.removeItem(key);
+    } catch {
+      // A browser may expose Storage but reject individual mutations. Keep
+      // trying the remaining obsolete keys without making storage mandatory.
+    }
+  }
 }
 
 export async function loadBackendConfig(): Promise<BackendConfig> {

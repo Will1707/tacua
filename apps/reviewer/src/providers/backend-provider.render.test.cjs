@@ -24,6 +24,15 @@ const originalTSXLoader = Module._extensions[".tsx"];
 let storedConfig;
 let api;
 const mockPlatform = { OS: "web" };
+const appStateListeners = new Set();
+const mockAppState = {
+  currentState: "active",
+  addEventListener(event, listener) {
+    assert.equal(event, "change");
+    appStateListeners.add(listener);
+    return { remove() { appStateListeners.delete(listener); } };
+  },
+};
 const constructedConfigs = [];
 const savedConfigs = [];
 
@@ -72,7 +81,7 @@ Module._resolveFilename = function resolveFilename(request, parent, isMain, opti
   return originalResolveFilename.call(this, resolvedRequest, parent, isMain, options);
 };
 Module._load = function load(request, parent, isMain) {
-  if (request === "react-native") return { Platform: mockPlatform };
+  if (request === "react-native") return { AppState: mockAppState, Platform: mockPlatform };
   if (request === "@/api/client") return { TacuaApiClient, TacuaApiError };
   if (request === "@/api/version-probe") {
     return { probeTacuaBackend: (baseUrl) => api.probeTacuaBackend(baseUrl) };
@@ -123,6 +132,7 @@ function bootstrap(reviewerId = "reviewer_owner") {
 }
 
 function reset(overrides = {}) {
+  mockAppState.currentState = "active";
   storedConfig = endpointConfig;
   constructedConfigs.length = 0;
   savedConfigs.length = 0;
@@ -165,6 +175,11 @@ async function renderProvider() {
   };
 }
 
+function emitAppState(nextState) {
+  mockAppState.currentState = nextState;
+  for (const listener of [...appStateListeners]) listener(nextState);
+}
+
 test("web capability access connects from the exact origin without stored secrets", async () => {
   reset({
     async getReviewerSession() {
@@ -187,6 +202,158 @@ test("web capability access connects from the exact origin without stored secret
   ]);
   assert.deepEqual(savedConfigs, []);
   await TestRenderer.act(async () => rendered.renderer.unmount());
+});
+
+test("web refresh replaces a revoked pairing principal and its CSRF-bound client", async () => {
+  let sessionCalls = 0;
+  reset({
+    async getReviewerSession() {
+      sessionCalls += 1;
+      if (sessionCalls === 1) return principal();
+      return principal({
+        auth_kind: "tailscale_capability",
+        session_id: null,
+        device_label: null,
+        client_kind: "tailscale_web",
+        expires_at: null,
+        csrf_token: "capability-csrf-token",
+      });
+    },
+  });
+  const rendered = await renderProvider();
+  try {
+    const pairedClient = rendered.observed.client;
+    assert.equal(rendered.observed.session.auth_kind, "session");
+
+    await TestRenderer.act(async () => {
+      await rendered.observed.reload();
+      await settle();
+    });
+
+    assert.equal(rendered.observed.status, "connected");
+    assert.equal(rendered.observed.session.auth_kind, "tailscale_capability");
+    assert.notStrictEqual(rendered.observed.client, pairedClient);
+    assert.deepEqual(constructedConfigs.slice(-2), [
+      { baseUrl: "https://tacua.example", clientKind: "web" },
+      {
+        baseUrl: "https://tacua.example",
+        clientKind: "web",
+        csrfToken: "capability-csrf-token",
+      },
+    ]);
+  } finally {
+    await TestRenderer.act(async () => rendered.renderer.unmount());
+  }
+});
+
+test("web foreground revalidates a replaced effective principal", async () => {
+  let sessionCalls = 0;
+  reset({
+    async getReviewerSession() {
+      sessionCalls += 1;
+      if (sessionCalls === 1) return principal();
+      return principal({
+        auth_kind: "tailscale_capability",
+        session_id: null,
+        device_label: null,
+        client_kind: "tailscale_web",
+        expires_at: null,
+        csrf_token: "foreground-capability-csrf-token",
+      });
+    },
+  });
+  const rendered = await renderProvider();
+  try {
+    const pairedClient = rendered.observed.client;
+    await TestRenderer.act(async () => {
+      emitAppState("background");
+      emitAppState("active");
+      await settle();
+    });
+
+    assert.equal(sessionCalls, 2);
+    assert.equal(rendered.observed.status, "connected");
+    assert.equal(rendered.observed.session.auth_kind, "tailscale_capability");
+    assert.notStrictEqual(rendered.observed.client, pairedClient);
+    assert.equal(
+      constructedConfigs.at(-1).csrfToken,
+      "foreground-capability-csrf-token",
+    );
+  } finally {
+    await TestRenderer.act(async () => rendered.renderer.unmount());
+  }
+});
+
+test("web pairing expiry revalidates at the exact expiry time", async (context) => {
+  const now = Date.parse("2026-08-21T12:00:00Z");
+  context.mock.timers.enable({ apis: ["Date", "setTimeout"], now });
+  let sessionCalls = 0;
+  reset({
+    async getReviewerSession() {
+      sessionCalls += 1;
+      if (sessionCalls === 1) {
+        return principal({ expires_at: "2026-08-21T12:00:01Z" });
+      }
+      return principal({
+        auth_kind: "tailscale_capability",
+        session_id: null,
+        device_label: null,
+        client_kind: "tailscale_web",
+        expires_at: null,
+        csrf_token: "expiry-capability-csrf-token",
+      });
+    },
+  });
+  const rendered = await renderProvider();
+  try {
+    const pairedClient = rendered.observed.client;
+    context.mock.timers.tick(999);
+    await settle();
+    assert.equal(sessionCalls, 1);
+
+    await TestRenderer.act(async () => {
+      context.mock.timers.tick(1);
+      await settle();
+    });
+
+    assert.equal(sessionCalls, 2);
+    assert.equal(rendered.observed.status, "connected");
+    assert.equal(rendered.observed.session.auth_kind, "tailscale_capability");
+    assert.notStrictEqual(rendered.observed.client, pairedClient);
+    assert.equal(constructedConfigs.at(-1).csrfToken, "expiry-capability-csrf-token");
+  } finally {
+    await TestRenderer.act(async () => rendered.renderer.unmount());
+  }
+});
+
+test("web pairing expiry cannot create a zero-delay loop when backend time lags", async (context) => {
+  const now = Date.parse("2026-08-21T12:00:00Z");
+  context.mock.timers.enable({ apis: ["Date", "setTimeout"], now });
+  let sessionCalls = 0;
+  reset({
+    async getReviewerSession() {
+      sessionCalls += 1;
+      return principal({ expires_at: "2026-08-21T12:00:01Z" });
+    },
+  });
+  const rendered = await renderProvider();
+  try {
+    await TestRenderer.act(async () => {
+      context.mock.timers.tick(1_000);
+      await settle();
+    });
+    assert.equal(sessionCalls, 2);
+
+    await TestRenderer.act(async () => {
+      context.mock.timers.tick(60_000);
+      await settle();
+    });
+    assert.equal(sessionCalls, 2);
+    assert.equal(rendered.observed.status, "connected");
+    assert.equal(rendered.observed.session.auth_kind, "session");
+  } finally {
+    await TestRenderer.act(async () => rendered.renderer.unmount());
+  }
 });
 
 test("native retries a valid capability immediately after clearing a stale bearer", async () => {
@@ -227,6 +394,128 @@ test("native retries a valid capability immediately after clearing a stale beare
       { baseUrl: "https://tacua.example", clientKind: "native" },
       { baseUrl: "https://tacua.example", clientKind: "native", csrfToken: "csrf-token" },
     ]);
+  } finally {
+    await TestRenderer.act(async () => rendered.renderer.unmount());
+    mockPlatform.OS = "web";
+  }
+});
+
+test("native endpoint replacement revokes the persisted session before overwriting storage", async () => {
+  mockPlatform.OS = "native";
+  const sessionId = "rsess_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const sessionToken = `${sessionId}.${"B".repeat(43)}`;
+  const oldConfig = { baseUrl: "https://old-tacua.example", sessionToken };
+  const replacementConfig = { baseUrl: "https://new-tacua.example", sessionToken: null };
+  storedConfig = oldConfig;
+  constructedConfigs.length = 0;
+  savedConfigs.length = 0;
+  let sessionCalls = 0;
+  let resolveRevocation;
+  const revocation = new Promise((resolve) => { resolveRevocation = resolve; });
+  api = {
+    async probeTacuaBackend() {},
+    async getReviewerSession() {
+      sessionCalls += 1;
+      if (sessionCalls === 1) throw new Error("initial connection failed");
+      if (sessionCalls === 2) {
+        return principal({
+          session_id: sessionId,
+          device_label: "Tacua native reviewer",
+          client_kind: "native",
+        });
+      }
+      throw new TacuaApiError(401, "REVIEWER_AUTHENTICATION_FAILED", "reviewer authentication failed");
+    },
+    async getReviewerBootstrap() { throw new Error("unexpected bootstrap"); },
+    async createPairingRequest() { throw new Error("unexpected pairing request"); },
+    async exchangePairing() { throw new Error("unexpected pairing exchange"); },
+    async revokeReviewerSession() {
+      await revocation;
+      return {
+        session_id: sessionId,
+        reviewer_id: "reviewer_owner",
+        client_kind: "native",
+      };
+    },
+  };
+  const rendered = await renderProvider();
+  try {
+    assert.equal(rendered.observed.status, "error");
+    let replacement;
+    await TestRenderer.act(async () => {
+      replacement = rendered.observed.configureEndpoint(replacementConfig.baseUrl);
+      await settle();
+    });
+    assert.equal(rendered.observed.status, "loading");
+    assert.strictEqual(storedConfig, oldConfig, "the old bearer remains durable until DELETE succeeds");
+    assert.deepEqual(savedConfigs, []);
+
+    await TestRenderer.act(async () => {
+      resolveRevocation();
+      await replacement;
+      await settle();
+    });
+
+    assert.deepEqual(savedConfigs, [replacementConfig]);
+    assert.deepEqual(storedConfig, replacementConfig);
+    assert.equal(rendered.observed.status, "pairing_required");
+    assert.deepEqual(constructedConfigs.slice(1, 3), [
+      { baseUrl: oldConfig.baseUrl, clientKind: "native", sessionToken },
+      {
+        baseUrl: oldConfig.baseUrl,
+        clientKind: "native",
+        sessionToken,
+        csrfToken: "csrf-token",
+      },
+    ]);
+  } finally {
+    await TestRenderer.act(async () => rendered.renderer.unmount());
+    mockPlatform.OS = "web";
+  }
+});
+
+test("native endpoint replacement keeps a possibly-live session when revocation is ambiguous", async () => {
+  mockPlatform.OS = "native";
+  const sessionId = "rsess_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const sessionToken = `${sessionId}.${"B".repeat(43)}`;
+  const oldConfig = { baseUrl: "https://old-tacua.example", sessionToken };
+  storedConfig = oldConfig;
+  constructedConfigs.length = 0;
+  savedConfigs.length = 0;
+  let sessionCalls = 0;
+  api = {
+    async probeTacuaBackend() {},
+    async getReviewerSession() {
+      sessionCalls += 1;
+      if (sessionCalls === 1) throw new Error("initial connection failed");
+      return principal({
+        session_id: sessionId,
+        device_label: "Tacua native reviewer",
+        client_kind: "native",
+      });
+    },
+    async getReviewerBootstrap() { throw new Error("unexpected bootstrap"); },
+    async createPairingRequest() { throw new Error("unexpected pairing request"); },
+    async exchangePairing() { throw new Error("unexpected pairing exchange"); },
+    async revokeReviewerSession() { throw new Error("network details must not be exposed"); },
+  };
+  const rendered = await renderProvider();
+  try {
+    assert.equal(rendered.observed.status, "error");
+    await TestRenderer.act(async () => {
+      await assert.rejects(
+        rendered.observed.configureEndpoint("https://new-tacua.example"),
+        /previous endpoint was kept/u,
+      );
+      await settle();
+    });
+
+    assert.strictEqual(storedConfig, oldConfig);
+    assert.deepEqual(savedConfigs, []);
+    assert.equal(rendered.observed.status, "error");
+    assert.strictEqual(rendered.observed.config, oldConfig);
+    assert.match(rendered.observed.error, /previous endpoint was kept/u);
+    assert.doesNotMatch(rendered.observed.error, /network details/u);
   } finally {
     await TestRenderer.act(async () => rendered.renderer.unmount());
     mockPlatform.OS = "web";

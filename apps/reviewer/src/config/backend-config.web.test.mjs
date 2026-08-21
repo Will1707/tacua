@@ -66,6 +66,41 @@ test("web rejects cross-origin endpoints and bearer persistence", async (context
   assert.equal(storage.length, 0);
 });
 
+test("web capability setup ignores denied session-storage access", async (context) => {
+  Object.defineProperty(globalThis, "sessionStorage", {
+    configurable: true,
+    get() { throw new DOMException("Storage is disabled.", "SecurityError"); },
+  });
+  Object.defineProperty(globalThis, "location", {
+    configurable: true,
+    value: { origin: "https://reviewer.example" },
+  });
+  context.after(() => {
+    delete globalThis.sessionStorage;
+    delete globalThis.location;
+  });
+
+  const expected = { baseUrl: "https://reviewer.example", sessionToken: null };
+  assert.deepEqual(await loadBackendConfig(), expected);
+  await saveBackendConfig(expected);
+  await clearBackendConfig();
+});
+
+test("web capability setup ignores denied obsolete-key removal", async (context) => {
+  const storage = installBrowser(context);
+  let removalAttempts = 0;
+  storage.removeItem = () => {
+    removalAttempts += 1;
+    throw new DOMException("Storage mutation is disabled.", "SecurityError");
+  };
+
+  const expected = { baseUrl: "https://reviewer.example", sessionToken: null };
+  assert.deepEqual(await loadBackendConfig(), expected);
+  await saveBackendConfig(expected);
+  await clearBackendConfig();
+  assert.ok(removalAttempts > 0);
+});
+
 test("web fails closed without a valid browser origin", async (context) => {
   installBrowser(context, "not-an-origin");
   await assert.rejects(loadBackendConfig(), /valid URL|HTTPS/u);

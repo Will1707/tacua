@@ -2,7 +2,7 @@
 
 import { Link } from "expo-router";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ActivityIndicator, AppState, Pressable, RefreshControl, ScrollView, Text, View } from "react-native";
+import { ActivityIndicator, Pressable, RefreshControl, ScrollView, Text, View } from "react-native";
 
 import type { TacuaApiClient } from "@/api/client";
 import type { CaptureSession, ReviewerBootstrap } from "@/api/types";
@@ -138,16 +138,6 @@ export default function ReviewsRoute() {
     };
   }, [bootstrap, client, refresh, status]);
 
-  const appState = useRef(AppState.currentState);
-  useEffect(() => {
-    const subscription = AppState.addEventListener("change", (nextState) => {
-      const returnedToTacua = appState.current !== "active" && nextState === "active";
-      appState.current = nextState;
-      if (returnedToTacua) void refresh();
-    });
-    return () => subscription.remove();
-  }, [refresh]);
-
   const dataIsCurrent = status === "connected"
     && client !== null
     && bootstrap !== null
@@ -199,7 +189,7 @@ export default function ReviewsRoute() {
   return (
     <ScrollView
       contentInsetAdjustmentBehavior="automatic"
-      refreshControl={<RefreshControl refreshing={visibleLoading} onRefresh={() => void refresh()} />}
+      refreshControl={<RefreshControl refreshing={visibleLoading} onRefresh={() => void reloadBackend()} />}
       contentContainerStyle={{ padding: 16, gap: 12 }}
     >
       <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "flex-start", gap: 8, paddingBottom: 4 }}>

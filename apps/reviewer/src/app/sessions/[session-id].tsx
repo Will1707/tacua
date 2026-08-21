@@ -18,7 +18,7 @@ import { formatBytes, formatDate } from "@/utils/format";
 
 export default function SessionRoute() {
   const { "session-id": sessionId } = useLocalSearchParams<{ "session-id": string }>();
-  const { bootstrap, client } = useBackend();
+  const { bootstrap, client, reload: reloadBackend } = useBackend();
   const [storedSession, setSession] = useState<CaptureSession | null>(null);
   const [storedCandidates, setCandidates] = useState<readonly TicketCandidateSummary[]>([]);
   const [storedNextCandidateCursor, setNextCandidateCursor] = useState<string | null>(null);
@@ -172,12 +172,12 @@ export default function SessionRoute() {
   if (!session) return (
     <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 16, gap: 12 }}>
       <MessageState title="Session unavailable" detail={error ?? (client ? "The session was not found." : "A verified backend connection is required.")} />
-      {client && sessionId ? <ActionButton label="Retry session" loading={loading} onPress={() => void refresh()} /> : null}
+      {client && sessionId ? <ActionButton label="Retry session" loading={loading} onPress={() => void reloadBackend()} /> : null}
     </ScrollView>
   );
 
   return (
-    <ScrollView contentInsetAdjustmentBehavior="automatic" refreshControl={<RefreshControl refreshing={loading} onRefresh={() => void refresh()} />} contentContainerStyle={{ padding: 16, gap: 14 }}>
+    <ScrollView contentInsetAdjustmentBehavior="automatic" refreshControl={<RefreshControl refreshing={loading} onRefresh={() => void reloadBackend()} />} contentContainerStyle={{ padding: 16, gap: 14 }}>
       <SectionCard title={session.build_id} trailing={<StatusPill value={session.state} />}>
         <Text selectable style={{ color: colors.secondaryLabel }}>{session.application_id}</Text>
         <Text selectable style={{ color: colors.tertiaryLabel, fontVariant: ["tabular-nums"] }}>Started {formatDate(session.created_at)}</Text>
@@ -189,7 +189,7 @@ export default function SessionRoute() {
           <Text selectable accessibilityRole="alert" style={{ color: colors.red, lineHeight: 20 }}>
             {error} Previously loaded details remain visible, but recovery is locked until refresh succeeds.
           </Text>
-          <ActionButton label="Retry session refresh" loading={loading} onPress={() => void refresh()} />
+          <ActionButton label="Retry session refresh" loading={loading} onPress={() => void reloadBackend()} />
         </SectionCard>
       ) : null}
 

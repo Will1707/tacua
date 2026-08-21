@@ -52,7 +52,7 @@ type CandidateDataBinding = {
 
 export default function CandidateRoute() {
   const { "candidate-id": candidateId } = useLocalSearchParams<{ "candidate-id": string }>();
-  const { bootstrap, client } = useBackend();
+  const { bootstrap, client, reload: reloadBackend } = useBackend();
   const showDialog = useAppDialog();
   const [storedCandidate, setCandidate] = useState<TicketCandidate | null>(null);
   const [storedSupersession, setSupersession] = useState<CandidateReplacementOperationProjection | null>(null);
@@ -620,7 +620,7 @@ export default function CandidateRoute() {
   if (!candidate || !client) return (
     <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 16, gap: 12 }}>
       <MessageState title="Candidate unavailable" detail={error ?? "The candidate was not found."} />
-      {client && candidateId ? <ActionButton label="Retry candidate" loading={loading} onPress={() => void load()} /> : null}
+      {client && candidateId ? <ActionButton label="Retry candidate" loading={loading} onPress={() => void reloadBackend()} /> : null}
     </ScrollView>
   );
   const unresolved = candidate.content.clarifications.filter((item) => item.status === "unresolved");
@@ -635,7 +635,7 @@ export default function CandidateRoute() {
   return (
     <ScrollView
       contentInsetAdjustmentBehavior="automatic"
-      refreshControl={<RefreshControl refreshing={loading} onRefresh={() => { if (actionRef.current === null) void load(); }} />}
+      refreshControl={<RefreshControl refreshing={loading} onRefresh={() => { if (actionRef.current === null) void reloadBackend(); }} />}
       contentContainerStyle={{ padding: 16, gap: 14 }}
     >
       <View style={{ gap: 8 }}>
@@ -659,7 +659,7 @@ export default function CandidateRoute() {
             label="Refresh ticket"
             disabled={loading || action !== null}
             loading={loading}
-            onPress={() => { void load(); }}
+            onPress={() => { void reloadBackend(); }}
           />
         </SectionCard>
       ) : null}

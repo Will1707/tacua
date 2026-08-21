@@ -9,7 +9,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { Platform } from "react-native";
+import { AppState, Platform } from "react-native";
 
 import { TacuaApiClient, TacuaApiError } from "@/api/client";
 import type {
@@ -124,6 +124,49 @@ class IssuedSessionCleanupError extends Error {
   }
 }
 
+class ExistingSessionRetentionError extends Error {
+  constructor() {
+    super("Tacua could not safely revoke the existing reviewer session, so the previous endpoint was kept.");
+    this.name = "ExistingSessionRetentionError";
+  }
+}
+
+async function revokeNativeSessionBeforeEndpointReplacement(
+  config: BackendConfig,
+): Promise<void> {
+  if (config.sessionToken === null) return;
+  let session: ReviewerPrincipal;
+  try {
+    session = await clientFor(config).getReviewerSession();
+  } catch (caught) {
+    // A definitive authentication failure proves that this persisted bearer
+    // no longer names a live server-side session. Transport and protocol
+    // failures do not, so retain the old endpoint and credential for retry.
+    if (isApiError(caught, 401)) return;
+    throw new ExistingSessionRetentionError();
+  }
+  if (
+    session.auth_kind !== "session"
+    || session.session_id === null
+    || session.client_kind !== "native"
+    || !config.sessionToken.startsWith(`${session.session_id}.`)
+  ) throw new ExistingSessionRetentionError();
+  try {
+    const revoked = await clientFor(config, session.csrf_token).revokeReviewerSession();
+    if (
+      revoked.session_id !== session.session_id
+      || revoked.reviewer_id !== session.reviewer_id
+      || revoked.client_kind !== "native"
+    ) throw new ExistingSessionRetentionError();
+  } catch (caught) {
+    // The session can expire or be revoked between the principal probe and
+    // DELETE. That 401 is also conclusive; an ambiguous failure is not.
+    if (isApiError(caught, 401)) return;
+    if (caught instanceof ExistingSessionRetentionError) throw caught;
+    throw new ExistingSessionRetentionError();
+  }
+}
+
 async function reconcileAmbiguousWebPairingExchange(
   config: BackendConfig,
 ): Promise<void> {
@@ -166,6 +209,8 @@ function waitForPairingPoll(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 1_500));
 }
 
+const maximumSessionRevalidationDelay = 2_147_000_000;
+
 export const BackendContext = createContext<BackendContextValue | null>(null);
 
 export function BackendProvider({ children }: PropsWithChildren) {
@@ -175,6 +220,8 @@ export function BackendProvider({ children }: PropsWithChildren) {
   const generation = useRef(0);
   const pendingPairingToken = useRef<string | null>(null);
   const pairingRequestInFlight = useRef(false);
+  const appState = useRef(AppState.currentState);
+  const expiryRevalidatedSession = useRef<string | null>(null);
   stateRef.current = state;
 
   const activate = useCallback(async () => {
@@ -479,7 +526,35 @@ export function BackendProvider({ children }: PropsWithChildren) {
       throw new Error("The web reviewer always uses its own origin.");
     }
     const config = validateBackendConfig({ baseUrl, sessionToken: null });
-    await saveBackendConfig(config);
+    generation.current += 1;
+    pendingPairingToken.current = null;
+    setState({
+      ...initialState,
+      status: "loading",
+      config: stateRef.current.config,
+    });
+    let previousConfig = stateRef.current.config;
+    try {
+      previousConfig = await loadBackendConfig();
+      if (previousConfig !== null) {
+        await revokeNativeSessionBeforeEndpointReplacement(previousConfig);
+      }
+      await saveBackendConfig(config);
+    } catch (caught) {
+      if (mounted.current) {
+        generation.current += 1;
+        pendingPairingToken.current = null;
+        setState({
+          ...initialState,
+          status: "error",
+          config: previousConfig,
+          error: caught instanceof ExistingSessionRetentionError
+            ? caught.message
+            : message(caught, "Tacua could not safely update the backend endpoint."),
+        });
+      }
+      throw caught;
+    }
     await activate();
   }, [activate]);
 
@@ -586,6 +661,50 @@ export function BackendProvider({ children }: PropsWithChildren) {
       pairingRequestInFlight.current = false;
     };
   }, [activate]);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", (nextState) => {
+      const returnedToTacua = appState.current !== "active" && nextState === "active";
+      appState.current = nextState;
+      if (returnedToTacua && stateRef.current.status === "connected") void activate();
+    });
+    return () => subscription.remove();
+  }, [activate]);
+
+  useEffect(() => {
+    if (state.status !== "connected") return;
+    if (state.session?.auth_kind !== "session" || state.session.expires_at === null) {
+      expiryRevalidatedSession.current = null;
+      return;
+    }
+    const sessionExpiryKey = `${state.session.session_id}:${state.session.expires_at}`;
+    if (expiryRevalidatedSession.current === sessionExpiryKey) return;
+    const expiresAt = Date.parse(state.session.expires_at);
+    if (!Number.isFinite(expiresAt)) return;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let canceled = false;
+    const schedule = () => {
+      if (canceled) return;
+      const remaining = expiresAt - Date.now();
+      timer = setTimeout(() => {
+        timer = null;
+        if (expiresAt > Date.now()) schedule();
+        else {
+          // If the browser clock is ahead of the backend, the revalidation may
+          // still return this session. Mark this exact immutable session/expiry
+          // pair before activating so that result cannot create a zero-delay
+          // request loop. Foreground and explicit refresh remain available.
+          expiryRevalidatedSession.current = sessionExpiryKey;
+          void activate();
+        }
+      }, Math.max(0, Math.min(remaining, maximumSessionRevalidationDelay)));
+    };
+    schedule();
+    return () => {
+      canceled = true;
+      if (timer !== null) clearTimeout(timer);
+    };
+  }, [activate, state.session, state.status]);
 
   const value = useMemo<BackendContextValue>(() => ({
     ...state,
