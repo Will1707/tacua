@@ -40,9 +40,11 @@ npm start
 
 The app accepts an HTTPS backend origin. Loopback HTTP is allowed only in a
 development build. Native builds persist one atomic, this-device-only Secure
-Store document containing only the endpoint and an optional revocable reviewer
-session bearer. The administrator secret, reviewer ID, and QA launch scheme are
-never entered or stored by the reviewer. On startup the provider probes the
+Store V5 document containing the endpoint and exactly one authentication state:
+no credential, a revocable reviewer session bearer, or the short-lived pairing
+token and native client kind needed for crash recovery. The recovery state and
+session bearer can never coexist. The administrator secret, reviewer ID, and QA
+launch scheme are never entered or stored by the reviewer. On startup the provider probes the
 public protocol, authenticates a scoped reviewer session or Tailscale
 capability, obtains the authoritative reviewer/build binding from
 `/v1/reviewer/bootstrap`, and exposes an operational client only after the
@@ -56,15 +58,24 @@ CSRF token; web requests rely on the browser's exact same-origin `Origin` and
 cookie behavior. Never commit a real endpoint, credential, recording, or
 private pilot identifier.
 
+Existing exact V4 endpoint/bearer documents migrate by committing V5 before
+best-effort legacy cleanup. Any later configuration clear removes the V4
+fallback authoritatively before V5, so a retained legacy bearer cannot be
+resurrected if old-key deletion fails.
+
 Canceling a pending pairing is a server-confirmed operation, not a local UI
-reset. The provider retains the opaque token in memory, waits for any exchange
-request already in flight, and confirms a final token-bound cancellation before
-another pairing can start. That endpoint deletes an unconsumed request or
+reset. The web provider retains the opaque token in memory. Native durably
+journals the exact token and client kind before sending the first exchange, then
+waits for any exchange request already in flight and confirms a final
+token-bound cancellation before another pairing can start. On native restart,
+that cancellation and the journal-clearing write both complete before any
+backend probe or connection attempt. The cancellation endpoint deletes an unconsumed request or
 revokes the session issued from the exact token; on web it also expires the
 pairing cookie. If confirmation fails, the same pairing remains visible only by
 its human code and can be canceled again. Native never persists an issued
-bearer before principal/bootstrap binding, and cancellation serializes its
-final clearing write after any older Secure Store write.
+bearer before principal/bootstrap binding; the final bearer write atomically
+replaces the recovery journal, and cancellation serializes its clearing write
+after any older Secure Store write.
 
 The reviewer also has a browser export for a private, same-origin self-hosted
 deployment:

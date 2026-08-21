@@ -22,8 +22,10 @@ const originalTypeScriptLoader = Module._extensions[".ts"];
 const originalTSXLoader = Module._extensions[".tsx"];
 
 let storedConfig;
+let storedPairingCleanup;
 let api;
 let saveConfigHook;
+let savePairingCleanupHook;
 const mockPlatform = { OS: "web" };
 const appStateListeners = new Set();
 const mockAppState = {
@@ -36,6 +38,7 @@ const mockAppState = {
 };
 const constructedConfigs = [];
 const savedConfigs = [];
+const savedPairingCleanups = [];
 
 class TacuaApiError extends Error {
   constructor(status, code, message) {
@@ -90,11 +93,29 @@ Module._load = function load(request, parent, isMain) {
   }
   if (request === "@/config/backend-config") {
     return {
-      async loadBackendConfig() { return storedConfig; },
+      async loadBackendConfigState() {
+        return storedConfig === null
+          ? null
+          : {
+            config: storedConfig,
+            // SecureStore JSON parsing produces a fresh object for each
+            // concurrent activation even when the durable value is unchanged.
+            pendingPairingCleanup: storedPairingCleanup === null
+              ? null
+              : { ...storedPairingCleanup },
+          };
+      },
       async saveBackendConfig(config) {
         savedConfigs.push(config);
         if (saveConfigHook) await saveConfigHook(config);
         storedConfig = config;
+        storedPairingCleanup = null;
+      },
+      async savePendingPairingCleanup(config, cleanup) {
+        savedPairingCleanups.push({ config, cleanup });
+        if (savePairingCleanupHook) await savePairingCleanupHook(config, cleanup);
+        storedConfig = config;
+        storedPairingCleanup = cleanup;
       },
       validateBackendConfig(config) { return config; },
     };
@@ -134,13 +155,8 @@ function bootstrap(reviewerId = "reviewer_owner") {
   };
 }
 
-function reset(overrides = {}) {
-  mockAppState.currentState = "active";
-  storedConfig = endpointConfig;
-  saveConfigHook = null;
-  constructedConfigs.length = 0;
-  savedConfigs.length = 0;
-  api = {
+function apiWith(overrides = {}) {
+  return {
     async probeTacuaBackend() {},
     async getReviewerSession() { return principal(); },
     async getReviewerBootstrap() { return bootstrap(); },
@@ -150,6 +166,18 @@ function reset(overrides = {}) {
     async revokeReviewerSession() { throw new Error("unexpected revocation"); },
     ...overrides,
   };
+}
+
+function reset(overrides = {}) {
+  mockAppState.currentState = "active";
+  storedConfig = endpointConfig;
+  storedPairingCleanup = null;
+  saveConfigHook = null;
+  savePairingCleanupHook = null;
+  constructedConfigs.length = 0;
+  savedConfigs.length = 0;
+  savedPairingCleanups.length = 0;
+  api = apiWith(overrides);
 }
 
 function Observer({ observe }) {
@@ -810,6 +838,263 @@ test("an invalid web exchange is cleaned by its pairing token without probing co
   await TestRenderer.act(async () => rendered.renderer.unmount());
 });
 
+test("native restart cancels a committed exchange from V5 before probing or connecting", async () => {
+  mockPlatform.OS = "native";
+  const pairingToken = `rpair_${"a".repeat(32)}.${"B".repeat(43)}`;
+  let serverSessionActive = false;
+  let reportExchangeCommitted;
+  const exchangeCommitted = new Promise((resolve) => { reportExchangeCommitted = resolve; });
+  const firstProcessEvents = [];
+  reset({
+    async getReviewerSession() {
+      throw new TacuaApiError(401, "REVIEWER_AUTHENTICATION_FAILED", "reviewer authentication failed");
+    },
+    async createPairingRequest(_config, label) {
+      return {
+        pairing_id: "rpair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        pairing_token: pairingToken,
+        human_code: "ABCD-EFGH",
+        device_label: label,
+        client_kind: "native",
+        created_at: "2026-08-21T12:00:00Z",
+        expires_at: "2026-08-21T12:10:00Z",
+      };
+    },
+    async exchangePairing(_config, token) {
+      assert.equal(token, pairingToken);
+      assert.deepEqual(storedPairingCleanup, {
+        pairingToken,
+        clientKind: "native",
+      });
+      firstProcessEvents.push("exchange:committed");
+      serverSessionActive = true;
+      reportExchangeCommitted();
+      return new Promise(() => {});
+    },
+  });
+  savePairingCleanupHook = async (_config, cleanup) => {
+    firstProcessEvents.push(`journal:${cleanup.clientKind}`);
+  };
+
+  const firstProcess = await renderProvider();
+  await TestRenderer.act(async () => {
+    await firstProcess.observed.beginPairing();
+    await exchangeCommitted;
+    await settle();
+  });
+  assert.deepEqual(firstProcessEvents, ["journal:native", "exchange:committed"]);
+  assert.equal(serverSessionActive, true);
+  assert.equal(storedConfig.sessionToken, null);
+  assert.deepEqual(storedPairingCleanup, { pairingToken, clientKind: "native" });
+
+  // Simulate process termination: hook state disappears, while SecureStore and
+  // the possibly committed backend session survive into a fresh provider.
+  await TestRenderer.act(async () => firstProcess.renderer.unmount());
+  constructedConfigs.length = 0;
+  savedConfigs.length = 0;
+  savedPairingCleanups.length = 0;
+  savePairingCleanupHook = null;
+  const restartEvents = [];
+  api = apiWith({
+    async cancelPairing(config, token) {
+      restartEvents.push("cancel");
+      assert.deepEqual(config, {
+        baseUrl: "https://tacua.example",
+        clientKind: "native",
+      });
+      assert.equal(token, pairingToken);
+      serverSessionActive = false;
+      return { status: "canceled" };
+    },
+    async probeTacuaBackend() {
+      restartEvents.push("probe");
+      assert.equal(serverSessionActive, false);
+    },
+    async getReviewerSession() {
+      restartEvents.push("session");
+      assert.equal(serverSessionActive, false);
+      throw new TacuaApiError(401, "REVIEWER_AUTHENTICATION_FAILED", "reviewer authentication failed");
+    },
+  });
+  saveConfigHook = async (config) => {
+    assert.equal(config.sessionToken, null);
+    restartEvents.push("journal:cleared");
+  };
+
+  const restarted = await renderProvider();
+  try {
+    assert.equal(restarted.observed.status, "pairing_required");
+    assert.deepEqual(restartEvents, ["cancel", "journal:cleared", "probe", "session"]);
+    assert.equal(serverSessionActive, false);
+    assert.equal(storedPairingCleanup, null);
+    assert.deepEqual(savedConfigs, [
+      { baseUrl: "https://tacua.example", sessionToken: null },
+    ]);
+  } finally {
+    await TestRenderer.act(async () => restarted.renderer.unmount());
+    saveConfigHook = null;
+    mockPlatform.OS = "web";
+  }
+});
+
+test("native restart remains fail closed until durable pairing cleanup succeeds", async () => {
+  mockPlatform.OS = "native";
+  const pairingToken = `rpair_${"a".repeat(32)}.${"B".repeat(43)}`;
+  let cancellationAttempts = 0;
+  let probes = 0;
+  let pairingRequests = 0;
+  reset({
+    async cancelPairing(config, token) {
+      cancellationAttempts += 1;
+      assert.deepEqual(config, {
+        baseUrl: "https://tacua.example",
+        clientKind: "native",
+      });
+      assert.equal(token, pairingToken);
+      throw new Error("simulated offline restart");
+    },
+    async probeTacuaBackend() { probes += 1; },
+    async createPairingRequest() { pairingRequests += 1; },
+  });
+  storedPairingCleanup = { pairingToken, clientKind: "native" };
+
+  const rendered = await renderProvider();
+  try {
+    assert.equal(rendered.observed.status, "error");
+    assert.match(rendered.observed.error, /could not confirm/u);
+    assert.equal(cancellationAttempts, 1);
+    assert.equal(probes, 0, "startup must not probe while exact cleanup is unconfirmed");
+
+    await TestRenderer.act(async () => {
+      await rendered.observed.beginPairing();
+      await assert.rejects(
+        rendered.observed.configureEndpoint("https://replacement.example"),
+        /Cancel the current pairing/u,
+      );
+      await settle();
+    });
+    assert.equal(pairingRequests, 0);
+    assert.equal(probes, 0);
+    assert.deepEqual(storedPairingCleanup, { pairingToken, clientKind: "native" });
+
+    api = apiWith({
+      async cancelPairing(_config, token) {
+        cancellationAttempts += 1;
+        assert.equal(token, pairingToken);
+        return { status: "canceled" };
+      },
+      async probeTacuaBackend() { probes += 1; },
+      async getReviewerSession() {
+        throw new TacuaApiError(401, "REVIEWER_AUTHENTICATION_FAILED", "reviewer authentication failed");
+      },
+    });
+    await TestRenderer.act(async () => {
+      await rendered.observed.reload();
+      await settle();
+    });
+    assert.equal(rendered.observed.status, "pairing_required");
+    assert.equal(cancellationAttempts, 2);
+    assert.equal(probes, 1);
+    assert.equal(storedPairingCleanup, null);
+  } finally {
+    await TestRenderer.act(async () => rendered.renderer.unmount());
+    mockPlatform.OS = "web";
+  }
+});
+
+test("concurrent native recovery activations clear equivalent journals by value", async () => {
+  mockPlatform.OS = "native";
+  const pairingToken = `rpair_${"a".repeat(32)}.${"B".repeat(43)}`;
+  let releaseCancellation;
+  let reportCancellationStarted;
+  const cancellationRelease = new Promise((resolve) => { releaseCancellation = resolve; });
+  const cancellationStarted = new Promise((resolve) => { reportCancellationStarted = resolve; });
+  const events = [];
+  let cancellationCalls = 0;
+  reset({
+    async cancelPairing(config, token) {
+      cancellationCalls += 1;
+      events.push("cancel:start");
+      assert.deepEqual(config, {
+        baseUrl: "https://tacua.example",
+        clientKind: "native",
+      });
+      assert.equal(token, pairingToken);
+      reportCancellationStarted();
+      await cancellationRelease;
+      events.push("cancel:done");
+      return { status: "canceled" };
+    },
+    async probeTacuaBackend(baseUrl) {
+      events.push(`probe:${baseUrl}`);
+    },
+    async getReviewerSession(config) {
+      events.push(`session:${config.baseUrl}`);
+      throw new TacuaApiError(401, "REVIEWER_AUTHENTICATION_FAILED", "reviewer authentication failed");
+    },
+  });
+  storedPairingCleanup = { pairingToken, clientKind: "native" };
+  saveConfigHook = async (config) => {
+    events.push(`save:${config.baseUrl}`);
+  };
+
+  const rendered = await renderProvider();
+  try {
+    await cancellationStarted;
+    assert.equal(rendered.observed.status, "loading");
+
+    // A second activation reloads the same V5 bytes into an equivalent but
+    // distinct cleanup object and joins the first token-bound cancellation.
+    let concurrentReload;
+    await TestRenderer.act(async () => {
+      concurrentReload = rendered.observed.reload();
+      await settle();
+    });
+    assert.equal(cancellationCalls, 1);
+
+    await TestRenderer.act(async () => {
+      releaseCancellation();
+      await concurrentReload;
+      await settle();
+    });
+    assert.equal(rendered.observed.status, "pairing_required");
+    assert.equal(storedPairingCleanup, null);
+    assert.deepEqual(events, [
+      "cancel:start",
+      "cancel:done",
+      "save:https://tacua.example",
+      "probe:https://tacua.example",
+      "session:https://tacua.example",
+    ]);
+    assert.deepEqual(savedConfigs, [
+      { baseUrl: "https://tacua.example", sessionToken: null },
+    ]);
+
+    // Successful authoritative cleanup must clear the in-memory blocker even
+    // though the joining activation held a different deserialized object.
+    await TestRenderer.act(async () => {
+      await rendered.observed.configureEndpoint("https://replacement.example");
+      await settle();
+    });
+    assert.equal(rendered.observed.status, "pairing_required");
+    assert.equal(rendered.observed.config.baseUrl, "https://replacement.example");
+    assert.equal(cancellationCalls, 1, "endpoint replacement must not repeat recovery cancellation");
+    assert.deepEqual(savedConfigs, [
+      { baseUrl: "https://tacua.example", sessionToken: null },
+      { baseUrl: "https://replacement.example", sessionToken: null },
+    ]);
+    assert.deepEqual(events.slice(5), [
+      "save:https://replacement.example",
+      "probe:https://replacement.example",
+      "session:https://replacement.example",
+    ]);
+  } finally {
+    await TestRenderer.act(async () => rendered.renderer.unmount());
+    saveConfigHook = null;
+    mockPlatform.OS = "web";
+  }
+});
+
 test("native pairing verifies the session and bootstrap before persisting its bearer", async () => {
   mockPlatform.OS = "native";
   const sessionId = "rsess_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1040,7 +1325,9 @@ for (const [name, exchangeError] of [
         baseUrl: "https://tacua.example",
         clientKind: "native",
       });
-      assert.deepEqual(savedConfigs, []);
+      assert.deepEqual(savedConfigs, [
+        { baseUrl: "https://tacua.example", sessionToken: null },
+      ]);
     } finally {
       await TestRenderer.act(async () => rendered.renderer.unmount());
       mockPlatform.OS = "web";

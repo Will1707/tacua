@@ -14,15 +14,18 @@ import { AppState, Platform } from "react-native";
 import { TacuaApiClient, TacuaApiError } from "@/api/client";
 import type {
   ReviewerBootstrap,
+  ReviewerClientKind,
   ReviewerPairingExchange,
   ReviewerPairingRequest,
   ReviewerPrincipal,
 } from "@/api/types";
 import { probeTacuaBackend } from "@/api/version-probe";
 import {
-  loadBackendConfig,
+  loadBackendConfigState,
   saveBackendConfig,
+  savePendingPairingCleanup,
   type BackendConfig,
+  type PendingPairingCleanup,
   validateBackendConfig,
 } from "@/config/backend-config";
 
@@ -74,10 +77,14 @@ function reviewerClientKind(): "web" | "native" {
   return Platform.OS === "web" ? "web" : "native";
 }
 
-function clientFor(config: BackendConfig, csrfToken?: string): TacuaApiClient {
+function clientFor(
+  config: BackendConfig,
+  csrfToken?: string,
+  clientKind: ReviewerClientKind = reviewerClientKind(),
+): TacuaApiClient {
   return new TacuaApiClient({
     baseUrl: config.baseUrl,
-    clientKind: reviewerClientKind(),
+    clientKind,
     ...(config.sessionToken === null ? {} : { sessionToken: config.sessionToken }),
     ...(csrfToken === undefined ? {} : { csrfToken }),
   });
@@ -194,10 +201,12 @@ export function BackendProvider({ children }: PropsWithChildren) {
   const pairingRequestInFlight = useRef(false);
   const pairingCancellationInFlight = useRef<{
     readonly token: string;
+    readonly clientKind: ReviewerClientKind;
     readonly promise: Promise<void>;
   } | null>(null);
   const pairingCancellationRequestInFlight = useRef<{
     readonly token: string;
+    readonly clientKind: ReviewerClientKind;
     readonly promise: Promise<void>;
   } | null>(null);
   const pairingExchangeInFlight = useRef<{
@@ -209,6 +218,7 @@ export function BackendProvider({ children }: PropsWithChildren) {
     readonly promise: Promise<void>;
   } | null>(null);
   const canceledPairingTokens = useRef(new Set<string>());
+  const durablePairingCleanup = useRef<PendingPairingCleanup | null>(null);
   const pendingNativePairingPersistence = useRef<{
     readonly token: string;
     readonly settled: Promise<void>;
@@ -220,15 +230,24 @@ export function BackendProvider({ children }: PropsWithChildren) {
   const cancelPairingToken = useCallback((
     config: BackendConfig,
     token: string,
+    clientKind: ReviewerClientKind,
   ): Promise<void> => {
     const active = pairingCancellationRequestInFlight.current;
     if (active !== null) {
-      if (active.token === token) return active.promise;
+      if (active.token === token && active.clientKind === clientKind) return active.promise;
       return Promise.reject(new PairingCleanupError());
     }
 
-    let operation: { readonly token: string; readonly promise: Promise<void> };
-    const promise = clientFor({ baseUrl: config.baseUrl, sessionToken: null })
+    let operation: {
+      readonly token: string;
+      readonly clientKind: ReviewerClientKind;
+      readonly promise: Promise<void>;
+    };
+    const promise = clientFor(
+      { baseUrl: config.baseUrl, sessionToken: null },
+      undefined,
+      clientKind,
+    )
       .cancelPairing(token)
       .then(() => undefined)
       .catch(() => {
@@ -239,7 +258,7 @@ export function BackendProvider({ children }: PropsWithChildren) {
           pairingCancellationRequestInFlight.current = null;
         }
       });
-    operation = { token, promise };
+    operation = { token, clientKind, promise };
     pairingCancellationRequestInFlight.current = operation;
     return promise;
   }, []);
@@ -247,11 +266,13 @@ export function BackendProvider({ children }: PropsWithChildren) {
   const cleanPairing = useCallback((
     config: BackendConfig,
     token: string,
+    clientKind: ReviewerClientKind = reviewerClientKind(),
   ): Promise<void> => {
-    if (canceledPairingTokens.current.has(token)) return Promise.resolve();
+    const cancellationKey = `${clientKind}:${token}`;
+    if (canceledPairingTokens.current.has(cancellationKey)) return Promise.resolve();
     const active = pairingCancellationInFlight.current;
     if (active !== null) {
-      if (active.token === token) return active.promise;
+      if (active.token === token && active.clientKind === clientKind) return active.promise;
       return Promise.reject(new PairingCleanupError());
     }
 
@@ -263,11 +284,20 @@ export function BackendProvider({ children }: PropsWithChildren) {
     const exchange = pairingExchangeInFlight.current?.token === token
       ? pairingExchangeInFlight.current.settled
       : null;
-    let operation: { readonly token: string; readonly promise: Promise<void> };
+    const currentPersistedCleanup = durablePairingCleanup.current;
+    const persistedCleanup = currentPersistedCleanup?.pairingToken === token
+      && currentPersistedCleanup.clientKind === clientKind
+      ? currentPersistedCleanup
+      : null;
+    let operation: {
+      readonly token: string;
+      readonly clientKind: ReviewerClientKind;
+      readonly promise: Promise<void>;
+    };
     const promise = (async () => {
       let cancellationSucceeded = false;
       try {
-        await cancelPairingToken(config, token);
+        await cancelPairingToken(config, token, clientKind);
         cancellationSucceeded = true;
       } catch {
         cancellationSucceeded = false;
@@ -275,7 +305,7 @@ export function BackendProvider({ children }: PropsWithChildren) {
       if (exchange !== null) {
         await exchange;
         try {
-          await cancelPairingToken(config, token);
+          await cancelPairingToken(config, token, clientKind);
           cancellationSucceeded = true;
         } catch {
           cancellationSucceeded = false;
@@ -290,8 +320,20 @@ export function BackendProvider({ children }: PropsWithChildren) {
         // cancellation must never resolve while an older Secure Store write
         // can still complete later and resurrect the revoked bearer.
         await nativePersistence.settled;
+      }
+      if (persistedCleanup !== null || nativePersistence !== null) {
         try {
+          // Cancellation is the authoritative server-side transition. Only
+          // after it succeeds (and any older bearer write settles) may V5 be
+          // atomically replaced with its unauthenticated state.
           await saveBackendConfig({ baseUrl: config.baseUrl, sessionToken: null });
+          const currentCleanup = durablePairingCleanup.current;
+          if (
+            currentCleanup?.pairingToken === token
+            && currentCleanup.clientKind === clientKind
+          ) {
+            durablePairingCleanup.current = null;
+          }
           if (pendingNativePairingPersistence.current === nativePersistence) {
             pendingNativePairingPersistence.current = null;
           }
@@ -299,13 +341,13 @@ export function BackendProvider({ children }: PropsWithChildren) {
           throw new PairingCleanupError();
         }
       }
-      canceledPairingTokens.current.add(token);
+      canceledPairingTokens.current.add(cancellationKey);
     })().finally(() => {
       if (pairingCancellationInFlight.current === operation) {
         pairingCancellationInFlight.current = null;
       }
     });
-    operation = { token, promise };
+    operation = { token, clientKind, promise };
     pairingCancellationInFlight.current = operation;
     return promise;
   }, [cancelPairingToken]);
@@ -330,11 +372,27 @@ export function BackendProvider({ children }: PropsWithChildren) {
     }));
     let config: BackendConfig | null = null;
     try {
-      config = await loadBackendConfig();
+      const stored = await loadBackendConfigState();
       if (!mounted.current || activation !== generation.current) return;
-      if (config === null) {
+      if (stored === null) {
+        durablePairingCleanup.current = null;
         setState({ ...initialState, status: "endpoint_required" });
         return;
+      }
+      config = stored.config;
+      durablePairingCleanup.current = stored.pendingPairingCleanup;
+      if (stored.pendingPairingCleanup !== null) {
+        // A native process may have terminated after the backend committed an
+        // exchange but before the bearer reached V5. The exact token and kind
+        // are the only safe cleanup authority, so recovery precedes every
+        // backend probe, authentication attempt, or new pairing.
+        await cleanPairing(
+          config,
+          stored.pendingPairingCleanup.pairingToken,
+          stored.pendingPairingCleanup.clientKind,
+        );
+        if (!mounted.current || activation !== generation.current) return;
+        config = { baseUrl: config.baseUrl, sessionToken: null };
       }
 
       await probeTacuaBackend(config.baseUrl);
@@ -408,7 +466,7 @@ export function BackendProvider({ children }: PropsWithChildren) {
         error: message(caught, "Tacua could not connect to the reviewer backend."),
       });
     }
-  }, []);
+  }, [cleanPairing]);
 
   const finishPairing = useCallback(async (
     activation: number,
@@ -472,6 +530,15 @@ export function BackendProvider({ children }: PropsWithChildren) {
         if (!isCurrent()) {
           await abandonIssuedSession();
           return;
+        }
+        const persistedCleanup = durablePairingCleanup.current;
+        if (
+          persistedCleanup?.pairingToken === pairingToken
+          && persistedCleanup.clientKind === clientKind
+        ) {
+          // The single V5 bearer write above atomically replaced the recovery
+          // journal, so only now may its in-memory mirror be forgotten.
+          durablePairingCleanup.current = null;
         }
         if (pendingNativePairingPersistence.current === persistence) {
           pendingNativePairingPersistence.current = null;
@@ -611,6 +678,7 @@ export function BackendProvider({ children }: PropsWithChildren) {
     }
     if (
       pendingPairingToken.current !== null
+      || durablePairingCleanup.current !== null
       || pairingCancellationInFlight.current !== null
     ) {
       throw new Error("Cancel the current pairing before changing the backend endpoint.");
@@ -625,7 +693,12 @@ export function BackendProvider({ children }: PropsWithChildren) {
     });
     let previousConfig = stateRef.current.config;
     try {
-      previousConfig = await loadBackendConfig();
+      const previousState = await loadBackendConfigState();
+      if (previousState !== null && previousState.pendingPairingCleanup !== null) {
+        durablePairingCleanup.current = previousState.pendingPairingCleanup;
+        throw new PairingCleanupError();
+      }
+      previousConfig = previousState?.config ?? null;
       if (previousConfig !== null) {
         await revokeNativeSessionBeforeEndpointReplacement(previousConfig);
       }
@@ -658,7 +731,8 @@ export function BackendProvider({ children }: PropsWithChildren) {
       || pendingPairingToken.current !== null
     ) return;
     pairingRequestInFlight.current = true;
-    const pairingClient = clientFor(current.config);
+    const clientKind = reviewerClientKind();
+    const pairingClient = clientFor(current.config, undefined, clientKind);
     const activation = ++generation.current;
     pendingPairingToken.current = null;
     setState({
@@ -668,10 +742,62 @@ export function BackendProvider({ children }: PropsWithChildren) {
     });
     try {
       const pairing = await pairingClient.createPairingRequest(
-        reviewerClientKind() === "web" ? "Tacua web reviewer" : "Tacua native reviewer",
+        clientKind === "web" ? "Tacua web reviewer" : "Tacua native reviewer",
       );
       if (!mounted.current || activation !== generation.current) return;
       pendingPairingToken.current = pairing.pairing_token;
+      if (clientKind === "native") {
+        const persistedCleanup: PendingPairingCleanup = {
+          pairingToken: pairing.pairing_token,
+          clientKind: "native",
+        };
+        durablePairingCleanup.current = persistedCleanup;
+        try {
+          // Do not send the first exchange until the exact token and client
+          // kind are durably recoverable. If this write has not committed, a
+          // process exit can only abandon the short-lived unexchanged request.
+          await savePendingPairingCleanup(current.config, persistedCleanup);
+        } catch (persistenceError) {
+          try {
+            await cleanPairing(current.config, pairing.pairing_token, clientKind);
+          } catch {
+            if (!mounted.current || activation !== generation.current) return;
+            setState({
+              ...initialState,
+              status: "pairing_pending",
+              config: current.config,
+              pairing: publicPairing(pairing),
+              error: new PairingCleanupError().message,
+            });
+            return;
+          }
+          if (pendingPairingToken.current === pairing.pairing_token) {
+            pendingPairingToken.current = null;
+          }
+          if (!mounted.current || activation !== generation.current) return;
+          setState({
+            ...initialState,
+            status: "pairing_required",
+            config: current.config,
+            error: message(
+              persistenceError,
+              "Tacua could not securely prepare reviewer pairing.",
+            ),
+          });
+          return;
+        }
+        if (!mounted.current || activation !== generation.current) {
+          try {
+            await cleanPairing(current.config, pairing.pairing_token, clientKind);
+            if (pendingPairingToken.current === pairing.pairing_token) {
+              pendingPairingToken.current = null;
+            }
+          } catch {
+            // V5 retains the recovery token for the next provider activation.
+          }
+          return;
+        }
+      }
       setState({
         ...initialState,
         status: "pairing_pending",
@@ -694,7 +820,7 @@ export function BackendProvider({ children }: PropsWithChildren) {
     } finally {
       pairingRequestInFlight.current = false;
     }
-  }, [pollPairing]);
+  }, [cleanPairing, pollPairing]);
 
   const cancelPairing = useCallback((): Promise<void> => {
     const current = stateRef.current;

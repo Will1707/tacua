@@ -2,17 +2,24 @@
 
 import {
   type BackendConfig,
+  type BackendConfigState,
+  type PendingPairingCleanup,
   validateBackendConfig,
 } from "./backend-config-validation.ts";
 
 export { normalizeBaseUrl } from "./base-url.ts";
 export { validateBackendConfig } from "./backend-config-validation.ts";
-export type { BackendConfig } from "./backend-config-validation.ts";
+export type {
+  BackendConfig,
+  BackendConfigState,
+  PendingPairingCleanup,
+} from "./backend-config-validation.ts";
 
 // Web authentication is an HttpOnly same-origin cookie or a header injected by
 // Tailscale Serve. No endpoint, identity, launch scheme, or bearer credential is
 // persisted in browser storage.
 const obsoleteSessionKeys = [
+  "tacua.backend.configuration.v5",
   "tacua.backend.configuration.web-session.v2",
   "tacua.backend.configuration.web-session.v1",
   "tacua.backend.configuration.v4",
@@ -52,10 +59,13 @@ function forgetObsoleteBrowserConfiguration(): void {
   }
 }
 
-export async function loadBackendConfig(): Promise<BackendConfig> {
+export async function loadBackendConfigState(): Promise<BackendConfigState> {
   forgetObsoleteBrowserConfiguration();
   const origin = exactBrowserOrigin();
-  return validateBackendConfig({ baseUrl: origin, sessionToken: null }, origin);
+  return {
+    config: validateBackendConfig({ baseUrl: origin, sessionToken: null }, origin),
+    pendingPairingCleanup: null,
+  };
 }
 
 export async function saveBackendConfig(config: BackendConfig): Promise<void> {
@@ -65,6 +75,13 @@ export async function saveBackendConfig(config: BackendConfig): Promise<void> {
     throw new Error("The web reviewer cannot store a bearer credential.");
   }
   forgetObsoleteBrowserConfiguration();
+}
+
+export async function savePendingPairingCleanup(
+  _config: BackendConfig,
+  _pendingPairingCleanup: PendingPairingCleanup,
+): Promise<void> {
+  throw new Error("The web reviewer cannot persist a pairing secret.");
 }
 
 export async function clearBackendConfig(): Promise<void> {

@@ -7,6 +7,16 @@ export type BackendConfig = {
   readonly sessionToken: string | null;
 };
 
+export type PendingPairingCleanup = {
+  readonly pairingToken: string;
+  readonly clientKind: "native";
+};
+
+export type BackendConfigState = {
+  readonly config: BackendConfig;
+  readonly pendingPairingCleanup: PendingPairingCleanup | null;
+};
+
 const reviewerSessionTokenPattern = /^rsess_[a-f0-9]{32}\.[A-Za-z0-9_-]{43}$/;
 
 export function validateBackendConfig(

@@ -63,7 +63,7 @@ export default function SettingsRoute() {
       <Text selectable style={{ color: colors.secondaryLabel, lineHeight: 21 }}>
         {Platform.OS === "web"
           ? "This reviewer uses the backend on the page’s exact HTTPS origin. Access comes from a Tailscale app capability or a revocable same-origin pairing cookie; Tacua stores no administrator secret in the browser."
-          : "This reviewer stores only the backend endpoint and a revocable reviewer session in this device’s secure storage. Reviewer identity and QA launch schemes come from the backend."}
+          : "This reviewer stores the backend endpoint and either a revocable reviewer session or a temporary pairing-recovery credential in this device’s secure storage. Reviewer identity and QA launch schemes come from the backend."}
       </Text>
 
       {Platform.OS === "web" ? (
@@ -126,7 +126,7 @@ export default function SettingsRoute() {
             Pair this reviewer
           </Text>
           <Text selectable style={{ color: colors.secondaryLabel, lineHeight: 21 }}>
-            Request a short-lived code, approve it once on the backend host, and Tacua will connect automatically. The pairing secret never leaves memory or appears on this screen.
+            Request a short-lived code, approve it once on the backend host, and Tacua will connect automatically. The pairing secret never appears on this screen; native keeps it in device-only secure storage only until pairing or cleanup finishes.
           </Text>
           <ActionButton
             disabled={!pairingAvailable || migrationRequired}
