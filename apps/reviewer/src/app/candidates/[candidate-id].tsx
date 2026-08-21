@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { Link, useLocalSearchParams } from "expo-router";
-import * as Crypto from "expo-crypto";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Pressable, RefreshControl, ScrollView, Text, TextInput, View } from "react-native";
 
@@ -277,11 +276,7 @@ export default function CandidateRoute() {
         reason,
       };
       const request = nextAction === "approve"
-        ? {
-          ...binding,
-          action: "approve" as const,
-          approval_id: `approval_${Crypto.randomUUID().replaceAll("-", "")}`,
-        }
+        ? { ...binding, action: "approve" as const }
         : nextAction === "mark_ready"
           ? { ...binding, action: "mark_ready" as const }
           : { ...binding, action: "reject" as const };

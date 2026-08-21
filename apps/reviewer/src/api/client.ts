@@ -77,6 +77,7 @@ import {
   validateCandidateSupersededErrorEnvelope,
   validateCandidateSupersessionResponse,
 } from "@/api/candidate-replacement";
+import { serializedCandidateTransitionRequest } from "@/api/candidate-transition";
 
 const maximumJsonResponseBytes = 2 * 1_024 * 1_024;
 const maximumCandidateBytes = 1_048_576;
@@ -950,14 +951,15 @@ export class TacuaApiClient {
       }
       throw error;
     }
-    const idempotencyKey = `candidate:${candidateId}:${body.expected_candidate_version}:${body.action}:${operationFingerprint(JSON.stringify(body))}`;
+    const serializedBody = serializedCandidateTransitionRequest(body);
+    const idempotencyKey = `candidate:${candidateId}:${body.expected_candidate_version}:${body.action}:${operationFingerprint(serializedBody)}`;
     const result = await this.requestDocument<unknown>(`/v1/admin/candidates/${encodeURIComponent(candidateId)}/transitions`, {
       method: "POST",
       headers: {
         "If-Match": quotedEntityTag(body.expected_candidate_digest),
         "Idempotency-Key": idempotencyKey,
       },
-      body: JSON.stringify(body),
+      body: serializedBody,
     }, { maximumBytes: maximumCandidateBytes, expectedStatuses: [200, 201] });
     try {
       const candidate = await validateTicketCandidateSnapshot(result.body, sha256Digest) as TicketCandidate;

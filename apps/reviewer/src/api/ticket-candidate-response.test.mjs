@@ -227,10 +227,11 @@ test("binds edits, approval, rejection, and clarification to the exact predecess
     choice_id: "choice_use_approved",
     resolution_note: null,
   }, ready);
-  validateTransitionBinding(ready, {
-    ...base(ready, "approve", approved.transition.reason),
-    approval_id: approved.approval.approval_id,
-  }, approved);
+  validateTransitionBinding(
+    ready,
+    base(ready, "approve", approved.transition.reason),
+    approved,
+  );
   const rejected = await rejectedSuccessor(ready);
   validateTransitionBinding(ready, base(ready, "reject", rejected.transition.reason), rejected);
   const edited = editedSuccessor(ready);
@@ -248,13 +249,14 @@ test("binds edits, approval, rejection, and clarification to the exact predecess
 
   const substituted = structuredClone(approved);
   substituted.transition.actor.actor_id = "reviewer_other";
-  assert.throws(() => validateTransitionBinding(ready, {
-    ...base(ready, "approve", approved.transition.reason),
-    approval_id: approved.approval.approval_id,
-  }, substituted));
+  assert.throws(() => validateTransitionBinding(
+    ready,
+    base(ready, "approve", approved.transition.reason),
+    substituted,
+  ));
 });
 
-test("transition requests use the backend's exact action-specific field contract", async () => {
+test("internal transition bindings remain exact and predecessor-bound", async () => {
   const [needsClarification, ready] = await Promise.all([
     fixture("version-2-needs-clarification.json"),
     fixture("version-3-ready.json"),
@@ -272,7 +274,7 @@ test("transition requests use the backend's exact action-specific field contract
   const valid = [
     { ...base(ready, "edit_content"), content: editedSuccessor(ready).content },
     base(ready, "mark_ready"),
-    { ...base(ready, "approve"), approval_id: "approval_reviewer_request" },
+    base(ready, "approve"),
     base(ready, "reject"),
     {
       ...base(needsClarification, "resolve_clarification"),
@@ -288,24 +290,23 @@ test("transition requests use the backend's exact action-specific field contract
     ));
   }
 
-  const legacyAliases = {
+  const publicWireShape = {
     expected_candidate_digest: ready.candidate_digest,
     candidate_version: ready.candidate_version,
     candidate_content_digest: ready.candidate_content_digest,
     evidence_manifest_digest: ready.evidence_manifest.manifest_digest,
     action: "approve",
     actor_id: "reviewer_owner",
-    reason: "Legacy request fields must be rejected.",
+    reason: "Public wire fields must not replace the internal binding.",
   };
   assert.throws(
-    () => validateTransitionRequestBinding(ready, legacyAliases),
+    () => validateTransitionRequestBinding(ready, publicWireShape),
     (error) => error?.code === "TRANSITION_REQUEST_BINDING_MISMATCH",
   );
   assert.throws(
     () => validateTransitionRequestBinding(ready, {
       ...base(ready, "approve"),
       approval_id: "approval_reviewer_request",
-      extra: true,
     }),
     (error) => error?.code === "TRANSITION_REQUEST_BINDING_MISMATCH",
   );
