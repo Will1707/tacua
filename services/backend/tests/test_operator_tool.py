@@ -12,6 +12,7 @@ import stat
 import tempfile
 import unittest
 from unittest.mock import patch
+import urllib.error
 import urllib.parse
 
 
@@ -87,6 +88,8 @@ class FakeOpener:
         url = request.full_url
         self.requests.append((url, request.get_header("Authorization")))
         path = urllib.parse.urlsplit(url).path
+        if path not in self.documents:
+            raise urllib.error.HTTPError(url, 404, "not found", {}, None)
         return FakeResponse(url, self.documents[path])
 
 
@@ -1516,6 +1519,22 @@ class OperatorToolTests(unittest.TestCase):
                 [authorization for _url, authorization in opener.requests],
             )
 
+            legacy_documents = dict(opener.documents)
+            legacy_documents.pop("/v1/admin/reviewer-bootstrap")
+            legacy_opener = FakeOpener(legacy_documents)
+            legacy_result = smoke_deployment(
+                config_file,
+                secret_file,
+                origin_override="http://127.0.0.1:8080",
+                allow_loopback_http=True,
+                opener_factory=lambda _context: legacy_opener,
+            )
+            self.assertEqual("ok", legacy_result["status"])
+            self.assertEqual(
+                "/v1/admin/reviewer-bootstrap",
+                urllib.parse.urlsplit(legacy_opener.requests[-1][0]).path,
+            )
+
     def test_smoke_rejects_an_unbounded_content_length_without_integer_parsing(self) -> None:
         response = FakeResponse("https://qa.example/version", {"status": "ok"})
         response.headers["Content-Length"] = "9" * 5_000
@@ -1528,6 +1547,12 @@ class OperatorToolTests(unittest.TestCase):
         with self.assertRaisesRegex(OperatorError, "invalid byte declaration"):
             operator_tool._read_smoke_json(
                 OversizedLengthOpener(),
+                "https://qa.example/version",
+                authorization=None,
+            )
+        with self.assertRaisesRegex(OperatorError, "HTTP 404"):
+            operator_tool._read_smoke_json(
+                FakeOpener({}),
                 "https://qa.example/version",
                 authorization=None,
             )

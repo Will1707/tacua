@@ -4,8 +4,10 @@ import {
   type BackendConfig,
   validateBackendConfig,
 } from "../config/backend-config-validation.ts";
+import type { ReviewerBootstrap } from "./types.ts";
 
 export type BackendConfigurationClient = {
+  readonly getReviewerBootstrap: () => Promise<ReviewerBootstrap>;
   readonly listBuilds: () => Promise<unknown>;
   readonly verifyReviewerIdentity: () => Promise<void>;
 };
@@ -40,9 +42,35 @@ export async function verifyBackendConfig(
   const config = validateBackendConfig(candidate);
   await dependencies.probeBackend(config.baseUrl);
   const client = dependencies.createClient(config);
-  await client.verifyReviewerIdentity();
-  await client.listBuilds();
-  return config;
+  let bootstrap: ReviewerBootstrap;
+  try {
+    bootstrap = await client.getReviewerBootstrap();
+  } catch (error) {
+    if (
+      error === null
+      || typeof error !== "object"
+      || !("status" in error)
+      || error.status !== 404
+    ) throw error;
+    // Backends predating the additive bootstrap contract remain usable while
+    // their transport 1.1 build is migrated. They retain the manual identity
+    // and scheme fields because the old build registry cannot prove either.
+    await client.verifyReviewerIdentity();
+    await client.listBuilds();
+    return config;
+  }
+  const [build] = bootstrap.builds;
+  if (!build || bootstrap.builds.length !== 1) {
+    throw new Error("The Tacua deployment must register exactly one reviewer build.");
+  }
+  const verifiedConfig = {
+    ...config,
+    reviewerId: bootstrap.reviewer_id,
+    targetScheme: build.launch_scheme ?? config.targetScheme,
+  };
+  const verifiedClient = dependencies.createClient(verifiedConfig);
+  await verifiedClient.verifyReviewerIdentity();
+  return verifiedConfig;
 }
 
 export async function verifyAndPersistBackendConfig(

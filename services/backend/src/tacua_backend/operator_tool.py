@@ -1925,7 +1925,8 @@ def _read_smoke_json(
     endpoint: str,
     *,
     authorization: str | None,
-) -> dict[str, Any]:
+    allow_not_found: bool = False,
+) -> dict[str, Any] | None:
     headers = {"Accept": "application/json", "Cache-Control": "no-store"}
     if authorization is not None:
         headers["Authorization"] = f"Bearer {authorization}"
@@ -1949,7 +1950,11 @@ def _read_smoke_json(
     except OperatorError:
         raise
     except urllib.error.HTTPError as exc:
-        raise OperatorError(f"smoke endpoint failed with HTTP {exc.code}") from exc
+        status = exc.code
+        exc.close()
+        if allow_not_found and status == 404:
+            return None
+        raise OperatorError(f"smoke endpoint failed with HTTP {status}") from exc
     except (OSError, urllib.error.URLError) as exc:
         raise OperatorError("smoke endpoint could not be reached securely") from exc
     if len(payload) != int(declared):
@@ -2086,16 +2091,21 @@ def smoke_deployment(
         opener,
         f"{origin}/v1/admin/reviewer-bootstrap",
         authorization=secret.decode("utf-8"),
+        allow_not_found=config.launch_scheme is None,
     )
-    expected_bootstrap_build = {**expected_build, "launch_scheme": config.launch_scheme}
-    if bootstrap != {
-        "contract_version": "tacua.reviewer-bootstrap@1.0.0",
-        "reviewer_id": config.reviewer_id,
-        "builds": [expected_bootstrap_build],
-    }:
-        raise OperatorError(
-            "authenticated smoke did not return the pinned reviewer bootstrap"
-        )
+    if bootstrap is not None:
+        expected_bootstrap_build = {
+            **expected_build,
+            "launch_scheme": config.launch_scheme,
+        }
+        if bootstrap != {
+            "contract_version": "tacua.reviewer-bootstrap@1.0.0",
+            "reviewer_id": config.reviewer_id,
+            "builds": [expected_bootstrap_build],
+        }:
+            raise OperatorError(
+                "authenticated smoke did not return the pinned reviewer bootstrap"
+            )
     return {
         "status": "ok",
         "origin": origin,
