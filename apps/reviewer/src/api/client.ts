@@ -84,6 +84,7 @@ const maximumCandidateBytes = 1_048_576;
 const maximumCandidateEvidenceViewBytes = 1_572_864;
 const maximumCandidateReplacementBytes = 16 * 1_024 * 1_024;
 const maximumEvidencePreviewBytes = 2 * 1_024 * 1_024;
+const maximumReviewerBindingBytes = 64;
 const evidencePreviewContentTypes = new Set(["image/png", "image/jpeg", "image/webp"] as const);
 
 type ExpectedJsonResponse = {
@@ -431,6 +432,32 @@ export class TacuaApiClient {
       throw new TacuaApiError(502, "INVALID_BUILD_REGISTRY", "The backend returned an invalid build registry.");
     }
     return response.builds;
+  }
+
+  async verifyReviewerIdentity(): Promise<void> {
+    if (!isIdentifier(this.config.reviewerId)) {
+      throw new TacuaApiError(
+        0,
+        "INVALID_REVIEWER_ID",
+        "The reviewer identity is invalid.",
+      );
+    }
+    const response = await this.request<unknown>(
+      "/v1/admin/reviewer-binding",
+      { headers: { "Tacua-Reviewer-ID": this.config.reviewerId } },
+      { expectedStatuses: [200], maximumBytes: maximumReviewerBindingBytes },
+    );
+    if (
+      !isRecord(response)
+      || !hasExactKeys(response, ["status"])
+      || response.status !== "verified"
+    ) {
+      throw new TacuaApiError(
+        502,
+        "INVALID_REVIEWER_BINDING_STATUS",
+        "The backend returned an invalid reviewer binding status.",
+      );
+    }
   }
 
   async createLaunchGrant(buildId: string): Promise<StartLaunchGrant> {

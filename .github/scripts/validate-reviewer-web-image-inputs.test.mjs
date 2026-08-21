@@ -23,6 +23,10 @@ import {
 import {
   validateFallbackAuditRows,
 } from "./generate-reviewer-third-party-notices.mjs";
+import {
+  RetryableBrowserStartupError,
+  runWithBrowserStartupRetry,
+} from "./smoke-reviewer-web-browser.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const dockerfile = readFileSync(
@@ -58,6 +62,37 @@ test("stops the healthy reviewer before normal verification cleanup", () => {
     stopIndex < removeIndex,
     "successful cleanup must stop the reviewer before removing it",
   );
+});
+
+test("browser smoke retries only one bounded fresh-Chrome startup timeout", async () => {
+  const attempts = [];
+  const result = await runWithBrowserStartupRetry(async (attempt) => {
+    attempts.push(attempt);
+    if (attempt === 1) throw new RetryableBrowserStartupError();
+    return "completed";
+  });
+  assert.equal(result, "completed");
+  assert.deepEqual(attempts, [1, 2]);
+
+  const nonStartupAttempts = [];
+  await assert.rejects(
+    () => runWithBrowserStartupRetry(async (attempt) => {
+      nonStartupAttempts.push(attempt);
+      throw new Error("application assertion failed");
+    }),
+    /application assertion failed/u,
+  );
+  assert.deepEqual(nonStartupAttempts, [1]);
+
+  const boundedAttempts = [];
+  await assert.rejects(
+    () => runWithBrowserStartupRetry(async (attempt) => {
+      boundedAttempts.push(attempt);
+      throw new RetryableBrowserStartupError();
+    }),
+    RetryableBrowserStartupError,
+  );
+  assert.deepEqual(boundedAttempts, [1, 2]);
 });
 
 test("rejects mutable image, expanded build context, and added authority", () => {

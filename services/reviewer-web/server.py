@@ -48,6 +48,7 @@ SENSITIVE_REQUEST_HEADERS = frozenset(
         "tacua-page-cursor",
         "tacua-protocol-version",
         "tacua-requested-at",
+        "tacua-reviewer-id",
         "tacua-scope-digest",
         "tacua-sidecar-digest",
         "tailscale-user-login",

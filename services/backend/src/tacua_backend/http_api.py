@@ -138,6 +138,23 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
     def _admin(self) -> None:
         self.backend.authenticate_admin(self._bearer())
 
+    def _reviewer_id(self) -> str:
+        values = self.headers.get_all("Tacua-Reviewer-ID") or []
+        if len(values) != 1 or not values[0] or len(values[0]) > 64:
+            raise ApiError(
+                400,
+                "REVIEWER_ID_REQUIRED",
+                "one valid reviewer identity header is required",
+            )
+        reviewer_id = values[0]
+        if re.fullmatch(ID, reviewer_id) is None:
+            raise ApiError(
+                400,
+                "REVIEWER_ID_INVALID",
+                "reviewer identity header is invalid",
+            )
+        return reviewer_id
+
     def _entity_tag(self) -> str:
         value = self._single_header("If-Match", "CANDIDATE_ETAG_REQUIRED", 80)
         match = re.fullmatch(r'"(sha256:[a-f0-9]{64})"', value)
@@ -285,6 +302,15 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
         if self.command == "GET" and path == "/v1/admin/builds":
             self._admin()
             self._send_json(200, {"builds": self.backend.list_builds()})
+            return
+        if self.command == "GET" and path == "/v1/admin/reviewer-binding":
+            # Authenticate before parsing the claim so this route cannot be
+            # used as an oracle for the configured reviewer identity.
+            self._admin()
+            self._send_json(
+                200,
+                self.backend.verify_reviewer_identity(self._reviewer_id()),
+            )
             return
         if self.command == "POST" and path == "/v1/admin/launch-codes":
             self._admin()

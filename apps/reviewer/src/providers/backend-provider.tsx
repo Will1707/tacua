@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { createContext, type PropsWithChildren, useCallback, useEffect, useMemo, useState } from "react";
+import { createContext, type PropsWithChildren, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { loadVerifiedBackendConfig } from "@/api/backend-config-verification";
 import { TacuaApiClient } from "@/api/client";
 import { loadBackendConfig, type BackendConfig } from "@/config/backend-config";
 
@@ -16,33 +17,62 @@ type BackendContextValue = {
 export const BackendContext = createContext<BackendContextValue | null>(null);
 
 export function BackendProvider({ children }: PropsWithChildren) {
-  const [config, setConfig] = useState<BackendConfig | null>(null);
+  const [activeBackend, setActiveBackend] = useState<{
+    readonly config: BackendConfig;
+    readonly client: TacuaApiClient;
+  } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const mounted = useRef(true);
+  const reloadGeneration = useRef(0);
   const reload = useCallback(async () => {
+    if (!mounted.current) return;
+    const generation = ++reloadGeneration.current;
     setLoading(true);
     setError(null);
+    setActiveBackend(null);
     try {
-      setConfig(await loadBackendConfig());
+      const verified = await loadVerifiedBackendConfig({
+        loadConfig: loadBackendConfig,
+        createClient: (config) => new TacuaApiClient(config),
+      });
+      if (!mounted.current || generation !== reloadGeneration.current) return;
+      setActiveBackend(verified === null ? null : {
+        config: verified.config,
+        client: verified.client,
+      });
     } catch (caught) {
+      if (!mounted.current || generation !== reloadGeneration.current) return;
       // A credential-store failure must not silently retain an earlier client
-      // or masquerade as a first-run, unconfigured installation.
-      setConfig(null);
+      // or let an unverified/stale identity reach reviewer operations.
+      setActiveBackend(null);
       setError(caught instanceof Error
         ? caught.message
-        : "Tacua could not read the secure backend configuration.");
+        : "Tacua could not verify the secure backend configuration.");
     } finally {
-      setLoading(false);
+      if (mounted.current && generation === reloadGeneration.current) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
+    mounted.current = true;
     void reload();
+    return () => {
+      // Invalidate any verification that settles after this provider unmounts.
+      mounted.current = false;
+      reloadGeneration.current += 1;
+    };
   }, [reload]);
 
   const value = useMemo<BackendContextValue>(
-    () => ({ config, client: config ? new TacuaApiClient(config) : null, error, loading, reload }),
-    [config, error, loading, reload],
+    () => ({
+      config: activeBackend?.config ?? null,
+      client: activeBackend?.client ?? null,
+      error,
+      loading,
+      reload,
+    }),
+    [activeBackend, error, loading, reload],
   );
   return <BackendContext value={value}>{children}</BackendContext>;
 }

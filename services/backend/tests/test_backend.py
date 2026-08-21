@@ -2851,6 +2851,7 @@ class HTTPAdapterTests(BackendHarness):
         *,
         method: str = "GET",
         authorization: str | None = None,
+        reviewer_id: str | None = None,
         body: bytes = b"",
     ) -> PilotRequestHandler:
         handler = object.__new__(PilotRequestHandler)
@@ -2863,6 +2864,8 @@ class HTTPAdapterTests(BackendHarness):
         handler.wfile = io.BytesIO()
         if authorization is not None:
             handler.headers["Authorization"] = authorization
+        if reviewer_id is not None:
+            handler.headers["Tacua-Reviewer-ID"] = reviewer_id
         if body:
             handler.headers["Content-Length"] = str(len(body))
         return handler
@@ -3007,6 +3010,57 @@ class HTTPAdapterTests(BackendHarness):
             },
             sent[0][1],
         )
+
+    def test_reviewer_binding_is_authenticated_status_only_and_non_mutating(self) -> None:
+        authorization = "Bearer " + self.admin_secret.decode("ascii")
+        configured_id = self.config.reviewer_id
+        database_before = self.backend.db_path.read_bytes()
+
+        authenticated = self.handler(
+            "/v1/admin/reviewer-binding",
+            authorization=authorization,
+            reviewer_id=configured_id,
+        )
+        sent: list[tuple[int, dict]] = []
+        authenticated._send_json = lambda status, body: sent.append((status, body))
+        authenticated._dispatch()
+        self.assertEqual([(200, {"status": "verified"})], sent)
+
+        cases = (
+            ("incorrect", "reviewer_other", 403, "REVIEWER_MISMATCH"),
+            ("missing", None, 400, "REVIEWER_ID_REQUIRED"),
+            ("stale", "reviewer_previous", 403, "REVIEWER_MISMATCH"),
+        )
+        for name, claimed_id, expected_status, expected_code in cases:
+            with self.subTest(name=name):
+                handler = self.handler(
+                    "/v1/admin/reviewer-binding",
+                    authorization=authorization,
+                    reviewer_id=claimed_id,
+                )
+                with self.assertRaises(ApiError) as captured:
+                    handler._dispatch()
+                self.assertEqual(expected_status, captured.exception.status)
+                self.assertEqual(expected_code, captured.exception.code)
+
+                errors: list[tuple[int, dict]] = []
+                handler._send_json = lambda status, body: errors.append((status, body))
+                handler._send_api_error(captured.exception)
+                serialized = canonical_json(errors[0][1])
+                self.assertNotIn(configured_id, serialized)
+                self.assertNotIn(self.admin_secret.decode("ascii"), serialized)
+                if claimed_id is not None:
+                    self.assertNotIn(claimed_id, serialized)
+
+        unauthenticated = self.handler(
+            "/v1/admin/reviewer-binding",
+            reviewer_id=configured_id,
+        )
+        with self.assertRaises(ApiError) as captured:
+            unauthenticated._dispatch()
+        self.assertEqual(401, captured.exception.status)
+        self.assertEqual("ADMIN_AUTHENTICATION_FAILED", captured.exception.code)
+        self.assertEqual(database_before, self.backend.db_path.read_bytes())
 
     def test_candidate_routes_preserve_exact_etag_and_evidence_bindings(self) -> None:
         lifecycle = self.full_completed_session()

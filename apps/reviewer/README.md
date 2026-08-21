@@ -42,10 +42,16 @@ The app accepts an HTTPS backend origin. Loopback HTTP is allowed only in a
 development build. The complete endpoint-and-credential configuration is
 committed as one `expo-secure-store` value with this-device-only, when-unlocked
 accessibility, preventing a partial settings write from pairing an old token
-with a new origin. Authenticated requests use the native Expo fetch boundary,
-omit cookies, reject redirects, and verify the response origin before parsing
-bounded JSON. Never commit a real endpoint, credential, recording, or private
-pilot identifier.
+with a new origin. Before “Save and connect” persists anything, the reviewer
+checks the public protocol, authenticates the administrator bearer, verifies
+the entered reviewer ID against the deployment through a non-mutating
+status-only route, and validates the bounded build registry. Provider startup
+repeats the identity-binding check before exposing a persisted client, so a
+missing, incorrect, or stale ID fails closed. Neither the success response nor
+the bounded errors disclose the configured or supplied identity. Authenticated
+requests use the native Expo fetch boundary, omit cookies, reject redirects,
+and verify the response origin before parsing bounded JSON. Never commit a real
+endpoint, credential, recording, or private pilot identifier.
 
 The reviewer also has a browser export for a private, same-origin self-hosted
 deployment:

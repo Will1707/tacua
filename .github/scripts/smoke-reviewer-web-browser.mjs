@@ -29,7 +29,9 @@ const adminToken =
 const reviewerId = "reviewer_browser";
 const targetScheme = "tacua-smoke-app";
 const commandTimeoutMilliseconds = 15_000;
+const browserStartupTimeoutMilliseconds = 30_000;
 const smokeTimeoutMilliseconds = 20_000;
+const maximumBrowserStartupAttempts = 2;
 
 const contentTypes = new Map([
   [".css", "text/css; charset=utf-8"],
@@ -276,6 +278,22 @@ async function createFixtureServer(temporaryDirectory) {
         }
         if (pathname === "/v1/admin/builds") {
           sendCanonicalJson(response, 200, { builds: [] });
+          return;
+        }
+        if (pathname === "/v1/admin/reviewer-binding") {
+          if (request.headers["tacua-reviewer-id"] !== reviewerId) {
+            protocolErrors.push(
+              `${request.method} ${request.url} did not bind the configured reviewer`,
+            );
+            sendCanonicalJson(response, 403, {
+              error: {
+                code: "REVIEWER_MISMATCH",
+                message: "The reviewer identity does not match this deployment.",
+              },
+            });
+            return;
+          }
+          sendCanonicalJson(response, 200, { status: "verified" });
           return;
         }
         if (pathname === "/v1/admin/sessions") {
@@ -540,7 +558,12 @@ class DevToolsPipe {
     return () => this.listeners.delete(listener);
   }
 
-  send(method, params = {}, sessionId) {
+  send(
+    method,
+    params = {},
+    sessionId,
+    timeoutMilliseconds = commandTimeoutMilliseconds,
+  ) {
     if (this.closed) return Promise.reject(new Error("Chrome debugging pipe is closed."));
     const id = this.nextId + 1;
     this.nextId = id;
@@ -550,7 +573,7 @@ class DevToolsPipe {
       const timeout = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`${method} exceeded the DevTools command timeout.`));
-      }, commandTimeoutMilliseconds);
+      }, timeoutMilliseconds);
       this.pending.set(id, { method, reject, resolve, timeout });
       this.input.write(`${JSON.stringify(message)}\0`, "utf8", (error) => {
         if (!error) return;
@@ -561,6 +584,13 @@ class DevToolsPipe {
         reject(error);
       });
     });
+  }
+}
+
+export class RetryableBrowserStartupError extends Error {
+  constructor() {
+    super("Chrome did not create a fresh DevTools target within the startup bound.");
+    this.name = "RetryableBrowserStartupError";
   }
 }
 
@@ -589,9 +619,20 @@ function stringifyRemoteObject(object) {
   return object.description ?? object.type ?? "unknown";
 }
 
-async function runBrowserSmoke(browser, fixture, temporaryDirectory) {
-  const profileDirectory = path.join(temporaryDirectory, "chrome-profile");
-  const downloadDirectory = path.join(temporaryDirectory, "downloads");
+async function runBrowserSmokeAttempt(
+  browser,
+  fixture,
+  temporaryDirectory,
+  attempt,
+) {
+  const profileDirectory = path.join(
+    temporaryDirectory,
+    `chrome-profile-${attempt}`,
+  );
+  const downloadDirectory = path.join(
+    temporaryDirectory,
+    `downloads-${attempt}`,
+  );
   const child = spawn(browser, [
     "--headless=new",
     "--allow-insecure-localhost",
@@ -669,10 +710,23 @@ async function runBrowserSmoke(browser, fixture, temporaryDirectory) {
 
   let sessionId;
   try {
-    const target = await devtools.send(
-      "Target.createTarget",
-      { url: "about:blank" },
-    );
+    let target;
+    try {
+      target = await devtools.send(
+        "Target.createTarget",
+        { url: "about:blank" },
+        undefined,
+        browserStartupTimeoutMilliseconds,
+      );
+    } catch (error) {
+      if (
+        error instanceof Error
+        && error.message === "Target.createTarget exceeded the DevTools command timeout."
+      ) {
+        throw new RetryableBrowserStartupError();
+      }
+      throw error;
+    }
     const attached = await devtools.send(
       "Target.attachToTarget",
       { flatten: true, targetId: target.targetId },
@@ -882,6 +936,10 @@ async function runBrowserSmoke(browser, fixture, temporaryDirectory) {
       "the reviewer escaped the bounded same-origin administrator protocol",
     );
     assert.ok(
+      fixture.requests.includes("GET /v1/admin/reviewer-binding"),
+      "the real reviewer did not verify its configured reviewer identity",
+    );
+    assert.ok(
       fixture.requests.includes(
         `GET /v1/admin/candidates/${fixture.candidate.candidate_id}/versions/${fixture.candidate.candidate_version}/handoff.json`,
       ),
@@ -899,16 +957,43 @@ async function runBrowserSmoke(browser, fixture, temporaryDirectory) {
     throw error;
   } finally {
     unsubscribe();
-    try {
-      await devtools.send("Browser.close");
-    } catch {
+    if (sessionId === undefined) {
       child.kill("SIGTERM");
+    } else {
+      try {
+        await devtools.send("Browser.close");
+      } catch {
+        child.kill("SIGTERM");
+      }
     }
     await Promise.race([
       new Promise((resolve) => child.once("exit", resolve)),
       delay(2_000).then(() => child.kill("SIGKILL")),
     ]);
   }
+}
+
+export async function runWithBrowserStartupRetry(runAttempt) {
+  for (let attempt = 1; attempt <= maximumBrowserStartupAttempts; attempt += 1) {
+    try {
+      return await runAttempt(attempt);
+    } catch (error) {
+      if (
+        !(error instanceof RetryableBrowserStartupError)
+        || attempt === maximumBrowserStartupAttempts
+      ) {
+        throw error;
+      }
+      await delay(250);
+    }
+  }
+  throw new Error("The bounded browser startup retry became unreachable.");
+}
+
+async function runBrowserSmoke(browser, fixture, temporaryDirectory) {
+  await runWithBrowserStartupRetry((attempt) =>
+    runBrowserSmokeAttempt(browser, fixture, temporaryDirectory, attempt)
+  );
 }
 
 export async function main() {
