@@ -3120,7 +3120,7 @@ class HTTPAdapterTests(BackendHarness):
         self.assertEqual("ADMIN_AUTHENTICATION_FAILED", captured.exception.code)
         self.assertEqual(database_before, self.backend.db_path.read_bytes())
 
-    def test_reviewer_bootstrap_requires_admin_and_omits_identity_for_legacy_transport(self) -> None:
+    def test_reviewer_bootstrap_requires_admin_and_returns_exact_compatibility_shape(self) -> None:
         unauthenticated = self.handler("/v1/admin/reviewer-bootstrap")
         with self.assertRaises(ApiError) as captured:
             unauthenticated._dispatch()
@@ -3148,6 +3148,7 @@ class HTTPAdapterTests(BackendHarness):
                     200,
                     {
                         "contract_version": REVIEWER_BOOTSTRAP_CONTRACT,
+                        "reviewer_id": self.config.reviewer_id,
                         "builds": [
                             {
                                 "build_id": self.build["build_id"],
@@ -3167,7 +3168,6 @@ class HTTPAdapterTests(BackendHarness):
             ],
             sent,
         )
-        self.assertNotIn(self.config.reviewer_id, canonical_json(sent[0][1]))
 
     def test_candidate_routes_preserve_exact_etag_and_evidence_bindings(self) -> None:
         lifecycle = self.full_completed_session()

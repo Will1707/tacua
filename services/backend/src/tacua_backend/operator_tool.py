@@ -2062,11 +2062,14 @@ def _read_smoke_json(
     endpoint: str,
     *,
     authorization: str | None,
+    reviewer_id: str | None = None,
     allow_not_found: bool = False,
 ) -> dict[str, Any] | None:
     headers = {"Accept": "application/json", "Cache-Control": "no-store"}
     if authorization is not None:
         headers["Authorization"] = f"Bearer {authorization}"
+    if reviewer_id is not None:
+        headers["Tacua-Reviewer-ID"] = reviewer_id
     request = urllib.request.Request(endpoint, method="GET", headers=headers)
     try:
         response = opener.open(request, timeout=10)
@@ -2108,6 +2111,7 @@ def smoke_deployment(
     *,
     origin_override: str | None,
     allow_loopback_http: bool,
+    allow_prebootstrap_reviewer_routes: bool = False,
     opener_factory: Callable[[ssl.SSLContext], urllib.request.OpenerDirector]
     | None = None,
 ) -> dict[str, Any]:
@@ -2202,6 +2206,21 @@ def smoke_deployment(
     if age < -300 or age > 2 * config.retention_sweep_interval_seconds + 60:
         raise OperatorError("retention sweep is stale")
 
+    legacy_routes_may_be_missing = (
+        allow_prebootstrap_reviewer_routes or config.launch_scheme is None
+    )
+    reviewer_binding = _read_smoke_json(
+        opener,
+        f"{origin}/v1/admin/reviewer-binding",
+        authorization=secret.decode("utf-8"),
+        reviewer_id=config.reviewer_id,
+        allow_not_found=legacy_routes_may_be_missing,
+    )
+    if reviewer_binding is not None and reviewer_binding != {"status": "verified"}:
+        raise OperatorError(
+            "authenticated smoke did not verify the pinned reviewer identity"
+        )
+
     builds = _read_smoke_json(
         opener,
         f"{origin}/v1/admin/builds",
@@ -2228,27 +2247,18 @@ def smoke_deployment(
         opener,
         f"{origin}/v1/admin/reviewer-bootstrap",
         authorization=secret.decode("utf-8"),
-        # This endpoint is additive and may be absent on the running side of
-        # an upgrade even when the candidate V1.2 config seals a launch scheme.
-        allow_not_found=True,
+        allow_not_found=legacy_routes_may_be_missing,
     )
     if bootstrap is not None:
         expected_bootstrap_build = {
             **expected_build,
             "launch_scheme": config.launch_scheme,
         }
-        supported_bootstraps = (
-            {
-                "contract_version": "tacua.reviewer-bootstrap@1.1.0",
-                "builds": [expected_bootstrap_build],
-            },
-            {
-                "contract_version": "tacua.reviewer-bootstrap@1.0.0",
-                "reviewer_id": config.reviewer_id,
-                "builds": [expected_bootstrap_build],
-            },
-        )
-        if bootstrap not in supported_bootstraps:
+        if bootstrap != {
+            "contract_version": "tacua.reviewer-bootstrap@1.0.0",
+            "reviewer_id": config.reviewer_id,
+            "builds": [expected_bootstrap_build],
+        }:
             raise OperatorError(
                 "authenticated smoke did not return the pinned reviewer bootstrap"
             )

@@ -67,13 +67,10 @@ async function authenticateBackendConfig<Client extends BackendConfigurationClie
   if (!build || bootstrap.builds.length !== 1) {
     throw new Error("The Tacua deployment must register exactly one reviewer build.");
   }
-  if (
-    bootstrap.contract_version === "tacua.reviewer-bootstrap@1.0.0"
-    && bootstrap.reviewer_id !== identityConfig.reviewerId
-  ) {
+  if (bootstrap.reviewer_id !== identityConfig.reviewerId) {
     // The status-only binding already succeeded. Treat disagreement from the
-    // legacy migration projection as a bounded consistency failure, never as
-    // an alternate source of reviewer identity.
+    // bootstrap projection as a bounded consistency failure, never as an
+    // alternate source of reviewer identity.
     throw new Error("The reviewer identity does not match this deployment.");
   }
   const verifiedConfig = validateBackendConfig({

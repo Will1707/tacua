@@ -81,15 +81,30 @@ class FakeResponse:
 
 
 class FakeOpener:
-    def __init__(self, documents: dict[str, dict]):
+    def __init__(
+        self,
+        documents: dict[str, dict],
+        *,
+        expected_reviewer_id: str | None = None,
+    ):
         self.documents = documents
-        self.requests: list[tuple[str, str | None]] = []
+        self.expected_reviewer_id = expected_reviewer_id
+        self.requests: list[tuple[str, str | None, str | None]] = []
 
     def open(self, request, timeout: int):
         self.assert_timeout = timeout
         url = request.full_url
-        self.requests.append((url, request.get_header("Authorization")))
+        reviewer_id = request.get_header("Tacua-reviewer-id")
+        self.requests.append(
+            (url, request.get_header("Authorization"), reviewer_id)
+        )
         path = urllib.parse.urlsplit(url).path
+        if (
+            path == "/v1/admin/reviewer-binding"
+            and self.expected_reviewer_id is not None
+            and reviewer_id != self.expected_reviewer_id
+        ):
+            raise urllib.error.HTTPError(url, 403, "forbidden", {}, None)
         if path not in self.documents:
             raise urllib.error.HTTPError(url, 404, "not found", {}, None)
         return FakeResponse(url, self.documents[path])
@@ -1458,7 +1473,47 @@ class OperatorToolTests(unittest.TestCase):
             finally:
                 backend.stop_retention_enforcement()
 
-    def test_smoke_checks_public_health_retention_and_authenticated_build(self) -> None:
+    @staticmethod
+    def smoke_documents(config, swept_at: str) -> dict[str, dict]:
+        expected_build = {
+            "build_id": config.build_id,
+            "application_id": config.application_id,
+            "bundle_identifier": config.bundle_identifier,
+            "native_version": config.build_identity["native_version"],
+            "native_build": config.build_identity["native_build"],
+            "distribution": config.build_identity["distribution"],
+            "build_identity_digest": config.build_identity_digest,
+        }
+        return {
+            "/version": {
+                "service": "tacua-backend",
+                "version": "0.2.0",
+                "protocol_version": "tacua.sdk-backend@1.0.0",
+            },
+            "/healthz": {
+                "status": "ok",
+                "service": "tacua-backend",
+                "version": "0.2.0",
+                "protocol_version": "tacua.sdk-backend@1.0.0",
+                "schema_version": 2,
+                "sessions": 0,
+                "tombstones": 0,
+                "pending_deletions": 0,
+                "retention_worker_running": True,
+                "retention_last_swept_at": swept_at,
+                "retention_last_deleted_sessions": 0,
+                "retention_last_failed_sessions": 0,
+            },
+            "/v1/admin/reviewer-binding": {"status": "verified"},
+            "/v1/admin/builds": {"builds": [expected_build]},
+            "/v1/admin/reviewer-bootstrap": {
+                "contract_version": "tacua.reviewer-bootstrap@1.0.0",
+                "reviewer_id": config.reviewer_id,
+                "builds": [{**expected_build, "launch_scheme": config.launch_scheme}],
+            },
+        }
+
+    def test_smoke_binds_reviewer_before_exact_authenticated_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             config_file, secret_file, _state = self.deployment(root)
@@ -1466,60 +1521,10 @@ class OperatorToolTests(unittest.TestCase):
             swept_at = datetime.now(timezone.utc).replace(microsecond=0).strftime(
                 "%Y-%m-%dT%H:%M:%SZ"
             )
+            documents = self.smoke_documents(config, swept_at)
             opener = FakeOpener(
-                {
-                    "/version": {
-                        "service": "tacua-backend",
-                        "version": "0.2.0",
-                        "protocol_version": "tacua.sdk-backend@1.0.0",
-                    },
-                    "/healthz": {
-                        "status": "ok",
-                        "service": "tacua-backend",
-                        "version": "0.2.0",
-                        "protocol_version": "tacua.sdk-backend@1.0.0",
-                        "schema_version": 2,
-                        "sessions": 0,
-                        "tombstones": 0,
-                        "pending_deletions": 0,
-                        "retention_worker_running": True,
-                        "retention_last_swept_at": swept_at,
-                        "retention_last_deleted_sessions": 0,
-                        "retention_last_failed_sessions": 0,
-                    },
-                    "/v1/admin/builds": {
-                        "builds": [
-                            {
-                                "build_id": config.build_id,
-                                "application_id": config.application_id,
-                                "bundle_identifier": config.bundle_identifier,
-                                "native_version": config.build_identity[
-                                    "native_version"
-                                ],
-                                "native_build": config.build_identity["native_build"],
-                                "distribution": config.build_identity["distribution"],
-                                "build_identity_digest": config.build_identity_digest,
-                            }
-                        ]
-                    },
-                    "/v1/admin/reviewer-bootstrap": {
-                        "contract_version": "tacua.reviewer-bootstrap@1.1.0",
-                        "builds": [
-                            {
-                                "build_id": config.build_id,
-                                "application_id": config.application_id,
-                                "bundle_identifier": config.bundle_identifier,
-                                "native_version": config.build_identity[
-                                    "native_version"
-                                ],
-                                "native_build": config.build_identity["native_build"],
-                                "distribution": config.build_identity["distribution"],
-                                "build_identity_digest": config.build_identity_digest,
-                                "launch_scheme": config.launch_scheme,
-                            }
-                        ],
-                    },
-                }
+                documents,
+                expected_reviewer_id=config.reviewer_id,
             )
             result = smoke_deployment(
                 config_file,
@@ -1531,145 +1536,172 @@ class OperatorToolTests(unittest.TestCase):
             self.assertEqual("ok", result["status"])
             self.assertEqual(
                 [
-                    None,
-                    None,
-                    f"Bearer {secret.decode('utf-8')}",
-                    f"Bearer {secret.decode('utf-8')}",
+                    "/version",
+                    "/healthz",
+                    "/v1/admin/reviewer-binding",
+                    "/v1/admin/builds",
+                    "/v1/admin/reviewer-bootstrap",
                 ],
-                [authorization for _url, authorization in opener.requests],
+                [urllib.parse.urlsplit(url).path for url, _auth, _reviewer in opener.requests],
             )
-
-            staggered_documents = copy.deepcopy(opener.documents)
-            staggered_documents["/v1/admin/reviewer-bootstrap"] = {
-                "contract_version": "tacua.reviewer-bootstrap@1.0.0",
-                "reviewer_id": config.reviewer_id,
-                "builds": copy.deepcopy(
-                    opener.documents["/v1/admin/reviewer-bootstrap"]["builds"]
-                ),
-            }
-            staggered_result = smoke_deployment(
-                config_file,
-                secret_file,
-                origin_override="http://127.0.0.1:8080",
-                allow_loopback_http=True,
-                opener_factory=lambda _context: FakeOpener(staggered_documents),
-            )
-            self.assertEqual("ok", staggered_result["status"])
-
-            missing_documents = dict(opener.documents)
-            missing_documents.pop("/v1/admin/reviewer-bootstrap")
-            missing_opener = FakeOpener(missing_documents)
-            missing_result = smoke_deployment(
-                config_file,
-                secret_file,
-                origin_override="http://127.0.0.1:8080",
-                allow_loopback_http=True,
-                opener_factory=lambda _context: missing_opener,
-            )
-            self.assertEqual("ok", missing_result["status"])
+            bearer = f"Bearer {secret.decode('utf-8')}"
             self.assertEqual(
-                "/v1/admin/reviewer-bootstrap",
-                urllib.parse.urlsplit(missing_opener.requests[-1][0]).path,
+                [None, None, bearer, bearer, bearer],
+                [authorization for _url, authorization, _reviewer in opener.requests],
+            )
+            self.assertEqual(
+                [None, None, config.reviewer_id, None, None],
+                [reviewer for _url, _authorization, reviewer in opener.requests],
             )
 
-            invalid_documents = copy.deepcopy(opener.documents)
-            invalid_documents["/v1/admin/reviewer-bootstrap"]["contract_version"] = (
-                "tacua.reviewer-bootstrap@2.0.0"
+            legacy_documents = copy.deepcopy(documents)
+            legacy_documents.pop("/v1/admin/reviewer-binding")
+            legacy_documents.pop("/v1/admin/reviewer-bootstrap")
+            legacy_opener = FakeOpener(legacy_documents)
+            legacy_result = smoke_deployment(
+                config_file,
+                secret_file,
+                origin_override="http://127.0.0.1:8080",
+                allow_loopback_http=True,
+                opener_factory=lambda _context: legacy_opener,
             )
-            with self.assertRaisesRegex(
-                OperatorError,
-                "pinned reviewer bootstrap",
-            ):
+            self.assertEqual("ok", legacy_result["status"])
+            self.assertEqual(
+                [
+                    "/v1/admin/reviewer-binding",
+                    "/v1/admin/reviewer-bootstrap",
+                ],
+                [
+                    urllib.parse.urlsplit(request[0]).path
+                    for request in (legacy_opener.requests[2], legacy_opener.requests[-1])
+                ],
+            )
+
+            wrong_binding_opener = FakeOpener(
+                documents,
+                expected_reviewer_id="reviewer_other",
+            )
+            with self.assertRaisesRegex(OperatorError, "HTTP 403"):
                 smoke_deployment(
                     config_file,
                     secret_file,
                     origin_override="http://127.0.0.1:8080",
                     allow_loopback_http=True,
-                    opener_factory=lambda _context: FakeOpener(invalid_documents),
+                    opener_factory=lambda _context: wrong_binding_opener,
                 )
 
-            wrong_identity_documents = copy.deepcopy(staggered_documents)
-            wrong_identity_documents["/v1/admin/reviewer-bootstrap"][
-                "reviewer_id"
-            ] = "reviewer_other"
-            with self.assertRaisesRegex(
-                OperatorError,
-                "pinned reviewer bootstrap",
-            ):
+            malformed_binding_documents = copy.deepcopy(documents)
+            malformed_binding_documents["/v1/admin/reviewer-binding"] = {
+                "status": "verified",
+                "unexpected": True,
+            }
+            with self.assertRaisesRegex(OperatorError, "pinned reviewer identity"):
                 smoke_deployment(
                     config_file,
                     secret_file,
                     origin_override="http://127.0.0.1:8080",
                     allow_loopback_http=True,
                     opener_factory=lambda _context: FakeOpener(
-                        wrong_identity_documents
+                        malformed_binding_documents
                     ),
                 )
 
-    def test_smoke_allows_missing_additive_bootstrap_for_transport_1_2(self) -> None:
+            for mutation in ("contract", "identity"):
+                invalid_documents = copy.deepcopy(documents)
+                if mutation == "contract":
+                    invalid_documents["/v1/admin/reviewer-bootstrap"][
+                        "contract_version"
+                    ] = "tacua.reviewer-bootstrap@2.0.0"
+                else:
+                    invalid_documents["/v1/admin/reviewer-bootstrap"][
+                        "reviewer_id"
+                    ] = "reviewer_other"
+                with self.subTest(mutation=mutation), self.assertRaisesRegex(
+                    OperatorError,
+                    "pinned reviewer bootstrap",
+                ):
+                    smoke_deployment(
+                        config_file,
+                        secret_file,
+                        origin_override="http://127.0.0.1:8080",
+                        allow_loopback_http=True,
+                        opener_factory=lambda _context: FakeOpener(invalid_documents),
+                    )
+
+    def test_smoke_requires_transport_1_2_reviewer_routes_except_during_preadoption(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             config_file, secret_file, _state = self.deployment(
                 root,
                 launch_scheme="tacua-kuzaba-qa",
             )
-            config, secret = load_config(config_file, secret_file)
+            config, _secret = load_config(config_file, secret_file)
             self.assertEqual("tacua-kuzaba-qa", config.launch_scheme)
             swept_at = datetime.now(timezone.utc).replace(microsecond=0).strftime(
                 "%Y-%m-%dT%H:%M:%SZ"
             )
-            opener = FakeOpener(
-                {
-                    "/version": {
-                        "service": "tacua-backend",
-                        "version": "0.2.0",
-                        "protocol_version": "tacua.sdk-backend@1.0.0",
-                    },
-                    "/healthz": {
-                        "status": "ok",
-                        "service": "tacua-backend",
-                        "version": "0.2.0",
-                        "protocol_version": "tacua.sdk-backend@1.0.0",
-                        "schema_version": 2,
-                        "sessions": 0,
-                        "tombstones": 0,
-                        "pending_deletions": 0,
-                        "retention_worker_running": True,
-                        "retention_last_swept_at": swept_at,
-                        "retention_last_deleted_sessions": 0,
-                        "retention_last_failed_sessions": 0,
-                    },
-                    "/v1/admin/builds": {
-                        "builds": [
-                            {
-                                "build_id": config.build_id,
-                                "application_id": config.application_id,
-                                "bundle_identifier": config.bundle_identifier,
-                                "native_version": config.build_identity["native_version"],
-                                "native_build": config.build_identity["native_build"],
-                                "distribution": config.build_identity["distribution"],
-                                "build_identity_digest": config.build_identity_digest,
-                            }
-                        ]
-                    },
-                }
-            )
-            result = smoke_deployment(
+            documents = self.smoke_documents(config, swept_at)
+
+            for missing_path in (
+                "/v1/admin/reviewer-binding",
+                "/v1/admin/reviewer-bootstrap",
+            ):
+                missing_documents = copy.deepcopy(documents)
+                missing_documents.pop(missing_path)
+                with self.subTest(missing_path=missing_path), self.assertRaisesRegex(
+                    OperatorError,
+                    "HTTP 404",
+                ):
+                    smoke_deployment(
+                        config_file,
+                        secret_file,
+                        origin_override="http://127.0.0.1:8080",
+                        allow_loopback_http=True,
+                        opener_factory=lambda _context: FakeOpener(missing_documents),
+                    )
+
+            prebootstrap_documents = copy.deepcopy(documents)
+            prebootstrap_documents.pop("/v1/admin/reviewer-binding")
+            prebootstrap_documents.pop("/v1/admin/reviewer-bootstrap")
+            prebootstrap = smoke_deployment(
                 config_file,
                 secret_file,
                 origin_override="http://127.0.0.1:8080",
                 allow_loopback_http=True,
-                opener_factory=lambda _context: opener,
+                allow_prebootstrap_reviewer_routes=True,
+                opener_factory=lambda _context: FakeOpener(prebootstrap_documents),
             )
-            self.assertEqual("ok", result["status"])
-            self.assertEqual(
-                "/v1/admin/reviewer-bootstrap",
-                urllib.parse.urlsplit(opener.requests[-1][0]).path,
-            )
-            self.assertEqual(
-                f"Bearer {secret.decode('utf-8')}",
-                opener.requests[-1][1],
-            )
+            self.assertEqual("ok", prebootstrap["status"])
+
+            malformed_documents = copy.deepcopy(documents)
+            malformed_documents["/v1/admin/reviewer-binding"] = {"status": "unknown"}
+            with self.assertRaisesRegex(OperatorError, "pinned reviewer identity"):
+                smoke_deployment(
+                    config_file,
+                    secret_file,
+                    origin_override="http://127.0.0.1:8080",
+                    allow_loopback_http=True,
+                    allow_prebootstrap_reviewer_routes=True,
+                    opener_factory=lambda _context: FakeOpener(malformed_documents),
+                )
+
+            malformed_bootstrap_documents = copy.deepcopy(documents)
+            malformed_bootstrap_documents["/v1/admin/reviewer-bootstrap"][
+                "reviewer_id"
+            ] = "reviewer_other"
+            with self.assertRaisesRegex(OperatorError, "pinned reviewer bootstrap"):
+                smoke_deployment(
+                    config_file,
+                    secret_file,
+                    origin_override="http://127.0.0.1:8080",
+                    allow_loopback_http=True,
+                    allow_prebootstrap_reviewer_routes=True,
+                    opener_factory=lambda _context: FakeOpener(
+                        malformed_bootstrap_documents
+                    ),
+                )
 
     def test_approve_reviewer_pairing_uses_exact_https_admin_request_and_content_free_output(
         self,
@@ -1819,7 +1851,7 @@ class OperatorToolTests(unittest.TestCase):
                 result,
             )
             self.assertEqual(
-                [(endpoint, "Bearer " + secret.decode("ascii"))],
+                [(endpoint, "Bearer " + secret.decode("ascii"), None)],
                 opener.requests,
             )
             self.assertEqual(1, len(built))

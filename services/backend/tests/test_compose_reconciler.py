@@ -616,12 +616,18 @@ class ComposeReconcilerTests(unittest.TestCase):
                     return_value=(deployment, True),
                 ), mock.patch.object(
                     RECONCILER, "_smoke"
-                ), mock.patch.object(
+                ) as smoke, mock.patch.object(
                     RECONCILER, "_enable_serve"
                 ) as enable:
                     result = RECONCILER.reconcile(state, runner=mock.Mock())
                 self.assertEqual(expected, result)
                 self.assertEqual(0 if active else 1, enable.call_count)
+                self.assertTrue(
+                    all(
+                        "allow_prebootstrap_reviewer_routes" not in call.kwargs
+                        for call in smoke.call_args_list
+                    )
+                )
 
     def test_post_start_failure_leaves_serve_proven_empty(self) -> None:
         manifest = {
@@ -1246,6 +1252,7 @@ class ComposeReconcilerTests(unittest.TestCase):
             "secret": {"path": "/private/secret"},
         }
         built: list[tuple[object, ...]] = []
+        prebootstrap_flags: list[bool] = []
 
         def fake_build_opener(*handlers):
             built.append(handlers)
@@ -1253,6 +1260,9 @@ class ComposeReconcilerTests(unittest.TestCase):
 
         def fake_smoke(*_args, **kwargs):
             kwargs["opener_factory"](mock.Mock())
+            prebootstrap_flags.append(
+                kwargs["allow_prebootstrap_reviewer_routes"]
+            )
             return {"status": "ok"}
 
         with mock.patch.object(
@@ -1263,14 +1273,21 @@ class ComposeReconcilerTests(unittest.TestCase):
             RECONCILER, "smoke_deployment", side_effect=fake_smoke
         ), mock.patch.object(RECONCILER, "_reviewer_smoke"):
             RECONCILER._smoke(manifest, public=False)
-        self.assertEqual(1, len(built))
+            RECONCILER._smoke(
+                manifest,
+                public=False,
+                allow_prebootstrap_reviewer_routes=True,
+            )
+        self.assertEqual([False, True], prebootstrap_flags)
+        self.assertEqual(2, len(built))
         proxy_handlers = [
             handler
-            for handler in built[0]
+            for handlers in built
+            for handler in handlers
             if isinstance(handler, RECONCILER.urllib.request.ProxyHandler)
         ]
-        self.assertEqual(1, len(proxy_handlers))
-        self.assertEqual({}, proxy_handlers[0].proxies)
+        self.assertEqual(2, len(proxy_handlers))
+        self.assertTrue(all(handler.proxies == {} for handler in proxy_handlers))
 
     def test_rootless_daemon_projection_rejects_rootful_and_identity_drift(self) -> None:
         manifest = {
@@ -2003,9 +2020,16 @@ class ComposeReconcilerTests(unittest.TestCase):
             with self._seal_runtime(
                 deployment,
                 tailnet_result=({}, True),
-            ):
+            ) as observed:
                 result = RECONCILER.seal(args, runner=mock.Mock())
             self.assertEqual("healthy", result["status"])
+            self.assertEqual(2, observed.smoke.call_count)
+            self.assertTrue(
+                all(
+                    call.kwargs["allow_prebootstrap_reviewer_routes"]
+                    for call in observed.smoke.call_args_list
+                )
+            )
             desired, manifest, _compose = RECONCILER._load_bound_state(
                 args.state_directory
             )
@@ -2049,6 +2073,11 @@ class ComposeReconcilerTests(unittest.TestCase):
             observed.inspect_deployment.assert_called_once()
             observed.smoke.assert_called_once()
             self.assertFalse(observed.smoke.call_args.kwargs["public"])
+            self.assertTrue(
+                observed.smoke.call_args.kwargs[
+                    "allow_prebootstrap_reviewer_routes"
+                ]
+            )
             self.assertEqual(2, observed.tailnet.call_count)
             self.assertEqual(
                 [

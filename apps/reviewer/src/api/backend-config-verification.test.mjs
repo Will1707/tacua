@@ -21,7 +21,8 @@ function candidate(overrides = {}) {
 
 function bootstrap(overrides = {}) {
   return {
-    contract_version: "tacua.reviewer-bootstrap@1.1.0",
+    contract_version: "tacua.reviewer-bootstrap@1.0.0",
+    reviewer_id: "reviewer_owner",
     builds: [{
       build_id: "build_kuzaba_qa",
       application_id: "application_kuzaba_qa",
@@ -32,15 +33,6 @@ function bootstrap(overrides = {}) {
       build_identity_digest: `sha256:${"a".repeat(64)}`,
       launch_scheme: "tacua-qa-app",
     }],
-    ...overrides,
-  };
-}
-
-function legacyBootstrap(overrides = {}) {
-  return {
-    ...bootstrap(),
-    contract_version: "tacua.reviewer-bootstrap@1.0.0",
-    reviewer_id: "reviewer_owner",
     ...overrides,
   };
 }
@@ -117,7 +109,7 @@ test("derives only the launch scheme from the authoritative bootstrap", async ()
   assert.deepEqual(identityBindings, ["reviewer_owner"]);
 });
 
-test("accepts exact staggered 1.0 metadata only after binding the supplied identity", async () => {
+test("accepts exact 1.0 metadata only after binding the supplied identity", async () => {
   const calls = [];
   const verified = await verifyBackendConfig(candidate({
     targetScheme: "stale-qa-app",
@@ -127,7 +119,7 @@ test("accepts exact staggered 1.0 metadata only after binding the supplied ident
       calls.push(`client:${config.reviewerId}`);
       return {
         async verifyReviewerIdentity() { calls.push("identity-binding"); },
-        async getReviewerBootstrap() { calls.push("bootstrap-1.0"); return legacyBootstrap(); },
+        async getReviewerBootstrap() { calls.push("bootstrap-1.0"); return bootstrap(); },
         async listBuilds() { assert.fail("legacy registry fallback was unexpected"); },
       };
     },
@@ -143,7 +135,7 @@ test("accepts exact staggered 1.0 metadata only after binding the supplied ident
   assert.equal(verified.targetScheme, "tacua-qa-app");
 });
 
-test("rejects inconsistent staggered 1.0 identity without deriving or persisting it", async () => {
+test("rejects an inconsistent bootstrap identity without deriving or persisting it", async () => {
   const suppliedId = "reviewer_owner";
   const legacyId = "reviewer_other";
   const adminToken = "a".repeat(32);
@@ -160,7 +152,7 @@ test("rejects inconsistent staggered 1.0 identity without deriving or persisting
       return {
         async verifyReviewerIdentity() {},
         async getReviewerBootstrap() {
-          return legacyBootstrap({ reviewer_id: legacyId });
+          return bootstrap({ reviewer_id: legacyId });
         },
         async listBuilds() { assert.fail("legacy registry fallback was unexpected"); },
       };
