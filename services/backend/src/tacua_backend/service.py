@@ -721,6 +721,7 @@ class PilotBackend:
                        UNION ALL SELECT accepted_at FROM pending_deletions
                        UNION ALL SELECT deleted_at FROM tombstones
                        UNION ALL SELECT occurred_at FROM audit_events
+                       UNION ALL SELECT observed_at FROM tacua_reviewer_auth_time_floor
                        UNION ALL SELECT created_at FROM reviewer_pairing_requests
                        UNION ALL SELECT approved_at FROM reviewer_pairing_requests
                        UNION ALL SELECT consumed_at FROM reviewer_pairing_requests
@@ -2084,6 +2085,22 @@ class PilotBackend:
             raise ApiError(404, "NOT_FOUND", "route was not found")
         try:
             return self._reviewer_auth_store.exchange_pairing(
+                pairing_token,
+                expected_client_kind=expected_client_kind,
+            )
+        except ReviewerAuthStoreError as error:
+            self._raise_reviewer_store_error(error)
+
+    def cancel_reviewer_pairing(
+        self,
+        pairing_token: Any,
+        *,
+        expected_client_kind: Any,
+    ) -> None:
+        if self.config.reviewer_auth.mode == REVIEWER_AUTH_LEGACY_ADMIN:
+            raise ApiError(404, "NOT_FOUND", "route was not found")
+        try:
+            self._reviewer_auth_store.cancel_pairing(
                 pairing_token,
                 expected_client_kind=expected_client_kind,
             )

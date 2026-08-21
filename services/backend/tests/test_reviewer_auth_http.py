@@ -199,6 +199,25 @@ class ReviewerAuthHTTPTests(BackendHarness):
         self.assertEqual(201, exchange_status)
         return pairing, session, headers
 
+    def cancel_pairing(
+        self,
+        pairing_token: object,
+        client_kind: str,
+        *,
+        origin: str | None = None,
+    ) -> tuple[int, dict, dict[str, str]]:
+        return self.dispatch_json(
+            self.handler(
+                "/v1/reviewer/pairing-cancellations",
+                method="POST",
+                body={
+                    "pairing_token": pairing_token,
+                    "client_kind": client_kind,
+                },
+                origin=origin,
+            )
+        )
+
     def test_legacy_admin_reviewer_alias_is_transitional_and_origin_bound(self) -> None:
         authorization = "Bearer " + self.admin_secret.decode("ascii")
         status, bootstrap, _ = self.dispatch_json(
@@ -245,6 +264,89 @@ class ReviewerAuthHTTPTests(BackendHarness):
                      ORDER BY rowid DESC LIMIT 1"""
             ).fetchone()
         self.assertEqual("reviewer", audit["actor_kind"])
+
+    def test_pairing_cancellation_is_content_free_and_invalidates_native_session(self) -> None:
+        self.use_auth_mode("pairing")
+        pairing, session, _ = self.pair("native")
+        token = pairing["pairing_token"]
+        session_token = session["session_token"]
+        replacement = "A" if token[-1] != "A" else "B"
+
+        for candidate, client_kind in (
+            (token[:-1] + replacement, "native"),
+            (token, "web"),
+            ("not-a-token", "native"),
+        ):
+            status, document, _ = self.cancel_pairing(
+                candidate,
+                client_kind,
+                origin=(
+                    self.config.backend_origin if client_kind == "web" else None
+                ),
+            )
+            self.assertEqual((200, {"status": "canceled"}), (status, document))
+            status, principal, _ = self.dispatch_json(
+                self.handler(
+                    "/v1/reviewer/session",
+                    authorization="Bearer " + session_token,
+                )
+            )
+            self.assertEqual(200, status)
+            self.assertEqual(session["session_id"], principal["session_id"])
+
+        status, document, headers = self.cancel_pairing(token, "native")
+        self.assertEqual((200, {"status": "canceled"}, {}), (status, document, headers))
+        status, replay, replay_headers = self.cancel_pairing(token, "native")
+        self.assertEqual(
+            (200, {"status": "canceled"}, {}),
+            (status, replay, replay_headers),
+        )
+        with self.assertRaises(ApiError) as captured:
+            self.handler(
+                "/v1/reviewer/session",
+                authorization="Bearer " + session_token,
+            )._dispatch()
+        self.assertEqual("REVIEWER_AUTHENTICATION_FAILED", captured.exception.code)
+
+    def test_web_pairing_cancellation_requires_origin_and_expires_cookie(self) -> None:
+        self.use_auth_mode("pairing")
+        pairing, _, exchange_headers = self.pair("web")
+        cookie = exchange_headers["Set-Cookie"].split(";", 1)[0]
+
+        with self.assertRaises(ApiError) as captured:
+            self.cancel_pairing(pairing["pairing_token"], "web")
+        self.assertEqual("REVIEWER_ORIGIN_FORBIDDEN", captured.exception.code)
+
+        status, document, headers = self.cancel_pairing(
+            pairing["pairing_token"],
+            "web",
+            origin=self.config.backend_origin,
+        )
+        self.assertEqual((200, {"status": "canceled"}), (status, document))
+        self.assertIn("Set-Cookie", headers)
+        self.assertIn("Max-Age=0", headers["Set-Cookie"])
+        with self.assertRaises(ApiError) as captured:
+            self.handler("/v1/reviewer/session", cookie=cookie)._dispatch()
+        self.assertEqual("REVIEWER_AUTHENTICATION_FAILED", captured.exception.code)
+
+    def test_pairing_cancellation_rejects_non_exact_body_and_legacy_mode(self) -> None:
+        self.use_auth_mode("pairing")
+        with self.assertRaises(ApiError) as captured:
+            self.handler(
+                "/v1/reviewer/pairing-cancellations",
+                method="POST",
+                body={
+                    "pairing_token": "not-a-token",
+                    "client_kind": "native",
+                    "extra": True,
+                },
+            )._dispatch()
+        self.assertEqual("INVALID_PAIRING_CANCELLATION", captured.exception.code)
+
+        self.use_auth_mode("legacy_admin")
+        with self.assertRaises(ApiError) as captured:
+            self.cancel_pairing("not-a-token", "native")
+        self.assertEqual("NOT_FOUND", captured.exception.code)
 
     def test_admin_launch_grant_keeps_admin_audit_attribution(self) -> None:
         status, _, _ = self.dispatch_json(
@@ -346,6 +448,47 @@ class ReviewerAuthHTTPTests(BackendHarness):
         )
         self.assertEqual(200, status)
         self.assertEqual("native", current["client_kind"])
+
+    def test_restart_restores_auth_floor_before_issuing_protocol_timestamps(self) -> None:
+        self.use_auth_mode("pairing")
+        durable_floor = "2026-07-21T10:30:00Z"
+        self.clock.set(durable_floor)
+        self.assert_api_error(
+            401,
+            "REVIEWER_AUTHENTICATION_FAILED",
+            lambda: self.backend.authenticate_reviewer_session(
+                "rsess_" + "a" * 32 + "." + "A" * 43,
+                required_scope="reviewer.read",
+            ),
+        )
+        with self.backend._connect() as connection:
+            self.assertEqual(
+                durable_floor,
+                connection.execute(
+                    "SELECT observed_at FROM tacua_reviewer_auth_time_floor "
+                    "WHERE singleton = 1"
+                ).fetchone()["observed_at"],
+            )
+
+        self.clock.set("2026-07-21T09:57:01Z")
+        restarted = PilotBackend(self.config, self.admin_secret, clock=self.clock)
+        grant = restarted.create_launch_code(
+            {
+                "exchange_kind": "start_session",
+                "build_id": self.config.build_id,
+            }
+        )
+        request = fixture("launch-exchange-request")
+        request["launch_code"] = grant["launch_code"]
+        scope = copy.deepcopy(self.scope)
+        scope["consent"]["granted_at"] = durable_floor
+        request["scope"] = seal(scope)
+        request["requested_at"] = durable_floor
+        response = restarted.exchange_launch_code(seal(request))
+
+        self.assertEqual(201, response.status)
+        self.assertEqual(durable_floor, response.json()["received_at"])
+        self.assertEqual(durable_floor, response.json()["issued_at"])
 
     def test_admin_pairing_approval_authenticates_before_reading_body(self) -> None:
         self.use_auth_mode("pairing")

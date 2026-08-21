@@ -496,6 +496,72 @@ class ReviewerAuthStore:
             "reviewer authentication identifier generation failed",
         )
 
+    def cancel_pairing(
+        self,
+        pairing_token: str,
+        *,
+        expected_client_kind: str | None = None,
+    ) -> None:
+        """Consume one pairing capability and remove any session it issued.
+
+        Cancellation is deliberately content-free and idempotent.  A missing,
+        malformed, tampered, already-canceled, or client-kind-mismatched token
+        is indistinguishable from a successful cancellation.  A caller that
+        holds the real pairing token can therefore safely retry after an
+        ambiguous exchange response without turning this route into a pairing
+        or session oracle.
+        """
+
+        if expected_client_kind is not None:
+            try:
+                expected_client_kind = self._validate_client_kind(
+                    expected_client_kind
+                )
+            except ReviewerAuthStoreError:
+                return
+        parsed = self._parse_token(pairing_token, _PAIRING_ID_PATTERN)
+        if parsed is None:
+            return
+        pairing_id, _ = parsed
+        supplied_verifier = self._verifier(_PAIRING_TOKEN_DOMAIN, pairing_token)
+        canceled_at = self._format_time(self._now())
+
+        with closing(self._connection()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._prune_inactive_state(connection, canceled_at)
+            row = connection.execute(
+                """SELECT pairing_verifier, client_kind
+                     FROM reviewer_pairing_requests WHERE pairing_id = ?""",
+                (pairing_id,),
+            ).fetchone()
+            if (
+                row is None
+                or not hmac.compare_digest(
+                    self._stored_verifier(row["pairing_verifier"]),
+                    supplied_verifier,
+                )
+                or (
+                    expected_client_kind is not None
+                    and row["client_kind"] != expected_client_kind
+                )
+            ):
+                return
+
+            # The pairing row is the stable capability binding retained for an
+            # active session.  Deleting the session verifier first and the
+            # pairing row second makes cancellation atomic whether it wins the
+            # database lock before or after exchange_pairing().
+            connection.execute(
+                """DELETE FROM reviewer_sessions
+                     WHERE originating_pairing_id = ? AND reviewer_id = ?
+                       AND client_kind = ?""",
+                (pairing_id, self.reviewer_id, row["client_kind"]),
+            )
+            connection.execute(
+                "DELETE FROM reviewer_pairing_requests WHERE pairing_id = ?",
+                (pairing_id,),
+            )
+
     def authenticate_session(
         self,
         session_token: str,

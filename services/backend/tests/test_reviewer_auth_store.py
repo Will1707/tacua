@@ -435,6 +435,156 @@ class ReviewerAuthStoreTests(unittest.TestCase):
         )
         self.assertEqual("web", issued.session.client_kind)
 
+    def test_pairing_cancellation_is_idempotent_and_removes_pending_request(self) -> None:
+        pairing = self.store.create_pairing(device_label="browser", client_kind="web")
+        self.store.approve_pairing(pairing.human_code)
+
+        self.store.cancel_pairing(
+            pairing.pairing_token,
+            expected_client_kind="web",
+        )
+        self.store.cancel_pairing(
+            pairing.pairing_token,
+            expected_client_kind="web",
+        )
+        self.assert_store_error(
+            401,
+            "PAIRING_EXCHANGE_INVALID",
+            lambda: self.store.exchange_pairing(
+                pairing.pairing_token,
+                expected_client_kind="web",
+            ),
+        )
+        with closing(self.connect()) as connection:
+            self.assertEqual(
+                [],
+                connection.execute(
+                    "SELECT pairing_id FROM reviewer_pairing_requests"
+                ).fetchall(),
+            )
+
+    def test_pairing_cancellation_removes_the_session_issued_from_that_token(self) -> None:
+        pairing, issued = self.issue_session(client_kind="native")
+        self.assertEqual(
+            issued.session.session_id,
+            self.store.authenticate_session(issued.session_token).session_id,
+        )
+
+        self.store.cancel_pairing(
+            pairing.pairing_token,
+            expected_client_kind="native",
+        )
+
+        self.assert_store_error(
+            401,
+            "REVIEWER_SESSION_UNAUTHORIZED",
+            lambda: self.store.authenticate_session(issued.session_token),
+        )
+        self.assertEqual((), self.store.list_sessions())
+        with closing(self.connect()) as connection:
+            self.assertEqual(
+                (0, 0),
+                (
+                    connection.execute(
+                        "SELECT COUNT(*) FROM reviewer_pairing_requests"
+                    ).fetchone()[0],
+                    connection.execute(
+                        "SELECT COUNT(*) FROM reviewer_sessions"
+                    ).fetchone()[0],
+                ),
+            )
+
+    def test_pairing_cancellation_is_content_free_for_unbound_tokens(self) -> None:
+        pairing, issued = self.issue_session(client_kind="web")
+        replacement = "A" if pairing.pairing_token[-1] != "A" else "B"
+        tampered = pairing.pairing_token[:-1] + replacement
+
+        for token, client_kind in (
+            ("not-a-token", "web"),
+            (tampered, "web"),
+            (pairing.pairing_token, "native"),
+            ("rpair_" + "0" * 32 + "." + "A" * 43, "web"),
+        ):
+            self.assertIsNone(
+                self.store.cancel_pairing(
+                    token,
+                    expected_client_kind=client_kind,
+                )
+            )
+            self.assertEqual(
+                issued.session.session_id,
+                self.store.authenticate_session(issued.session_token).session_id,
+            )
+
+        self.store.cancel_pairing(
+            pairing.pairing_token,
+            expected_client_kind="web",
+        )
+        self.assert_store_error(
+            401,
+            "REVIEWER_SESSION_UNAUTHORIZED",
+            lambda: self.store.authenticate_session(issued.session_token),
+        )
+
+    def test_pairing_cancellation_racing_exchange_leaves_no_live_session(self) -> None:
+        pairing = self.store.create_pairing(device_label="phone", client_kind="native")
+        self.store.approve_pairing(pairing.human_code)
+        start = threading.Barrier(3)
+        issued_tokens: list[str] = []
+        exchange_errors: list[ReviewerAuthStoreError] = []
+
+        def exchange() -> None:
+            start.wait()
+            try:
+                issued_tokens.append(
+                    self.store.exchange_pairing(
+                        pairing.pairing_token,
+                        expected_client_kind="native",
+                    ).session_token
+                )
+            except ReviewerAuthStoreError as error:
+                exchange_errors.append(error)
+
+        def cancel() -> None:
+            start.wait()
+            self.store.cancel_pairing(
+                pairing.pairing_token,
+                expected_client_kind="native",
+            )
+
+        exchange_thread = threading.Thread(target=exchange)
+        cancel_thread = threading.Thread(target=cancel)
+        exchange_thread.start()
+        cancel_thread.start()
+        start.wait()
+        exchange_thread.join(timeout=10)
+        cancel_thread.join(timeout=10)
+        self.assertFalse(exchange_thread.is_alive())
+        self.assertFalse(cancel_thread.is_alive())
+        self.assertLessEqual(len(issued_tokens), 1)
+        self.assertLessEqual(len(exchange_errors), 1)
+        if exchange_errors:
+            self.assertEqual("PAIRING_EXCHANGE_INVALID", exchange_errors[0].code)
+        for session_token in issued_tokens:
+            self.assert_store_error(
+                401,
+                "REVIEWER_SESSION_UNAUTHORIZED",
+                lambda token=session_token: self.store.authenticate_session(token),
+            )
+        self.assertEqual((), self.store.list_sessions())
+        with closing(self.connect()) as connection:
+            self.assertEqual(
+                (0, 0),
+                (
+                    connection.execute(
+                        "SELECT COUNT(*) FROM reviewer_pairing_requests"
+                    ).fetchone()[0],
+                    connection.execute(
+                        "SELECT COUNT(*) FROM reviewer_sessions"
+                    ).fetchone()[0],
+                ),
+            )
+
     def test_pairing_expiry_and_token_tampering_share_a_content_free_failure(self) -> None:
         expired = self.store.create_pairing(device_label="expired", client_kind="web")
         self.store.approve_pairing(expired.human_code)

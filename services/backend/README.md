@@ -213,6 +213,16 @@ the next reviewer-auth transaction. `GET /v1/admin/reviewer-sessions` therefore
 returns only the bounded active set, and a subsequently requested pruned session
 returns `404 REVIEWER_SESSION_NOT_FOUND`.
 
+A client retains the pairing token until exchange is fully verified. It may
+send that capability to `POST /v1/reviewer/pairing-cancellations` before or
+after exchange. Cancellation atomically deletes the pending request or the
+session verifier issued from it, so an ambiguous native response and a delayed
+browser cookie cannot leave an unreachable live session. The endpoint is safe
+to retry and always returns the same content-free success for missing,
+malformed, tampered, already-cleaned, or client-kind-mismatched tokens; it is
+not a pairing or session oracle. Web cancellation also expires the reviewer
+cookie in its response.
+
 When a pairing-capable client creates a request and displays its code, approve
 that one-use request on the backend host within ten minutes. The command reads
 the administrator secret from its protected file, sends it only to the
@@ -481,6 +491,7 @@ validated constants but are never used without the complete machine binding.
 | `POST` | `/v1/admin/launch-codes` | admin bearer | Create a start or resume grant |
 | `POST` | `/v1/reviewer/pairing-requests` | public, exact web Origin when applicable | Create one ten-minute reviewer pairing request |
 | `POST` | `/v1/reviewer/pairing-exchanges` | one-use pairing token | Exchange an approved request for a scoped web cookie or native bearer |
+| `POST` | `/v1/reviewer/pairing-cancellations` | pairing token, exact web Origin when applicable | Atomically cancel a request or remove the session it issued |
 | `GET` | `/v1/reviewer/session` | reviewer session or configured app capability | Read the authenticated reviewer principal and CSRF token |
 | `DELETE` | `/v1/reviewer/session` | pairing-issued reviewer session, exact Origin and CSRF | Revoke the caller's current reviewer session |
 | `GET` | `/v1/reviewer/bootstrap` | reviewer read scope | Read the authoritative reviewer/build/launch metadata |

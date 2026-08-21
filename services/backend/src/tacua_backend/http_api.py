@@ -599,6 +599,35 @@ class PilotRequestHandler(BaseHTTPRequestHandler):
             self._send_json(201, response, headers=headers)
             return
 
+        if self.command == "POST" and path == "/v1/reviewer/pairing-cancellations":
+            self._optional_native_origin()
+            body = self._read_json(16_384)
+            if (
+                not isinstance(body, dict)
+                or set(body) != {"pairing_token", "client_kind"}
+                or body.get("client_kind") not in {"web", "native"}
+            ):
+                raise ApiError(
+                    400,
+                    "INVALID_PAIRING_CANCELLATION",
+                    "pairing cancellation metadata is invalid",
+                )
+            if body["client_kind"] == "web":
+                self._reviewer_origin()
+            else:
+                self._optional_native_origin()
+            self.backend.cancel_reviewer_pairing(
+                body["pairing_token"],
+                expected_client_kind=body["client_kind"],
+            )
+            headers = (
+                {"Set-Cookie": self._clear_reviewer_cookie()}
+                if body["client_kind"] == "web"
+                else None
+            )
+            self._send_json(200, {"status": "canceled"}, headers=headers)
+            return
+
         if self.command == "GET" and path == "/v1/reviewer/session":
             principal = self._reviewer(REVIEWER_READ_SCOPE)
             self._send_json(200, self._reviewer_principal_document(principal))
