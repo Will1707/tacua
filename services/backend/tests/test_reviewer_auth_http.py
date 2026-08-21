@@ -515,6 +515,19 @@ class ReviewerAuthHTTPTests(BackendHarness):
         self.assertEqual(200, status)
         self.assertEqual("tailscale_capability", session["auth_kind"])
 
+        _, paired, paired_headers = self.pair("web")
+        paired_cookie = paired_headers["Set-Cookie"].split(";", 1)[0]
+        status, cookie_principal, _ = self.dispatch_json(
+            self.handler(
+                "/v1/reviewer/session",
+                cookie=paired_cookie,
+                capability=exact,
+            )
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("session", cookie_principal["auth_kind"])
+        self.assertEqual(paired["session_id"], cookie_principal["session_id"])
+
         identity_only = self.handler("/v1/reviewer/session")
         identity_only.headers["Tailscale-User-Login"] = "will@example.com"
         with self.assertRaises(ApiError) as captured:

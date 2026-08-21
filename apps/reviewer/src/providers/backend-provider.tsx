@@ -124,6 +124,34 @@ class IssuedSessionCleanupError extends Error {
   }
 }
 
+async function reconcileAmbiguousWebPairingExchange(
+  config: BackendConfig,
+): Promise<void> {
+  try {
+    const principal = await clientFor(config).getReviewerSession();
+    // The backend authenticates a supplied reviewer cookie before falling back
+    // to the Serve capability. A capability principal therefore proves that
+    // the browser sent no currently valid pairing-session cookie; a valid
+    // ambiguous 201 cookie would have produced a session principal here.
+    if (principal.auth_kind === "tailscale_capability") return;
+    if (
+      principal.auth_kind !== "session"
+      || principal.client_kind !== "web"
+      || principal.session_id === null
+    ) throw new IssuedSessionCleanupError();
+    const revoked = await clientFor(config, principal.csrf_token).revokeReviewerSession();
+    if (
+      revoked.session_id !== principal.session_id
+      || revoked.reviewer_id !== principal.reviewer_id
+      || revoked.client_kind !== "web"
+    ) throw new IssuedSessionCleanupError();
+  } catch (caught) {
+    if (isApiError(caught, 401)) return;
+    if (caught instanceof IssuedSessionCleanupError) throw caught;
+    throw new IssuedSessionCleanupError();
+  }
+}
+
 function publicPairing(pairing: ReviewerPairingRequest): PendingReviewerPairing {
   return {
     pairing_id: pairing.pairing_id,
@@ -363,6 +391,61 @@ export function BackendProvider({ children }: PropsWithChildren) {
             config,
             error: caught.message,
           });
+          return;
+        }
+        if (
+          reviewerClientKind() === "web"
+          && !isApiError(caught, 401)
+          && (
+            !(caught instanceof TacuaApiError)
+            || caught.status === 0
+            || caught.status === 408
+            || caught.status === 502
+          )
+        ) {
+          // A browser installs Set-Cookie from the response headers before the
+          // exchange body is read and validated. A timeout, truncated 201, or
+          // invalid success body can therefore have issued a live HttpOnly
+          // session even though exchangePairing threw. Quarantine all newer
+          // activations before inspecting the cookie so no connection can race
+          // the cleanup and retain a revoked client.
+          const wasCurrent = mounted.current && activation === generation.current;
+          const cleanupActivation = ++generation.current;
+          pendingPairingToken.current = null;
+          if (mounted.current) {
+            setState({
+              ...initialState,
+              status: "loading",
+              config,
+            });
+          }
+          try {
+            await reconcileAmbiguousWebPairingExchange(config);
+          } catch (cleanupCaught) {
+            if (!mounted.current || cleanupActivation !== generation.current) return;
+            setState({
+              ...initialState,
+              status: "error",
+              config,
+              error: cleanupCaught instanceof IssuedSessionCleanupError
+                ? cleanupCaught.message
+                : "Tacua could not safely reconcile the reviewer session issued during pairing.",
+            });
+            return;
+          }
+          if (!mounted.current || cleanupActivation !== generation.current) return;
+          setState(wasCurrent
+            ? {
+              ...initialState,
+              status: "error",
+              config,
+              error: message(caught, "Tacua could not finish reviewer pairing."),
+            }
+            : {
+              ...initialState,
+              status: "pairing_required",
+              config,
+            });
           return;
         }
         if (!mounted.current || activation !== generation.current) return;

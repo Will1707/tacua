@@ -384,6 +384,128 @@ test("a canceled exchange fails closed when its issued session cannot be revoked
   await TestRenderer.act(async () => rendered.renderer.unmount());
 });
 
+test("a canceled web exchange reconciles a cookie installed before an invalid body", async () => {
+  let sessionCalls = 0;
+  let rejectExchange;
+  let revocationConfig;
+  const exchange = new Promise((_resolve, reject) => { rejectExchange = reject; });
+  reset({
+    async getReviewerSession() {
+      sessionCalls += 1;
+      if (sessionCalls === 1) {
+        throw new TacuaApiError(401, "REVIEWER_AUTHENTICATION_FAILED", "reviewer authentication failed");
+      }
+      // The browser accepted the 201 Set-Cookie header before response-body
+      // validation failed, so the reconciliation probe now sees that session.
+      return principal();
+    },
+    async createPairingRequest(_config, label) {
+      return {
+        pairing_id: "rpair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        pairing_token: `rpair_${"a".repeat(32)}.${"B".repeat(43)}`,
+        human_code: "ABCD-EFGH",
+        device_label: label,
+        client_kind: "web",
+        created_at: "2026-08-21T12:00:00Z",
+        expires_at: "2026-08-21T12:10:00Z",
+      };
+    },
+    async exchangePairing() { return exchange; },
+    async revokeReviewerSession(config) {
+      revocationConfig = config;
+      return {
+        session_id: principal().session_id,
+        reviewer_id: principal().reviewer_id,
+        client_kind: "web",
+      };
+    },
+  });
+  const rendered = await renderProvider();
+  await TestRenderer.act(async () => {
+    await rendered.observed.beginPairing();
+    await settle();
+  });
+  assert.equal(rendered.observed.status, "pairing_pending");
+
+  await TestRenderer.act(async () => {
+    rendered.observed.cancelPairing();
+    rejectExchange(new TacuaApiError(
+      502,
+      "INVALID_PAIRING_EXCHANGE",
+      "The pairing exchange body was invalid.",
+    ));
+    await exchange.catch(() => undefined);
+    await settle();
+  });
+
+  assert.equal(rendered.observed.status, "pairing_required");
+  assert.equal(rendered.observed.client, null);
+  assert.equal(rendered.observed.error, null);
+  assert.equal(sessionCalls, 2);
+  assert.deepEqual(revocationConfig, {
+    baseUrl: "https://tacua.example",
+    clientKind: "web",
+    csrfToken: "csrf-token",
+  });
+  await TestRenderer.act(async () => rendered.renderer.unmount());
+});
+
+test("an ordinary truncated web exchange revokes its installed cookie before reporting the error", async () => {
+  let sessionCalls = 0;
+  let revocationConfig;
+  reset({
+    async getReviewerSession() {
+      sessionCalls += 1;
+      if (sessionCalls === 1) {
+        throw new TacuaApiError(401, "REVIEWER_AUTHENTICATION_FAILED", "reviewer authentication failed");
+      }
+      return principal();
+    },
+    async createPairingRequest(_config, label) {
+      return {
+        pairing_id: "rpair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        pairing_token: `rpair_${"a".repeat(32)}.${"B".repeat(43)}`,
+        human_code: "ABCD-EFGH",
+        device_label: label,
+        client_kind: "web",
+        created_at: "2026-08-21T12:00:00Z",
+        expires_at: "2026-08-21T12:10:00Z",
+      };
+    },
+    async exchangePairing() {
+      throw new TacuaApiError(
+        408,
+        "REQUEST_TIMEOUT",
+        "The pairing exchange response was truncated.",
+      );
+    },
+    async revokeReviewerSession(config) {
+      revocationConfig = config;
+      return {
+        session_id: principal().session_id,
+        reviewer_id: principal().reviewer_id,
+        client_kind: "web",
+      };
+    },
+  });
+  const rendered = await renderProvider();
+  await TestRenderer.act(async () => {
+    await rendered.observed.beginPairing();
+    await settle();
+  });
+
+  assert.equal(rendered.observed.status, "error");
+  assert.equal(rendered.observed.client, null);
+  assert.match(rendered.observed.error, /response was truncated/u);
+  assert.equal(sessionCalls, 2);
+  assert.deepEqual(revocationConfig, {
+    baseUrl: "https://tacua.example",
+    clientKind: "web",
+    csrfToken: "csrf-token",
+  });
+  await TestRenderer.act(async () => rendered.renderer.unmount());
+});
+
 test("a stale cleanup failure invalidates a newer pairing exchange", async () => {
   const firstPairingToken = `rpair_${"a".repeat(32)}.${"B".repeat(43)}`;
   const secondPairingToken = `rpair_${"b".repeat(32)}.${"C".repeat(43)}`;
