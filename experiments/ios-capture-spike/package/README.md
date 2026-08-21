@@ -297,7 +297,12 @@ await controller.admitAndDrain();
 
 unsubscribe();
 removeRouterLaunchListener();
-host.dispose();
+const teardownConfirmed = host.disposeWithConfirmation();
+if (!teardownConfirmed) {
+  // Keep this process terminal for Tacua host ownership. Disposed callbacks are inert, but the
+  // SDK could not prove that every native listener and volatile launch handle was removed.
+  renderRelaunchRequiredState();
+}
 ```
 
 The native inbox is memory-only, bounded to 32 validated URLs, atomically
@@ -306,11 +311,18 @@ URL, code, or user content. The adapter ignores an exact duplicate launch URL
 after its first delivery attempt, without retaining the URL itself. Only an
 `inactive`/`background`-to-`active` transition invokes `notifyForeground()`;
 bursts are coalesced while preserving a transition that arrives during native
-work. `dispose()` is idempotent, removes all three host listeners immediately,
-suppresses queued callbacks, and disposes its owned controller. Results that
-arrive after teardown cannot trigger initial-URL reads, URL delivery, discovery,
-or state publication; an in-flight RESUME match also cancels its newly prepared
-native consent handle before rejecting.
+work. `dispose()` remains an idempotent, non-throwing compatibility teardown.
+`disposeWithConfirmation()` attempts all three host-listener removals and
+owned-controller teardown and returns one sticky boolean result.
+`true` proves every removal and volatile launch-handle cancellation completed;
+`false` requires the host to remain terminal and avoid installing a replacement
+owner until process relaunch. Disposed callbacks are inert in either case.
+Results that arrive after teardown cannot trigger initial-URL reads, URL
+delivery, discovery, or state publication; an in-flight RESUME match also
+cancels its newly prepared native consent handle before rejecting. Lifecycle
+errors distinguish source/filter delivery (`deliver_launch_url`) from a launch
+that reached and was rejected by controller preparation (`prepare_launch`),
+without projecting the URL, code, or underlying error.
 
 `createBackendManagedHostController()` remains the dependency-light lower-level
 seam for tests or a non-React-Native host. Such a host must deliberately own
@@ -335,7 +347,9 @@ during reconciliation preserved for one follow-up pass. ReplayKit automatic
 stop therefore moves `capturing` to `stopped` while the app remains foregrounded
 and projects the applicable explicit `keep_verified_partial` or
 `admit_and_drain` action. It does not automatically finalize, admit, upload, or
-delete anything. `dispose()` removes both native listeners.
+delete anything. `disposeWithConfirmation()` attempts both native-listener
+removals and any volatile launch-handle cancellation, clears all JS-held
+authority, and returns the same sticky confirmation boolean described above.
 
 The fixed interrupted-capture choices are projected as typed actions. With a
 current recovered or freshly resumed plan, the host can call

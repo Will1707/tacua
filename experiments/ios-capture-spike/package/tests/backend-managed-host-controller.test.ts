@@ -833,7 +833,194 @@ test("duplicate and reordered native wake-ups coalesce without reverting authori
   );
 });
 
-test("dispose removes native lifecycle listeners and ignores later callbacks", async () => {
+test("dispose returns one sticky confirmation after all native ownership is released", () => {
+  const harness = createHarness();
+  const controller = createBackendManagedHostControllerForPrimitives(
+    harness.sdk,
+  );
+  assert.equal(harness.lifecycleListenerCount(), 1);
+
+  assert.equal(controller.disposeWithConfirmation(), true);
+  assert.equal(controller.disposeWithConfirmation(), true);
+  assert.equal(harness.lifecycleListenerCount(), 0);
+  assert.equal(
+    harness.calls.filter((call) => call === "unsubscribe-lifecycle").length,
+    1,
+  );
+});
+
+test("reentrant disposal during native teardown forces one sticky false result", () => {
+  const harness = createHarness();
+  const baseSubscribe = harness.sdk.subscribeCaptureLifecycle;
+  let controller: BackendManagedHostController | null = null;
+  let reentrantResult: boolean | null = null;
+  const sdk: BackendManagedHostPrimitives = {
+    ...harness.sdk,
+    subscribeCaptureLifecycle: (listeners) => {
+      const remove = baseSubscribe(listeners);
+      return () => {
+        remove();
+        reentrantResult = controller?.disposeWithConfirmation() ?? null;
+      };
+    },
+  };
+  controller = createBackendManagedHostControllerForPrimitives(sdk);
+
+  assert.equal(controller.disposeWithConfirmation(), false);
+  assert.equal(reentrantResult, false);
+  assert.equal(controller.disposeWithConfirmation(), false);
+  assert.equal(
+    harness.calls.filter((call) => call === "unsubscribe-lifecycle").length,
+    1,
+  );
+});
+
+test("reentrant disposal during launch cancellation forces one sticky false result", async () => {
+  const harness = createHarness();
+  let controller: BackendManagedHostController | null = null;
+  let reentrantResult: boolean | null = null;
+  const sdk: BackendManagedHostPrimitives = {
+    ...harness.sdk,
+    cancelBackendLaunch: (requestId) => {
+      harness.calls.push(`cancel:${requestId}`);
+      reentrantResult = controller?.disposeWithConfirmation() ?? null;
+    },
+  };
+  controller = createBackendManagedHostControllerForPrimitives(sdk);
+  await controller.prepareLaunch(
+    `tacua-test://tacua/start?launch_code=${LAUNCH_CODE}`,
+  );
+
+  assert.equal(controller.disposeWithConfirmation(), false);
+  assert.equal(reentrantResult, false);
+  assert.equal(controller.disposeWithConfirmation(), false);
+  assert.equal(
+    harness.calls.filter(
+      (call) => call === "cancel:consent_controller",
+    ).length,
+    1,
+  );
+});
+
+test("reentrant disposal during synchronous launch preparation is conservative", async () => {
+  const harness = createHarness();
+  let controller: BackendManagedHostController | null = null;
+  let reentrantResult: boolean | null = null;
+  const sdk: BackendManagedHostPrimitives = {
+    ...harness.sdk,
+    prepareBackendLaunch: (launchURL) => {
+      reentrantResult = controller?.disposeWithConfirmation() ?? null;
+      return harness.sdk.prepareBackendLaunch(launchURL);
+    },
+  };
+  controller = createBackendManagedHostControllerForPrimitives(sdk);
+
+  await assert.rejects(
+    controller.prepareLaunch(
+      `tacua-test://tacua/start?launch_code=${LAUNCH_CODE}`,
+    ),
+    (error: unknown) =>
+      error instanceof BackendManagedHostControllerError &&
+      error.category === "invalid_state",
+  );
+
+  assert.equal(reentrantResult, false);
+  assert.equal(controller.disposeWithConfirmation(), false);
+  assert.equal(
+    harness.calls.filter(
+      (call) => call === "cancel:consent_controller",
+    ).length,
+    1,
+  );
+});
+
+test("late prepared-handle cancellation failure remains terminal and private", async () => {
+  const harness = createHarness();
+  let controller: BackendManagedHostController | null = null;
+  let reentrantResult: boolean | null = null;
+  const sdk: BackendManagedHostPrimitives = {
+    ...harness.sdk,
+    prepareBackendLaunch: (launchURL) => {
+      reentrantResult = controller?.disposeWithConfirmation() ?? null;
+      return harness.sdk.prepareBackendLaunch(launchURL);
+    },
+    cancelBackendLaunch: (requestId) => {
+      harness.calls.push(`cancel:${requestId}`);
+      throw new Error(`private cancellation detail ${LAUNCH_CODE}`);
+    },
+  };
+  controller = createBackendManagedHostControllerForPrimitives(sdk);
+
+  await assert.rejects(
+    controller.prepareLaunch(
+      `tacua-test://tacua/start?launch_code=${LAUNCH_CODE}`,
+    ),
+    (error: unknown) =>
+      error instanceof BackendManagedHostControllerError &&
+      error.category === "invalid_state" &&
+      !String(error).includes("private cancellation detail"),
+  );
+
+  assert.equal(reentrantResult, false);
+  assert.equal(controller.disposeWithConfirmation(), false);
+  assert.equal(
+    harness.calls.filter(
+      (call) => call === "cancel:consent_controller",
+    ).length,
+    1,
+  );
+  assert.equal(JSON.stringify(controller).includes("consent_controller"), false);
+  assert.equal(JSON.stringify(controller).includes(LAUNCH_CODE), false);
+});
+
+test("late approved-handle cancellation failure remains terminal and private", async () => {
+  const harness = createHarness();
+  let controller: BackendManagedHostController | null = null;
+  let reentrantResult: boolean | null = null;
+  const sdk: BackendManagedHostPrimitives = {
+    ...harness.sdk,
+    confirmBackendLaunchConsent: (requestId, granted) => {
+      reentrantResult = controller?.disposeWithConfirmation() ?? null;
+      return harness.sdk.confirmBackendLaunchConsent(requestId, granted);
+    },
+    cancelBackendLaunch: (requestId) => {
+      harness.calls.push(`cancel:${requestId}`);
+      throw new Error(`private cancellation detail ${LAUNCH_CODE}`);
+    },
+  };
+  controller = createBackendManagedHostControllerForPrimitives(sdk);
+  await controller.prepareLaunch(
+    `tacua-test://tacua/start?launch_code=${LAUNCH_CODE}`,
+  );
+
+  await assert.rejects(
+    controller.respondToLaunchConsent(true),
+    (error: unknown) =>
+      error instanceof BackendManagedHostControllerError &&
+      error.category === "invalid_state" &&
+      !String(error).includes("private cancellation detail"),
+  );
+
+  assert.equal(reentrantResult, false);
+  assert.equal(controller.disposeWithConfirmation(), false);
+  assert.equal(
+    harness.calls.filter(
+      (call) => call === "cancel:consent_controller",
+    ).length,
+    1,
+  );
+  assert.equal(
+    harness.calls.filter(
+      (call) => call === "cancel:approved_controller",
+    ).length,
+    1,
+  );
+  assert.equal(JSON.stringify(controller).includes("consent_controller"), false);
+  assert.equal(JSON.stringify(controller).includes("approved_controller"), false);
+  assert.equal(JSON.stringify(controller).includes(LAUNCH_CODE), false);
+});
+
+test("dispose reports uncertain native lifecycle removal and ignores later callbacks", async () => {
   const harness = createHarness();
   const baseSubscribe = harness.sdk.subscribeCaptureLifecycle;
   const sdk: BackendManagedHostPrimitives = {
@@ -852,7 +1039,7 @@ test("dispose removes native lifecycle listeners and ignores later callbacks", a
   assert.equal(harness.lifecycleListenerCount(), 1);
   const revision = controller.getSnapshot().revision;
 
-  assert.doesNotThrow(() => controller.dispose());
+  assert.equal(controller.disposeWithConfirmation(), false);
   assert.equal(harness.lifecycleListenerCount(), 0);
   harness.setStatus(captureStatus("completed", false, LOCAL_SESSION_ID, 1));
   harness.emitState();
@@ -863,12 +1050,41 @@ test("dispose removes native lifecycle listeners and ignores later callbacks", a
     harness.calls.filter((call) => call === "unsubscribe-lifecycle").length,
     1,
   );
-  controller.dispose();
+  assert.equal(controller.disposeWithConfirmation(), false);
   assert.equal(
     harness.calls.filter((call) => call === "unsubscribe-lifecycle").length,
     1,
   );
 });
+
+for (const launchStage of ["pending consent", "approved launch"] as const) {
+  test(`dispose returns sticky false when ${launchStage} cancellation is uncertain`, async () => {
+    const harness = createHarness();
+    const sdk: BackendManagedHostPrimitives = {
+      ...harness.sdk,
+      cancelBackendLaunch: (requestId) => {
+        harness.calls.push(`cancel:${requestId}`);
+        throw new Error(`private cancellation detail ${LAUNCH_CODE}`);
+      },
+    };
+    const controller = createBackendManagedHostControllerForPrimitives(sdk);
+    await controller.prepareLaunch(
+      `tacua-test://tacua/start?launch_code=${LAUNCH_CODE}`,
+    );
+    if (launchStage === "approved launch") {
+      await controller.respondToLaunchConsent(true);
+    }
+
+    assert.equal(controller.disposeWithConfirmation(), false);
+    assert.equal(controller.disposeWithConfirmation(), false);
+    assert.equal(harness.lifecycleListenerCount(), 0);
+    assert.equal(
+      harness.calls.filter((call) => call.startsWith("cancel:")).length,
+      1,
+    );
+    assert.equal(JSON.stringify(controller).includes(LAUNCH_CODE), false);
+  });
+}
 
 test("dispose during RESUME target matching cancels the in-flight consent handle", async () => {
   const harness = createHarness();
@@ -894,7 +1110,13 @@ test("dispose during RESUME target matching cancels the in-flight consent handle
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
   }
 
-  controller.dispose();
+  assert.equal(controller.disposeWithConfirmation(), true);
+  assert.equal(
+    harness.calls.filter(
+      (call) => call === "cancel:consent_controller",
+    ).length,
+    1,
+  );
   const revisionAtDisposal = controller.getSnapshot().revision;
   const release = releaseMatching as (() => void) | null;
   release?.();
@@ -918,7 +1140,271 @@ test("dispose during RESUME target matching cancels the in-flight consent handle
     false,
   );
   assert.equal(harness.lifecycleListenerCount(), 0);
+  assert.equal(controller.disposeWithConfirmation(), true);
   assert.equal(JSON.stringify(controller.getSnapshot()).includes(LAUNCH_CODE), false);
+});
+
+test("dispose reports sticky false when in-flight RESUME cancellation is uncertain", async () => {
+  const harness = createHarness();
+  harness.setPreparedExpectedSessionId(REMOTE_SESSION_ID);
+  harness.queues.set(LOCAL_SESSION_ID, resumeQueue());
+  let releaseMatching: (() => void) | null = null;
+  const originalList = harness.sdk.listBackendSessions;
+  const sdk: BackendManagedHostPrimitives = {
+    ...harness.sdk,
+    listBackendSessions: async () => {
+      harness.calls.push("resume-match-enter");
+      await new Promise<void>((resolve) => {
+        releaseMatching = resolve;
+      });
+      return originalList();
+    },
+    cancelBackendLaunch: (requestId) => {
+      harness.calls.push(`cancel:${requestId}`);
+      throw new Error(`private cancellation detail ${LAUNCH_CODE}`);
+    },
+  };
+  const controller = createBackendManagedHostControllerForPrimitives(sdk);
+  const preparation = controller.prepareLaunch(
+    `tacua-test://tacua/start?launch_code=${LAUNCH_CODE}&session_id=${REMOTE_SESSION_ID}`,
+  );
+  while (releaseMatching === null) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+
+  assert.equal(controller.disposeWithConfirmation(), false);
+  assert.equal(controller.disposeWithConfirmation(), false);
+  assert.equal(
+    harness.calls.filter(
+      (call) => call === "cancel:consent_controller",
+    ).length,
+    1,
+  );
+  const release = releaseMatching as (() => void) | null;
+  release?.();
+  await assert.rejects(
+    preparation,
+    (error: unknown) =>
+      error instanceof BackendManagedHostControllerError &&
+      error.category === "invalid_state" &&
+      !String(error).includes(LAUNCH_CODE) &&
+      !String(error).includes("private cancellation detail"),
+  );
+
+  assert.equal(
+    harness.calls.filter(
+      (call) => call === "cancel:consent_controller",
+    ).length,
+    1,
+  );
+  assert.equal(harness.lifecycleListenerCount(), 0);
+  assert.equal(JSON.stringify(controller.getSnapshot()).includes(LAUNCH_CODE), false);
+});
+
+test("dispose owns an approved handle while START exchange is in flight", async () => {
+  const harness = createHarness();
+  let releasePlan: (() => void) | null = null;
+  const sdk: BackendManagedHostPrimitives = {
+    ...harness.sdk,
+    createCaptureSessionPlan: async () => {
+      harness.calls.push("create-plan-enter");
+      await new Promise<void>((resolve) => {
+        releasePlan = resolve;
+      });
+      return startedPlan();
+    },
+  };
+  const controller = createBackendManagedHostControllerForPrimitives(sdk);
+  await controller.prepareLaunch(
+    `tacua-test://tacua/start?launch_code=${LAUNCH_CODE}`,
+  );
+  await controller.respondToLaunchConsent(true);
+  const exchange = controller.exchangeApprovedLaunch();
+  while (releasePlan === null) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+
+  assert.equal(controller.disposeWithConfirmation(), true);
+  assert.equal(
+    harness.calls.filter(
+      (call) => call === "cancel:approved_controller",
+    ).length,
+    1,
+  );
+  const release = releasePlan as (() => void) | null;
+  release?.();
+  await assert.rejects(
+    exchange,
+    (error: unknown) =>
+      error instanceof BackendManagedHostControllerError &&
+      error.category === "invalid_state",
+  );
+  assert.equal(
+    harness.calls.filter(
+      (call) => call === "cancel:approved_controller",
+    ).length,
+    1,
+  );
+});
+
+test("dispose reports sticky false for uncertain in-flight START cancellation", async () => {
+  const harness = createHarness();
+  let releasePlan: (() => void) | null = null;
+  const sdk: BackendManagedHostPrimitives = {
+    ...harness.sdk,
+    createCaptureSessionPlan: async () => {
+      harness.calls.push("create-plan-enter");
+      await new Promise<void>((resolve) => {
+        releasePlan = resolve;
+      });
+      return startedPlan();
+    },
+    cancelBackendLaunch: (requestId) => {
+      harness.calls.push(`cancel:${requestId}`);
+      throw new Error(`private cancellation detail ${LAUNCH_CODE}`);
+    },
+  };
+  const controller = createBackendManagedHostControllerForPrimitives(sdk);
+  await controller.prepareLaunch(
+    `tacua-test://tacua/start?launch_code=${LAUNCH_CODE}`,
+  );
+  await controller.respondToLaunchConsent(true);
+  const exchange = controller.exchangeApprovedLaunch();
+  while (releasePlan === null) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+
+  assert.equal(controller.disposeWithConfirmation(), false);
+  assert.equal(controller.disposeWithConfirmation(), false);
+  const release = releasePlan as (() => void) | null;
+  release?.();
+  await assert.rejects(
+    exchange,
+    (error: unknown) =>
+      error instanceof BackendManagedHostControllerError &&
+      error.category === "invalid_state" &&
+      !String(error).includes("private cancellation detail"),
+  );
+  assert.equal(
+    harness.calls.filter(
+      (call) => call === "cancel:approved_controller",
+    ).length,
+    1,
+  );
+});
+
+test("a consumed approved handle is not cancelled during later plan projection", async () => {
+  const harness = createHarness();
+  let releaseProjection: (() => void) | null = null;
+  const sdk: BackendManagedHostPrimitives = {
+    ...harness.sdk,
+    listRecoverableSessions: async () => {
+      harness.calls.push("plan-projection-enter");
+      await new Promise<void>((resolve) => {
+        releaseProjection = resolve;
+      });
+      return [];
+    },
+  };
+  const controller = createBackendManagedHostControllerForPrimitives(sdk);
+  await controller.prepareLaunch(
+    `tacua-test://tacua/start?launch_code=${LAUNCH_CODE}`,
+  );
+  await controller.respondToLaunchConsent(true);
+  const exchange = controller.exchangeApprovedLaunch();
+  while (releaseProjection === null) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+
+  assert.equal(controller.disposeWithConfirmation(), true);
+  assert.equal(
+    harness.calls.includes("cancel:approved_controller"),
+    false,
+  );
+  const release = releaseProjection as (() => void) | null;
+  release?.();
+  await assert.rejects(
+    exchange,
+    (error: unknown) =>
+      error instanceof BackendManagedHostControllerError &&
+      error.category === "invalid_state",
+  );
+  assert.equal(
+    harness.calls.includes("cancel:approved_controller"),
+    false,
+  );
+});
+
+test("failed consent cancellation retains ownership and blocks replacement", async () => {
+  const harness = createHarness();
+  const sdk: BackendManagedHostPrimitives = {
+    ...harness.sdk,
+    cancelBackendLaunch: (requestId) => {
+      harness.calls.push(`cancel:${requestId}`);
+      throw new Error(`private cancellation detail ${LAUNCH_CODE}`);
+    },
+  };
+  const controller = createBackendManagedHostControllerForPrimitives(sdk);
+  const launchURL =
+    `tacua-test://tacua/start?launch_code=${LAUNCH_CODE}`;
+  await controller.prepareLaunch(launchURL);
+
+  await assert.rejects(
+    controller.respondToLaunchConsent(false),
+    (error: unknown) =>
+      error instanceof BackendManagedHostControllerError &&
+      error.category === "native_rejected" &&
+      !String(error).includes("private cancellation detail"),
+  );
+  await assert.rejects(
+    controller.prepareLaunch(launchURL),
+    (error: unknown) =>
+      error instanceof BackendManagedHostControllerError &&
+      error.category === "invalid_state",
+  );
+  assert.equal(controller.disposeWithConfirmation(), false);
+  assert.equal(
+    harness.calls.filter(
+      (call) => call === "cancel:consent_controller",
+    ).length,
+    2,
+  );
+});
+
+test("failed exchange cleanup retains ownership and blocks replacement", async () => {
+  const harness = createHarness();
+  const sdk: BackendManagedHostPrimitives = {
+    ...harness.sdk,
+    createCaptureSessionPlan: async () => {
+      throw Object.assign(new Error("private exchange outcome"), {
+        code: "ERR_TACUA_TEST_EXCHANGE_UNKNOWN",
+      });
+    },
+    cancelBackendLaunch: (requestId) => {
+      harness.calls.push(`cancel:${requestId}`);
+      throw new Error(`private cancellation detail ${LAUNCH_CODE}`);
+    },
+  };
+  const controller = createBackendManagedHostControllerForPrimitives(sdk);
+  const launchURL =
+    `tacua-test://tacua/start?launch_code=${LAUNCH_CODE}`;
+  await controller.prepareLaunch(launchURL);
+  await controller.respondToLaunchConsent(true);
+
+  await assert.rejects(controller.exchangeApprovedLaunch());
+  await assert.rejects(
+    controller.prepareLaunch(launchURL),
+    (error: unknown) =>
+      error instanceof BackendManagedHostControllerError &&
+      error.category === "invalid_state",
+  );
+  assert.equal(controller.disposeWithConfirmation(), false);
+  assert.equal(
+    harness.calls.filter(
+      (call) => call === "cancel:approved_controller",
+    ).length,
+    2,
+  );
 });
 
 test("dispose during refresh prevents all post-await discovery and snapshot writes", async () => {
