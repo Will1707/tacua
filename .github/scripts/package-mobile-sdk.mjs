@@ -53,6 +53,8 @@ const allowedRuntimePaths = new Set([
   "ios/TacuaDiagnosticJournal.swift",
   "ios/TacuaLocalHarnessPolicy.swift",
   "ios/TacuaLaunchLink.swift",
+  "ios/TacuaLaunchURLAppDelegateSubscriber.swift",
+  "ios/TacuaLaunchURLInbox.swift",
   "ios/TacuaSDKBackendClient.swift",
   "ios/TacuaSDKBackendProtocol.swift",
   "ios/TacuaSDKBackendRequests.swift",

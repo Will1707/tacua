@@ -79,9 +79,13 @@ function createControllerHarness(options: ControllerHarnessOptions = {}) {
 
 type LifecycleHarnessOptions = Readonly<{
   initialURL?: string | null;
+  initialNativeURLs?: readonly string[];
   currentState?: BackendManagedHostAppState;
   emitURLWhileSubscribing?: string;
+  emitNativeSignalWhileSubscribing?: boolean;
   getInitialURL?: () => Promise<string | null>;
+  drainPendingLaunchURLs?: () => readonly string[];
+  initialURLTimeoutMilliseconds?: number;
   subscribeAppState?: (
     listener: (state: BackendManagedHostAppState) => void,
   ) => () => void;
@@ -90,11 +94,14 @@ type LifecycleHarnessOptions = Readonly<{
 function createLifecycleHarness(options: LifecycleHarnessOptions = {}) {
   const calls: string[] = [];
   const incomingURLListeners = new Set<(url: string) => void>();
+  const pendingNativeLaunchListeners = new Set<() => void>();
   const appStateListeners = new Set<
     (state: BackendManagedHostAppState) => void
   >();
   let incomingURLRemovalCount = 0;
+  let pendingNativeLaunchRemovalCount = 0;
   let appStateRemovalCount = 0;
+  let pendingNativeURLs = [...(options.initialNativeURLs ?? [])];
 
   const primitives: BackendManagedHostLifecyclePrimitives = {
     getInitialURL: async () => {
@@ -102,6 +109,31 @@ function createLifecycleHarness(options: LifecycleHarnessOptions = {}) {
       if (options.getInitialURL) return options.getInitialURL();
       return options.initialURL ?? null;
     },
+    drainPendingLaunchURLs: () => {
+      calls.push("drain-native-launch-urls");
+      if (options.drainPendingLaunchURLs) {
+        return options.drainPendingLaunchURLs();
+      }
+      const drained = pendingNativeURLs;
+      pendingNativeURLs = [];
+      return drained;
+    },
+    subscribePendingLaunchURL: (listener) => {
+      calls.push("subscribe-native-launch");
+      pendingNativeLaunchListeners.add(listener);
+      if (options.emitNativeSignalWhileSubscribing) listener();
+      return () => {
+        calls.push("remove-native-launch");
+        pendingNativeLaunchRemovalCount += 1;
+        pendingNativeLaunchListeners.delete(listener);
+      };
+    },
+    ...(options.initialURLTimeoutMilliseconds === undefined
+      ? {}
+      : {
+          initialURLTimeoutMilliseconds:
+            options.initialURLTimeoutMilliseconds,
+        }),
     getCurrentAppState: () => {
       calls.push("get-current-state");
       return options.currentState ?? "active";
@@ -138,12 +170,22 @@ function createLifecycleHarness(options: LifecycleHarnessOptions = {}) {
     emitURL(url: string) {
       for (const listener of incomingURLListeners) listener(url);
     },
+    enqueueNativeURL(url: string, signal = true) {
+      pendingNativeURLs.push(url);
+      if (signal) {
+        for (const listener of pendingNativeLaunchListeners) listener();
+      }
+    },
     emitAppState(state: BackendManagedHostAppState) {
       for (const listener of appStateListeners) listener(state);
     },
     incomingURLListenerCount: () => incomingURLListeners.size,
+    pendingNativeLaunchListenerCount: () =>
+      pendingNativeLaunchListeners.size,
     appStateListenerCount: () => appStateListeners.size,
     incomingURLRemovalCount: () => incomingURLRemovalCount,
+    pendingNativeLaunchRemovalCount: () =>
+      pendingNativeLaunchRemovalCount,
     appStateRemovalCount: () => appStateRemovalCount,
   };
 }
@@ -186,6 +228,7 @@ test("startup installs listeners, refreshes, and privately delivers the initial 
     controllerHarness.controller,
     lifecycleHarness.primitives,
   );
+  assert.equal(lifecycleHarness.pendingNativeLaunchListenerCount(), 1);
   assert.equal(lifecycleHarness.incomingURLListenerCount(), 1);
   assert.equal(lifecycleHarness.appStateListenerCount(), 1);
 
@@ -202,6 +245,8 @@ test("startup and event duplicates cause one exact launch delivery", async () =>
   const controllerHarness = createControllerHarness();
   const lifecycleHarness = createLifecycleHarness({
     initialURL: LAUNCH_URL,
+    initialNativeURLs: [LAUNCH_URL],
+    emitNativeSignalWhileSubscribing: true,
     emitURLWhileSubscribing: LAUNCH_URL,
   });
   const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
@@ -220,6 +265,126 @@ test("startup and event duplicates cause one exact launch delivery", async () =>
   await waitFor(() => controllerHarness.preparedURLs.length === 2);
   assert.deepEqual(controllerHarness.preparedURLs, [LAUNCH_URL, secondURL]);
   adapter.dispose();
+});
+
+test("native cold-launch inbox delivers before a stuck initial URL lookup times out", async () => {
+  const errors: BackendManagedHostLifecycleError[] = [];
+  const controllerHarness = createControllerHarness();
+  const lifecycleHarness = createLifecycleHarness({
+    initialNativeURLs: [LAUNCH_URL],
+    initialURLTimeoutMilliseconds: 10,
+    getInitialURL: () => new Promise<string | null>(() => undefined),
+  });
+  const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controllerHarness.controller,
+    lifecycleHarness.primitives,
+    { onError: (error) => errors.push(error) },
+  );
+
+  await waitFor(() => controllerHarness.preparedURLs.length === 1);
+  assert.deepEqual(controllerHarness.preparedURLs, [LAUNCH_URL]);
+  await adapter.ready;
+  assert.deepEqual(errors, [
+    {
+      operation: "get_initial_url",
+      category: "host_lifecycle_rejected",
+    },
+  ]);
+  adapter.dispose();
+});
+
+test("content-free native signal drains a warm launch into the shared queue", async () => {
+  const controllerHarness = createControllerHarness();
+  const lifecycleHarness = createLifecycleHarness();
+  const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controllerHarness.controller,
+    lifecycleHarness.primitives,
+  );
+  await adapter.ready;
+
+  lifecycleHarness.enqueueNativeURL(LAUNCH_URL);
+  lifecycleHarness.emitURL(LAUNCH_URL);
+  adapter.deliverLaunchURL(LAUNCH_URL);
+  await waitFor(() => controllerHarness.preparedURLs.length === 1);
+  assert.deepEqual(controllerHarness.preparedURLs, [LAUNCH_URL]);
+  adapter.dispose();
+});
+
+test("foreground drains a retained native URL even when its signal was missed", async () => {
+  const controllerHarness = createControllerHarness();
+  const lifecycleHarness = createLifecycleHarness();
+  const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controllerHarness.controller,
+    lifecycleHarness.primitives,
+  );
+  await adapter.ready;
+
+  lifecycleHarness.enqueueNativeURL(LAUNCH_URL, false);
+  lifecycleHarness.emitAppState("background");
+  lifecycleHarness.emitAppState("active");
+  await waitFor(
+    () =>
+      controllerHarness.preparedURLs.length === 1 &&
+      controllerHarness.calls.includes("notify-foreground"),
+  );
+  assert.deepEqual(controllerHarness.calls.slice(-2), [
+    "prepare-launch",
+    "notify-foreground",
+  ]);
+  adapter.dispose();
+});
+
+test("native inbox failures are content-safe and do not block fallback discovery", async () => {
+  const errors: BackendManagedHostLifecycleError[] = [];
+  const controllerHarness = createControllerHarness();
+  const lifecycleHarness = createLifecycleHarness({
+    drainPendingLaunchURLs: () => {
+      throw new Error(`private ${LAUNCH_URL}`);
+    },
+  });
+  const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controllerHarness.controller,
+    lifecycleHarness.primitives,
+    { onError: (error) => errors.push(error) },
+  );
+
+  await adapter.ready;
+  assert.deepEqual(errors, [
+    {
+      operation: "drain_native_launch_urls",
+      category: "host_lifecycle_rejected",
+    },
+  ]);
+  assert.equal(JSON.stringify(errors).includes(LAUNCH_CODE), false);
+  adapter.dispose();
+});
+
+test("host-owned linking seams enter the adapter's existing private dedupe queue", async () => {
+  const controllerHarness = createControllerHarness();
+  const lifecycleHarness = createLifecycleHarness({ initialURL: LAUNCH_URL });
+  const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controllerHarness.controller,
+    lifecycleHarness.primitives,
+  );
+
+  adapter.deliverLaunchURL(LAUNCH_URL);
+  lifecycleHarness.emitURL(LAUNCH_URL);
+  await adapter.ready;
+
+  assert.deepEqual(controllerHarness.preparedURLs, [LAUNCH_URL]);
+  assert.equal(adapter.deliverLaunchURL(LAUNCH_URL), undefined);
+  assert.equal(JSON.stringify(adapter).includes(LAUNCH_CODE), false);
+
+  const secondURL = `${LAUNCH_URL}-host-source`;
+  adapter.deliverLaunchURL(secondURL);
+  lifecycleHarness.emitURL(secondURL);
+  await waitFor(() => controllerHarness.preparedURLs.length === 2);
+  assert.deepEqual(controllerHarness.preparedURLs, [LAUNCH_URL, secondURL]);
+
+  adapter.dispose();
+  adapter.deliverLaunchURL(`${LAUNCH_URL}-after-dispose`);
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  assert.equal(controllerHarness.preparedURLs.length, 2);
 });
 
 test("incoming URLs and foreground work serialize behind initial discovery", async () => {
@@ -307,8 +472,10 @@ test("dispose is idempotent and prevents startup, queued, and later callback wor
 
   assert.deepEqual(controllerHarness.calls, ["dispose-controller"]);
   assert.equal(controllerHarness.disposeCount(), 1);
+  assert.equal(lifecycleHarness.pendingNativeLaunchRemovalCount(), 1);
   assert.equal(lifecycleHarness.incomingURLRemovalCount(), 1);
   assert.equal(lifecycleHarness.appStateRemovalCount(), 1);
+  assert.equal(lifecycleHarness.pendingNativeLaunchListenerCount(), 0);
   assert.equal(lifecycleHarness.incomingURLListenerCount(), 0);
   assert.equal(lifecycleHarness.appStateListenerCount(), 0);
 });
@@ -358,16 +525,6 @@ for (const failure of [
         throw new Error(`private ${LAUNCH_CODE}`);
       },
     },
-  },
-  {
-    name: "initial URL lookup",
-    operation: "get_initial_url",
-    lifecycle: {
-      getInitialURL: async () => {
-        throw new Error(`private ${LAUNCH_CODE}`);
-      },
-    },
-    controller: {},
   },
   {
     name: "launch delivery",
@@ -420,6 +577,31 @@ for (const failure of [
   });
 }
 
+test("initial URL lookup rejection is safely reported as a fallback miss", async () => {
+  const errors: BackendManagedHostLifecycleError[] = [];
+  const controllerHarness = createControllerHarness();
+  const lifecycleHarness = createLifecycleHarness({
+    getInitialURL: async () => {
+      throw new Error(`private ${LAUNCH_CODE}`);
+    },
+  });
+  const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controllerHarness.controller,
+    lifecycleHarness.primitives,
+    { onError: (error) => errors.push(error) },
+  );
+
+  await adapter.ready;
+  assert.deepEqual(errors, [
+    {
+      operation: "get_initial_url",
+      category: "host_lifecycle_rejected",
+    },
+  ]);
+  assert.equal(JSON.stringify(errors).includes(LAUNCH_CODE), false);
+  adapter.dispose();
+});
+
 test("listener installation failure cleans up and throws only a safe error", () => {
   const controllerHarness = createControllerHarness();
   const lifecycleHarness = createLifecycleHarness({
@@ -442,6 +624,7 @@ test("listener installation failure cleans up and throws only a safe error", () 
       !String(error).includes(LAUNCH_CODE),
   );
   assert.equal(controllerHarness.disposeCount(), 1);
+  assert.equal(lifecycleHarness.pendingNativeLaunchRemovalCount(), 1);
   assert.equal(lifecycleHarness.incomingURLRemovalCount(), 1);
   assert.deepEqual(errors, [
     {

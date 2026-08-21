@@ -10,6 +10,7 @@ public final class TacuaCaptureSpikeModule: Module {
   private var lastTerminalStatus: [String: Any]?
   private let sessionLock = NSLock()
   private let launchConsentGate = TacuaLaunchConsentGate()
+  private var pendingLaunchURLObserver: NSObjectProtocol?
   private let backendCoordinatorLock = NSLock()
   private struct BackendLifecycleContext {
     let start: TacuaSDKStartLifecycleCoordinator
@@ -26,7 +27,25 @@ public final class TacuaCaptureSpikeModule: Module {
   public func definition() -> ModuleDefinition {
     Name("TacuaCaptureSpikeModule")
 
-    Events("onState", "onSegment", "onGap", "onMarker", "onError")
+    Events(
+      "onState",
+      "onSegment",
+      "onGap",
+      "onMarker",
+      "onError",
+      "onPendingBackendLaunchURL"
+    )
+
+    OnCreate {
+      self.pendingLaunchURLObserver = NotificationCenter.default.addObserver(
+        forName: .tacuaPendingBackendLaunchURL,
+        object: nil,
+        queue: .main
+      ) { [weak self] _ in
+        // This signal intentionally carries no URL, code, or user content.
+        self?.sendEvent("onPendingBackendLaunchURL")
+      }
+    }
 
     Function("getCapabilities") { () -> [String: Any] in
       let recorder = RPScreenRecorder.shared()
@@ -85,6 +104,10 @@ public final class TacuaCaptureSpikeModule: Module {
         "redirectPolicy": "reject_all",
         "launchURLTemplate": "\(launchConfiguration.scheme)://tacua/start?launch_code=<opaque>",
       ]
+    }
+
+    Function("drainPendingBackendLaunchURLs") { () -> [String] in
+      TacuaLaunchURLInbox.shared.drain()
     }
 
     Function("prepareBackendLaunch") { (launchURL: String) throws -> [String: Any] in
@@ -721,6 +744,10 @@ public final class TacuaCaptureSpikeModule: Module {
     }
 
     OnDestroy {
+      if let observer = self.pendingLaunchURLObserver {
+        NotificationCenter.default.removeObserver(observer)
+        self.pendingLaunchURLObserver = nil
+      }
       self.takeSession()?.cancelForModuleDestruction()
     }
   }
