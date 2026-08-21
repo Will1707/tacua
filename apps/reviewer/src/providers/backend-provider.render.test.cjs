@@ -185,6 +185,18 @@ function Observer({ observe }) {
   return React.createElement("Observer");
 }
 
+function BindingSensitiveRoute({ observe }) {
+  const backend = React.use(BackendContext);
+  const [draft, setDraft] = React.useState(null);
+  const [cache, setCache] = React.useState(null);
+  React.useEffect(() => {
+    setDraft(null);
+    setCache(null);
+  }, [backend.bootstrap, backend.client, backend.session]);
+  observe({ backend, cache, draft, setCache, setDraft });
+  return React.createElement("BindingSensitiveRoute");
+}
+
 async function settle() {
   for (let index = 0; index < 8; index += 1) await Promise.resolve();
 }
@@ -198,6 +210,27 @@ async function renderProvider() {
         BackendProvider,
         null,
         React.createElement(Observer, { observe: (value) => { observed = value; } }),
+      ),
+    );
+    await settle();
+  });
+  return {
+    get observed() { return observed; },
+    renderer,
+  };
+}
+
+async function renderProviderWithBindingSensitiveRoute() {
+  let observed;
+  let renderer;
+  await TestRenderer.act(async () => {
+    renderer = TestRenderer.create(
+      React.createElement(
+        BackendProvider,
+        null,
+        React.createElement(BindingSensitiveRoute, {
+          observe: (value) => { observed = value; },
+        }),
       ),
     );
     await settle();
@@ -375,6 +408,202 @@ test("session revalidation repeats on the fixed cadence when the device clock le
     assert.equal(sessionCalls, 3, "the same live session must continue to be revalidated");
     assert.equal(rendered.observed.status, "connected");
     assert.equal(rendered.observed.session.auth_kind, "session");
+  } finally {
+    await TestRenderer.act(async () => rendered.renderer.unmount());
+  }
+});
+
+test("unchanged periodic revalidation preserves binding identities and route-local work", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  let sessionCalls = 0;
+  let bootstrapCalls = 0;
+  reset({
+    async getReviewerSession() {
+      sessionCalls += 1;
+      return principal();
+    },
+    async getReviewerBootstrap() {
+      bootstrapCalls += 1;
+      return bootstrap();
+    },
+  });
+  const rendered = await renderProviderWithBindingSensitiveRoute();
+  try {
+    const boundClient = rendered.observed.backend.client;
+    const boundSession = rendered.observed.backend.session;
+    const boundBootstrap = rendered.observed.backend.bootstrap;
+    const cachedPage = { sessionIds: ["sess_cached"] };
+    await TestRenderer.act(async () => {
+      rendered.observed.setDraft("unsaved reviewer note");
+      rendered.observed.setCache(cachedPage);
+      await settle();
+    });
+
+    await TestRenderer.act(async () => {
+      context.mock.timers.tick(60_000);
+      await settle();
+    });
+
+    assert.equal(sessionCalls, 2);
+    assert.equal(bootstrapCalls, 2);
+    assert.equal(rendered.observed.backend.status, "connected");
+    assert.strictEqual(rendered.observed.backend.client, boundClient);
+    assert.strictEqual(rendered.observed.backend.session, boundSession);
+    assert.strictEqual(rendered.observed.backend.bootstrap, boundBootstrap);
+    assert.equal(rendered.observed.draft, "unsaved reviewer note");
+    assert.strictEqual(rendered.observed.cache, cachedPage);
+  } finally {
+    await TestRenderer.act(async () => rendered.renderer.unmount());
+  }
+});
+
+test("periodic authentication loss fails closed and clears route-local work", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  let sessionCalls = 0;
+  reset({
+    async getReviewerSession() {
+      sessionCalls += 1;
+      if (sessionCalls === 1) return principal();
+      throw new TacuaApiError(
+        401,
+        "REVIEWER_AUTHENTICATION_FAILED",
+        "reviewer authentication failed",
+      );
+    },
+  });
+  const rendered = await renderProviderWithBindingSensitiveRoute();
+  try {
+    await TestRenderer.act(async () => {
+      rendered.observed.setDraft("must be cleared");
+      rendered.observed.setCache({ sessionIds: ["sess_private"] });
+      await settle();
+    });
+
+    await TestRenderer.act(async () => {
+      context.mock.timers.tick(60_000);
+      await settle();
+    });
+
+    assert.equal(sessionCalls, 3, "the definitive 401 is confirmed by full activation");
+    assert.equal(rendered.observed.backend.status, "pairing_required");
+    assert.equal(rendered.observed.backend.client, null);
+    assert.equal(rendered.observed.backend.session, null);
+    assert.equal(rendered.observed.backend.bootstrap, null);
+    assert.equal(rendered.observed.draft, null);
+    assert.equal(rendered.observed.cache, null);
+  } finally {
+    await TestRenderer.act(async () => rendered.renderer.unmount());
+  }
+});
+
+test("periodic binding drift clears the old route generation before replacement", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  let probeCalls = 0;
+  let sessionCalls = 0;
+  let resolveReplacementProbe;
+  const replacementProbe = new Promise((resolve) => { resolveReplacementProbe = resolve; });
+  const rotatedPrincipal = principal({ csrf_token: "rotated-csrf-token" });
+  reset({
+    async probeTacuaBackend() {
+      probeCalls += 1;
+      if (probeCalls === 2) await replacementProbe;
+    },
+    async getReviewerSession() {
+      sessionCalls += 1;
+      return sessionCalls === 1 ? principal() : rotatedPrincipal;
+    },
+  });
+  const rendered = await renderProviderWithBindingSensitiveRoute();
+  try {
+    const oldClient = rendered.observed.backend.client;
+    const oldSession = rendered.observed.backend.session;
+    const oldBootstrap = rendered.observed.backend.bootstrap;
+    await TestRenderer.act(async () => {
+      rendered.observed.setDraft("belongs only to the old binding");
+      rendered.observed.setCache({ sessionIds: ["sess_old"] });
+      await settle();
+    });
+
+    await TestRenderer.act(async () => {
+      context.mock.timers.tick(60_000);
+      await settle();
+    });
+
+    assert.equal(probeCalls, 2);
+    assert.equal(rendered.observed.backend.status, "loading");
+    assert.equal(rendered.observed.backend.client, null);
+    assert.equal(rendered.observed.backend.session, null);
+    assert.equal(rendered.observed.backend.bootstrap, null);
+    assert.equal(rendered.observed.draft, null);
+    assert.equal(rendered.observed.cache, null);
+
+    await TestRenderer.act(async () => {
+      resolveReplacementProbe();
+      await settle();
+    });
+
+    assert.equal(rendered.observed.backend.status, "connected");
+    assert.equal(rendered.observed.backend.session.csrf_token, "rotated-csrf-token");
+    assert.notStrictEqual(rendered.observed.backend.client, oldClient);
+    assert.notStrictEqual(rendered.observed.backend.session, oldSession);
+    assert.notStrictEqual(rendered.observed.backend.bootstrap, oldBootstrap);
+  } finally {
+    await TestRenderer.act(async () => rendered.renderer.unmount());
+  }
+});
+
+test("transient periodic failure keeps the binding and retries without overlap", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  let sessionCalls = 0;
+  let bootstrapCalls = 0;
+  let rejectRevalidation;
+  const delayedFailure = new Promise((_, reject) => { rejectRevalidation = reject; });
+  reset({
+    async getReviewerSession() {
+      sessionCalls += 1;
+      if (sessionCalls === 2) return delayedFailure;
+      return principal();
+    },
+    async getReviewerBootstrap() {
+      bootstrapCalls += 1;
+      return bootstrap();
+    },
+  });
+  const rendered = await renderProvider();
+  try {
+    const boundClient = rendered.observed.client;
+    const boundSession = rendered.observed.session;
+    const boundBootstrap = rendered.observed.bootstrap;
+    await TestRenderer.act(async () => {
+      context.mock.timers.tick(60_000);
+      await settle();
+    });
+    assert.equal(sessionCalls, 2);
+
+    await TestRenderer.act(async () => {
+      context.mock.timers.tick(600_000);
+      await settle();
+    });
+    assert.equal(sessionCalls, 2, "no timer request overlaps the pending revalidation");
+
+    await TestRenderer.act(async () => {
+      rejectRevalidation(new TacuaApiError(0, "NETWORK_ERROR", "offline"));
+      await settle();
+    });
+    assert.equal(rendered.observed.status, "connected");
+    assert.strictEqual(rendered.observed.client, boundClient);
+    assert.strictEqual(rendered.observed.session, boundSession);
+    assert.strictEqual(rendered.observed.bootstrap, boundBootstrap);
+
+    await TestRenderer.act(async () => {
+      context.mock.timers.tick(60_000);
+      await settle();
+    });
+    assert.equal(sessionCalls, 3);
+    assert.equal(bootstrapCalls, 2, "the next cadence retries and completes verification");
+    assert.strictEqual(rendered.observed.client, boundClient);
+    assert.strictEqual(rendered.observed.session, boundSession);
+    assert.strictEqual(rendered.observed.bootstrap, boundBootstrap);
   } finally {
     await TestRenderer.act(async () => rendered.renderer.unmount());
   }

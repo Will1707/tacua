@@ -113,15 +113,43 @@ function principalsMatch(
   exchanged: ReviewerPairingExchange,
   session: ReviewerPrincipal,
 ): boolean {
-  return session.auth_kind === "session"
-    && session.reviewer_id === exchanged.reviewer_id
-    && session.session_id === exchanged.session_id
-    && session.device_label === exchanged.device_label
-    && session.client_kind === exchanged.client_kind
-    && session.expires_at === exchanged.expires_at
-    && session.csrf_token === exchanged.csrf_token
-    && session.scopes.length === exchanged.scopes.length
-    && session.scopes.every((scope, index) => scope === exchanged.scopes[index]);
+  return session.auth_kind === "session" && reviewerPrincipalsMatch(exchanged, session);
+}
+
+function reviewerPrincipalsMatch(
+  left: ReviewerPrincipal,
+  right: ReviewerPrincipal,
+): boolean {
+  return left.reviewer_id === right.reviewer_id
+    && left.auth_kind === right.auth_kind
+    && left.session_id === right.session_id
+    && left.device_label === right.device_label
+    && left.client_kind === right.client_kind
+    && left.expires_at === right.expires_at
+    && left.csrf_token === right.csrf_token
+    && left.scopes.length === right.scopes.length
+    && left.scopes.every((scope, index) => scope === right.scopes[index]);
+}
+
+function reviewerBootstrapsMatch(
+  left: ReviewerBootstrap,
+  right: ReviewerBootstrap,
+): boolean {
+  return left.contract_version === right.contract_version
+    && left.reviewer_id === right.reviewer_id
+    && left.builds.length === right.builds.length
+    && left.builds.every((build, index) => {
+      const other = right.builds[index];
+      return other !== undefined
+        && build.build_id === other.build_id
+        && build.application_id === other.application_id
+        && build.bundle_identifier === other.bundle_identifier
+        && build.native_version === other.native_version
+        && build.native_build === other.native_build
+        && build.distribution === other.distribution
+        && build.build_identity_digest === other.build_identity_digest
+        && build.launch_scheme === other.launch_scheme;
+    });
 }
 
 class PairingCleanupError extends Error {
@@ -224,6 +252,7 @@ export function BackendProvider({ children }: PropsWithChildren) {
     readonly settled: Promise<void>;
   } | null>(null);
   const appState = useRef(AppState.currentState);
+  const sessionRevalidationInFlight = useRef(false);
   stateRef.current = state;
 
   const cancelPairingToken = useCallback((
@@ -466,6 +495,70 @@ export function BackendProvider({ children }: PropsWithChildren) {
       });
     }
   }, [cleanPairing]);
+
+  const revalidateConnectedSession = useCallback(async () => {
+    const current = stateRef.current;
+    if (
+      current.status !== "connected"
+      || current.config === null
+      || current.client === null
+      || current.session?.auth_kind !== "session"
+      || current.bootstrap === null
+      || sessionRevalidationInFlight.current
+    ) return;
+
+    const expectedGeneration = generation.current;
+    const expectedClient = current.client;
+    const expectedSession = current.session;
+    const expectedBootstrap = current.bootstrap;
+    const isCurrent = () => mounted.current
+      && generation.current === expectedGeneration
+      && stateRef.current.status === "connected"
+      && stateRef.current.client === expectedClient
+      && stateRef.current.session === expectedSession
+      && stateRef.current.bootstrap === expectedBootstrap;
+
+    sessionRevalidationInFlight.current = true;
+    try {
+      let authoritativeSession: ReviewerPrincipal;
+      try {
+        authoritativeSession = await expectedClient.getReviewerSession();
+      } catch (caught) {
+        if (isCurrent() && isApiError(caught, 401)) await activate();
+        // A timeout, transport failure, or invalid response cannot prove that
+        // the bound session changed. Keep the verified binding and let the
+        // fixed cadence retry; protected backend operations still enforce it.
+        return;
+      }
+      if (!isCurrent()) return;
+      if (!reviewerPrincipalsMatch(expectedSession, authoritativeSession)) {
+        // Never silently replace a route's authentication generation. A full
+        // activation first publishes a content-free loading state, then binds
+        // the newly authoritative principal and bootstrap together.
+        await activate();
+        return;
+      }
+
+      let authoritativeBootstrap: ReviewerBootstrap;
+      try {
+        authoritativeBootstrap = await expectedClient.getReviewerBootstrap();
+      } catch (caught) {
+        if (isCurrent() && isApiError(caught, 401)) await activate();
+        return;
+      }
+      if (!isCurrent()) return;
+      if (
+        authoritativeSession.reviewer_id !== authoritativeBootstrap.reviewer_id
+        || !reviewerBootstrapsMatch(expectedBootstrap, authoritativeBootstrap)
+      ) {
+        await activate();
+      }
+      // Exact validated values deliberately perform no state update. Keeping
+      // these object identities stable preserves route-bound caches and drafts.
+    } finally {
+      sessionRevalidationInFlight.current = false;
+    }
+  }, [activate]);
 
   const finishPairing = useCallback(async (
     activation: number,
@@ -928,6 +1021,7 @@ export function BackendProvider({ children }: PropsWithChildren) {
       explicitPairingCancellationInFlight.current = null;
       canceledPairingTokens.current.clear();
       pendingNativePairingPersistence.current = null;
+      sessionRevalidationInFlight.current = false;
     };
   }, [activate]);
 
@@ -945,13 +1039,23 @@ export function BackendProvider({ children }: PropsWithChildren) {
     // Session expiry is enforced by the backend, whose clock is authoritative.
     // Revalidate on a fixed cadence so a skewed device clock can neither leave
     // a stale principal connected indefinitely nor create a zero-delay loop.
-    // A successful activation installs a fresh one-shot timer, while loading,
-    // capability, and unauthenticated states remain timer-free.
-    const timer = setTimeout(() => {
-      void activate();
-    }, sessionRevalidationIntervalMs);
-    return () => clearTimeout(timer);
-  }, [activate, state.session, state.status]);
+    // Each settled verification installs a fresh one-shot timer, while
+    // loading, capability, and unauthenticated states remain timer-free.
+    let canceled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const schedule = () => {
+      if (canceled) return;
+      timer = setTimeout(() => {
+        timer = null;
+        void revalidateConnectedSession().finally(schedule);
+      }, sessionRevalidationIntervalMs);
+    };
+    schedule();
+    return () => {
+      canceled = true;
+      if (timer !== null) clearTimeout(timer);
+    };
+  }, [revalidateConnectedSession, state.session, state.status]);
 
   const value = useMemo<BackendContextValue>(() => ({
     ...state,
