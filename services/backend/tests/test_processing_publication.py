@@ -2,28 +2,50 @@
 
 from __future__ import annotations
 
+import base64
 import copy
-from datetime import timedelta
+from datetime import datetime, timedelta
+import importlib.util
+import json
 from pathlib import Path
+import sqlite3
 import sys
 import unittest
 from unittest.mock import patch
 
 
 SOURCE = Path(__file__).resolve().parents[1] / "src"
+REPOSITORY = SOURCE.parents[2]
 sys.path.insert(0, str(SOURCE))
 
 from tacua_backend.candidate_domain import TICKET_CONTRACT  # noqa: E402
-from tacua_backend.candidate_store import CandidateStore  # noqa: E402
+from tacua_backend.candidate_store import CandidateStore, CandidateStoreError  # noqa: E402
+from tacua_backend.handoff_export import HANDOFF  # noqa: E402
+from tacua_backend.handoff_store import HandoffStore  # noqa: E402
+from tacua_backend.processing_adapter import (  # noqa: E402
+    COMMAND_CONTRACT,
+    _parse_result,
+    _processing_input,
+)
 from tacua_backend.processing_jobs import (  # noqa: E402
     JOB_STAGES,
+    ProcessingJobClaim,
     ProcessingJobStore,
     ProcessingJobStoreError,
     ProcessingResult,
     PublicationCandidate,
 )
-from tacua_backend.service import ApiError, PilotBackend  # noqa: E402
+from tacua_backend.service import ApiError, ClosingConnection, PilotBackend  # noqa: E402
 from test_backend import BackendHarness, instant  # noqa: E402
+
+
+PROCESSOR_PATH = REPOSITORY / "services" / "processor" / "processor.py"
+PROCESSOR_SPEC = importlib.util.spec_from_file_location(
+    "tacua_grounding_regression_processor", PROCESSOR_PATH
+)
+assert PROCESSOR_SPEC is not None and PROCESSOR_SPEC.loader is not None
+PROCESSOR = importlib.util.module_from_spec(PROCESSOR_SPEC)
+PROCESSOR_SPEC.loader.exec_module(PROCESSOR)
 
 
 class SyntheticEngine:
@@ -92,6 +114,86 @@ class ProcessingPublicationTests(BackendHarness):
             summary="Synthetic local processor found candidate issues.",
             candidates=tuple(bundles),
         )
+
+    def marked_processor_result(
+        self,
+        claim: dict,
+        *,
+        transcript: str | None = (
+            "The save button uses the wrong copy and should say Save profile."
+        ),
+    ) -> ProcessingResult:
+        job = claim["job"]
+        lease = claim["lease"]
+        keyframe = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+            "YAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+        )
+        created_at = instant(job["requested_at"])
+
+        class ProcessorClock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return created_at if tz is None else created_at.astimezone(tz)
+
+        processing_claim = ProcessingJobClaim(
+            job=copy.deepcopy(job),
+            worker_id=lease["worker_id"],
+            stage_name=lease["stage_name"],
+            lease_token=lease["lease_token"],
+            lease_expires_at=lease["lease_expires_at"],
+        )
+        with _processing_input(
+            self.backend,
+            processing_claim,
+            command_contract_version=COMMAND_CONTRACT,
+        ) as snapshot:
+            source = snapshot.document
+            segment_reference = source["capture"]["segments"][0]
+            segment = {
+                "content_digest": segment_reference["content_digest"],
+                "content_type": segment_reference["content_type"],
+                "end_ms": 60_000,
+                "path": Path(segment_reference["read_only_path"]),
+                "segment_id": segment_reference["segment_id"],
+                "sequence": segment_reference["sequence"],
+                "size_bytes": segment_reference["size_bytes"],
+                "start_ms": 0,
+            }
+            with (
+                patch.object(PROCESSOR, "capture_segments", return_value=[segment]),
+                patch.object(PROCESSOR, "extract_keyframe", return_value=keyframe),
+                patch.object(
+                    PROCESSOR,
+                    "extract_narration",
+                    return_value=(
+                        transcript,
+                        (5_000, 40_000) if transcript is not None else None,
+                        [segment] if transcript is not None else [],
+                    ),
+                ),
+                patch.object(PROCESSOR, "datetime", ProcessorClock),
+            ):
+                processor_document, preview_bodies = PROCESSOR.generate_tickets(
+                    source,
+                    ffmpeg=Path("/unused/ffmpeg"),
+                    ffprobe=Path("/unused/ffprobe"),
+                    whisper_cli=Path("/unused/whisper-cli"),
+                    model=Path("/unused/model.bin"),
+                    model_id="whisper-base-en",
+                    model_digest="sha256:" + "a" * 64,
+                )
+            self.assertEqual("terminal", processor_document["disposition"])
+            terminal = processor_document["result"]
+            self.assertEqual("candidates_created", terminal["disposition"])
+            for name, body in preview_bodies:
+                (snapshot.output_directory / name).write_bytes(body)
+            parsed = _parse_result(
+                PROCESSOR.canonical_bytes(processor_document), snapshot
+            )
+        self.assertIsInstance(parsed, ProcessingResult)
+        assert isinstance(parsed, ProcessingResult)
+        return parsed
 
     def test_two_candidates_publish_with_terminal_job_and_lease_in_one_commit(self) -> None:
         lifecycle, claim = self.advance_to_final_stage()
@@ -184,6 +286,317 @@ class ProcessingPublicationTests(BackendHarness):
         )
         restarted = PilotBackend(self.config, self.admin_secret, clock=self.clock)
         self.assertEqual(succeeded, restarted.get_job(claim["job"]["job_id"]))
+
+    def test_marked_processor_candidate_approves_and_exports_without_content_edit(self) -> None:
+        _lifecycle, claim = self.advance_to_final_stage()
+        result = self.marked_processor_result(claim)
+        generated_output = result.candidates[0]
+        generated = generated_output.candidate
+        claims_by_kind = {
+            item["kind"]: item for item in generated["content"]["claims"]
+        }
+        self.assertEqual("direct", claims_by_kind["observed"]["support"])
+        self.assertEqual("inferred", claims_by_kind["hypothesis"]["support"])
+
+        succeeded = self.backend.publish_processing_result(
+            claim["job"]["job_id"], claim["lease"]["lease_token"], result
+        )
+        self.assertEqual("succeeded", succeeded["status"])
+        self.assertEqual(generated, self.backend.get_candidate(generated["candidate_id"]))
+
+        clarification = generated["content"]["clarifications"][0]
+        transcript_choice = next(
+            choice
+            for choice in clarification["choices"]
+            if choice["label"] == "Use transcribed intent"
+        )
+        resolved = json.loads(
+            self.backend.transition_candidate(
+                generated["candidate_id"],
+                if_match=generated["candidate_digest"],
+                idempotency_key="candidate:processor-grounding:resolve",
+                body=self.candidate_transition_body(
+                    generated,
+                    "resolve_clarification",
+                    clarification_id=clarification["clarification_id"],
+                    selected_choice_id=transcript_choice["choice_id"],
+                ),
+            ).body
+        )
+        self.assertEqual("ready_for_review", resolved["state"])
+        self.clock.set("2026-07-21T10:02:08Z")
+        approval_body = self.candidate_transition_body(resolved, "approve")
+        approval_key = "candidate:processor-grounding:approve"
+        original_handoff_put = HandoffStore.put
+        handoff_put_snapshots: list[tuple[int, int]] = []
+        pre_failure_snapshots: list[tuple[int, int, int, int, str]] = []
+
+        def observe_successful_handoff_put(store, candidate, artifacts):
+            original_handoff_put(store, candidate, artifacts)
+            handoff_put_snapshots.append(
+                (
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM approved_handoffs WHERE candidate_id = ?",
+                        (candidate["candidate_id"],),
+                    ).fetchone()[0],
+                    candidate["candidate_version"],
+                )
+            )
+
+        class FailAfterApprovalWritesConnection(ClosingConnection):
+            def execute(self, sql, parameters=()):  # type: ignore[no-untyped-def]
+                cursor = super().execute(sql, parameters)
+                if (
+                    "INSERT INTO candidate_operations" in sql
+                    and len(parameters) > 1
+                    and parameters[1] == approval_key
+                ):
+                    head = super().execute(
+                        "SELECT candidate_version, state FROM candidate_heads "
+                        "WHERE candidate_id = ?",
+                        (resolved["candidate_id"],),
+                    ).fetchone()
+                    pre_failure_snapshots.append(
+                        (
+                            super().execute(
+                                "SELECT COUNT(*) FROM approved_handoffs "
+                                "WHERE candidate_id = ?",
+                                (resolved["candidate_id"],),
+                            ).fetchone()[0],
+                            super().execute(
+                                "SELECT COUNT(*) FROM candidate_versions WHERE candidate_id = ?",
+                                (resolved["candidate_id"],),
+                            ).fetchone()[0],
+                            super().execute(
+                                "SELECT COUNT(*) FROM candidate_operations "
+                                "WHERE candidate_id = ?",
+                                (resolved["candidate_id"],),
+                            ).fetchone()[0],
+                            head["candidate_version"],
+                            head["state"],
+                        )
+                    )
+                    raise CandidateStoreError(
+                        500,
+                        "SYNTHETIC_POST_HANDOFF_FAILURE",
+                        "synthetic failure after all approval writes",
+                    )
+                return cursor
+
+        def failing_connect():
+            connection = sqlite3.connect(
+                self.backend.db_path,
+                timeout=10,
+                factory=FailAfterApprovalWritesConnection,
+            )
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 10000")
+            connection.execute("PRAGMA secure_delete = ON")
+            return connection
+
+        with (
+            patch.object(HandoffStore, "put", new=observe_successful_handoff_put),
+            patch.object(self.backend, "_connect", side_effect=failing_connect),
+        ):
+            self.assert_api_error(
+                500,
+                "SYNTHETIC_POST_HANDOFF_FAILURE",
+                lambda: self.backend.transition_candidate(
+                    resolved["candidate_id"],
+                    if_match=resolved["candidate_digest"],
+                    idempotency_key=approval_key,
+                    body=approval_body,
+                ),
+            )
+
+        self.assertEqual([(1, 3)], handoff_put_snapshots)
+        self.assertEqual([(1, 3, 2, 3, "approved")], pre_failure_snapshots)
+        self.assertEqual(resolved, self.backend.get_candidate(resolved["candidate_id"]))
+        with self.backend._connect() as connection:
+            head = connection.execute(
+                "SELECT candidate_version, candidate_digest, state FROM candidate_heads "
+                "WHERE candidate_id = ?",
+                (resolved["candidate_id"],),
+            ).fetchone()
+            self.assertEqual(
+                (2, resolved["candidate_digest"], "ready_for_review"),
+                tuple(head),
+            )
+            self.assertEqual(
+                (2, 1, 0),
+                (
+                    connection.execute(
+                        "SELECT COUNT(*) FROM candidate_versions WHERE candidate_id = ?",
+                        (resolved["candidate_id"],),
+                    ).fetchone()[0],
+                    connection.execute(
+                        "SELECT COUNT(*) FROM candidate_operations WHERE candidate_id = ?",
+                        (resolved["candidate_id"],),
+                    ).fetchone()[0],
+                    connection.execute(
+                        "SELECT COUNT(*) FROM approved_handoffs WHERE candidate_id = ?",
+                        (resolved["candidate_id"],),
+                    ).fetchone()[0],
+                ),
+            )
+
+        approved = json.loads(
+            self.backend.transition_candidate(
+                resolved["candidate_id"],
+                if_match=resolved["candidate_digest"],
+                idempotency_key=approval_key,
+                body=approval_body,
+            ).body
+        )
+        versions = [
+            self.backend.get_candidate(approved["candidate_id"], version)
+            for version in (1, 2, 3)
+        ]
+        self.assertEqual("approved", approved["state"])
+        self.assertEqual(
+            ["generated", "clarification_answered", "approved"],
+            [version["lineage"]["operation"] for version in versions],
+        )
+        self.assertEqual(
+            versions[1]["candidate_content_digest"],
+            versions[2]["candidate_content_digest"],
+        )
+        for field in set(versions[0]["content"]) - {"clarifications"}:
+            self.assertEqual(
+                versions[0]["content"][field], versions[1]["content"][field]
+            )
+
+        stored = self.backend.get_candidate_handoff(
+            approved["candidate_id"], approved["candidate_version"]
+        )
+        handoff = json.loads(stored.json_bytes)
+        self.assertEqual("approved", handoff["ticket"]["state"])
+        self.assertEqual(
+            [
+                {
+                    "clarification_id": clarification["clarification_id"],
+                    "impact": "blocking",
+                    "question": clarification["question"],
+                    "resolution": "Use transcribed intent",
+                    "status": "resolved",
+                }
+            ],
+            handoff["ticket"]["clarifications"],
+        )
+        self.assertEqual(
+            "Implement the outcome of the expected-behavior clarification.",
+            handoff["ticket"]["reproduction"]["expected_result"],
+        )
+        semantic_export = (
+            stored.json_bytes.decode("utf-8")
+            + "\n"
+            + stored.markdown_bytes.decode("utf-8")
+        ).lower()
+        self.assertNotIn("unconfirmed", semantic_export)
+        self.assertNotIn("unresolved", semantic_export)
+        self.assertNotIn("unapproved", semantic_export)
+        self.assertEqual(
+            TICKET_CONTRACT.canonical_json(approved),
+            handoff["source_candidate"]["canonical_json"],
+        )
+        self.assertEqual(stored.json_bytes, HANDOFF.canonical_json_artifact(handoff))
+        HANDOFF.validate_handoff(handoff, executable=False)
+        HANDOFF.validate_markdown(handoff, stored.markdown_bytes.decode("utf-8"))
+
+    def test_marked_processor_without_transcript_resolves_note_and_exports(self) -> None:
+        _lifecycle, claim = self.advance_to_final_stage()
+        result = self.marked_processor_result(claim, transcript=None)
+        generated = result.candidates[0].candidate
+        self.assertEqual(
+            {"expected", "observed"},
+            {item["kind"] for item in generated["content"]["claims"]},
+        )
+        clarification = generated["content"]["clarifications"][0]
+        self.assertEqual(
+            ["Add expected result", "Dismiss finding"],
+            [choice["label"] for choice in clarification["choices"]],
+        )
+
+        succeeded = self.backend.publish_processing_result(
+            claim["job"]["job_id"], claim["lease"]["lease_token"], result
+        )
+        self.assertEqual("succeeded", succeeded["status"])
+        written_choice = next(
+            choice
+            for choice in clarification["choices"]
+            if choice["label"] == "Add expected result"
+        )
+        resolution_note = "The captured screen should show Save profile."
+        resolved = json.loads(
+            self.backend.transition_candidate(
+                generated["candidate_id"],
+                if_match=generated["candidate_digest"],
+                idempotency_key="candidate:processor-no-transcript:resolve",
+                body=self.candidate_transition_body(
+                    generated,
+                    "resolve_clarification",
+                    clarification_id=clarification["clarification_id"],
+                    selected_choice_id=written_choice["choice_id"],
+                    resolution_note=resolution_note,
+                ),
+            ).body
+        )
+        self.assertEqual("ready_for_review", resolved["state"])
+        approved = json.loads(
+            self.backend.transition_candidate(
+                resolved["candidate_id"],
+                if_match=resolved["candidate_digest"],
+                idempotency_key="candidate:processor-no-transcript:approve",
+                body=self.candidate_transition_body(resolved, "approve"),
+            ).body
+        )
+        self.assertEqual("approved", approved["state"])
+        self.assertEqual(
+            ["generated", "clarification_answered", "approved"],
+            [
+                self.backend.get_candidate(approved["candidate_id"], version)[
+                    "lineage"
+                ]["operation"]
+                for version in (1, 2, 3)
+            ],
+        )
+
+        stored = self.backend.get_candidate_handoff(
+            approved["candidate_id"], approved["candidate_version"]
+        )
+        handoff = json.loads(stored.json_bytes)
+        self.assertEqual(
+            [
+                {
+                    "clarification_id": clarification["clarification_id"],
+                    "impact": "blocking",
+                    "question": clarification["question"],
+                    "resolution": resolution_note,
+                    "status": "resolved",
+                }
+            ],
+            handoff["ticket"]["clarifications"],
+        )
+        semantic_export = (
+            stored.json_bytes.decode("utf-8")
+            + "\n"
+            + stored.markdown_bytes.decode("utf-8")
+        ).lower()
+        for stale_text in (
+            "unconfirmed",
+            "unresolved",
+            "unapproved",
+            "use transcribed intent",
+        ):
+            self.assertNotIn(stale_text, semantic_export)
+        self.assertEqual(
+            TICKET_CONTRACT.canonical_json(approved),
+            handoff["source_candidate"]["canonical_json"],
+        )
+        self.assertEqual(stored.json_bytes, HANDOFF.canonical_json_artifact(handoff))
+        HANDOFF.validate_handoff(handoff, executable=False)
+        HANDOFF.validate_markdown(handoff, stored.markdown_bytes.decode("utf-8"))
 
     def test_future_candidate_timestamps_fail_before_staging_and_remain_retryable(self) -> None:
         lifecycle, claim = self.advance_to_final_stage()

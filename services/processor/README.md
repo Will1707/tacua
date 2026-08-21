@@ -86,12 +86,16 @@ seconds suppress automatic transcription; the screenshot still becomes a draft
 candidate and the reviewer is asked to describe the expected result. A known
 app-video gap at the exact mark fails closed and publishes nothing.
 
-Whisper output is treated as low-confidence, unconfirmed derived text. Only
+Whisper output is treated as a low-confidence derived hypothesis. Only
 timestamped utterances near the mark are retained. Ticket evidence cites the
 digest-bound retained QuickTime source clips—not an ephemeral transcript file—
 and records the selected model ID plus pinned `whisper.cpp` revision as
-uncertainty. The processor independently hashes models up to 1 GiB so the exact
-model digest survives with that provenance. Human confirmation remains blocking.
+uncertainty. The application screen in the extracted keyframe is the direct
+observed claim; marker/frame timing remains evidence provenance rather than a
+claim inferred from PNG bytes. Any retained transcript is a separate
+low-confidence inferred hypothesis grounded in those source clips. The processor
+independently hashes models up to 1 GiB so the exact model digest survives with
+that provenance. Human selection of the intended behavior remains blocking.
 
 One run accepts at most 12 issue marks, at most 2 MiB per screenshot, and at most
 24 MiB of screenshot bytes in total. PNG extraction retries at narrower widths

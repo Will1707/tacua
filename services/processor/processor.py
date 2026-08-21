@@ -1024,7 +1024,8 @@ def clean_title(transcript: str | None, ordinal: int) -> str:
         first = re.split(r"(?<=[.!?])\s+", transcript, maxsplit=1)[0]
         first = first.strip(" \t\r\n-:;,.!?")
         if first:
-            return f"Marked QA finding: {first[:MAX_TITLE_CODEPOINTS - 19]}"
+            prefix = "Marked QA finding (narration hypothesis): "
+            return prefix + first[: MAX_TITLE_CODEPOINTS - len(prefix)]
     return f"Marked QA finding {ordinal}"
 
 
@@ -1159,6 +1160,7 @@ def build_candidate_bundle(
     items = [frame_item]
     evidence_ids = [frame_id]
     cited_ids = [frame_id]
+    narration_evidence_ids: list[str] = []
     if transcript:
         require(narration_sources, "transcript has no retained source clip")
         for narration_source in narration_sources:
@@ -1174,8 +1176,8 @@ def build_candidate_bundle(
                     evidence_id=clip_id,
                     evidence_type="media.clip",
                     description=(
-                        "Retained microphone-bearing capture segment used for the unconfirmed "
-                        "offline transcription around this issue mark."
+                        "Retained microphone-bearing capture segment used for the offline "
+                        "transcription hypothesis around this issue mark."
                     ),
                     content=None,
                     content_type=narration_source["content_type"],
@@ -1188,6 +1190,7 @@ def build_candidate_bundle(
             )
             evidence_ids.append(clip_id)
             cited_ids.append(clip_id)
+            narration_evidence_ids.append(clip_id)
     manifest = seal_evidence_manifest(
         {
             "contract_version": EVIDENCE_MANIFEST_CONTRACT,
@@ -1201,19 +1204,28 @@ def build_candidate_bundle(
         }
     )
     evidence_ids = sorted(evidence_ids)
-    narrative = (
-        (
-            "An explicit issue mark was recorded at the attached frame. "
-            f'Unconfirmed offline microphone transcription: "{transcript}"'
-        )
+    observed_statement = "The attached keyframe shows the captured application screen."
+    transcript_hypothesis = (
+        f'Offline microphone transcription hypothesis: "{transcript}"'
         if transcript
-        else (
-            "An explicit issue mark was recorded at the attached frame, but no trustworthy "
-            "microphone transcription was available."
-        )
+        else None
+    )
+    narrative = " ".join(
+        statement
+        for statement in (observed_statement, transcript_hypothesis)
+        if statement is not None
     )
     observed_claim_id = identifier("claim", candidate_id, "observed")
+    transcript_claim_id = (
+        identifier("claim", candidate_id, "transcript_hypothesis")
+        if transcript
+        else None
+    )
     expected_claim_id = identifier("claim", candidate_id, "expected")
+    narrative_claim_ids = [
+        observed_claim_id,
+        *([transcript_claim_id] if transcript_claim_id is not None else []),
+    ]
     candidate = {
         "approval": None,
         "build_id": binding["build_id"],
@@ -1228,38 +1240,53 @@ def build_candidate_bundle(
                 {
                     "claim_refs": [expected_claim_id],
                     "criterion": (
-                        "The reviewer-confirmed expected behavior is implemented, and the marked "
-                        "flow no longer reproduces the marked finding."
+                        "The implemented behavior matches the outcome selected through the "
+                        "expected-behavior clarification."
                     ),
                     "criterion_id": identifier("criterion", candidate_id, "confirmed"),
                     "evidence_refs": cited_ids,
                     "verification": (
                         "Repeat the captured QA flow in a new build and compare the result with "
-                        "the confirmed expectation and attached frame."
+                        "the selected clarification choice and attached keyframe."
                     ),
                 }
             ],
             "actual_behavior": {
                 "claim_refs": [observed_claim_id],
-                "evidence_refs": cited_ids,
-                "text": narrative,
+                "evidence_refs": [frame_id],
+                "text": observed_statement,
             },
             "claims": [
                 {
                     "claim_id": observed_claim_id,
-                    "confidence": "low",
-                    "evidence_refs": cited_ids,
+                    "confidence": "high",
+                    "evidence_refs": [frame_id],
                     "kind": "observed",
-                    "statement": narrative,
-                    "support": "inferred",
+                    "statement": observed_statement,
+                    "support": "direct",
                 },
+                *(
+                    [
+                        {
+                            "claim_id": transcript_claim_id,
+                            "confidence": "low",
+                            "evidence_refs": narration_evidence_ids,
+                            "kind": "hypothesis",
+                            "statement": transcript_hypothesis,
+                            "support": "inferred",
+                        }
+                    ]
+                    if transcript_claim_id is not None
+                    and transcript_hypothesis is not None
+                    else []
+                ),
                 {
                     "claim_id": expected_claim_id,
                     "confidence": "unknown",
                     "evidence_refs": [],
                     "kind": "expected",
                     "statement": (
-                        "The intended corrected behavior has not yet been confirmed by a human."
+                        "The expected-behavior clarification governs the intended behavior."
                     ),
                     "support": "unknown",
                 },
@@ -1267,24 +1294,33 @@ def build_candidate_bundle(
             "clarifications": [
                 {
                     "choices": [
-                        {
-                            "choice_id": identifier("choice", candidate_id, "transcript"),
-                            "consequence": (
-                                "The implementation ticket will use the unconfirmed offline "
-                                "transcription as its intended change only after reviewer confirmation."
-                            ),
-                            "description": (
-                                "Confirm the offline transcription as the expected behavior."
-                            ),
-                            "evidence_refs": cited_ids,
-                            "label": "Use transcribed intent",
-                            "presentation": {
-                                "evidence_ref": frame_id,
-                                "kind": "evidence_thumbnail",
-                                "value": None,
-                            },
-                            "requires_note": False,
-                        },
+                        *(
+                            [
+                                {
+                                    "choice_id": identifier(
+                                        "choice", candidate_id, "transcript"
+                                    ),
+                                    "consequence": (
+                                        "The offline transcription hypothesis is the intended "
+                                        "implementation outcome when this choice is selected."
+                                    ),
+                                    "description": (
+                                        "Treat the offline transcription hypothesis as the "
+                                        "expected behavior."
+                                    ),
+                                    "evidence_refs": cited_ids,
+                                    "label": "Use transcribed intent",
+                                    "presentation": {
+                                        "evidence_ref": frame_id,
+                                        "kind": "evidence_thumbnail",
+                                        "value": None,
+                                    },
+                                    "requires_note": False,
+                                }
+                            ]
+                            if transcript_hypothesis is not None
+                            else []
+                        ),
                         {
                             "choice_id": identifier("choice", candidate_id, "describe"),
                             "consequence": (
@@ -1327,7 +1363,7 @@ def build_candidate_bundle(
             "expected_behavior": {
                 "claim_refs": [expected_claim_id],
                 "evidence_refs": cited_ids,
-                "text": "Confirm the intended corrected behavior before implementation.",
+                "text": "Implement the outcome of the expected-behavior clarification.",
             },
             "priority": "P2",
             "reproduction": {
@@ -1344,13 +1380,13 @@ def build_candidate_bundle(
                 "steps": [
                     {
                         "action": (
-                            "Follow the SDK route and interaction timeline immediately before the "
-                            "issue mark, then inspect the attached screen."
+                            "Open the attached keyframe and inspect the captured application "
+                            "screen."
                         ),
-                        "actual_result": narrative,
+                        "actual_result": observed_statement,
                         "claim_refs": [observed_claim_id],
-                        "confidence": "low",
-                        "evidence_refs": cited_ids,
+                        "confidence": "high",
+                        "evidence_refs": [frame_id],
                         "expected_result": None,
                         "step_id": identifier("step", candidate_id, "inspect"),
                     }
@@ -1358,15 +1394,16 @@ def build_candidate_bundle(
             },
             "scope": {
                 "in_scope": [
-                    "Investigate and correct the reviewer-confirmed behavior at this marked point."
+                    "Investigate the captured application screen and implement the outcome of "
+                    "the expected-behavior clarification."
                 ],
                 "out_of_scope": [
                     "Do not infer repository, backend, Sentry, or PostHog evidence that was not collected.",
-                    "Do not deploy or merge from this unapproved candidate.",
+                    "Deployment and merge authorization are outside this ticket's scope.",
                 ],
             },
             "summary": {
-                "claim_refs": [observed_claim_id],
+                "claim_refs": narrative_claim_ids,
                 "evidence_refs": cited_ids,
                 "text": narrative,
             },
@@ -1377,8 +1414,8 @@ def build_candidate_bundle(
                         "evidence_refs": cited_ids,
                         "impact": "blocking",
                         "statement": (
-                            "Expected behavior is intentionally unresolved until a human confirms "
-                            "the transcription or supplies a precise result."
+                            "The intended behavior is governed by the blocking expected-behavior "
+                            "clarification."
                         ),
                         "uncertainty_id": identifier("uncertainty", candidate_id, "expected"),
                     },
@@ -1388,9 +1425,9 @@ def build_candidate_bundle(
                                 "evidence_refs": sorted(cited_ids[1:]),
                                 "impact": "non_blocking",
                                 "statement": (
-                                    "The microphone wording is an unconfirmed offline transcription "
+                                    "The microphone wording is an offline transcription hypothesis "
                                     f"from model {model_id} ({model_digest}) using whisper.cpp revision "
-                                    f"{WHISPER_CPP_REV[:12]}; verify it against the retained clip."
+                                    f"{WHISPER_CPP_REV[:12]}; compare it with the retained clip."
                                 ),
                                 "uncertainty_id": identifier(
                                     "uncertainty", candidate_id, "transcription"
