@@ -317,30 +317,19 @@ test("web foreground revalidates a replaced effective principal", async () => {
   }
 });
 
-test("web pairing expiry revalidates at the exact expiry time", async (context) => {
-  const now = Date.parse("2026-08-21T12:00:00Z");
+test("session revalidation uses a fixed cadence when the device clock trails the backend", async (context) => {
+  const now = Date.parse("2020-08-21T12:00:00Z");
   context.mock.timers.enable({ apis: ["Date", "setTimeout"], now });
   let sessionCalls = 0;
   reset({
     async getReviewerSession() {
       sessionCalls += 1;
-      if (sessionCalls === 1) {
-        return principal({ expires_at: "2026-08-21T12:00:01Z" });
-      }
-      return principal({
-        auth_kind: "tailscale_capability",
-        session_id: null,
-        device_label: null,
-        client_kind: "tailscale_web",
-        expires_at: null,
-        csrf_token: "expiry-capability-csrf-token",
-      });
+      return principal({ expires_at: "2026-08-21T12:00:00Z" });
     },
   });
   const rendered = await renderProvider();
   try {
-    const pairedClient = rendered.observed.client;
-    context.mock.timers.tick(999);
+    context.mock.timers.tick(59_999);
     await settle();
     assert.equal(sessionCalls, 1);
 
@@ -351,28 +340,30 @@ test("web pairing expiry revalidates at the exact expiry time", async (context) 
 
     assert.equal(sessionCalls, 2);
     assert.equal(rendered.observed.status, "connected");
-    assert.equal(rendered.observed.session.auth_kind, "tailscale_capability");
-    assert.notStrictEqual(rendered.observed.client, pairedClient);
-    assert.equal(constructedConfigs.at(-1).csrfToken, "expiry-capability-csrf-token");
+    assert.equal(rendered.observed.session.auth_kind, "session");
   } finally {
     await TestRenderer.act(async () => rendered.renderer.unmount());
   }
 });
 
-test("web pairing expiry cannot create a zero-delay loop when backend time lags", async (context) => {
-  const now = Date.parse("2026-08-21T12:00:00Z");
+test("session revalidation repeats on the fixed cadence when the device clock leads the backend", async (context) => {
+  const now = Date.parse("2030-08-21T12:00:00Z");
   context.mock.timers.enable({ apis: ["Date", "setTimeout"], now });
   let sessionCalls = 0;
   reset({
     async getReviewerSession() {
       sessionCalls += 1;
-      return principal({ expires_at: "2026-08-21T12:00:01Z" });
+      return principal({ expires_at: "2026-08-21T12:00:00Z" });
     },
   });
   const rendered = await renderProvider();
   try {
+    context.mock.timers.tick(59_999);
+    await settle();
+    assert.equal(sessionCalls, 1, "a future device clock must not trigger an immediate loop");
+
     await TestRenderer.act(async () => {
-      context.mock.timers.tick(1_000);
+      context.mock.timers.tick(1);
       await settle();
     });
     assert.equal(sessionCalls, 2);
@@ -381,9 +372,38 @@ test("web pairing expiry cannot create a zero-delay loop when backend time lags"
       context.mock.timers.tick(60_000);
       await settle();
     });
-    assert.equal(sessionCalls, 2);
+    assert.equal(sessionCalls, 3, "the same live session must continue to be revalidated");
     assert.equal(rendered.observed.status, "connected");
     assert.equal(rendered.observed.session.auth_kind, "session");
+  } finally {
+    await TestRenderer.act(async () => rendered.renderer.unmount());
+  }
+});
+
+test("capability principals do not start periodic session revalidation", async (context) => {
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  let sessionCalls = 0;
+  reset({
+    async getReviewerSession() {
+      sessionCalls += 1;
+      return principal({
+        auth_kind: "tailscale_capability",
+        session_id: null,
+        device_label: null,
+        client_kind: "tailscale_web",
+        expires_at: null,
+      });
+    },
+  });
+  const rendered = await renderProvider();
+  try {
+    await TestRenderer.act(async () => {
+      context.mock.timers.tick(600_000);
+      await settle();
+    });
+    assert.equal(sessionCalls, 1);
+    assert.equal(rendered.observed.status, "connected");
+    assert.equal(rendered.observed.session.auth_kind, "tailscale_capability");
   } finally {
     await TestRenderer.act(async () => rendered.renderer.unmount());
   }

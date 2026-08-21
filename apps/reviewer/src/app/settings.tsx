@@ -53,6 +53,13 @@ export default function SettingsRoute() {
   const endpointChanged = config === null || baseUrl.trim().replace(/\/$/, "") !== config.baseUrl;
   const endpointReady = baseUrl.trim().length > 0;
   const pairingAvailable = status === "pairing_required" && !endpointChanged;
+  const capabilityEndpointReplacementAvailable = status === "connected"
+    && session?.auth_kind === "tailscale_capability";
+  const endpointEditable = status !== "loading"
+    && status !== "pairing_pending"
+    && (status !== "connected" || capabilityEndpointReplacementAvailable);
+  const endpointActionAvailable = status !== "pairing_pending"
+    && (status !== "connected" || capabilityEndpointReplacementAvailable);
 
   return (
     <ScrollView
@@ -75,7 +82,7 @@ export default function SettingsRoute() {
             accessibilityLabel="Backend URL"
             autoCapitalize="none"
             autoCorrect={false}
-            editable={status !== "loading" && status !== "pairing_pending" && status !== "connected"}
+            editable={endpointEditable}
             keyboardType="url"
             onChangeText={setBaseUrl}
             placeholder="https://mini-pc.example.ts.net"
@@ -94,7 +101,7 @@ export default function SettingsRoute() {
               fontSize: 16,
             }}
           />
-          {status !== "connected" && status !== "pairing_pending" ? (
+          {endpointActionAvailable ? (
             <ActionButton
               disabled={!endpointReady || !endpointChanged || status === "loading"}
               label={config === null ? "Use this endpoint" : "Update endpoint"}
@@ -164,7 +171,7 @@ export default function SettingsRoute() {
           <ConnectionValue label="SDK-enabled builds" value={String(bootstrap.builds.length)} />
           {session.auth_kind === "tailscale_capability" ? (
             <Text selectable style={{ color: colors.secondaryLabel, fontSize: 13, lineHeight: 19 }}>
-              This capability is managed by your tailnet policy and cannot be revoked from Tacua. Remove the app capability from that policy to disconnect access.
+              This capability is managed by your tailnet policy and cannot be revoked from Tacua. Remove the app capability from that policy to disconnect access.{Platform.OS === "web" ? "" : " To use another backend, update the endpoint above."}
             </Text>
           ) : (
             <ActionButton

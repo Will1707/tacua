@@ -188,7 +188,7 @@ function waitForPairingPoll(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 1_500));
 }
 
-const maximumSessionRevalidationDelay = 2_147_000_000;
+const sessionRevalidationIntervalMs = 60_000;
 
 export const BackendContext = createContext<BackendContextValue | null>(null);
 
@@ -224,7 +224,6 @@ export function BackendProvider({ children }: PropsWithChildren) {
     readonly settled: Promise<void>;
   } | null>(null);
   const appState = useRef(AppState.currentState);
-  const expiryRevalidatedSession = useRef<string | null>(null);
   stateRef.current = state;
 
   const cancelPairingToken = useCallback((
@@ -942,38 +941,16 @@ export function BackendProvider({ children }: PropsWithChildren) {
   }, [activate]);
 
   useEffect(() => {
-    if (state.status !== "connected") return;
-    if (state.session?.auth_kind !== "session" || state.session.expires_at === null) {
-      expiryRevalidatedSession.current = null;
-      return;
-    }
-    const sessionExpiryKey = `${state.session.session_id}:${state.session.expires_at}`;
-    if (expiryRevalidatedSession.current === sessionExpiryKey) return;
-    const expiresAt = Date.parse(state.session.expires_at);
-    if (!Number.isFinite(expiresAt)) return;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    let canceled = false;
-    const schedule = () => {
-      if (canceled) return;
-      const remaining = expiresAt - Date.now();
-      timer = setTimeout(() => {
-        timer = null;
-        if (expiresAt > Date.now()) schedule();
-        else {
-          // If the browser clock is ahead of the backend, the revalidation may
-          // still return this session. Mark this exact immutable session/expiry
-          // pair before activating so that result cannot create a zero-delay
-          // request loop. Foreground and explicit refresh remain available.
-          expiryRevalidatedSession.current = sessionExpiryKey;
-          void activate();
-        }
-      }, Math.max(0, Math.min(remaining, maximumSessionRevalidationDelay)));
-    };
-    schedule();
-    return () => {
-      canceled = true;
-      if (timer !== null) clearTimeout(timer);
-    };
+    if (state.status !== "connected" || state.session?.auth_kind !== "session") return;
+    // Session expiry is enforced by the backend, whose clock is authoritative.
+    // Revalidate on a fixed cadence so a skewed device clock can neither leave
+    // a stale principal connected indefinitely nor create a zero-delay loop.
+    // A successful activation installs a fresh one-shot timer, while loading,
+    // capability, and unauthenticated states remain timer-free.
+    const timer = setTimeout(() => {
+      void activate();
+    }, sessionRevalidationIntervalMs);
+    return () => clearTimeout(timer);
   }, [activate, state.session, state.status]);
 
   const value = useMemo<BackendContextValue>(() => ({
