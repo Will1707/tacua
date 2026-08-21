@@ -296,6 +296,25 @@ async function createFixtureServer(temporaryDirectory) {
           sendCanonicalJson(response, 200, { status: "verified" });
           return;
         }
+        if (pathname === "/v1/admin/reviewer-bootstrap") {
+          sendCanonicalJson(response, 200, {
+            contract_version: "tacua.reviewer-bootstrap@1.0.0",
+            reviewer_id: reviewerId,
+            builds: [
+              {
+                build_id: "build_browser_smoke",
+                application_id: "application_browser_smoke",
+                bundle_identifier: "com.example.tacua.browser-smoke",
+                native_version: "1.0.0",
+                native_build: "1",
+                distribution: "local",
+                build_identity_digest: `sha256:${"b".repeat(64)}`,
+                launch_scheme: targetScheme,
+              },
+            ],
+          });
+          return;
+        }
         if (pathname === "/v1/admin/sessions") {
           sendCanonicalJson(response, 200, {
             next_cursor: null,
