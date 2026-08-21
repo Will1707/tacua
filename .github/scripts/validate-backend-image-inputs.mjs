@@ -104,19 +104,27 @@ const expectedInputPaths = new Set([
   "services/backend/src/tacua_backend/processing_worker.py",
   "services/backend/src/tacua_backend/service.py",
 ]);
+const expectedInputDirectories = new Set([""]);
+for (const inputPath of expectedInputPaths) {
+  let directory = path.posix.dirname(inputPath);
+  while (directory !== ".") {
+    expectedInputDirectories.add(directory);
+    directory = path.posix.dirname(directory);
+  }
+}
 const expectedCopyBodies = [
-  "--chown=root:root LICENSE NOTICE /app/",
-  "--chown=root:root services/backend/src/tacua_backend/*.py /app/services/backend/src/tacua_backend/",
+  "--chown=root:root --chmod=0444 LICENSE NOTICE /app/",
+  "--chown=root:root --chmod=0444 services/backend/src/tacua_backend/*.py /app/services/backend/src/tacua_backend/",
   "--chown=root:root --chmod=0555 services/backend/scripts/run_compose_isolated_processing.py services/backend/scripts/run_isolated_processor.py /app/services/backend/scripts/",
-  "--chown=root:root services/backend/config.example.json services/backend/config.template.example.json /app/services/backend/",
-  "--chown=root:root contracts/sdk-backend-protocol/src/*.py /app/contracts/sdk-backend-protocol/src/",
-  "--chown=root:root contracts/sdk-backend-protocol/schemas/*.schema.json /app/contracts/sdk-backend-protocol/schemas/",
-  "--chown=root:root contracts/runtime/src/*.py /app/contracts/runtime/src/",
-  "--chown=root:root contracts/runtime/schemas/*.schema.json /app/contracts/runtime/schemas/",
-  "--chown=root:root contracts/ticket-candidate/src/*.py /app/contracts/ticket-candidate/src/",
-  "--chown=root:root contracts/ticket-candidate/schemas/*.schema.json /app/contracts/ticket-candidate/schemas/",
-  "--chown=root:root contracts/approved-handoff/src/*.py /app/contracts/approved-handoff/src/",
-  "--chown=root:root contracts/approved-handoff/schemas/*.schema.json /app/contracts/approved-handoff/schemas/",
+  "--chown=root:root --chmod=0444 services/backend/config.example.json services/backend/config.template.example.json /app/services/backend/",
+  "--chown=root:root --chmod=0444 contracts/sdk-backend-protocol/src/*.py /app/contracts/sdk-backend-protocol/src/",
+  "--chown=root:root --chmod=0444 contracts/sdk-backend-protocol/schemas/*.schema.json /app/contracts/sdk-backend-protocol/schemas/",
+  "--chown=root:root --chmod=0444 contracts/runtime/src/*.py /app/contracts/runtime/src/",
+  "--chown=root:root --chmod=0444 contracts/runtime/schemas/*.schema.json /app/contracts/runtime/schemas/",
+  "--chown=root:root --chmod=0444 contracts/ticket-candidate/src/*.py /app/contracts/ticket-candidate/src/",
+  "--chown=root:root --chmod=0444 contracts/ticket-candidate/schemas/*.schema.json /app/contracts/ticket-candidate/schemas/",
+  "--chown=root:root --chmod=0444 contracts/approved-handoff/src/*.py /app/contracts/approved-handoff/src/",
+  "--chown=root:root --chmod=0444 contracts/approved-handoff/schemas/*.schema.json /app/contracts/approved-handoff/schemas/",
 ];
 const expectedInstructions = [
   ["FROM", expectedBase],
@@ -186,6 +194,14 @@ const expectedIgnoreRules = new Set([
 
 function fail(message) {
   throw new Error(message);
+}
+
+function readAcceptedFile(absolutePath, relativePath) {
+  try {
+    readFileSync(absolutePath);
+  } catch {
+    fail(`backend image input is not readable by this process: ${relativePath}`);
+  }
 }
 
 function parseDockerInstructions(dockerfile) {
@@ -288,6 +304,8 @@ export function validateInputRecords(records) {
       record.regular !== true ||
       record.symbolicLink !== false ||
       record.links !== 1 ||
+      record.readable !== true ||
+      ![0o444, 0o600, 0o644].includes(record.mode) ||
       !Number.isSafeInteger(record.size) ||
       record.size < 1 ||
       record.size > MAX_BACKEND_IMAGE_INPUT_FILE_BYTES
@@ -307,34 +325,165 @@ export function validateInputRecords(records) {
   return totalBytes;
 }
 
-function record(relativePath) {
-  const absolutePath = path.join(repositoryRoot, relativePath);
+function metadataIdentity(metadata) {
+  return [
+    metadata.dev,
+    metadata.ino,
+    metadata.mode,
+    metadata.nlink,
+    metadata.size,
+    metadata.mtimeMs,
+    metadata.ctimeMs,
+  ];
+}
+
+function sameMetadata(left, right) {
+  const before = metadataIdentity(left);
+  const after = metadataIdentity(right);
+  return before.every((value, index) => value === after[index]);
+}
+
+function validateDirectoryAncestry(root) {
+  const absoluteRoot = path.resolve(root);
+  const rootMetadata = lstatSync(absoluteRoot);
+  if (
+    !rootMetadata.isDirectory()
+    || rootMetadata.isSymbolicLink()
+    || ![0o700, 0o755].includes(rootMetadata.mode & 0o7777)
+  ) {
+    fail("backend image input root is not a safe real directory");
+  }
+  const resolvedRoot = realpathSync(absoluteRoot);
+  const snapshots = new Map();
+  const directories = [...expectedInputDirectories].sort((left, right) => (
+    left.split("/").length - right.split("/").length
+    || left.localeCompare(right)
+  ));
+  for (const relativePath of directories) {
+    const absolutePath = relativePath
+      ? path.join(absoluteRoot, relativePath)
+      : absoluteRoot;
+    const metadata = lstatSync(absolutePath);
+    const expectedResolved = relativePath
+      ? path.join(resolvedRoot, ...relativePath.split("/"))
+      : resolvedRoot;
+    if (
+      !metadata.isDirectory()
+      || metadata.isSymbolicLink()
+      || ![0o700, 0o755].includes(metadata.mode & 0o7777)
+      || realpathSync(absolutePath) !== expectedResolved
+    ) {
+      fail(`backend image input directory ancestry is unsafe: ${relativePath || "."}`);
+    }
+    snapshots.set(absolutePath, { expectedResolved, metadata });
+  }
+  return { absoluteRoot, resolvedRoot, snapshots };
+}
+
+function revalidateDirectoryAncestry(snapshots) {
+  for (const [absolutePath, before] of snapshots) {
+    const after = lstatSync(absolutePath);
+    if (
+      !after.isDirectory()
+      || after.isSymbolicLink()
+      || !sameMetadata(before.metadata, after)
+      || realpathSync(absolutePath) !== before.expectedResolved
+    ) {
+      fail("backend image input directory ancestry changed during validation");
+    }
+  }
+}
+
+function record(absoluteRoot, resolvedRoot, relativePath, snapshots) {
+  const absolutePath = path.join(absoluteRoot, relativePath);
   const metadata = lstatSync(absolutePath);
-  const resolvedRoot = `${realpathSync(repositoryRoot)}${path.sep}`;
   const resolved = realpathSync(absolutePath);
-  if (!resolved.startsWith(resolvedRoot)) {
+  const after = lstatSync(absolutePath);
+  if (
+    resolved !== path.join(resolvedRoot, ...relativePath.split("/"))
+    || !sameMetadata(metadata, after)
+  ) {
     fail(`backend image input escaped the repository: ${relativePath}`);
   }
-  return {
+  const inputRecord = {
     links: metadata.nlink,
+    mode: metadata.mode & 0o7777,
     path: relativePath,
     regular: metadata.isFile(),
     size: metadata.size,
     symbolicLink: metadata.isSymbolicLink(),
   };
+  if (
+    !expectedInputPaths.has(relativePath)
+    || inputRecord.regular !== true
+    || inputRecord.symbolicLink !== false
+    || inputRecord.links !== 1
+    || ![0o444, 0o600, 0o644].includes(inputRecord.mode)
+    || inputRecord.size < 1
+    || inputRecord.size > MAX_BACKEND_IMAGE_INPUT_FILE_BYTES
+  ) {
+    fail(`backend image contains an unsafe or oversized input file: ${relativePath}`);
+  }
+  readAcceptedFile(absolutePath, relativePath);
+  const afterRead = lstatSync(absolutePath);
+  if (
+    !sameMetadata(metadata, afterRead)
+    || realpathSync(absolutePath) !== resolved
+  ) {
+    fail(`backend image input changed while its content was read: ${relativePath}`);
+  }
+  snapshots.set(absolutePath, {
+    expectedResolved: resolved,
+    metadata,
+    relativePath,
+  });
+  return {
+    ...inputRecord,
+    readable: true,
+  };
 }
 
-function collectRecords() {
-  const records = exactPaths.map(record);
+function revalidateInputFiles(snapshots) {
+  for (const [absolutePath, before] of snapshots) {
+    const after = lstatSync(absolutePath);
+    if (
+      !after.isFile()
+      || after.isSymbolicLink()
+      || !sameMetadata(before.metadata, after)
+      || realpathSync(absolutePath) !== before.expectedResolved
+    ) {
+      fail(`backend image input changed during validation: ${before.relativePath}`);
+    }
+  }
+}
+
+export function collectInputRecords(root = repositoryRoot) {
+  const ancestry = validateDirectoryAncestry(root);
+  const fileSnapshots = new Map();
+  const records = exactPaths.map((relativePath) => record(
+    ancestry.absoluteRoot,
+    ancestry.resolvedRoot,
+    relativePath,
+    fileSnapshots,
+  ));
   for (const family of sourceFamilies) {
-    for (const entry of readdirSync(path.join(repositoryRoot, family.directory), {
+    for (const entry of readdirSync(
+      path.join(ancestry.absoluteRoot, family.directory), {
       withFileTypes: true,
-    })) {
+      },
+    )) {
       if (family.pattern.test(entry.name)) {
-        records.push(record(`${family.directory}/${entry.name}`));
+        records.push(record(
+          ancestry.absoluteRoot,
+          ancestry.resolvedRoot,
+          `${family.directory}/${entry.name}`,
+          fileSnapshots,
+        ));
       }
     }
   }
+  revalidateInputFiles(fileSnapshots);
+  revalidateDirectoryAncestry(ancestry.snapshots);
   return records.sort((left, right) => left.path.localeCompare(right.path));
 }
 
@@ -346,7 +495,7 @@ function main() {
       "utf8",
     ),
   );
-  const records = collectRecords();
+  const records = collectInputRecords();
   const totalBytes = validateInputRecords(records);
   process.stdout.write(
     `${JSON.stringify({ files: records.length, status: "ok", totalBytes })}\n`,

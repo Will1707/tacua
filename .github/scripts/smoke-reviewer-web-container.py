@@ -5,8 +5,49 @@ from __future__ import annotations
 from http.client import HTTPConnection
 from pathlib import Path
 import re
+import stat
 
 MAX_FILE_BYTES = 16_777_216
+
+
+def require_image_path(path: str, *, mode: int, directory: bool) -> Path:
+    target = Path(path)
+    metadata = target.lstat()
+    assert metadata.st_uid == 0 and metadata.st_gid == 0
+    assert stat.S_IMODE(metadata.st_mode) == mode
+    if directory:
+        assert stat.S_ISDIR(metadata.st_mode)
+    else:
+        assert stat.S_ISREG(metadata.st_mode)
+    return target
+
+
+static_root = require_image_path(
+    "/srv/tacua-reviewer",
+    mode=0o555,
+    directory=True,
+)
+for entry in static_root.rglob("*"):
+    metadata = entry.lstat()
+    assert metadata.st_uid == 0 and metadata.st_gid == 0
+    assert stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)
+    expected_mode = 0o555 if stat.S_ISDIR(metadata.st_mode) else 0o444
+    assert stat.S_IMODE(metadata.st_mode) == expected_mode
+
+require_image_path(
+    "/usr/local/bin/tacua-reviewer-web",
+    mode=0o555,
+    directory=False,
+)
+for directory_path in ("/licenses", "/licenses/tacua", "/licenses/reviewer"):
+    require_image_path(directory_path, mode=0o555, directory=True)
+for license_path in (
+    "/licenses/tacua/LICENSE",
+    "/licenses/tacua/NOTICE",
+    "/licenses/reviewer/NOTICE",
+    "/licenses/reviewer/THIRD_PARTY_NOTICES.txt",
+):
+    require_image_path(license_path, mode=0o444, directory=False)
 
 
 def request(
