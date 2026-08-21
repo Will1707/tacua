@@ -294,7 +294,8 @@ fixed static directory spine and server entry point are mode `0555`. The
 reviewer export validator accepts the exact ordinary `0755`/`0644` tree or an
 owner-private `0700`/`0600` tree, then the image build normalizes either form.
 Both image validators reject symlinked ancestry, linked or special input
-files, unsafe source modes, and input replacement observed during validation;
+files, unsafe source modes, inputs that the invoking process cannot actually
+open and read, and input replacement observed during validation;
 the reviewer validator's final recheck covers its complete export tree after
 the bundle, metadata, notice, Dockerfile, and non-export inputs have been read.
 This does not change the protected host modes or bind-mount behavior of the

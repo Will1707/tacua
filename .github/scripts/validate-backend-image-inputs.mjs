@@ -196,6 +196,14 @@ function fail(message) {
   throw new Error(message);
 }
 
+function readAcceptedFile(absolutePath, relativePath) {
+  try {
+    readFileSync(absolutePath);
+  } catch {
+    fail(`backend image input is not readable by this process: ${relativePath}`);
+  }
+}
+
 function parseDockerInstructions(dockerfile) {
   if (/^\s*#\s*(?:check|escape|syntax)\s*=/imu.test(dockerfile)) {
     fail("backend Dockerfile must not select parser or frontend directives");
@@ -296,6 +304,7 @@ export function validateInputRecords(records) {
       record.regular !== true ||
       record.symbolicLink !== false ||
       record.links !== 1 ||
+      record.readable !== true ||
       ![0o444, 0o600, 0o644].includes(record.mode) ||
       !Number.isSafeInteger(record.size) ||
       record.size < 1 ||
@@ -396,18 +405,41 @@ function record(absoluteRoot, resolvedRoot, relativePath, snapshots) {
   ) {
     fail(`backend image input escaped the repository: ${relativePath}`);
   }
-  snapshots.set(absolutePath, {
-    expectedResolved: resolved,
-    metadata,
-    relativePath,
-  });
-  return {
+  const inputRecord = {
     links: metadata.nlink,
     mode: metadata.mode & 0o7777,
     path: relativePath,
     regular: metadata.isFile(),
     size: metadata.size,
     symbolicLink: metadata.isSymbolicLink(),
+  };
+  if (
+    !expectedInputPaths.has(relativePath)
+    || inputRecord.regular !== true
+    || inputRecord.symbolicLink !== false
+    || inputRecord.links !== 1
+    || ![0o444, 0o600, 0o644].includes(inputRecord.mode)
+    || inputRecord.size < 1
+    || inputRecord.size > MAX_BACKEND_IMAGE_INPUT_FILE_BYTES
+  ) {
+    fail(`backend image contains an unsafe or oversized input file: ${relativePath}`);
+  }
+  readAcceptedFile(absolutePath, relativePath);
+  const afterRead = lstatSync(absolutePath);
+  if (
+    !sameMetadata(metadata, afterRead)
+    || realpathSync(absolutePath) !== resolved
+  ) {
+    fail(`backend image input changed while its content was read: ${relativePath}`);
+  }
+  snapshots.set(absolutePath, {
+    expectedResolved: resolved,
+    metadata,
+    relativePath,
+  });
+  return {
+    ...inputRecord,
+    readable: true,
   };
 }
 

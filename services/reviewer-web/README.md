@@ -24,8 +24,9 @@ the server, project notices, license, and generated third-party notice as
 bounded single-link regular files before the build runs.
 
 The validator snapshots the repository ancestry, every copied input, and the
-complete export tree, then rechecks their identities and modes after all
-content reads. Validation and a direct local `docker build` are still separate
+complete export tree, opens and reads every accepted file as the invoking
+process, then rechecks their identities and modes after all content reads.
+Validation and a direct local `docker build` are still separate
 processes, so run them only in a quiescent, access-controlled checkout; release
 automation must retain the verifier's exact image rather than rebuilding it.
 

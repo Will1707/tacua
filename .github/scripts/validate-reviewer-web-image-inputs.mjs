@@ -135,6 +135,14 @@ function fail(message) {
   throw new Error(message);
 }
 
+function readAcceptedFile(absolutePath, relativePath, family) {
+  try {
+    readFileSync(absolutePath);
+  } catch {
+    fail(`${family} contains a file that this process cannot read: ${relativePath}`);
+  }
+}
+
 function metadataIdentity(metadata) {
   return [
     metadata.dev,
@@ -202,6 +210,14 @@ function snapshotReviewerImageInputs(root) {
       || !sameMetadata(metadata, after)
     ) {
       fail(`reviewer image contains an unsafe copied input: ${relativePath}`);
+    }
+    readAcceptedFile(absolutePath, relativePath, "reviewer image");
+    const afterRead = lstatSync(absolutePath);
+    if (
+      !sameMetadata(metadata, afterRead)
+      || realpathSync(absolutePath) !== resolved
+    ) {
+      fail(`reviewer image input changed while its content was read: ${relativePath}`);
     }
     fileSnapshots.set(absolutePath, {
       expectedResolved: resolved,
@@ -375,6 +391,14 @@ function collectFiles(root) {
         });
       } else if (metadata.isFile()) {
         total += safeFile(relative, metadata);
+        readAcceptedFile(absolute, relative, "reviewer export");
+        const afterRead = lstatSync(absolute);
+        if (
+          !sameMetadata(metadata, afterRead)
+          || realpathSync(absolute) !== resolved
+        ) {
+          fail(`reviewer export changed while its content was read: ${relative}`);
+        }
         files.set(relative, absolute);
         snapshots.set(absolute, {
           expectedResolved: resolved,

@@ -117,6 +117,14 @@ test("a real owner-private backend input tree remains valid", (context) => {
 
   assert.doesNotThrow(() => validateInputRecords(privateRecords));
   assert.ok(privateRecords.every((record) => record.mode === 0o600));
+  assert.ok(privateRecords.every((record) => record.readable === true));
+  assert.throws(
+    () => validateInputRecords([
+      { ...privateRecords[0], readable: false },
+      ...privateRecords.slice(1),
+    ]),
+    /unsafe or oversized input file/u,
+  );
 });
 
 test("unsafe and symlinked backend directory ancestry is rejected", (context) => {
