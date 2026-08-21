@@ -172,11 +172,12 @@ processing-job version/lease rows, content-free audits, credentials, and the
 retained tombstone are metadata and are deliberately not counted as separate
 erased objects.
 
-The admin secret also roots launch and credential verifiers. Back it up as a
-deployment secret. Rotating it invalidates outstanding launch codes and SDK
-credentials; perform that as an explicit deployment reset, not as an ordinary
-admin-token rotation. The mounted value must be 32–4096 ASCII bytes in the RFC
-7235 `token68` alphabet (`A-Z`, `a-z`, `0-9`, `.`, `_`, `~`, `+`, `/`, `-`,
+The admin secret also roots launch, SDK credential, reviewer pairing/session,
+and reviewer CSRF verifiers. Back it up as a deployment secret. Rotating it
+invalidates outstanding launch codes, SDK credentials, reviewer pairings, and
+reviewer sessions; perform that as an explicit deployment reset, not as an
+ordinary admin-token rotation. The mounted value must be 32–4096 ASCII bytes
+in the RFC 7235 `token68` alphabet (`A-Z`, `a-z`, `0-9`, `.`, `_`, `~`, `+`, `/`, `-`,
 with at most two trailing `=` padding characters); Unicode, controls,
 whitespace, and embedded padding are rejected before startup.
 
