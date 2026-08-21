@@ -39,28 +39,43 @@ npm start
 ```
 
 The app accepts an HTTPS backend origin. Loopback HTTP is allowed only in a
-development build. The complete endpoint-and-credential configuration is
-committed as one `expo-secure-store` value with this-device-only, when-unlocked
-accessibility, preventing a partial settings write from pairing an old token
-with a new origin. Before “Save and connect” persists anything, the reviewer
-checks the public protocol, authenticates the administrator bearer, verifies
-the entered reviewer ID against the deployment through a non-mutating
-status-only route, and only then reads bounded build launch metadata. Provider
-startup repeats that order before exposing a persisted client, so a missing,
-incorrect, or stale ID fails closed. The entered identity is never replaced by
-backend metadata: the bootstrap 1.0 compatibility field must equal the already
-verified declaration and is discarded rather than used as configuration.
-Neither the status response nor bounded errors disclose the configured or
-supplied identity, and reviewer logs do not interpolate it or the administrator
-secret. Authenticated requests use the native Expo fetch boundary, omit
-cookies, reject redirects, and verify the response origin before parsing
-bounded JSON. Never commit a real endpoint, credential, recording, or private
-pilot identifier.
+development build. Native builds persist one atomic, this-device-only Secure
+Store V5 document containing the endpoint and exactly one authentication state:
+no credential, a revocable reviewer session bearer, or the short-lived pairing
+token and native client kind needed for crash recovery. The recovery state and
+session bearer can never coexist. The administrator secret, reviewer ID, and QA
+launch scheme are never entered or stored by the reviewer. On startup the provider probes the
+public protocol, authenticates a scoped reviewer session or Tailscale
+capability, obtains the authoritative reviewer/build binding from
+`/v1/reviewer/bootstrap`, and exposes an operational client only after the
+authenticated principal and the exact bootstrap 1.0 compatibility identity
+match. The bootstrap identity is only a consistency assertion and is never
+used to replace or derive reviewer configuration. Native authenticated
+requests use the Expo fetch boundary, omit cookies, reject redirects, and
+verify the response origin before parsing bounded JSON. Native unsafe requests
+also send the configured backend origin and the current principal's scoped
+CSRF token; web requests rely on the browser's exact same-origin `Origin` and
+cookie behavior. Never commit a real endpoint, credential, recording, or
+private pilot identifier.
 
-The reviewer accepts only the exact bootstrap 1.0 shape after the entered
-identity has passed the status-only check. Its compatibility identity field
-must agree exactly, is otherwise rejected, and is never used to replace or
-derive the entered reviewer ID.
+Existing exact V4 endpoint/bearer documents migrate by committing V5 before
+best-effort legacy cleanup. Any later configuration clear removes the V4
+fallback authoritatively before V5, so a retained legacy bearer cannot be
+resurrected if old-key deletion fails.
+
+Canceling a pending pairing is a server-confirmed operation, not a local UI
+reset. The web provider retains the opaque token in memory. Native durably
+journals the exact token and client kind before sending the first exchange, then
+waits for any exchange request already in flight and confirms a final
+token-bound cancellation before another pairing can start. On native restart,
+that cancellation and the journal-clearing write both complete before any
+backend probe or connection attempt. The cancellation endpoint deletes an unconsumed request or
+revokes the session issued from the exact token; on web it also expires the
+pairing cookie. If confirmation fails, the same pairing remains visible only by
+its human code and can be canceled again. Native never persists an issued
+bearer before principal/bootstrap binding; the final bearer write atomically
+replaces the recovery journal, and cancellation serializes its clearing write
+after any older Secure Store write.
 
 The reviewer also has a browser export for a private, same-origin self-hosted
 deployment:
@@ -69,19 +84,22 @@ deployment:
 npm run export:web -- --output-dir dist
 ```
 
-The web reviewer must be served from the backend's exact HTTPS origin. Its
-administrator configuration is kept only in that tab's `sessionStorage`, not
-in native secure storage or persistent `localStorage`, and approved handoffs
-download as verified files. The browser build deliberately rejects a different
-backend origin. The backend deliberately has no CORS surface, so do not add a
-wildcard origin or host the reviewer on a second origin. See
+The web reviewer must be served from the backend's exact HTTPS origin. It
+derives that origin from the page, persists no endpoint or credential in web
+storage, and removes superseded administrator-token settings. Access comes
+from a Tailscale Serve app capability or a revocable `HttpOnly` same-origin
+pairing cookie. The browser build deliberately rejects a different backend
+origin. The backend deliberately has no CORS surface, so do not add a wildcard
+origin or host the reviewer on a second origin. Approved handoffs download as
+verified files. See
 [SELF_HOSTED_WEB.md](SELF_HOSTED_WEB.md) before packaging the export in Docker.
 
-Bundle identifiers and the QA target scheme remain configurable for each
-self-hoster. The reviewer deliberately leaves the scheme blank on first setup:
-enter the exact dedicated `launchScheme` configured in the SDK-enabled QA
-build. A syntactically valid but different scheme belongs to another URL
-handler and cannot launch the intended app.
+For transport policy 1.2, the config compiler seals the QA launch scheme into
+the build profile and the backend composes every launch URL. The reviewer
+validates the returned URL against the exact bootstrapped build binding and
+never reconstructs it locally. Legacy transport 1.1 evidence remains readable,
+but starting or recovering a capture requires a newly sealed 1.2 deployment
+and matching QA build.
 
 The app uses the adaptive palette and accessibility rules in the
 [visual-direction guide](../../docs/design/visual-direction.md).

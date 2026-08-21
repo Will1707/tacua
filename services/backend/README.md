@@ -250,7 +250,7 @@ and CSRF checks, the backend atomically returns
 `grant` is the unchanged launch-code response. Resume links append the exact
 grant-bound `session_id`. A deployment without a sealed launch scheme fails
 with `409 REVIEWER_LAUNCH_SCHEME_UNAVAILABLE` before minting a grant. The
-The administrator `/v1/admin/launch-codes` route remains unchanged;
+administrator `/v1/admin/launch-codes` route remains unchanged;
 `/v1/reviewer/launch-codes` exposes the same grant contract for scoped
 compatibility.
 
@@ -524,9 +524,10 @@ The explicitly whitelisted operational `/v1/reviewer/*` aliases mirror the
 corresponding admin response contracts under reviewer scopes. Unsafe reviewer
 aliases additionally require the exact configured Origin and CSRF token.
 
-`GET /v1/admin/reviewer-bootstrap` is the transitional administrator-authenticated
-bootstrap used while reviewer-scoped authentication is introduced. Its exact
-`tacua.reviewer-bootstrap@1.0.0` response is:
+`GET /v1/reviewer/bootstrap` is the scoped bootstrap used by the reviewer after
+session or capability authentication. The transitional administrator endpoint
+`GET /v1/admin/reviewer-bootstrap` returns the same unchanged projection. Their
+exact `tacua.reviewer-bootstrap@1.0.0` response is:
 
 ```json
 {
@@ -548,11 +549,12 @@ bootstrap used while reviewer-scoped authentication is introduced. Its exact
 ```
 
 The object and every build use exact keys. The `reviewer_id` field remains in
-this response for compatibility with deployed 1.0 reviewer clients. Current
-clients first prove their locally entered identity through
-`/v1/admin/reviewer-binding`, require the bootstrap field to equal that already
-verified declaration, and discard it rather than using it as a source of
-configuration. `launch_scheme` is the scheme sealed into that build's transport
+this response for compatibility with deployed 1.0 reviewer clients. Scoped
+clients require it to equal the authenticated `/v1/reviewer/session` principal;
+legacy administrator clients first prove their locally entered identity through
+`/v1/admin/reviewer-binding` and require the same equality. Both discard the
+field rather than using it as a source of configuration. `launch_scheme` is the
+scheme sealed into that build's transport
 1.2 configuration. A legacy transport 1.1 build is represented without changing
 the response shape by the single exception `"launch_scheme": null`; clients must
 not construct a launch URL from that value. The older `/v1/admin/builds`
@@ -570,13 +572,15 @@ supersession history remain readable. Attempts to transition, replace, approve,
 reject, or export a superseded source fail with the stable
 `409 CANDIDATE_SUPERSEDED` conflict and replacement references.
 
-The reviewer-binding route authenticates the administrator bearer before it
-validates the claimed identity. A correct claim returns exactly
+The legacy reviewer-binding route authenticates the administrator bearer before
+it validates the claimed identity. A correct claim returns exactly
 `{"status":"verified"}` and performs no write. Missing, malformed, incorrect,
 or stale claims fail without returning either the configured or supplied
 identity. Those fixed failures and the related application logs never
-interpolate either identity or the administrator secret. This setup check does
-not replace transition authorization:
+interpolate either identity or the administrator secret. The scoped reviewer
+app no longer calls this route; it binds the authenticated
+`/v1/reviewer/session` principal to `/v1/reviewer/bootstrap` instead. The
+legacy check does not replace transition authorization:
 transition and replacement bodies still have to name the configured reviewer
 and remain fail-closed with `REVIEWER_MISMATCH`.
 

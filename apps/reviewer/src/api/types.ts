@@ -159,6 +159,70 @@ export type ReviewerBootstrap = {
   readonly builds: readonly ReviewerBootstrapBuild[];
 };
 
+export type ReviewerClientKind = "web" | "native";
+
+export type ReviewerScope =
+  | "reviewer.launch"
+  | "reviewer.read"
+  | "reviewer.write";
+
+export type ReviewerPrincipal = {
+  readonly reviewer_id: string;
+  readonly auth_kind: "legacy_admin" | "session" | "tailscale_capability";
+  readonly session_id: string | null;
+  readonly device_label: string | null;
+  readonly client_kind: ReviewerClientKind | "legacy_web" | "tailscale_web";
+  readonly scopes: readonly ReviewerScope[];
+  readonly expires_at: string | null;
+  readonly csrf_token: string;
+};
+
+export type ReviewerPairingRequest = {
+  readonly pairing_id: string;
+  readonly pairing_token: string;
+  readonly human_code: string;
+  readonly device_label: string;
+  readonly client_kind: ReviewerClientKind;
+  readonly created_at: string;
+  readonly expires_at: string;
+};
+
+export type ReviewerWebPairingExchange = ReviewerPrincipal & {
+  readonly auth_kind: "session";
+  readonly client_kind: "web";
+  readonly session_id: string;
+  readonly device_label: string;
+  readonly expires_at: string;
+};
+
+export type ReviewerNativePairingExchange = ReviewerPrincipal & {
+  readonly auth_kind: "session";
+  readonly client_kind: "native";
+  readonly session_id: string;
+  readonly device_label: string;
+  readonly expires_at: string;
+  readonly session_token: string;
+};
+
+export type ReviewerPairingExchange =
+  | ReviewerWebPairingExchange
+  | ReviewerNativePairingExchange;
+
+export type ReviewerPairingCancellation = {
+  readonly status: "canceled";
+};
+
+export type ReviewerSession = {
+  readonly session_id: string;
+  readonly reviewer_id: string;
+  readonly device_label: string;
+  readonly client_kind: ReviewerClientKind;
+  readonly scopes: readonly ReviewerScope[];
+  readonly created_at: string;
+  readonly expires_at: string;
+  readonly revoked_at: string | null;
+};
+
 type LaunchGrantBase = {
   readonly launch_id: string;
   readonly launch_code: string;
@@ -179,6 +243,22 @@ export type ResumeLaunchGrant = LaunchGrantBase & {
 };
 
 export type LaunchGrant = StartLaunchGrant | ResumeLaunchGrant;
+
+export type ReviewerStartLaunchLink = {
+  readonly contract_version: "tacua.reviewer-launch-link@1.0.0";
+  readonly launch_url: string;
+  readonly grant: StartLaunchGrant;
+};
+
+export type ReviewerResumeLaunchLink = {
+  readonly contract_version: "tacua.reviewer-launch-link@1.0.0";
+  readonly launch_url: string;
+  readonly grant: ResumeLaunchGrant;
+};
+
+export type ReviewerLaunchLink =
+  | ReviewerStartLaunchLink
+  | ReviewerResumeLaunchLink;
 
 export type ClarificationChoice = {
   readonly choice_id: string;

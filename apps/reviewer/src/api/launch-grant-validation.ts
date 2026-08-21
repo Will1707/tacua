@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import type { ResumeLaunchGrant, StartLaunchGrant } from "@/api/types";
+import type {
+  ResumeLaunchGrant,
+  ReviewerResumeLaunchLink,
+  ReviewerStartLaunchLink,
+  StartLaunchGrant,
+} from "@/api/types";
 import { isSafeTargetScheme } from "../config/target-scheme.ts";
 
 export class LaunchGrantValidationError extends Error {
@@ -12,6 +17,18 @@ export class LaunchGrantValidationError extends Error {
     this.code = code;
   }
 }
+
+export class ReviewerLaunchLinkValidationError extends Error {
+  readonly code: "INVALID_REVIEWER_LAUNCH_LINK" | "REVIEWER_LAUNCH_LINK_BINDING_MISMATCH";
+
+  constructor(code: ReviewerLaunchLinkValidationError["code"]) {
+    super(code);
+    this.name = "ReviewerLaunchLinkValidationError";
+    this.code = code;
+  }
+}
+
+export const maximumReviewerLaunchLinkResponseBytes = 8 * 1_024;
 
 function exactKeys(value: object, keys: readonly string[]): boolean {
   const actual = Object.keys(value).sort();
@@ -108,4 +125,97 @@ export function buildLaunchURL(
     ? ""
     : `&session_id=${encodeURIComponent(expectedSessionId)}`;
   return `${targetScheme}://tacua/start?launch_code=${encodeURIComponent(launchCode)}${sessionBinding}`;
+}
+
+function launchLinkEnvelope(value: unknown): Record<string, unknown> {
+  if (
+    value === null
+    || typeof value !== "object"
+    || Array.isArray(value)
+    || !exactKeys(value, ["contract_version", "launch_url", "grant"])
+  ) throw new ReviewerLaunchLinkValidationError("INVALID_REVIEWER_LAUNCH_LINK");
+  const record = value as Record<string, unknown>;
+  if (
+    record.contract_version !== "tacua.reviewer-launch-link@1.0.0"
+    || typeof record.launch_url !== "string"
+    || record.launch_url.length > 1_024
+  ) throw new ReviewerLaunchLinkValidationError("INVALID_REVIEWER_LAUNCH_LINK");
+  return record;
+}
+
+function requireLaunchLinkBinding(
+  envelope: Record<string, unknown>,
+  expectedUrl: string,
+  actualBuildIdentityDigest: string,
+  expectedBuildIdentityDigest: string,
+): void {
+  if (
+    !digest(expectedBuildIdentityDigest)
+    || actualBuildIdentityDigest !== expectedBuildIdentityDigest
+    || envelope.launch_url !== expectedUrl
+  ) {
+    throw new ReviewerLaunchLinkValidationError("REVIEWER_LAUNCH_LINK_BINDING_MISMATCH");
+  }
+}
+
+export function validateReviewerStartLaunchLink(
+  value: unknown,
+  expectedLaunchScheme: string,
+  expectedBuildIdentityDigest: string,
+): ReviewerStartLaunchLink {
+  const envelope = launchLinkEnvelope(value);
+  let grant: StartLaunchGrant;
+  try {
+    grant = validateStartLaunchGrant(envelope.grant);
+    requireLaunchLinkBinding(
+      envelope,
+      buildLaunchURL(expectedLaunchScheme, grant.launch_code),
+      grant.build_identity_digest,
+      expectedBuildIdentityDigest,
+    );
+  } catch (error) {
+    if (error instanceof ReviewerLaunchLinkValidationError) throw error;
+    if (error instanceof LaunchGrantValidationError) {
+      throw new ReviewerLaunchLinkValidationError("INVALID_REVIEWER_LAUNCH_LINK");
+    }
+    throw error;
+  }
+  return {
+    contract_version: "tacua.reviewer-launch-link@1.0.0",
+    launch_url: envelope.launch_url as string,
+    grant,
+  };
+}
+
+export function validateReviewerResumeLaunchLink(
+  value: unknown,
+  expectedSessionId: string,
+  expectedLaunchScheme: string,
+  expectedBuildIdentityDigest: string,
+): ReviewerResumeLaunchLink {
+  const envelope = launchLinkEnvelope(value);
+  let grant: ResumeLaunchGrant;
+  try {
+    grant = validateResumeLaunchGrant(envelope.grant, expectedSessionId);
+    requireLaunchLinkBinding(
+      envelope,
+      buildLaunchURL(expectedLaunchScheme, grant.launch_code, expectedSessionId),
+      grant.build_identity_digest,
+      expectedBuildIdentityDigest,
+    );
+  } catch (error) {
+    if (error instanceof ReviewerLaunchLinkValidationError) throw error;
+    if (error instanceof LaunchGrantValidationError) {
+      const code = error.code === "LAUNCH_GRANT_BINDING_MISMATCH"
+        ? "REVIEWER_LAUNCH_LINK_BINDING_MISMATCH"
+        : "INVALID_REVIEWER_LAUNCH_LINK";
+      throw new ReviewerLaunchLinkValidationError(code);
+    }
+    throw error;
+  }
+  return {
+    contract_version: "tacua.reviewer-launch-link@1.0.0",
+    launch_url: envelope.launch_url as string,
+    grant,
+  };
 }

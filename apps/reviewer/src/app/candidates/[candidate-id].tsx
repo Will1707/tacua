@@ -4,13 +4,14 @@ import { Link, useLocalSearchParams } from "expo-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Pressable, RefreshControl, ScrollView, Text, TextInput, View } from "react-native";
 
-import { CandidateSupersededApiError, TacuaApiError } from "@/api/client";
+import { CandidateSupersededApiError, TacuaApiError, type TacuaApiClient } from "@/api/client";
 import type {
   CandidateEvidenceView,
   CandidateReplacementDraft,
   CandidateReplacementOperationProjection,
   Clarification,
   ClarificationChoice,
+  ReviewerBootstrap,
   TicketCandidate,
 } from "@/api/types";
 import {
@@ -43,18 +44,25 @@ const handoffShareTypes = {
   },
 } as const;
 
+type CandidateDataBinding = {
+  readonly bootstrap: ReviewerBootstrap;
+  readonly candidateId: string;
+  readonly client: TacuaApiClient;
+};
+
 export default function CandidateRoute() {
   const { "candidate-id": candidateId } = useLocalSearchParams<{ "candidate-id": string }>();
-  const { client, config } = useBackend();
+  const { bootstrap, client, reload: reloadBackend } = useBackend();
   const showDialog = useAppDialog();
-  const [candidate, setCandidate] = useState<TicketCandidate | null>(null);
-  const [supersession, setSupersession] = useState<CandidateReplacementOperationProjection | null>(null);
-  const [supersessionChecked, setSupersessionChecked] = useState(false);
-  const [evidence, setEvidence] = useState<CandidateEvidenceView | null>(null);
+  const [storedCandidate, setCandidate] = useState<TicketCandidate | null>(null);
+  const [storedSupersession, setSupersession] = useState<CandidateReplacementOperationProjection | null>(null);
+  const [storedSupersessionChecked, setSupersessionChecked] = useState(false);
+  const [storedEvidence, setEvidence] = useState<CandidateEvidenceView | null>(null);
+  const [dataBinding, setDataBinding] = useState<CandidateDataBinding | null>(null);
   const [evidenceLoading, setEvidenceLoading] = useState(false);
   const [evidenceError, setEvidenceError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [candidateStale, setCandidateStale] = useState(true);
+  const [storedCandidateStale, setCandidateStale] = useState(true);
   const [action, setAction] = useState<string | null>(null);
   const [handoffAction, setHandoffAction] = useState<"json" | "markdown" | null>(null);
   const [handoffVerification, setHandoffVerification] = useState<{
@@ -79,11 +87,22 @@ export default function CandidateRoute() {
     readonly candidateBinding: string;
     readonly controller: AbortController;
   } | null>(null);
+  const dataIsCurrent = client !== null
+    && bootstrap !== null
+    && typeof candidateId === "string"
+    && dataBinding?.client === client
+    && dataBinding.bootstrap === bootstrap
+    && dataBinding.candidateId === candidateId;
+  const candidate = dataIsCurrent ? storedCandidate : null;
+  const supersession = dataIsCurrent ? storedSupersession : null;
+  const supersessionChecked = dataIsCurrent ? storedSupersessionChecked : false;
+  const evidence = dataIsCurrent ? storedEvidence : null;
+  const candidateStale = dataIsCurrent ? storedCandidateStale : true;
   const candidateBinding = candidate
     ? `${candidateId ?? "missing-route"}:${candidate.candidate_id}:${candidate.candidate_version}:${candidate.candidate_digest}`
     : null;
-  const currentContextRef = useRef({ candidate, candidateId, candidateStale, client, supersession, supersessionChecked });
-  currentContextRef.current = { candidate, candidateId, candidateStale, client, supersession, supersessionChecked };
+  const currentContextRef = useRef({ bootstrap, candidate, candidateId, candidateStale, client, dataIsCurrent, supersession, supersessionChecked });
+  currentContextRef.current = { bootstrap, candidate, candidateId, candidateStale, client, dataIsCurrent, supersession, supersessionChecked };
   const {
     activeIndex: activeKeyframeIndex,
     activePreviewState,
@@ -104,6 +123,7 @@ export default function CandidateRoute() {
   ): boolean {
     const current = currentContextRef.current;
     return mountedRef.current
+      && current.dataIsCurrent
       && !current.candidateStale
       && current.supersessionChecked
       && current.supersession === null
@@ -117,23 +137,42 @@ export default function CandidateRoute() {
   const load = useCallback(async (): Promise<{ readonly ok: true } | { readonly ok: false; readonly message: string }> => {
     const requestId = loadRequestSequence.current + 1;
     loadRequestSequence.current = requestId;
-    if (!client || !candidateId) {
-      const message = "A backend connection and candidate identifier are required.";
+    if (!client || !bootstrap || !candidateId) {
+      const message = "A verified backend connection, bootstrap, and candidate identifier are required.";
       loadingRef.current = false;
       setLoading(false);
       setCandidateStale(true);
       setError(message);
       return { ok: false, message };
     }
+    const requestClient = client;
+    const requestBootstrap = bootstrap;
+    const requestCandidateId = candidateId;
+    if (
+      currentContextRef.current.client !== requestClient
+      || currentContextRef.current.bootstrap !== requestBootstrap
+      || currentContextRef.current.candidateId !== requestCandidateId
+    ) {
+      return { ok: false, message: "The reviewer connection changed before this ticket could load." };
+    }
+    setDataBinding({
+      bootstrap: requestBootstrap,
+      candidateId: requestCandidateId,
+      client: requestClient,
+    });
+    const isCurrentRequest = () => loadRequestSequence.current === requestId
+      && currentContextRef.current.client === requestClient
+      && currentContextRef.current.bootstrap === requestBootstrap
+      && currentContextRef.current.candidateId === requestCandidateId;
     loadingRef.current = true;
     setLoading(true);
     setCandidateStale(true);
     setSupersessionChecked(false);
     setError(null);
     try {
-      const loaded = await client.getCandidate(candidateId);
-      const loadedSupersession = await client.getCandidateSupersession(loaded);
-      if (loadRequestSequence.current !== requestId) {
+      const loaded = await requestClient.getCandidate(requestCandidateId);
+      const loadedSupersession = await requestClient.getCandidateSupersession(loaded);
+      if (!isCurrentRequest()) {
         return { ok: false, message: "A newer ticket refresh replaced this request." };
       }
       setCandidate(loaded);
@@ -144,21 +183,35 @@ export default function CandidateRoute() {
       return { ok: true };
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : "Tacua could not load this candidate.";
-      if (loadRequestSequence.current === requestId) {
+      if (isCurrentRequest()) {
         setCandidateStale(true);
         setSupersessionChecked(false);
         setError(message);
       }
       return { ok: false, message };
     } finally {
-      if (loadRequestSequence.current === requestId) {
+      if (isCurrentRequest()) {
         loadingRef.current = false;
         setLoading(false);
       }
     }
-  }, [candidateId, client]);
+  }, [bootstrap, candidateId, client]);
 
   useEffect(() => {
+    // Candidate content and evidence are confidential to one exact reviewer
+    // client, bootstrap, and route generation. Clear the previous generation
+    // before issuing a load for the replacement binding.
+    loadRequestSequence.current += 1;
+    setDataBinding(null);
+    setCandidate(null);
+    setSupersession(null);
+    setSupersessionChecked(false);
+    setEvidence(null);
+    setEvidenceError(null);
+    setEvidenceLoading(false);
+    setCandidateStale(true);
+    setError(null);
+    setClarificationDraft(null);
     void load();
     return () => { loadRequestSequence.current += 1; };
   }, [load]);
@@ -187,16 +240,17 @@ export default function CandidateRoute() {
   }, [candidateBinding, client]);
 
   useEffect(() => {
-    // In-flight transitions belong to the client and route that created them.
+    // In-flight transitions belong to the client, route, and authoritative
+    // bootstrap reviewer identity that created them.
     // Releasing the local lock makes the new binding usable while stale
     // completions are ignored by the per-operation checks below.
     actionRef.current = null;
     setAction(null);
-  }, [candidateId, client]);
+  }, [bootstrap, candidateId, client]);
 
   useEffect(() => {
     let active = true;
-    if (!client || !candidate) {
+    if (!client || !candidate || !dataIsCurrent) {
       setEvidence(null);
       setEvidenceLoading(false);
       return () => { active = false; };
@@ -211,7 +265,7 @@ export default function CandidateRoute() {
       })
       .finally(() => { if (active) setEvidenceLoading(false); });
     return () => { active = false; };
-  }, [candidate, client]);
+  }, [candidate, client, dataIsCurrent]);
 
   async function handleTransitionError(title: string, caught: unknown, shouldReport: () => boolean) {
     if (caught instanceof TacuaApiError && (caught.status === 409 || caught.status === 412)) {
@@ -239,7 +293,7 @@ export default function CandidateRoute() {
   async function transition(nextAction: "mark_ready" | "approve" | "reject", reason: string) {
     if (
       !client
-      || !config
+      || !bootstrap
       || !candidate
       || candidateStale
       || loadingRef.current
@@ -249,6 +303,8 @@ export default function CandidateRoute() {
     const parent = candidate;
     const requestClient = client;
     const requestRouteId = candidateId;
+    const requestBootstrap = bootstrap;
+    const requestReviewerId = bootstrap.reviewer_id;
     actionRef.current = nextAction;
     setAction(nextAction);
     const isCurrentContext = () => {
@@ -256,7 +312,8 @@ export default function CandidateRoute() {
       return mountedRef.current
         && actionRef.current === nextAction
         && current.client === requestClient
-        && current.candidateId === requestRouteId;
+        && current.candidateId === requestRouteId
+        && current.bootstrap === requestBootstrap;
     };
     const isCurrentOperation = () => {
       const current = currentContextRef.current;
@@ -272,7 +329,7 @@ export default function CandidateRoute() {
         expected_candidate_digest: parent.candidate_digest,
         expected_candidate_content_digest: parent.candidate_content_digest,
         expected_evidence_manifest_digest: parent.evidence_manifest.manifest_digest,
-        actor_id: config.reviewerId,
+        actor_id: requestReviewerId,
         reason,
       };
       const request = nextAction === "approve"
@@ -300,7 +357,7 @@ export default function CandidateRoute() {
     const operation = "edit_content";
     if (
       !client
-      || !config
+      || !bootstrap
       || !candidate
       || candidateStale
       || loadingRef.current
@@ -310,6 +367,8 @@ export default function CandidateRoute() {
     const parent = candidate;
     const requestClient = client;
     const requestRouteId = candidateId;
+    const requestBootstrap = bootstrap;
+    const requestReviewerId = bootstrap.reviewer_id;
     actionRef.current = operation;
     setAction(operation);
     const isCurrentContext = () => {
@@ -317,7 +376,8 @@ export default function CandidateRoute() {
       return mountedRef.current
         && actionRef.current === operation
         && current.client === requestClient
-        && current.candidateId === requestRouteId;
+        && current.candidateId === requestRouteId
+        && current.bootstrap === requestBootstrap;
     };
     const isCurrentOperation = () => {
       const current = currentContextRef.current;
@@ -334,7 +394,7 @@ export default function CandidateRoute() {
         expected_candidate_content_digest: parent.candidate_content_digest,
         expected_evidence_manifest_digest: parent.evidence_manifest.manifest_digest,
         action: "edit_content",
-        actor_id: config.reviewerId,
+        actor_id: requestReviewerId,
         reason: "Reviewer corrected the candidate content.",
         content,
       });
@@ -359,7 +419,7 @@ export default function CandidateRoute() {
     const operation = "split";
     if (
       !client
-      || !config
+      || !bootstrap
       || !candidate
       || candidateStale
       || !supersessionChecked
@@ -371,6 +431,8 @@ export default function CandidateRoute() {
     const parent = candidate;
     const requestClient = client;
     const requestRouteId = candidateId;
+    const requestBootstrap = bootstrap;
+    const requestReviewerId = bootstrap.reviewer_id;
     actionRef.current = operation;
     setAction(operation);
     const isCurrentContext = () => {
@@ -378,7 +440,8 @@ export default function CandidateRoute() {
       return mountedRef.current
         && actionRef.current === operation
         && current.client === requestClient
-        && current.candidateId === requestRouteId;
+        && current.candidateId === requestRouteId
+        && current.bootstrap === requestBootstrap;
     };
     const isCurrentOperation = () => {
       const current = currentContextRef.current;
@@ -390,7 +453,7 @@ export default function CandidateRoute() {
     try {
       const response = await requestClient.replaceCandidates({
         operation: "split",
-        actorId: config.reviewerId,
+        actorId: requestReviewerId,
         reason: "Reviewer split one candidate finding into distinct result drafts.",
         sources: [parent],
         results: drafts,
@@ -421,7 +484,7 @@ export default function CandidateRoute() {
     const operation = `clarification:${clarificationId}`;
     if (
       !client
-      || !config
+      || !bootstrap
       || !candidate
       || candidateStale
       || loadingRef.current
@@ -431,6 +494,8 @@ export default function CandidateRoute() {
     const parent = candidate;
     const requestClient = client;
     const requestRouteId = candidateId;
+    const requestBootstrap = bootstrap;
+    const requestReviewerId = bootstrap.reviewer_id;
     actionRef.current = operation;
     setAction(operation);
     const isCurrentContext = () => {
@@ -438,7 +503,8 @@ export default function CandidateRoute() {
       return mountedRef.current
         && actionRef.current === operation
         && current.client === requestClient
-        && current.candidateId === requestRouteId;
+        && current.candidateId === requestRouteId
+        && current.bootstrap === requestBootstrap;
     };
     const isCurrentOperation = () => {
       const current = currentContextRef.current;
@@ -455,7 +521,7 @@ export default function CandidateRoute() {
         expected_candidate_content_digest: parent.candidate_content_digest,
         expected_evidence_manifest_digest: parent.evidence_manifest.manifest_digest,
         action: "resolve_clarification",
-        actor_id: config.reviewerId,
+        actor_id: requestReviewerId,
         reason: "Reviewer selected one bounded clarification choice.",
         clarification_id: clarificationId,
         choice_id: choiceId,
@@ -554,12 +620,13 @@ export default function CandidateRoute() {
   if (!candidate || !client) return (
     <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 16, gap: 12 }}>
       <MessageState title="Candidate unavailable" detail={error ?? "The candidate was not found."} />
-      {client && candidateId ? <ActionButton label="Retry candidate" loading={loading} onPress={() => void load()} /> : null}
+      {client && candidateId ? <ActionButton label="Retry candidate" loading={loading} onPress={() => void reloadBackend()} /> : null}
     </ScrollView>
   );
   const unresolved = candidate.content.clarifications.filter((item) => item.status === "unresolved");
   const resolved = candidate.content.clarifications.filter((item) => item.status === "resolved");
-  const actionsDisabled = candidateStale
+  const actionsDisabled = bootstrap === null
+    || candidateStale
     || !supersessionChecked
     || supersession !== null
     || loading
@@ -568,7 +635,7 @@ export default function CandidateRoute() {
   return (
     <ScrollView
       contentInsetAdjustmentBehavior="automatic"
-      refreshControl={<RefreshControl refreshing={loading} onRefresh={() => { if (actionRef.current === null) void load(); }} />}
+      refreshControl={<RefreshControl refreshing={loading} onRefresh={() => { if (actionRef.current === null) void reloadBackend(); }} />}
       contentContainerStyle={{ padding: 16, gap: 14 }}
     >
       <View style={{ gap: 8 }}>
@@ -592,7 +659,7 @@ export default function CandidateRoute() {
             label="Refresh ticket"
             disabled={loading || action !== null}
             loading={loading}
-            onPress={() => { void load(); }}
+            onPress={() => { void reloadBackend(); }}
           />
         </SectionCard>
       ) : null}
@@ -676,7 +743,7 @@ export default function CandidateRoute() {
           />
 
           <CandidateSplitCard
-            actorId={config?.reviewerId ?? ""}
+            actorId={bootstrap?.reviewer_id ?? ""}
             candidate={candidate}
             disabled={actionsDisabled}
             saving={action === "split"}

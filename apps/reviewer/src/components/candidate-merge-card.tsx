@@ -47,8 +47,8 @@ export function CandidateMergeCard({ candidates, client, disabled, reviewerId, o
   const candidateFingerprint = eligible.map((candidate) => (
     `${candidate.candidate_id}:${candidate.candidate_version}:${candidate.candidate_digest}`
   )).join("|");
-  const currentContextRef = useRef({ candidateFingerprint, client, onCompleted });
-  currentContextRef.current = { candidateFingerprint, client, onCompleted };
+  const currentContextRef = useRef({ candidateFingerprint, client, onCompleted, reviewerId });
+  currentContextRef.current = { candidateFingerprint, client, onCompleted, reviewerId };
 
   useEffect(() => {
     mountedRef.current = true;
@@ -65,7 +65,7 @@ export function CandidateMergeCard({ candidates, client, disabled, reviewerId, o
     setPreparing(false);
     setSubmitting(false);
     setError(null);
-  }, [candidateFingerprint, client]);
+  }, [candidateFingerprint, client, reviewerId]);
 
   if (eligible.length < 2) return null;
 
@@ -108,10 +108,16 @@ export function CandidateMergeCard({ candidates, client, disabled, reviewerId, o
   };
 
   const submit = async () => {
-    if (!prepared || disabled || submitting) return;
+    if (
+      !prepared
+      || disabled
+      || submitting
+      || currentContextRef.current.reviewerId !== reviewerId
+    ) return;
     const generation = requestGeneration.current;
     const requestClient = client;
     const requestFingerprint = candidateFingerprint;
+    const requestReviewerId = reviewerId;
     const completion = onCompleted;
     const preparedRequest = prepared;
     const isCurrent = () => {
@@ -120,14 +126,15 @@ export function CandidateMergeCard({ candidates, client, disabled, reviewerId, o
         && requestGeneration.current === generation
         && current.client === requestClient
         && current.candidateFingerprint === requestFingerprint
-        && current.onCompleted === completion;
+        && current.onCompleted === completion
+        && current.reviewerId === requestReviewerId;
     };
     setSubmitting(true);
     setError(null);
     try {
       const response = await requestClient.replaceCandidates({
         operation: "merge",
-        actorId: reviewerId,
+        actorId: requestReviewerId,
         reason: "Reviewer combined related candidate findings into one draft.",
         sources: preparedRequest.sources,
         results: [preparedRequest.draft],

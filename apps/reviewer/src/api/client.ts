@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import type { BackendConfig } from "@/config/backend-config";
 import type {
   ApprovedHandoffArtifact,
   AuditEventPage,
@@ -17,9 +16,14 @@ import type {
   ProcessingJob,
   RegisteredBuild,
   ReviewerBootstrap,
-  ResumeLaunchGrant,
+  ReviewerPairingCancellation,
+  ReviewerPairingExchange,
+  ReviewerPairingRequest,
+  ReviewerPrincipal,
+  ReviewerResumeLaunchLink,
+  ReviewerSession,
+  ReviewerStartLaunchLink,
   SessionPage,
-  StartLaunchGrant,
   TicketCandidate,
 } from "@/api/types";
 import * as Crypto from "expo-crypto";
@@ -59,9 +63,10 @@ import {
   validateCandidateEvidenceView,
 } from "@/api/candidate-evidence-view";
 import {
-  LaunchGrantValidationError,
-  validateResumeLaunchGrant,
-  validateStartLaunchGrant,
+  maximumReviewerLaunchLinkResponseBytes,
+  ReviewerLaunchLinkValidationError,
+  validateReviewerResumeLaunchLink,
+  validateReviewerStartLaunchLink,
 } from "@/api/launch-grant-validation";
 import {
   AdminPageCursorError,
@@ -84,18 +89,43 @@ import {
   ReviewerBootstrapValidationError,
   validateReviewerBootstrap,
 } from "@/api/reviewer-bootstrap-validation";
+import {
+  maximumReviewerPairingCancellationResponseBytes,
+  maximumReviewerPairingResponseBytes,
+  maximumReviewerSessionResponseBytes,
+  ReviewerAuthValidationError,
+  validateReviewerDeviceLabel,
+  validateReviewerPairingCancellation,
+  validateReviewerPairingCancellationToken,
+  validateReviewerPairingExchange,
+  validateReviewerPairingRequest,
+  validateReviewerPairingToken,
+  validateReviewerPrincipal,
+  validateRevokedReviewerSession,
+} from "@/api/reviewer-auth-validation";
+import {
+  buildReviewerRequestPolicy,
+  type LegacyAdminApiClientConfig,
+  type ReviewerApiClientConfig,
+  ReviewerRequestPolicyError,
+  type ValidatedApiClientConfig,
+  validateLegacyAdminApiClientConfig,
+  validateReviewerApiClientConfig,
+} from "@/api/reviewer-request-policy";
+
+export type { LegacyAdminApiClientConfig, ReviewerApiClientConfig } from "@/api/reviewer-request-policy";
 
 const maximumJsonResponseBytes = 2 * 1_024 * 1_024;
 const maximumCandidateBytes = 1_048_576;
 const maximumCandidateEvidenceViewBytes = 1_572_864;
 const maximumCandidateReplacementBytes = 16 * 1_024 * 1_024;
 const maximumEvidencePreviewBytes = 2 * 1_024 * 1_024;
-const maximumReviewerBindingBytes = 64;
 const evidencePreviewContentTypes = new Set(["image/png", "image/jpeg", "image/webp"] as const);
 
 type ExpectedJsonResponse = {
   readonly expectedStatuses: readonly number[];
   readonly maximumBytes?: number;
+  readonly csrfProtected?: boolean;
 };
 
 export class TacuaApiError extends Error {
@@ -292,8 +322,28 @@ function createEvidencePreviewObject(blob: Blob): Pick<EvidencePreview, "uri" | 
   };
 }
 
-export class TacuaApiClient {
-  constructor(private readonly config: BackendConfig) {}
+class BaseTacuaApiClient {
+  protected constructor(private readonly config: ValidatedApiClientConfig) {}
+
+  private requestPolicy(
+    init: FetchRequestInit | undefined,
+    csrfProtected: boolean,
+  ): ReturnType<typeof buildReviewerRequestPolicy> {
+    try {
+      return buildReviewerRequestPolicy(
+        this.config,
+        init?.headers,
+        init?.method ?? "GET",
+        { csrfProtected },
+      );
+    } catch (error) {
+      if (!(error instanceof ReviewerRequestPolicyError)) throw error;
+      const message = error.code === "REVIEWER_CSRF_REQUIRED"
+        ? "The current reviewer session is missing its origin-bound CSRF token."
+        : "The Tacua reviewer request policy is invalid.";
+      throw new TacuaApiError(0, error.code, message);
+    }
+  }
 
   private async requestDocument<T>(
     path: string,
@@ -311,22 +361,22 @@ export class TacuaApiClient {
       throw new TacuaApiError(0, "INVALID_REQUEST_ORIGIN", "The Tacua request escaped the configured backend.");
     }
 
+    const policy = this.requestPolicy(init, options.csrfProtected === true);
+    const headers = policy.headers;
+    headers.set("Accept", "application/json");
+    headers.set("Cache-Control", "no-store");
+    if (init?.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
     const controller = new AbortController();
     let timedOut = false;
     const timeout = setTimeout(() => {
       timedOut = true;
       controller.abort();
     }, 15_000);
-    const headers = new Headers(init?.headers);
-    headers.set("Accept", "application/json");
-    headers.set("Authorization", `Bearer ${this.config.adminToken}`);
-    headers.set("Cache-Control", "no-store");
-    if (init?.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
 
     try {
       const response = await fetch(endpoint, {
         ...init,
-        credentials: "omit",
+        credentials: policy.credentials,
         redirect: "error",
         headers,
         signal: controller.signal,
@@ -378,8 +428,167 @@ export class TacuaApiClient {
     return (await this.requestDocument<T>(path, init, options)).body;
   }
 
+  private reviewerClientKind(): "web" | "native" {
+    if (this.config.authentication !== "reviewer") {
+      throw new TacuaApiError(
+        0,
+        "PAIRING_UNAVAILABLE_FOR_LEGACY_ADMIN",
+        "Reviewer pairing is unavailable through the legacy administrator compatibility client.",
+      );
+    }
+    return this.config.clientKind;
+  }
+
+  async getReviewerSession(): Promise<ReviewerPrincipal> {
+    const response = await this.request<unknown>(
+      "/v1/reviewer/session",
+      undefined,
+      { expectedStatuses: [200], maximumBytes: maximumReviewerSessionResponseBytes },
+    );
+    try {
+      const principal = validateReviewerPrincipal(response);
+      const bindingMismatch = this.config.authentication === "legacy_admin"
+        ? principal.auth_kind !== "legacy_admin"
+        : principal.auth_kind === "legacy_admin"
+          || (
+            principal.auth_kind === "session"
+            && principal.client_kind !== this.config.clientKind
+          );
+      if (bindingMismatch) {
+        throw new TacuaApiError(
+          502,
+          "REVIEWER_CLIENT_BINDING_MISMATCH",
+          "The reviewer principal was not bound to this client kind.",
+        );
+      }
+      return principal;
+    } catch (error) {
+      if (error instanceof TacuaApiError) throw error;
+      if (error instanceof ReviewerAuthValidationError) {
+        throw new TacuaApiError(
+          502,
+          error.code,
+          "The backend returned an invalid reviewer principal.",
+        );
+      }
+      throw error;
+    }
+  }
+
+  async createPairingRequest(deviceLabel: string): Promise<ReviewerPairingRequest> {
+    const clientKind = this.reviewerClientKind();
+    let validatedLabel: string;
+    try {
+      validatedLabel = validateReviewerDeviceLabel(deviceLabel);
+    } catch (error) {
+      if (!(error instanceof ReviewerAuthValidationError)) throw error;
+      throw new TacuaApiError(0, error.code, "The reviewer device label is invalid.");
+    }
+    const response = await this.request<unknown>("/v1/reviewer/pairing-requests", {
+      method: "POST",
+      body: JSON.stringify({ device_label: validatedLabel, client_kind: clientKind }),
+    }, { expectedStatuses: [201], maximumBytes: maximumReviewerPairingResponseBytes });
+    try {
+      const pairing = validateReviewerPairingRequest(response);
+      if (pairing.client_kind !== clientKind || pairing.device_label !== validatedLabel) {
+        throw new ReviewerAuthValidationError("INVALID_PAIRING_REQUEST");
+      }
+      return pairing;
+    } catch (error) {
+      if (error instanceof ReviewerAuthValidationError) {
+        throw new TacuaApiError(502, error.code, "The backend returned an invalid pairing request.");
+      }
+      throw error;
+    }
+  }
+
+  async exchangePairing(pairingToken: string): Promise<ReviewerPairingExchange> {
+    const clientKind = this.reviewerClientKind();
+    let validatedToken: string;
+    try {
+      validatedToken = validateReviewerPairingToken(pairingToken);
+    } catch (error) {
+      if (!(error instanceof ReviewerAuthValidationError)) throw error;
+      throw new TacuaApiError(0, error.code, "The reviewer pairing token is invalid.");
+    }
+    const response = await this.request<unknown>("/v1/reviewer/pairing-exchanges", {
+      method: "POST",
+      body: JSON.stringify({ pairing_token: validatedToken, client_kind: clientKind }),
+    }, { expectedStatuses: [201], maximumBytes: maximumReviewerSessionResponseBytes });
+    try {
+      return validateReviewerPairingExchange(response, clientKind);
+    } catch (error) {
+      if (error instanceof ReviewerAuthValidationError) {
+        throw new TacuaApiError(502, error.code, "The backend returned an invalid pairing exchange.");
+      }
+      throw error;
+    }
+  }
+
+  async cancelPairing(pairingToken: string): Promise<ReviewerPairingCancellation> {
+    const clientKind = this.reviewerClientKind();
+    let validatedToken: string;
+    try {
+      validatedToken = validateReviewerPairingCancellationToken(pairingToken);
+    } catch (error) {
+      if (!(error instanceof ReviewerAuthValidationError)) throw error;
+      throw new TacuaApiError(0, error.code, "The reviewer pairing token is invalid.");
+    }
+    const response = await this.request<unknown>("/v1/reviewer/pairing-cancellations", {
+      method: "POST",
+      body: JSON.stringify({ pairing_token: validatedToken, client_kind: clientKind }),
+    }, {
+      expectedStatuses: [200],
+      maximumBytes: maximumReviewerPairingCancellationResponseBytes,
+    });
+    try {
+      return validateReviewerPairingCancellation(response);
+    } catch (error) {
+      if (error instanceof ReviewerAuthValidationError) {
+        throw new TacuaApiError(
+          502,
+          error.code,
+          "The backend returned an invalid pairing cancellation.",
+        );
+      }
+      throw error;
+    }
+  }
+
+  async revokeReviewerSession(): Promise<ReviewerSession> {
+    const response = await this.request<unknown>("/v1/reviewer/session", {
+      method: "DELETE",
+    }, {
+      expectedStatuses: [200],
+      maximumBytes: maximumReviewerSessionResponseBytes,
+      csrfProtected: true,
+    });
+    try {
+      const session = validateRevokedReviewerSession(response);
+      if (
+        this.config.authentication === "reviewer"
+        && this.config.clientKind === "native"
+        && this.config.sessionToken !== undefined
+        && !this.config.sessionToken.startsWith(`${session.session_id}.`)
+      ) {
+        throw new TacuaApiError(
+          502,
+          "REVIEWER_SESSION_BINDING_MISMATCH",
+          "The revoked reviewer session did not match this native credential.",
+        );
+      }
+      return session;
+    } catch (error) {
+      if (error instanceof TacuaApiError) throw error;
+      if (error instanceof ReviewerAuthValidationError) {
+        throw new TacuaApiError(502, error.code, "The backend returned an invalid revoked reviewer session.");
+      }
+      throw error;
+    }
+  }
+
   async listSessions(cursor?: string): Promise<SessionPage> {
-    const response = await this.request<SessionPage>("/v1/admin/sessions", { headers: pageHeaders(cursor) }, { expectedStatuses: [200] });
+    const response = await this.request<SessionPage>("/v1/reviewer/sessions", { headers: pageHeaders(cursor) }, { expectedStatuses: [200] });
     if (
       !isRecord(response)
       || !hasExactKeys(response, ["sessions", "next_cursor"])
@@ -396,7 +605,7 @@ export class TacuaApiClient {
   }
 
   async listBuilds(): Promise<readonly RegisteredBuild[]> {
-    const response = await this.request<{ readonly builds: readonly RegisteredBuild[] }>("/v1/admin/builds", undefined, { expectedStatuses: [200] });
+    const response = await this.request<{ readonly builds: readonly RegisteredBuild[] }>("/v1/reviewer/builds", undefined, { expectedStatuses: [200] });
     if (
       !response
       || typeof response !== "object"
@@ -440,35 +649,9 @@ export class TacuaApiClient {
     return response.builds;
   }
 
-  async verifyReviewerIdentity(): Promise<void> {
-    if (!isIdentifier(this.config.reviewerId)) {
-      throw new TacuaApiError(
-        0,
-        "INVALID_REVIEWER_ID",
-        "The reviewer identity is invalid.",
-      );
-    }
-    const response = await this.request<unknown>(
-      "/v1/admin/reviewer-binding",
-      { headers: { "Tacua-Reviewer-ID": this.config.reviewerId } },
-      { expectedStatuses: [200], maximumBytes: maximumReviewerBindingBytes },
-    );
-    if (
-      !isRecord(response)
-      || !hasExactKeys(response, ["status"])
-      || response.status !== "verified"
-    ) {
-      throw new TacuaApiError(
-        502,
-        "INVALID_REVIEWER_BINDING_STATUS",
-        "The backend returned an invalid reviewer binding status.",
-      );
-    }
-  }
-
   async getReviewerBootstrap(): Promise<ReviewerBootstrap> {
     const response = await this.request<unknown>(
-      "/v1/admin/reviewer-bootstrap",
+      "/v1/reviewer/bootstrap",
       undefined,
       { expectedStatuses: [200], maximumBytes: maximumReviewerBootstrapResponseBytes },
     );
@@ -486,38 +669,63 @@ export class TacuaApiClient {
     }
   }
 
-  async createLaunchGrant(buildId: string): Promise<StartLaunchGrant> {
+  async createLaunchLink(
+    buildId: string,
+    expectedLaunchScheme: string,
+    expectedBuildIdentityDigest: string,
+  ): Promise<ReviewerStartLaunchLink> {
     if (!isIdentifier(buildId)) {
       throw new TacuaApiError(0, "INVALID_BUILD_ID", "The selected build identifier is invalid.");
     }
-    const grant = await this.request<unknown>("/v1/admin/launch-codes", {
+    const response = await this.request<unknown>("/v1/reviewer/launch-links", {
       method: "POST",
       body: JSON.stringify({ exchange_kind: "start_session", build_id: buildId }),
-    }, { expectedStatuses: [201] });
+    }, {
+      expectedStatuses: [201],
+      maximumBytes: maximumReviewerLaunchLinkResponseBytes,
+      csrfProtected: true,
+    });
     try {
-      return validateStartLaunchGrant(grant);
+      return validateReviewerStartLaunchLink(
+        response,
+        expectedLaunchScheme,
+        expectedBuildIdentityDigest,
+      );
     } catch (error) {
-      if (!(error instanceof LaunchGrantValidationError)) throw error;
-      throw new TacuaApiError(502, "INVALID_LAUNCH_GRANT", "The backend returned an invalid launch grant.");
+      if (!(error instanceof ReviewerLaunchLinkValidationError)) throw error;
+      throw new TacuaApiError(502, error.code, "The backend returned an invalid reviewer launch link.");
     }
   }
 
-  async createResumeGrant(sessionId: string): Promise<ResumeLaunchGrant> {
+  async createResumeLaunchLink(
+    sessionId: string,
+    expectedLaunchScheme: string,
+    expectedBuildIdentityDigest: string,
+  ): Promise<ReviewerResumeLaunchLink> {
     if (!isIdentifier(sessionId)) {
       throw new TacuaApiError(0, "INVALID_SESSION_ID", "The session identifier is invalid.");
     }
-    const grant = await this.request<unknown>("/v1/admin/launch-codes", {
+    const response = await this.request<unknown>("/v1/reviewer/launch-links", {
       method: "POST",
       body: JSON.stringify({ exchange_kind: "resume_session", session_id: sessionId }),
-    }, { expectedStatuses: [201] });
+    }, {
+      expectedStatuses: [201],
+      maximumBytes: maximumReviewerLaunchLinkResponseBytes,
+      csrfProtected: true,
+    });
     try {
-      return validateResumeLaunchGrant(grant, sessionId);
+      return validateReviewerResumeLaunchLink(
+        response,
+        sessionId,
+        expectedLaunchScheme,
+        expectedBuildIdentityDigest,
+      );
     } catch (error) {
-      if (!(error instanceof LaunchGrantValidationError)) throw error;
+      if (!(error instanceof ReviewerLaunchLinkValidationError)) throw error;
       throw new TacuaApiError(
         502,
         error.code,
-        "The backend returned a recovery grant that was not bound to this session.",
+        "The backend returned a recovery link that was not bound to this session and build.",
       );
     }
   }
@@ -525,7 +733,7 @@ export class TacuaApiClient {
   async getSession(sessionId: string): Promise<CaptureSession> {
     if (!isIdentifier(sessionId)) throw new TacuaApiError(0, "INVALID_SESSION_ID", "The session identifier is invalid.");
     const response = await this.request<unknown>(
-      `/v1/admin/sessions/${encodeURIComponent(sessionId)}`,
+      `/v1/reviewer/sessions/${encodeURIComponent(sessionId)}`,
       undefined,
       { expectedStatuses: [200], maximumBytes: maximumSessionDetailResponseBytes },
     );
@@ -541,7 +749,7 @@ export class TacuaApiClient {
 
   async listJobs(cursor?: string): Promise<JobPage> {
     const response = await this.request<unknown>(
-      "/v1/admin/jobs",
+      "/v1/reviewer/jobs",
       { headers: pageHeaders(cursor) },
       { expectedStatuses: [200] },
     );
@@ -558,7 +766,7 @@ export class TacuaApiClient {
   async getJob(jobId: string): Promise<ProcessingJob> {
     if (!isIdentifier(jobId)) throw new TacuaApiError(0, "INVALID_JOB_ID", "The processing-job identifier is invalid.");
     const response = await this.request<unknown>(
-      `/v1/admin/jobs/${encodeURIComponent(jobId)}`,
+      `/v1/reviewer/jobs/${encodeURIComponent(jobId)}`,
       undefined,
       { expectedStatuses: [200] },
     );
@@ -574,7 +782,7 @@ export class TacuaApiClient {
 
   async listAuditEvents(cursor?: string): Promise<AuditEventPage> {
     const response = await this.request<unknown>(
-      "/v1/admin/audit-events",
+      "/v1/reviewer/audit-events",
       { headers: pageHeaders(cursor) },
       { expectedStatuses: [200] },
     );
@@ -591,7 +799,7 @@ export class TacuaApiClient {
   async listCandidates(sessionId: string, cursor?: string): Promise<CandidatePage> {
     if (!isIdentifier(sessionId)) throw new TacuaApiError(0, "INVALID_SESSION_ID", "The session identifier is invalid.");
     const response = await this.request<CandidatePage>(
-      `/v1/admin/sessions/${encodeURIComponent(sessionId)}/candidates`,
+      `/v1/reviewer/sessions/${encodeURIComponent(sessionId)}/candidates`,
       { headers: pageHeaders(cursor) },
       { expectedStatuses: [200] },
     );
@@ -629,7 +837,7 @@ export class TacuaApiClient {
   async getCandidate(candidateId: string): Promise<TicketCandidate> {
     if (!isIdentifier(candidateId)) throw new TacuaApiError(0, "INVALID_CANDIDATE_ID", "The candidate identifier is invalid.");
     const result = await this.requestDocument<unknown>(
-      `/v1/admin/candidates/${encodeURIComponent(candidateId)}`,
+      `/v1/reviewer/candidates/${encodeURIComponent(candidateId)}`,
       undefined,
       { maximumBytes: maximumCandidateBytes, expectedStatuses: [200] },
     );
@@ -656,7 +864,7 @@ export class TacuaApiClient {
   ): Promise<CandidateReplacementOperationProjection | null> {
     try {
       const response = await this.request<unknown>(
-        `/v1/admin/candidates/${encodeURIComponent(candidate.candidate_id)}/supersession`,
+        `/v1/reviewer/candidates/${encodeURIComponent(candidate.candidate_id)}/supersession`,
         undefined,
         { expectedStatuses: [200], maximumBytes: maximumCandidateReplacementBytes },
       );
@@ -674,7 +882,7 @@ export class TacuaApiClient {
 
   async getCandidateEvidence(candidate: TicketCandidate): Promise<CandidateEvidenceView> {
     const result = await this.requestDocument<unknown>(
-      `/v1/admin/candidates/${encodeURIComponent(candidate.candidate_id)}/versions/${candidate.candidate_version}/evidence`,
+      `/v1/reviewer/candidates/${encodeURIComponent(candidate.candidate_id)}/versions/${candidate.candidate_version}/evidence`,
       {
         headers: {
           "If-Match": quotedEntityTag(candidate.candidate_digest),
@@ -715,7 +923,7 @@ export class TacuaApiClient {
     expectedContentDigest: string,
     externalSignal?: AbortSignal,
   ): Promise<EvidencePreview> {
-    const path = `/v1/admin/candidates/${encodeURIComponent(candidate.candidate_id)}/versions/${candidate.candidate_version}/evidence/${encodeURIComponent(evidenceId)}/preview`;
+    const path = `/v1/reviewer/candidates/${encodeURIComponent(candidate.candidate_id)}/versions/${candidate.candidate_version}/evidence/${encodeURIComponent(evidenceId)}/preview`;
     if (!path.startsWith("/") || path.startsWith("//")) {
       throw new TacuaApiError(0, "INVALID_REQUEST_PATH", "The Tacua request path is invalid.");
     }
@@ -735,17 +943,20 @@ export class TacuaApiClient {
       controller.abort();
     }, 15_000);
     try {
-      const response = await fetch(endpoint, {
+      const policy = this.requestPolicy({
         method: "GET",
-        credentials: "omit",
-        redirect: "error",
         headers: {
           Accept: "image/png, image/jpeg, image/webp",
-          Authorization: `Bearer ${this.config.adminToken}`,
           "Cache-Control": "no-store",
           "If-Match": quotedEntityTag(candidate.candidate_digest),
           "Tacua-Evidence-Manifest-Digest": candidate.evidence_manifest.manifest_digest,
         },
+      }, false);
+      const response = await fetch(endpoint, {
+        method: "GET",
+        credentials: policy.credentials,
+        redirect: "error",
+        headers: policy.headers,
         signal: controller.signal,
       });
       if (new URL(response.url).origin !== this.config.baseUrl || response.redirected) {
@@ -861,7 +1072,7 @@ export class TacuaApiClient {
       throw new TacuaApiError(0, "HANDOFF_CANDIDATE_INVALID", "The approved ticket binding was invalid.");
     }
     const extension = format === "markdown" ? "md" : "json";
-    const path = `/v1/admin/candidates/${encodeURIComponent(candidate.candidate_id)}/versions/${candidate.candidate_version}/handoff.${extension}`;
+    const path = `/v1/reviewer/candidates/${encodeURIComponent(candidate.candidate_id)}/versions/${candidate.candidate_version}/handoff.${extension}`;
     const endpoint = new URL(path, `${this.config.baseUrl}/`);
     if (!path.startsWith("/") || path.startsWith("//") || endpoint.origin !== this.config.baseUrl) {
       throw new TacuaApiError(0, "INVALID_REQUEST_ORIGIN", "The Tacua handoff request escaped the configured backend.");
@@ -890,15 +1101,18 @@ export class TacuaApiClient {
       throw new TacuaApiError(499, "HANDOFF_REQUEST_CANCELLED", "The approved handoff request was cancelled.");
     };
     try {
-      const response = await fetch(endpoint, {
+      const policy = this.requestPolicy({
         method: "GET",
-        credentials: "omit",
-        redirect: "error",
         headers: {
           Accept: expectedContentType,
-          Authorization: `Bearer ${this.config.adminToken}`,
           "Cache-Control": "no-store",
         },
+      }, false);
+      const response = await fetch(endpoint, {
+        method: "GET",
+        credentials: policy.credentials,
+        redirect: "error",
+        headers: policy.headers,
         signal: controller.signal,
       });
       if (new URL(response.url).origin !== this.config.baseUrl || response.redirected) {
@@ -1006,14 +1220,14 @@ export class TacuaApiClient {
     }
     const serializedBody = serializedCandidateTransitionRequest(body);
     const idempotencyKey = `candidate:${candidateId}:${body.expected_candidate_version}:${body.action}:${operationFingerprint(serializedBody)}`;
-    const result = await this.requestDocument<unknown>(`/v1/admin/candidates/${encodeURIComponent(candidateId)}/transitions`, {
+    const result = await this.requestDocument<unknown>(`/v1/reviewer/candidates/${encodeURIComponent(candidateId)}/transitions`, {
       method: "POST",
       headers: {
         "If-Match": quotedEntityTag(body.expected_candidate_digest),
         "Idempotency-Key": idempotencyKey,
       },
       body: serializedBody,
-    }, { maximumBytes: maximumCandidateBytes, expectedStatuses: [200, 201] });
+    }, { maximumBytes: maximumCandidateBytes, expectedStatuses: [200, 201], csrfProtected: true });
     try {
       const candidate = await validateTicketCandidateSnapshot(result.body, sha256Digest) as TicketCandidate;
       validateTransitionBinding(parent, body, candidate);
@@ -1052,13 +1266,13 @@ export class TacuaApiClient {
       throw error;
     }
     const requestDigest = await replacementRequestDigest(request, sha256Digest);
-    const result = await this.requestDocument<unknown>("/v1/admin/candidate-replacements", {
+    const result = await this.requestDocument<unknown>("/v1/reviewer/candidate-replacements", {
       method: "POST",
       headers: {
         "Idempotency-Key": `replacement:${request.operation}:${requestDigest.slice("sha256:".length)}`,
       },
       body: serializedReplacementRequest(request),
-    }, { maximumBytes: maximumCandidateReplacementBytes, expectedStatuses: [201] });
+    }, { maximumBytes: maximumCandidateReplacementBytes, expectedStatuses: [201], csrfProtected: true });
     try {
       const response = await validateCandidateReplacementResponse(result.body, request, input.sources, sha256Digest);
       const bodyDigest = await sha256Digest(result.bytes);
@@ -1073,5 +1287,45 @@ export class TacuaApiClient {
       }
       throw error;
     }
+  }
+}
+
+function scopedClientConfig(config: ReviewerApiClientConfig): ValidatedApiClientConfig {
+  try {
+    return validateReviewerApiClientConfig(config);
+  } catch (error) {
+    if (error instanceof ReviewerRequestPolicyError) {
+      throw new TacuaApiError(0, error.code, "The Tacua reviewer client configuration is invalid.");
+    }
+    throw error;
+  }
+}
+
+function legacyAdminClientConfig(config: LegacyAdminApiClientConfig): ValidatedApiClientConfig {
+  try {
+    return validateLegacyAdminApiClientConfig(config);
+  } catch (error) {
+    if (error instanceof ReviewerRequestPolicyError) {
+      throw new TacuaApiError(0, error.code, "The Tacua legacy administrator client configuration is invalid.");
+    }
+    throw error;
+  }
+}
+
+/** Scoped reviewer client. Web uses its HttpOnly same-origin cookie; native uses a scoped bearer. */
+export class TacuaApiClient extends BaseTacuaApiClient {
+  constructor(config: ReviewerApiClientConfig) {
+    super(scopedClientConfig(config));
+  }
+}
+
+/**
+ * Explicit transitional compatibility for deployments still in
+ * `legacy_admin` reviewer-auth mode. The normal reviewer UI must never create
+ * this client or persist its administrator secret.
+ */
+export class LegacyAdminApiClient extends BaseTacuaApiClient {
+  constructor(config: LegacyAdminApiClientConfig) {
+    super(legacyAdminClientConfig(config));
   }
 }

@@ -81,11 +81,10 @@ logging contract. Do not use this profile as production-promotion evidence.
   stronger proxy-to-backend authenticity boundary.
 - The tested app's SDK profile pins the exact HTTPS origin at native build time.
   A TestFlight or preview build cannot switch origins through JavaScript or an
-  OTA update. This backend revision exposes reviewer-scoped session, bootstrap,
-  and launch APIs on that origin. The reviewer UI in this revision still uses
-  its Settings form and administrator-authenticated `/v1/admin/*` client;
-  automatic capability and pairing consumption lands with the companion client
-  change.
+  OTA update. The browser reviewer derives that same origin from its page,
+  connects automatically when Serve injects the configured capability, and
+  otherwise offers a one-use pairing flow. It never accepts or stores the
+  administrator secret, reviewer identity, or QA launch scheme.
 
 ## Reviewer authorization profile
 
@@ -131,8 +130,10 @@ current reviewer role. Tacua compares the complete JSON parameter array, not
 merely the capability name. Tailnet selector changes that preserve this payload
 require no Tacua secret rotation; changing the payload also requires the
 matching public Tacua configuration. `legacy_admin` remains available during
-migration. The backend capability mode is ready for compatible clients, but the
-reviewer UI in this revision does not yet consume it automatically.
+migration for older clients, but the zero-form reviewer reports **Server update
+required** until this deployment enables pairing or a Tailscale capability.
+The same-origin browser reviewer consumes the capability automatically and
+falls back to its explicit one-use pairing flow when the header is absent.
 
 ## 1. Verify the candidate before creating live inputs
 
@@ -510,11 +511,11 @@ PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool \
 ```
 
 The backend accepts the configured app capability on reviewer-scoped endpoints
-without pairing. A pairing-capable client may instead create a ten-minute
-request and display its code; approve that request on this Docker host with the
-command below. The reviewer UI in this revision does not yet initiate either
-flow, so loading that UI does not prove scoped authentication. Do not copy the
-administrator secret into the browser or phone:
+without pairing. The reviewer connects automatically when the browser reaches
+the exact origin through an authorized tailnet identity. If the capability is
+not present, select **Request pairing code** in the reviewer and approve its
+ten-minute code on this Docker host. Do not copy the administrator secret into
+the browser or phone:
 
 ```sh
 PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool \
@@ -527,13 +528,12 @@ PYTHONPATH=services/backend/src python3 -B -m tacua_backend.operator_tool \
 Then verify from the physical iPhone:
 
 1. Tailscale is connected.
-2. The static reviewer shell loads at the exact HTTPS origin. Its current
-   Settings form is the legacy administrator-authenticated client and is not
-   proof of scoped authentication.
-3. Exercise the capability and pairing endpoints with the backend integration
-   tests or a compatible client. Defer the zero-form reviewer launch and
-   evidence acceptance steps until the companion reviewer-client change is
-   deployed.
+2. The static reviewer shell loads at the exact HTTPS origin and shows
+   **Tailscale app capability** under Settings without asking for connection
+   fields. If the policy does not grant the capability, complete the displayed
+   pairing flow and confirm Settings shows **Paired reviewer session**.
+3. Start a review and confirm the reviewer uses the sealed QA build and launch
+   URL without asking for a reviewer ID or URL scheme.
 4. Consent, capture, stop, foreground upload, completion, recovery, deletion,
    and reviewer evidence access work through the tailnet address.
 5. A maximum configured segment uploads successfully through Serve without a

@@ -1,153 +1,205 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { router } from "expo-router";
-import type { ComponentProps } from "react";
 import { useEffect, useRef, useState } from "react";
 import { Platform, ScrollView, Text, TextInput, View } from "react-native";
 
 import { ActionButton } from "@/components/action-button";
-import { TacuaApiClient } from "@/api/client";
-import { verifyAndPersistBackendConfig } from "@/api/backend-config-verification";
-import { probeTacuaBackend } from "@/api/version-probe";
-import { clearBackendConfig, loadBackendConfig, saveBackendConfig } from "@/config/backend-config";
 import { useBackend } from "@/hooks/use-backend";
 import { useAppDialog } from "@/providers/app-dialog";
 import { colors } from "@/theme/colors";
-
-function initialBaseUrl(): string {
-  return Platform.OS === "web"
-    && typeof globalThis.location?.origin === "string"
-    ? globalThis.location.origin
-    : "";
-}
+import { formatDate } from "@/utils/format";
 
 export default function SettingsRoute() {
-  const { reload } = useBackend();
+  const {
+    status,
+    config,
+    session,
+    bootstrap,
+    pairing,
+    error,
+    migrationRequired,
+    reload,
+    configureEndpoint,
+    beginPairing,
+    cancelPairing,
+    disconnect,
+  } = useBackend();
   const showDialog = useAppDialog();
-  const [baseUrl, setBaseUrl] = useState(initialBaseUrl);
-  const [adminToken, setAdminToken] = useState("");
-  const [reviewerId, setReviewerId] = useState("reviewer_owner");
-  const [targetScheme, setTargetScheme] = useState("");
-  const [loadingConfig, setLoadingConfig] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [clearing, setClearing] = useState(false);
-  const [configurationError, setConfigurationError] = useState<string | null>(null);
+  const [baseUrl, setBaseUrl] = useState(config?.baseUrl ?? "");
+  const [savingEndpoint, setSavingEndpoint] = useState(false);
   const savingRef = useRef(false);
-  const clearingRef = useRef(false);
 
   useEffect(() => {
-    let active = true;
-    void loadBackendConfig()
-      .then((config) => {
-        if (!active || !config) return;
-        setBaseUrl(config.baseUrl);
-        setReviewerId(config.reviewerId);
-        setTargetScheme(config.targetScheme);
-        setAdminToken(config.adminToken);
-      })
-      .catch((caught) => {
-        if (active) {
-          setConfigurationError(caught instanceof Error
-            ? caught.message
-            : "Tacua could not read the secure backend configuration.");
-        }
-      })
-      .finally(() => { if (active) setLoadingConfig(false); });
-    return () => { active = false; };
-  }, []);
+    if (config !== null) setBaseUrl(config.baseUrl);
+  }, [config]);
 
-  async function save() {
-    if (loadingConfig || clearingRef.current || savingRef.current) return;
+  async function saveEndpoint() {
+    if (savingRef.current || status === "loading") return;
     savingRef.current = true;
-    setSaving(true);
-    setConfigurationError(null);
+    setSavingEndpoint(true);
     try {
-      await verifyAndPersistBackendConfig(
-        { baseUrl, adminToken, reviewerId, targetScheme },
-        {
-          probeBackend: probeTacuaBackend,
-          createClient: (config) => new TacuaApiClient(config),
-          persistConfig: saveBackendConfig,
-        },
-      );
-      await reload();
-      router.back();
+      await configureEndpoint(baseUrl);
     } catch (caught) {
-      showDialog("Configuration was not saved", caught instanceof Error ? caught.message : "The configuration is invalid.");
+      showDialog(
+        "Endpoint was not saved",
+        caught instanceof Error ? caught.message : "The backend endpoint is invalid.",
+      );
     } finally {
       savingRef.current = false;
-      setSaving(false);
+      setSavingEndpoint(false);
     }
   }
 
-  async function forget() {
-    if (loadingConfig || savingRef.current || clearingRef.current) return;
-    clearingRef.current = true;
-    setClearing(true);
-    setConfigurationError(null);
-    try {
-      await clearBackendConfig();
-      // Release the in-memory copy before dismissing this screen.
-      setAdminToken("");
-      setBaseUrl(initialBaseUrl());
-      setReviewerId("reviewer_owner");
-      setTargetScheme("");
-      await reload();
-      router.back();
-    } catch (caught) {
-      const message = caught instanceof Error
-        ? caught.message
-        : "Tacua could not remove the secure backend configuration.";
-      setConfigurationError(message);
-      showDialog("Configuration was not forgotten", message);
-    } finally {
-      clearingRef.current = false;
-      setClearing(false);
-    }
-  }
+  const endpointChanged = config === null || baseUrl.trim().replace(/\/$/, "") !== config.baseUrl;
+  const endpointReady = baseUrl.trim().length > 0;
+  const pairingAvailable = status === "pairing_required" && !endpointChanged;
+  const capabilityEndpointReplacementAvailable = status === "connected"
+    && session?.auth_kind === "tailscale_capability";
+  const endpointEditable = status !== "loading"
+    && status !== "pairing_pending"
+    && (status !== "connected" || capabilityEndpointReplacementAvailable);
+  const endpointActionAvailable = status !== "pairing_pending"
+    && (status !== "connected" || capabilityEndpointReplacementAvailable);
 
-  const formDisabled = loadingConfig || saving || clearing;
   return (
-    <ScrollView contentInsetAdjustmentBehavior="automatic" keyboardShouldPersistTaps="handled" contentContainerStyle={{ padding: 20, gap: 18 }}>
+    <ScrollView
+      contentInsetAdjustmentBehavior="automatic"
+      keyboardShouldPersistTaps="handled"
+      contentContainerStyle={{ padding: 20, gap: 18 }}
+    >
       <Text selectable style={{ color: colors.secondaryLabel, lineHeight: 21 }}>
         {Platform.OS === "web"
-          ? "Tacua connects to the backend on this page’s exact HTTPS origin. The administrator credential stays in this tab’s session storage and is never included in a launch link."
-          : "Tacua connects directly to your self-hosted deployment. The administrator credential stays in this device’s secure storage and is never included in a launch link."}
+          ? "This reviewer uses the backend on the page’s exact HTTPS origin. Access comes from a Tailscale app capability or a revocable same-origin pairing cookie; Tacua stores no administrator secret in the browser."
+          : "This reviewer stores the backend endpoint and either a revocable reviewer session or a temporary pairing-recovery credential in this device’s secure storage. Reviewer identity and QA launch schemes come from the backend."}
       </Text>
-      {loadingConfig ? <Text selectable accessibilityRole="progressbar" style={{ color: colors.tertiaryLabel }}>Loading secure configuration…</Text> : null}
-      {configurationError ? <Text selectable accessibilityRole="alert" style={{ color: colors.red, lineHeight: 20 }}>{configurationError}</Text> : null}
-      <Field editable={!formDisabled} label="Backend URL" value={baseUrl} onChangeText={setBaseUrl} placeholder="https://tacua.example.com" autoCapitalize="none" keyboardType="url" />
-      <Field editable={!formDisabled} label="Administrator token" value={adminToken} onChangeText={setAdminToken} placeholder="Mounted backend secret" autoCapitalize="none" secureTextEntry />
-      <Field editable={!formDisabled} label="Reviewer ID" value={reviewerId} onChangeText={setReviewerId} placeholder="reviewer_owner" autoCapitalize="none" />
-      <Field editable={!formDisabled} label="QA app URL scheme" value={targetScheme} onChangeText={setTargetScheme} placeholder="your-app-qa" autoCapitalize="none" />
-      <Text selectable style={{ color: colors.secondaryLabel, fontSize: 13, lineHeight: 18 }}>
-        Enter the exact dedicated launchScheme configured in the SDK-enabled QA build. Tacua cannot infer a custom URL scheme from the app bundle identifier.
-      </Text>
-      <ActionButton disabled={loadingConfig || clearing} label="Save and connect" loading={saving} onPress={() => void save()} />
-      <ActionButton
-        destructive
-        disabled={loadingConfig || saving}
-        label="Forget this backend"
-        loading={clearing}
-        onPress={() => showDialog(
-          "Forget backend configuration?",
-          "This removes the local endpoint and administrator credential. It does not delete backend evidence.",
-          [
-            { text: "Cancel", style: "cancel" },
-            { text: "Forget", style: "destructive", onPress: () => void forget() },
-          ],
-        )}
-      />
+
+      {Platform.OS === "web" ? (
+        <ConnectionValue label="Backend origin" value={config?.baseUrl ?? "Checking this page’s origin…"} />
+      ) : (
+        <View style={{ gap: 7 }}>
+          <Text style={{ color: colors.label, fontWeight: "700" }}>Backend URL</Text>
+          <TextInput
+            accessibilityLabel="Backend URL"
+            autoCapitalize="none"
+            autoCorrect={false}
+            editable={endpointEditable}
+            keyboardType="url"
+            onChangeText={setBaseUrl}
+            placeholder="https://mini-pc.example.ts.net"
+            placeholderTextColor={colors.tertiaryLabel}
+            selectionColor={colors.primary}
+            value={baseUrl}
+            style={{
+              color: colors.label,
+              backgroundColor: colors.secondaryBackground,
+              borderColor: colors.separator,
+              borderWidth: 1,
+              minHeight: 48,
+              borderRadius: 12,
+              borderCurve: "continuous",
+              paddingHorizontal: 13,
+              fontSize: 16,
+            }}
+          />
+          {endpointActionAvailable ? (
+            <ActionButton
+              disabled={!endpointReady || !endpointChanged || status === "loading"}
+              label={config === null ? "Use this endpoint" : "Update endpoint"}
+              loading={savingEndpoint}
+              onPress={() => void saveEndpoint()}
+            />
+          ) : null}
+        </View>
+      )}
+
+      {status === "loading" ? (
+        <Text selectable accessibilityRole="progressbar" style={{ color: colors.tertiaryLabel }}>
+          Verifying reviewer access…
+        </Text>
+      ) : null}
+
+      {error ? (
+        <View accessibilityRole="alert" style={{ backgroundColor: colors.secondaryBackground, borderColor: colors.red, borderWidth: 1, borderRadius: 14, borderCurve: "continuous", padding: 14, gap: 6 }}>
+          <Text selectable style={{ color: colors.red, fontWeight: "700" }}>
+            {migrationRequired ? "Server update required" : "Connection needs attention"}
+          </Text>
+          <Text selectable style={{ color: colors.secondaryLabel, lineHeight: 20 }}>{error}</Text>
+        </View>
+      ) : null}
+
+      {status === "pairing_required" ? (
+        <View style={{ gap: 10 }}>
+          <Text selectable style={{ color: colors.label, fontSize: 17, fontWeight: "700" }}>
+            Pair this reviewer
+          </Text>
+          <Text selectable style={{ color: colors.secondaryLabel, lineHeight: 21 }}>
+            Request a short-lived code, approve it once on the backend host, and Tacua will connect automatically. The pairing secret never appears on this screen; native keeps it in device-only secure storage only until pairing or cleanup finishes.
+          </Text>
+          <ActionButton
+            disabled={!pairingAvailable || migrationRequired}
+            label="Request pairing code"
+            onPress={() => void beginPairing()}
+          />
+        </View>
+      ) : null}
+
+      {status === "pairing_pending" && pairing !== null ? (
+        <View style={{ backgroundColor: colors.secondaryBackground, borderColor: colors.separator, borderWidth: 1, borderRadius: 16, borderCurve: "continuous", padding: 16, gap: 10 }}>
+          <Text selectable style={{ color: colors.label, fontSize: 17, fontWeight: "700" }}>Approve this pairing code</Text>
+          <Text selectable accessibilityLabel={`Pairing code ${pairing.human_code}`} style={{ color: colors.label, fontSize: 28, fontWeight: "800", letterSpacing: 2, fontVariant: ["tabular-nums"] }}>
+            {pairing.human_code}
+          </Text>
+          <Text selectable style={{ color: colors.secondaryLabel, lineHeight: 20 }}>
+            On the backend host, run the reviewer pairing approval command with this code. Tacua is waiting and will connect as soon as approval succeeds.
+          </Text>
+          <Text selectable style={{ color: colors.tertiaryLabel, fontSize: 13 }}>
+            Expires {formatDate(pairing.expires_at)}
+          </Text>
+          <ActionButton destructive label="Cancel pairing" onPress={() => void cancelPairing()} />
+        </View>
+      ) : null}
+
+      {status === "connected" && session !== null && bootstrap !== null ? (
+        <View style={{ gap: 12 }}>
+          <ConnectionValue label="Reviewer" value={bootstrap.reviewer_id} />
+          <ConnectionValue
+            label="Access"
+            value={session.auth_kind === "tailscale_capability" ? "Tailscale app capability" : "Paired reviewer session"}
+          />
+          {session.device_label ? <ConnectionValue label="Device" value={session.device_label} /> : null}
+          {session.expires_at ? <ConnectionValue label="Access expires" value={formatDate(session.expires_at)} /> : null}
+          <ConnectionValue label="SDK-enabled builds" value={String(bootstrap.builds.length)} />
+          {session.auth_kind === "tailscale_capability" ? (
+            <Text selectable style={{ color: colors.secondaryLabel, fontSize: 13, lineHeight: 19 }}>
+              This capability is managed by your tailnet policy and cannot be revoked from Tacua. Remove the app capability from that policy to disconnect access.{Platform.OS === "web" ? "" : " To use another backend, update the endpoint above."}
+            </Text>
+          ) : (
+            <ActionButton
+              destructive
+              label="Disconnect paired reviewer"
+              onPress={() => showDialog(
+                "Disconnect this reviewer?",
+                "This revokes the current reviewer session. It does not delete backend evidence.",
+                [
+                  { text: "Cancel", style: "cancel" },
+                  { text: "Disconnect", style: "destructive", onPress: () => void disconnect() },
+                ],
+              )}
+            />
+          )}
+        </View>
+      ) : null}
+
+      {status === "error" ? <ActionButton label="Try again" onPress={() => void reload()} /> : null}
     </ScrollView>
   );
 }
 
-function Field(props: ComponentProps<typeof TextInput> & { readonly label: string }) {
-  const { label, ...input } = props;
+function ConnectionValue({ label, value }: { readonly label: string; readonly value: string }) {
   return (
-    <View style={{ gap: 7 }}>
-      <Text style={{ color: colors.label, fontWeight: "700" }}>{label}</Text>
-      <TextInput {...input} accessibilityLabel={label} autoCorrect={false} placeholderTextColor={colors.tertiaryLabel} selectionColor={colors.primary} style={{ color: colors.label, backgroundColor: colors.secondaryBackground, borderColor: colors.separator, borderWidth: 1, minHeight: 48, borderRadius: 12, borderCurve: "continuous", paddingHorizontal: 13, fontSize: 16 }} />
+    <View style={{ gap: 4 }}>
+      <Text style={{ color: colors.tertiaryLabel, fontSize: 13, fontWeight: "700", textTransform: "uppercase" }}>{label}</Text>
+      <Text selectable style={{ color: colors.label, fontSize: 16 }}>{value}</Text>
     </View>
   );
 }
