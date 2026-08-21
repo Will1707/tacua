@@ -17,6 +17,7 @@ import {
 
 const LAUNCH_CODE = "launch-code-must-not-cross-the-adapter-boundary";
 const LAUNCH_URL = `tacua-test://tacua/start?launch_code=${LAUNCH_CODE}`;
+const ORDINARY_APP_URL = "kuzaba://test-mode/plain-cold-launch";
 
 type ControllerHarnessOptions = Readonly<{
   refresh?: () => Promise<void>;
@@ -80,6 +81,7 @@ function createControllerHarness(options: ControllerHarnessOptions = {}) {
 type LifecycleHarnessOptions = Readonly<{
   initialURL?: string | null;
   initialNativeURLs?: readonly string[];
+  isBackendLaunchURL?: (url: string) => boolean;
   currentState?: BackendManagedHostAppState;
   emitURLWhileSubscribing?: string;
   emitNativeSignalWhileSubscribing?: boolean;
@@ -109,6 +111,8 @@ function createLifecycleHarness(options: LifecycleHarnessOptions = {}) {
       if (options.getInitialURL) return options.getInitialURL();
       return options.initialURL ?? null;
     },
+    isBackendLaunchURL: (url) =>
+      options.isBackendLaunchURL?.(url) ?? url.startsWith("tacua-test://"),
     drainPendingLaunchURLs: () => {
       calls.push("drain-native-launch-urls");
       if (options.drainPendingLaunchURLs) {
@@ -264,6 +268,59 @@ test("startup and event duplicates cause one exact launch delivery", async () =>
   lifecycleHarness.emitURL(secondURL);
   await waitFor(() => controllerHarness.preparedURLs.length === 2);
   assert.deepEqual(controllerHarness.preparedURLs, [LAUNCH_URL, secondURL]);
+  adapter.dispose();
+});
+
+test("ordinary host-app initial and event URLs never enter the Tacua launch queue", async () => {
+  const errors: BackendManagedHostLifecycleError[] = [];
+  const controllerHarness = createControllerHarness();
+  const lifecycleHarness = createLifecycleHarness({
+    initialURL: ORDINARY_APP_URL,
+  });
+  const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controllerHarness.controller,
+    lifecycleHarness.primitives,
+    { onError: (error) => errors.push(error) },
+  );
+
+  await adapter.ready;
+  lifecycleHarness.emitURL(ORDINARY_APP_URL);
+  adapter.deliverLaunchURL(ORDINARY_APP_URL);
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+  assert.deepEqual(controllerHarness.preparedURLs, []);
+  assert.deepEqual(errors, []);
+
+  lifecycleHarness.emitURL(LAUNCH_URL);
+  await waitFor(() => controllerHarness.preparedURLs.length === 1);
+  assert.deepEqual(controllerHarness.preparedURLs, [LAUNCH_URL]);
+  adapter.dispose();
+});
+
+test("a launch matcher failure is content-safe and fails closed", async () => {
+  const errors: BackendManagedHostLifecycleError[] = [];
+  const controllerHarness = createControllerHarness();
+  const lifecycleHarness = createLifecycleHarness({
+    initialURL: LAUNCH_URL,
+    isBackendLaunchURL: () => {
+      throw new Error(`private matcher failure ${LAUNCH_URL}`);
+    },
+  });
+  const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controllerHarness.controller,
+    lifecycleHarness.primitives,
+    { onError: (error) => errors.push(error) },
+  );
+
+  await adapter.ready;
+  assert.deepEqual(controllerHarness.preparedURLs, []);
+  assert.deepEqual(errors, [
+    {
+      operation: "deliver_launch_url",
+      category: "host_lifecycle_rejected",
+    },
+  ]);
+  assert.equal(JSON.stringify(errors).includes(LAUNCH_CODE), false);
   adapter.dispose();
 });
 

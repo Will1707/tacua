@@ -56,7 +56,9 @@ and warm-open callbacks in an Expo AppDelegate subscriber, then mirrors only
 accepted Tacua URLs into a bounded, process-local native inbox. React Native
 linking and a host- or router-owned mailbox may deliver the same URL through the
 lifecycle adapter's manual delivery seam as compatibility fallbacks; every
-source joins the same serialized, fingerprint-deduplicated queue. URLs and
+fallback URL is rechecked by that build-pinned native parser before every
+accepted source joins the same serialized, fingerprint-deduplicated queue.
+Unrelated application URLs are ignored and remain owned by the host app. URLs and
 launch codes remain volatile: they are neither logged nor persisted nor
 projected into public state, and inbox wakeups and lifecycle errors contain no
 URL, code, or underlying platform error. Preservation alone grants no authority;

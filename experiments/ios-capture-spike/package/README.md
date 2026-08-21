@@ -236,9 +236,12 @@ their normal behavior. The adapter installs a content-free inbox signal plus
 native discovery, atomically drains the inbox, and privately samples
 `Linking.getInitialURL()` behind a fixed 1.5-second bound. A native URL cannot
 therefore be lost just because Expo Router or React Native subscribes after the
-AppDelegate callback. The inbox is also drained on foreground, and all sources
-join the same serialized fingerprint-deduplicated queue. It is not a React hook
-and does not create a second app:
+AppDelegate callback. Every React Native or host/router URL is screened through
+the same exact build-pinned native parser before it can enter the Tacua queue;
+ordinary product URLs are ignored and remain available to the app's existing
+handlers. The inbox is also drained on foreground, and all accepted sources join
+the same serialized fingerprint-deduplicated queue. It is not a React hook and
+does not create a second app:
 
 ```ts
 import * as TacuaCapture from '@tacua/mobile-sdk';

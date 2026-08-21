@@ -105,6 +105,10 @@ test("release registers content-preserving cold and warm native launch capture",
     path.join(packageRoot, "ios/TacuaLaunchURLAppDelegateSubscriber.swift"),
     "utf8",
   );
+  const module = readFileSync(
+    path.join(packageRoot, "ios/TacuaCaptureSpikeModule.swift"),
+    "utf8",
+  );
 
   assert.deepEqual(moduleConfig.apple.appDelegateSubscribers, [
     "TacuaLaunchURLAppDelegateSubscriber",
@@ -115,6 +119,8 @@ test("release registers content-preserving cold and warm native launch capture",
   assert.match(subscriber, /TacuaLaunchURLInbox\.shared\.capture/);
   assert.equal(subscriber.match(/return false/g)?.length, 2);
   assert.doesNotMatch(subscriber, /(?:print|NSLog|os_log)\s*\(/);
+  assert.match(module, /Function\("isBackendLaunchURL"\)/);
+  assert.match(module, /TacuaLaunchLinkParser\.parse/);
 });
 
 test("release inputs must be strict text without private-key material", () => {
