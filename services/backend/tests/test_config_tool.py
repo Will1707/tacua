@@ -229,6 +229,85 @@ class ConfigToolTests(unittest.TestCase):
             with self.subTest(document=document), self.assertRaises(ConfigError):
                 compile_config_artifacts(self.render(document))
 
+    def test_reviewer_auth_is_optional_secret_free_and_outside_the_deployment_pin(self) -> None:
+        legacy_text = compile_config_template(self.template_text())
+        legacy = parse_config_text(legacy_text)
+        self.assertEqual("legacy_admin", legacy.reviewer_auth.mode)
+        self.assertIsNone(legacy.reviewer_auth.tailscale_app_capabilities)
+
+        pairing_document = self.template_document()
+        pairing_document["reviewer_auth"] = {"mode": "pairing"}
+        pairing_text, pairing_profile = compile_config_artifacts(
+            self.render(pairing_document)
+        )
+        pairing = parse_config_text(pairing_text)
+        self.assertEqual("pairing", pairing.reviewer_auth.mode)
+        self.assertEqual(legacy.deployment_pin, pairing.deployment_pin)
+        self.assertNotIn("reviewer_auth", json.loads(pairing_profile))
+
+    def test_tailscale_reviewer_auth_requires_one_exact_bounded_custom_capability(self) -> None:
+        capability = {"qa.example.com/cap/tacua-reviewer": [{}]}
+        document = self.template_document()
+        document["reviewer_auth"] = {
+            "mode": "tailscale_capability_or_pairing",
+            "tailscale_app_capabilities": capability,
+        }
+        config = parse_config_text(compile_config_template(self.render(document)))
+        self.assertEqual(capability, config.reviewer_auth.tailscale_app_capabilities)
+        self.assertEqual(
+            canonical_json(capability),
+            config.reviewer_auth.tailscale_app_capabilities_json,
+        )
+
+        invalid_policies = (
+            {"mode": []},
+            {"mode": {}},
+            {"mode": None},
+            {"mode": True},
+            {"mode": 1},
+            {"mode": "pairing", "tailscale_app_capabilities": capability},
+            {
+                "mode": "tailscale_capability_or_pairing",
+                "tailscale_app_capabilities": {},
+            },
+            {
+                "mode": "tailscale_capability_or_pairing",
+                "tailscale_app_capabilities": {
+                    **capability,
+                    "other.example.com/cap/reviewer": [{}],
+                },
+            },
+            {
+                "mode": "tailscale_capability_or_pairing",
+                "tailscale_app_capabilities": {"tacua-reviewer": [{}]},
+            },
+            {
+                "mode": "tailscale_capability_or_pairing",
+                "tailscale_app_capabilities": {
+                    "qa.example.com/cap/tacua-reviewer": []
+                },
+            },
+            {
+                "mode": "tailscale_capability_or_pairing",
+                "tailscale_app_capabilities": {
+                    "qa.example.com/cap/tacua-reviewer": ["reviewer"]
+                },
+            },
+            {
+                "mode": "tailscale_capability_or_pairing",
+                "tailscale_app_capabilities": {
+                    "qa.example.com/cap/tacua-reviewer": [
+                        {"slot": index} for index in range(9)
+                    ]
+                },
+            },
+        )
+        for policy in invalid_policies:
+            changed = self.template_document()
+            changed["reviewer_auth"] = policy
+            with self.subTest(policy=policy), self.assertRaises(ConfigError):
+                compile_config_template(self.render(changed))
+
     def test_each_transport_limit_reseals_the_build_handoff_and_sdk_profile(self) -> None:
         original_config_text, original_profile_text = compile_config_artifacts(
             self.template_text()

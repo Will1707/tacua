@@ -22,7 +22,8 @@ import stat
 import tempfile
 import threading
 import unicodedata
-from typing import Any, BinaryIO, Callable, Protocol
+from typing import Any, BinaryIO, Callable, NoReturn, Protocol
+from urllib.parse import quote
 
 from . import PROCESSING_JOB_CONTRACT, __version__
 from .candidate_domain import ContractError as CandidateContractError, TICKET_CONTRACT
@@ -38,12 +39,16 @@ from .config import (
     DIGEST_PATTERN,
     ID_PATTERN,
     SUPPORTED_TRANSPORT_POLICY_VERSIONS,
+    REVIEWER_AUTH_LEGACY_ADMIN,
+    REVIEWER_AUTH_PAIRING,
+    REVIEWER_AUTH_TAILSCALE_OR_PAIRING,
     TRANSPORT_POLICY_VERSION,
     TRANSPORT_POLICY_VERSION_1_2,
     PilotConfig,
     normalize_backend_origin,
     validate_launch_scheme,
     validate_approved_handoff_config,
+    validate_reviewer_auth_config,
 )
 from .contracts import (
     ContractError,
@@ -85,6 +90,16 @@ from .processing_jobs import (
     initialize_processing_job_schema,
 )
 from .processing_bridge import WORKER_ERROR_CODE
+from .reviewer_auth_store import (
+    ApprovedPairing,
+    IssuedReviewerSession,
+    PairingRequest,
+    REVIEWER_SCOPES,
+    ReviewerAuthStore,
+    ReviewerAuthStoreError,
+    ReviewerPrincipal,
+    ReviewerSession,
+)
 
 
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
@@ -106,6 +121,7 @@ RETENTION_POLICY_VERSION = "tacua.retention-v1"
 MANIFEST_RETENTION_POLICY_VERSION = "tacua.retention@1.0.0"
 SDK_BACKEND_ERROR_CONTRACT = "tacua.sdk-backend-error@1.0.0"
 REVIEWER_BOOTSTRAP_CONTRACT = "tacua.reviewer-bootstrap@1.0.0"
+REVIEWER_LAUNCH_LINK_CONTRACT = "tacua.reviewer-launch-link@1.0.0"
 SDK_BACKEND_ERROR_MEDIA_TYPE = (
     "application/vnd.tacua.sdk-backend-error+json;version=1.0.0"
 )
@@ -130,6 +146,19 @@ class ClosingConnection(sqlite3.Connection):
             return super().__exit__(exc_type, exc_value, traceback)
         finally:
             self.close()
+
+
+@dataclass(frozen=True)
+class AuthenticatedReviewer:
+    """One scoped reviewer identity resolved by an HTTP authentication adapter."""
+
+    reviewer_id: str
+    auth_kind: str
+    scopes: tuple[str, ...]
+    session_id: str | None
+    device_label: str | None
+    client_kind: str
+    expires_at: str | None
 
 
 @dataclass(frozen=True)
@@ -517,6 +546,17 @@ class PilotBackend:
         ):
             raise ValueError("build_identity transport configuration differs from deployment")
         validate_approved_handoff_config(config)
+        try:
+            validated_reviewer_auth = validate_reviewer_auth_config(
+                config.reviewer_auth
+            )
+        except ConfigError as exc:
+            raise ValueError("reviewer_auth configuration is invalid") from exc
+        if validated_reviewer_auth != config.reviewer_auth:
+            raise ValueError("reviewer_auth configuration is not canonical")
+        tailscale_capabilities_json = (
+            validated_reviewer_auth.tailscale_app_capabilities_json
+        )
         if not all(
             1 <= value <= 30
             for value in (
@@ -541,6 +581,10 @@ class PilotBackend:
         ):
             raise ValueError("processing_engine must implement process_stage")
         self.config = config
+        # Public config contains a shallowly mutable JSON map. Authentication
+        # must remain pinned to the exact startup-validated bytes even if a
+        # caller later mutates its original Python object.
+        self._tailscale_app_capabilities_json = tailscale_capabilities_json
         self._registered_build_identity = strict_json_loads(canonical_json(config.build_identity))
         self._registered_build_identity_json = canonical_json(self._registered_build_identity)
         self._approved_handoff = strict_json_loads(
@@ -552,6 +596,11 @@ class PilotBackend:
         self._verifier_key = hmac.new(
             self._admin_secret,
             b"tacua sdk credential verifier root v1",
+            hashlib.sha256,
+        ).digest()
+        self._reviewer_auth_key = hmac.new(
+            self._admin_secret,
+            b"tacua reviewer authentication root v1",
             hashlib.sha256,
         ).digest()
         self._clock = clock
@@ -604,6 +653,16 @@ class PilotBackend:
                 raise ValueError("backend database is not owned by the service user")
         self._initialize_database()
         self.db_path.chmod(0o600)
+        self._reviewer_auth_store = ReviewerAuthStore(
+            self._connect,
+            verifier_key=self._reviewer_auth_key,
+            reviewer_id=self.config.reviewer_id,
+            clock=self._reviewer_auth_now,
+        )
+        try:
+            self._reviewer_auth_store.initialize_schema()
+        except ReviewerAuthStoreError as exc:
+            raise ValueError("reviewer authentication storage is incompatible") from exc
         self._restore_authoritative_time_floor()
         self._initialize_review_storage()
         self._recover_pending_deletions()
@@ -627,6 +686,13 @@ class PilotBackend:
             ):
                 return self._authoritative_time_floor
         return normalized
+
+    def _reviewer_auth_now(self) -> datetime:
+        """Advance the process time floor for reviewer credential events."""
+
+        value = self._now()
+        self._advance_authoritative_time_floor(value)
+        return value
 
     def _advance_authoritative_time_floor(self, value: datetime) -> None:
         normalized = value.astimezone(timezone.utc).replace(microsecond=0)
@@ -655,6 +721,12 @@ class PilotBackend:
                        UNION ALL SELECT accepted_at FROM pending_deletions
                        UNION ALL SELECT deleted_at FROM tombstones
                        UNION ALL SELECT occurred_at FROM audit_events
+                       UNION ALL SELECT observed_at FROM tacua_reviewer_auth_time_floor
+                       UNION ALL SELECT created_at FROM reviewer_pairing_requests
+                       UNION ALL SELECT approved_at FROM reviewer_pairing_requests
+                       UNION ALL SELECT consumed_at FROM reviewer_pairing_requests
+                       UNION ALL SELECT created_at FROM reviewer_sessions
+                       UNION ALL SELECT revoked_at FROM reviewer_sessions
                    )"""
             ).fetchone()
         if row is not None and row["event_at"] is not None:
@@ -1820,6 +1892,266 @@ class PilotBackend:
         return {"status": "verified"}
 
     @staticmethod
+    def _require_reviewer_scope(required_scope: str) -> str:
+        if required_scope not in REVIEWER_SCOPES:
+            raise ValueError("required reviewer scope is unsupported")
+        return required_scope
+
+    @staticmethod
+    def _reviewer_authentication_failed() -> NoReturn:
+        raise ApiError(
+            401,
+            "REVIEWER_AUTHENTICATION_FAILED",
+            "reviewer authentication failed",
+        )
+
+    @staticmethod
+    def _raise_reviewer_store_error(error: ReviewerAuthStoreError) -> NoReturn:
+        if error.status == 401:
+            PilotBackend._reviewer_authentication_failed()
+        raise ApiError(error.status, error.code, error.message) from error
+
+    @staticmethod
+    def _session_principal(principal: ReviewerPrincipal) -> AuthenticatedReviewer:
+        return AuthenticatedReviewer(
+            reviewer_id=principal.reviewer_id,
+            auth_kind="session",
+            scopes=principal.scopes,
+            session_id=principal.session_id,
+            device_label=principal.device_label,
+            client_kind=principal.client_kind,
+            expires_at=principal.expires_at,
+        )
+
+    def authenticate_legacy_reviewer(
+        self,
+        credential: str | None,
+        *,
+        required_scope: str,
+    ) -> AuthenticatedReviewer:
+        """Authenticate the transitional admin bearer on reviewer aliases only."""
+
+        self._require_reviewer_scope(required_scope)
+        if (
+            self.config.reviewer_auth.mode != REVIEWER_AUTH_LEGACY_ADMIN
+            or credential is None
+            or not hmac.compare_digest(
+                credential.encode("utf-8", "surrogatepass"), self._admin_secret
+            )
+        ):
+            self._reviewer_authentication_failed()
+        return AuthenticatedReviewer(
+            reviewer_id=self.config.reviewer_id,
+            auth_kind="legacy_admin",
+            scopes=REVIEWER_SCOPES,
+            session_id=None,
+            device_label=None,
+            client_kind="legacy_web",
+            expires_at=None,
+        )
+
+    def authenticate_reviewer_session(
+        self,
+        credential: str | None,
+        *,
+        required_scope: str,
+    ) -> AuthenticatedReviewer:
+        """Authenticate one revocable pairing-issued session bearer or cookie."""
+
+        self._require_reviewer_scope(required_scope)
+        if (
+            self.config.reviewer_auth.mode
+            not in {REVIEWER_AUTH_PAIRING, REVIEWER_AUTH_TAILSCALE_OR_PAIRING}
+            or credential is None
+        ):
+            self._reviewer_authentication_failed()
+        try:
+            principal = self._reviewer_auth_store.authenticate_session(
+                credential,
+                required_scope=required_scope,
+            )
+        except ReviewerAuthStoreError as error:
+            self._raise_reviewer_store_error(error)
+        return self._session_principal(principal)
+
+    def authenticate_tailscale_reviewer(
+        self,
+        capability_headers: tuple[str, ...],
+        *,
+        required_scope: str,
+    ) -> AuthenticatedReviewer | None:
+        """Authenticate one exact Serve-injected app-capability JSON header.
+
+        Absence returns ``None`` so the HTTP adapter can try a paired session.
+        Any present-but-invalid or duplicate representation fails generically.
+        """
+
+        self._require_reviewer_scope(required_scope)
+        if self.config.reviewer_auth.mode != REVIEWER_AUTH_TAILSCALE_OR_PAIRING:
+            return None
+        if not capability_headers:
+            return None
+        if len(capability_headers) != 1:
+            self._reviewer_authentication_failed()
+        serialized = capability_headers[0]
+        if not isinstance(serialized, str) or not serialized or len(serialized) > 4_096:
+            self._reviewer_authentication_failed()
+        try:
+            raw = serialized.encode("ascii", "strict")
+            parsed = strict_json_loads(raw)
+        except (
+            UnicodeError,
+            json.JSONDecodeError,
+            DuplicateJSONKey,
+            InvalidJSONValue,
+            ValueError,
+        ):
+            self._reviewer_authentication_failed()
+        expected = self._tailscale_app_capabilities_json
+        if (
+            not isinstance(parsed, dict)
+            or expected is None
+            or canonical_json(parsed) != expected
+        ):
+            self._reviewer_authentication_failed()
+        return AuthenticatedReviewer(
+            reviewer_id=self.config.reviewer_id,
+            auth_kind="tailscale_capability",
+            scopes=REVIEWER_SCOPES,
+            session_id=None,
+            device_label=None,
+            client_kind="tailscale_web",
+            expires_at=None,
+        )
+
+    def reviewer_csrf_token(self, principal: AuthenticatedReviewer) -> str:
+        """Return an origin-bound CSRF token without storing another secret."""
+
+        if (
+            principal.reviewer_id != self.config.reviewer_id
+            or principal.auth_kind
+            not in {"legacy_admin", "session", "tailscale_capability"}
+        ):
+            raise ValueError("reviewer principal is invalid")
+        binding = principal.session_id or principal.auth_kind
+        verifier = hmac.new(
+            self._reviewer_auth_key,
+            (
+                "tacua reviewer csrf v1\x00"
+                + self.config.backend_origin
+                + "\x00"
+                + self.config.reviewer_id
+                + "\x00"
+                + binding
+            ).encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+        return base64.urlsafe_b64encode(verifier).decode("ascii").rstrip("=")
+
+    def create_reviewer_pairing(
+        self,
+        *,
+        device_label: Any,
+        client_kind: Any,
+    ) -> PairingRequest:
+        if self.config.reviewer_auth.mode == REVIEWER_AUTH_LEGACY_ADMIN:
+            raise ApiError(404, "NOT_FOUND", "route was not found")
+        try:
+            return self._reviewer_auth_store.create_pairing(
+                device_label=device_label,
+                client_kind=client_kind,
+            )
+        except ReviewerAuthStoreError as error:
+            self._raise_reviewer_store_error(error)
+
+    def approve_reviewer_pairing(self, human_code: Any) -> ApprovedPairing:
+        if self.config.reviewer_auth.mode == REVIEWER_AUTH_LEGACY_ADMIN:
+            raise ApiError(404, "NOT_FOUND", "route was not found")
+        try:
+            return self._reviewer_auth_store.approve_pairing(
+                human_code,
+                scopes=REVIEWER_SCOPES,
+            )
+        except ReviewerAuthStoreError as error:
+            self._raise_reviewer_store_error(error)
+
+    def exchange_reviewer_pairing(
+        self,
+        pairing_token: Any,
+        *,
+        expected_client_kind: Any,
+    ) -> IssuedReviewerSession:
+        if self.config.reviewer_auth.mode == REVIEWER_AUTH_LEGACY_ADMIN:
+            raise ApiError(404, "NOT_FOUND", "route was not found")
+        try:
+            return self._reviewer_auth_store.exchange_pairing(
+                pairing_token,
+                expected_client_kind=expected_client_kind,
+            )
+        except ReviewerAuthStoreError as error:
+            self._raise_reviewer_store_error(error)
+
+    def cancel_reviewer_pairing(
+        self,
+        pairing_token: Any,
+        *,
+        expected_client_kind: Any,
+    ) -> None:
+        if self.config.reviewer_auth.mode == REVIEWER_AUTH_LEGACY_ADMIN:
+            raise ApiError(404, "NOT_FOUND", "route was not found")
+        try:
+            self._reviewer_auth_store.cancel_pairing(
+                pairing_token,
+                expected_client_kind=expected_client_kind,
+            )
+        except ReviewerAuthStoreError as error:
+            self._raise_reviewer_store_error(error)
+
+    def list_reviewer_sessions(self) -> tuple[ReviewerSession, ...]:
+        if self.config.reviewer_auth.mode == REVIEWER_AUTH_LEGACY_ADMIN:
+            raise ApiError(404, "NOT_FOUND", "route was not found")
+        try:
+            return self._reviewer_auth_store.list_sessions()
+        except ReviewerAuthStoreError as error:
+            self._raise_reviewer_store_error(error)
+
+    def revoke_reviewer_session(self, session_id: Any) -> ReviewerSession:
+        if self.config.reviewer_auth.mode == REVIEWER_AUTH_LEGACY_ADMIN:
+            raise ApiError(404, "NOT_FOUND", "route was not found")
+        try:
+            return self._reviewer_auth_store.revoke_session(session_id)
+        except ReviewerAuthStoreError as error:
+            self._raise_reviewer_store_error(error)
+
+    def create_reviewer_launch_link(
+        self,
+        body: Any,
+        *,
+        reviewer: AuthenticatedReviewer,
+    ) -> dict[str, Any]:
+        """Mint one grant and its exact sealed-build deep link as one response."""
+
+        launch_scheme = self.config.launch_scheme
+        if launch_scheme is None:
+            raise ApiError(
+                409,
+                "REVIEWER_LAUNCH_SCHEME_UNAVAILABLE",
+                "deployment does not seal a reviewer launch scheme",
+            )
+        grant = self.create_launch_code(body, reviewer=reviewer)
+        launch_url = (
+            f"{launch_scheme}://tacua/start?launch_code="
+            + quote(grant["launch_code"], safe="")
+        )
+        if grant["exchange_kind"] == "resume_session":
+            launch_url += "&session_id=" + quote(grant["session_id"], safe="")
+        return {
+            "contract_version": REVIEWER_LAUNCH_LINK_CONTRACT,
+            "launch_url": launch_url,
+            "grant": grant,
+        }
+
+    @staticmethod
     def _require_credential_rotation_capacity(
         connection: sqlite3.Connection,
         session_id: str,
@@ -1882,7 +2214,23 @@ class PilotBackend:
             ),
         )
 
-    def create_launch_code(self, body: Any) -> dict[str, Any]:
+    def create_launch_code(
+        self,
+        body: Any,
+        *,
+        reviewer: AuthenticatedReviewer | None = None,
+    ) -> dict[str, Any]:
+        actor_kind = "admin"
+        if reviewer is not None:
+            if (
+                not isinstance(reviewer, AuthenticatedReviewer)
+                or reviewer.reviewer_id != self.config.reviewer_id
+                or reviewer.auth_kind
+                not in {"legacy_admin", "session", "tailscale_capability"}
+                or "reviewer.launch" not in reviewer.scopes
+            ):
+                raise ValueError("reviewer launch principal is invalid")
+            actor_kind = "reviewer"
         if not isinstance(body, dict) or body.get("exchange_kind") not in {
             "start_session",
             "resume_session",
@@ -1951,7 +2299,14 @@ class PilotBackend:
                     timestamp(expires),
                 ),
             )
-            self._audit(conn, "launch_grant_created", "admin", "succeeded", session_id, timestamp(now))
+            self._audit(
+                conn,
+                "launch_grant_created",
+                actor_kind,
+                "succeeded",
+                session_id,
+                timestamp(now),
+            )
         response = {
             "launch_id": launch_id,
             "launch_code": code,

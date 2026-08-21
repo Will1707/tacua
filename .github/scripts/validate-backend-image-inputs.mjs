@@ -102,6 +102,7 @@ const expectedInputPaths = new Set([
   "services/backend/src/tacua_backend/processing_bridge.py",
   "services/backend/src/tacua_backend/processing_jobs.py",
   "services/backend/src/tacua_backend/processing_worker.py",
+  "services/backend/src/tacua_backend/reviewer_auth_store.py",
   "services/backend/src/tacua_backend/service.py",
 ]);
 const expectedInputDirectories = new Set([""]);

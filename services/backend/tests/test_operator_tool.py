@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import ssl
 import stat
 import tempfile
 import unittest
@@ -30,6 +31,7 @@ from tacua_backend.instance_lock import (  # noqa: E402
 )
 from tacua_backend.operator_tool import (  # noqa: E402
     OperatorError,
+    approve_reviewer_pairing,
     check_compose_state_copy_bound,
     create_admin_secret,
     create_backup,
@@ -115,6 +117,15 @@ class OperatorToolTests(unittest.TestCase):
         config, secret = load_config(config_file, secret_file)
         PilotBackend(config, secret)
         return config_file, secret_file, state
+
+    @staticmethod
+    def enable_reviewer_pairing(config_file: Path) -> None:
+        document = json.loads(config_file.read_text(encoding="utf-8"))
+        document["reviewer_auth"] = {"mode": "pairing"}
+        config_file.write_text(
+            json.dumps(document, ensure_ascii=False, allow_nan=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
     @staticmethod
     def add_session(
@@ -1534,6 +1545,244 @@ class OperatorToolTests(unittest.TestCase):
                 "/v1/admin/reviewer-bootstrap",
                 urllib.parse.urlsplit(legacy_opener.requests[-1][0]).path,
             )
+
+    def test_approve_reviewer_pairing_uses_exact_https_admin_request_and_content_free_output(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_file, secret_file, _state = self.deployment(root)
+            self.enable_reviewer_pairing(config_file)
+            config, secret = load_config(config_file, secret_file)
+            endpoint = (
+                config.backend_origin + "/v1/admin/reviewer-pairing-approvals"
+            )
+            response_document = {
+                "pairing_id": "rpair_" + "a" * 32,
+                "device_label": "Will's reviewer",
+                "client_kind": "web",
+                "scopes": [
+                    "reviewer.launch",
+                    "reviewer.read",
+                    "reviewer.write",
+                ],
+                "created_at": "2026-08-21T09:00:00Z",
+                "approved_at": "2026-08-21T09:00:01Z",
+                "expires_at": "2026-08-21T09:10:00Z",
+            }
+
+            class ApprovalOpener:
+                def open(self, request, timeout: int):
+                    self.request = request
+                    self.timeout = timeout
+                    return FakeResponse(endpoint, response_document)
+
+            opener = ApprovalOpener()
+            contexts: list[ssl.SSLContext] = []
+
+            def opener_factory(context: ssl.SSLContext):
+                contexts.append(context)
+                return opener
+
+            result = approve_reviewer_pairing(
+                config_file,
+                secret_file,
+                "ABCD-EFGH",
+                opener_factory=opener_factory,
+            )
+
+            self.assertEqual(
+                {"operation": "reviewer_pairing_approved", "status": "ok"},
+                result,
+            )
+            self.assertNotIn("ABCD-EFGH", json.dumps(result))
+            self.assertNotIn(response_document["pairing_id"], json.dumps(result))
+            self.assertNotIn(response_document["device_label"], json.dumps(result))
+            self.assertEqual(ssl.TLSVersion.TLSv1_2, contexts[0].minimum_version)
+            self.assertEqual(10, opener.timeout)
+            self.assertEqual("POST", opener.request.get_method())
+            self.assertEqual(endpoint, opener.request.full_url)
+            self.assertEqual(
+                b'{"human_code":"ABCD-EFGH"}',
+                opener.request.data,
+            )
+            self.assertEqual("application/json", opener.request.get_header("Accept"))
+            self.assertEqual(
+                "Bearer " + secret.decode("ascii"),
+                opener.request.get_header("Authorization"),
+            )
+            self.assertEqual(
+                "no-store",
+                opener.request.get_header("Cache-control"),
+            )
+            self.assertEqual(
+                "application/json",
+                opener.request.get_header("Content-type"),
+            )
+
+    def test_approve_reviewer_pairing_rejects_invalid_codes_before_file_or_network_access(
+        self,
+    ) -> None:
+        for code in (
+            "abcd-efgh",
+            "ABCI-EFGH",
+            "ABCO-EFGH",
+            "ABC1-EFGH",
+            "ABCD EFGH",
+            " ABCD-EFGH",
+            "ABCD-EFGH ",
+            "ABCD-EFGH2",
+            "ABCD-ÉFGH",
+        ):
+            with self.subTest(code=code), self.assertRaisesRegex(
+                OperatorError,
+                "pairing approval code is invalid",
+            ):
+                approve_reviewer_pairing(
+                    Path("/does/not/exist/config.json"),
+                    Path("/does/not/exist/admin-secret"),
+                    code,
+                )
+
+    def test_approve_reviewer_pairing_default_opener_disables_environment_proxies(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_file, secret_file, _state = self.deployment(root)
+            self.enable_reviewer_pairing(config_file)
+            config, secret = load_config(config_file, secret_file)
+            endpoint = (
+                config.backend_origin + "/v1/admin/reviewer-pairing-approvals"
+            )
+            opener = FakeOpener(
+                {
+                    "/v1/admin/reviewer-pairing-approvals": {
+                        "pairing_id": "rpair_" + "a" * 32,
+                        "device_label": "Will's reviewer",
+                        "client_kind": "web",
+                        "scopes": [
+                            "reviewer.launch",
+                            "reviewer.read",
+                            "reviewer.write",
+                        ],
+                        "created_at": "2026-08-21T09:00:00Z",
+                        "approved_at": "2026-08-21T09:00:01Z",
+                        "expires_at": "2026-08-21T09:10:00Z",
+                    }
+                }
+            )
+            built: list[tuple[object, ...]] = []
+
+            def fake_build_opener(*handlers: object) -> FakeOpener:
+                built.append(handlers)
+                return opener
+
+            with patch.object(
+                operator_tool.urllib.request,
+                "build_opener",
+                side_effect=fake_build_opener,
+            ):
+                result = approve_reviewer_pairing(
+                    config_file,
+                    secret_file,
+                    "ABCD-EFGH",
+                )
+
+            self.assertEqual(
+                {"operation": "reviewer_pairing_approved", "status": "ok"},
+                result,
+            )
+            self.assertEqual(
+                [(endpoint, "Bearer " + secret.decode("ascii"))],
+                opener.requests,
+            )
+            self.assertEqual(1, len(built))
+            proxy_handlers = [
+                handler
+                for handler in built[0]
+                if isinstance(handler, operator_tool.urllib.request.ProxyHandler)
+            ]
+            self.assertEqual(1, len(proxy_handlers))
+            self.assertEqual({}, proxy_handlers[0].proxies)
+
+    def test_approve_reviewer_pairing_rejects_legacy_mode_and_untrusted_response(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_file, secret_file, _state = self.deployment(root)
+            with self.assertRaisesRegex(OperatorError, "does not enable pairing"):
+                approve_reviewer_pairing(
+                    config_file,
+                    secret_file,
+                    "ABCD-EFGH",
+                    opener_factory=lambda _context: self.fail(
+                        "legacy mode must fail before opening the network"
+                    ),
+                )
+
+            self.enable_reviewer_pairing(config_file)
+            config, _secret = load_config(config_file, secret_file)
+            endpoint = (
+                config.backend_origin + "/v1/admin/reviewer-pairing-approvals"
+            )
+            malformed = {
+                "pairing_id": "rpair_" + "a" * 32,
+                "device_label": "Will's reviewer",
+                "client_kind": "web",
+                "scopes": [
+                    "reviewer.launch",
+                    "reviewer.read",
+                    "reviewer.write",
+                ],
+                "created_at": "2026-08-21T09:00:00Z",
+                "approved_at": "2026-08-21T09:00:01Z",
+                "expires_at": "2026-08-21T09:10:00Z",
+                "unexpected": True,
+            }
+
+            class MalformedResponseOpener:
+                def open(self, _request, timeout: int):
+                    self.timeout = timeout
+                    return FakeResponse(endpoint, malformed)
+
+            with self.assertRaisesRegex(
+                OperatorError,
+                "approval response is invalid",
+            ):
+                approve_reviewer_pairing(
+                    config_file,
+                    secret_file,
+                    "ABCD-EFGH",
+                    opener_factory=lambda _context: MalformedResponseOpener(),
+                )
+
+    def test_approve_reviewer_pairing_cli_wires_only_content_free_result(self) -> None:
+        expected = {"operation": "reviewer_pairing_approved", "status": "ok"}
+        with patch.object(
+            operator_tool,
+            "approve_reviewer_pairing",
+            return_value=expected,
+        ) as approve, patch("builtins.print") as output:
+            status = operator_tool.main(
+                [
+                    "approve-reviewer-pairing",
+                    "--config-file",
+                    "/private/config.json",
+                    "--admin-secret-file",
+                    "/private/admin-secret",
+                    "--code",
+                    "ABCD-EFGH",
+                ]
+            )
+        self.assertEqual(0, status)
+        approve.assert_called_once_with(
+            Path("/private/config.json"),
+            Path("/private/admin-secret"),
+            "ABCD-EFGH",
+        )
+        output.assert_called_once_with(operator_tool._canonical_json(expected))
 
     def test_smoke_rejects_an_unbounded_content_length_without_integer_parsing(self) -> None:
         response = FakeResponse("https://qa.example/version", {"status": "ok"})

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from email.message import Message
 import importlib.util
+import io
 from pathlib import Path
 import tempfile
 import unittest
@@ -26,6 +28,7 @@ class ReviewerWebServerTests(unittest.TestCase):
                 "if-match",
                 "proxy-authorization",
                 "tacua-content-digest",
+                "tacua-csrf-token",
                 "tacua-credential-id",
                 "tacua-evidence-manifest-digest",
                 "tacua-intent-digest",
@@ -35,12 +38,29 @@ class ReviewerWebServerTests(unittest.TestCase):
                 "tacua-reviewer-id",
                 "tacua-scope-digest",
                 "tacua-sidecar-digest",
+                "tailscale-app-capabilities",
                 "tailscale-user-login",
                 "tailscale-user-name",
                 "tailscale-user-profile-pic",
             },
             server.SENSITIVE_REQUEST_HEADERS,
         )
+
+    def test_csrf_header_is_rejected_even_without_the_ingress_scrubber(self) -> None:
+        handler = object.__new__(server.ReviewerRequestHandler)
+        handler.headers = Message()
+        handler.headers["Tacua-CSRF-Token"] = "synthetic"
+        handler.wfile = io.BytesIO()
+        statuses: list[int] = []
+        handler.send_response = statuses.append
+        handler._security_headers = lambda _cache_control: None
+        handler.send_header = lambda _name, _value: None
+        handler.end_headers = lambda: None
+
+        handler._write_response(include_body=True)
+
+        self.assertEqual([400], statuses)
+        self.assertEqual(server.ERROR_BODY, handler.wfile.getvalue())
 
     def test_spa_routes_and_exact_assets_remain_inside_the_document_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

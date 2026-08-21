@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import importlib.util
 import json
@@ -67,6 +67,22 @@ MAX_SAFE_INTEGER = 9_007_199_254_740_991
 APPROVED_HANDOFF_KEYS = frozenset(
     {"build_identity", "authority", "registry_revision"}
 )
+REVIEWER_AUTH_LEGACY_ADMIN = "legacy_admin"
+REVIEWER_AUTH_PAIRING = "pairing"
+REVIEWER_AUTH_TAILSCALE_OR_PAIRING = "tailscale_capability_or_pairing"
+REVIEWER_AUTH_MODES = frozenset(
+    {
+        REVIEWER_AUTH_LEGACY_ADMIN,
+        REVIEWER_AUTH_PAIRING,
+        REVIEWER_AUTH_TAILSCALE_OR_PAIRING,
+    }
+)
+TAILSCALE_CAPABILITY_NAME_PATTERN = re.compile(
+    r"^(?=.{1,255}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?/cap/"
+    r"[a-z][a-z0-9._-]{0,63}(?:/[a-z][a-z0-9._-]{0,63})*$"
+)
+MAX_TAILSCALE_CAPABILITIES_JSON_BYTES = 4_096
 
 
 def _load_approved_handoff_contract() -> ModuleType:
@@ -143,6 +159,20 @@ def normalize_backend_origin(value: str) -> str:
 
 
 @dataclass(frozen=True)
+class ReviewerAuthConfig:
+    """Public reviewer-auth policy; it never contains a credential."""
+
+    mode: str = REVIEWER_AUTH_LEGACY_ADMIN
+    tailscale_app_capabilities: dict[str, list[dict[str, Any]]] | None = None
+
+    @property
+    def tailscale_app_capabilities_json(self) -> str | None:
+        if self.tailscale_app_capabilities is None:
+            return None
+        return _canonical_json(self.tailscale_app_capabilities)
+
+
+@dataclass(frozen=True)
 class PilotConfig:
     organization_id: str
     project_id: str
@@ -166,6 +196,7 @@ class PilotConfig:
     transport_policy_version: str = TRANSPORT_POLICY_VERSION
     launch_scheme: str | None = None
     approved_handoff: dict[str, Any] | None = None
+    reviewer_auth: ReviewerAuthConfig = field(default_factory=ReviewerAuthConfig)
 
     @property
     def bundle_identifier(self) -> str:
@@ -248,6 +279,106 @@ def validate_launch_scheme(value: Any) -> str:
             "launch_scheme must be a dedicated normalized lowercase QA-app URL scheme"
         )
     return value
+
+
+def _validate_ascii_json(value: Any, *, field_name: str) -> None:
+    """Validate bounded JSON that is safe to compare with one HTTP header."""
+
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    while stack:
+        child, depth = stack.pop()
+        if depth > 8:
+            raise ConfigError(f"{field_name} exceeds the safe JSON nesting depth")
+        if child is None or isinstance(child, bool):
+            continue
+        if isinstance(child, int):
+            if abs(child) > MAX_SAFE_INTEGER:
+                raise ConfigError(f"{field_name} contains an unsafe integer")
+            continue
+        if isinstance(child, str):
+            if not child or len(child) > 512:
+                raise ConfigError(f"{field_name} contains invalid text")
+            try:
+                child.encode("ascii")
+            except UnicodeEncodeError as exc:
+                raise ConfigError(f"{field_name} must contain only ASCII JSON") from exc
+            continue
+        if isinstance(child, list):
+            if len(child) > 32:
+                raise ConfigError(f"{field_name} contains an oversized array")
+            stack.extend((item, depth + 1) for item in child)
+            continue
+        if isinstance(child, dict):
+            if len(child) > 32:
+                raise ConfigError(f"{field_name} contains an oversized object")
+            for key, item in child.items():
+                if not isinstance(key, str) or not key or len(key) > 255:
+                    raise ConfigError(f"{field_name} contains an invalid object key")
+                try:
+                    key.encode("ascii")
+                except UnicodeEncodeError as exc:
+                    raise ConfigError(
+                        f"{field_name} must contain only ASCII JSON"
+                    ) from exc
+                stack.append((item, depth + 1))
+            continue
+        raise ConfigError(f"{field_name} must contain only JSON values")
+
+
+def validate_reviewer_auth_config(value: Any) -> ReviewerAuthConfig:
+    """Validate one exact, secret-free reviewer authentication policy."""
+
+    if isinstance(value, ReviewerAuthConfig):
+        raw: dict[str, Any] = {"mode": value.mode}
+        if value.tailscale_app_capabilities is not None:
+            raw["tailscale_app_capabilities"] = value.tailscale_app_capabilities
+    elif isinstance(value, dict):
+        raw = value
+    else:
+        raise ConfigError("reviewer_auth must be an object")
+
+    mode = raw.get("mode")
+    if not isinstance(mode, str) or mode not in REVIEWER_AUTH_MODES:
+        raise ConfigError("reviewer_auth.mode is unsupported")
+    expected_keys = (
+        {"mode", "tailscale_app_capabilities"}
+        if mode == REVIEWER_AUTH_TAILSCALE_OR_PAIRING
+        else {"mode"}
+    )
+    if set(raw) != expected_keys:
+        raise ConfigError("reviewer_auth fields do not match its selected mode")
+    if mode != REVIEWER_AUTH_TAILSCALE_OR_PAIRING:
+        return ReviewerAuthConfig(mode=mode)
+
+    capabilities = raw.get("tailscale_app_capabilities")
+    if not isinstance(capabilities, dict) or len(capabilities) != 1:
+        raise ConfigError(
+            "reviewer_auth.tailscale_app_capabilities must contain exactly one capability"
+        )
+    capability_name, parameters = next(iter(capabilities.items()))
+    if (
+        not isinstance(capability_name, str)
+        or TAILSCALE_CAPABILITY_NAME_PATTERN.fullmatch(capability_name) is None
+    ):
+        raise ConfigError(
+            "reviewer_auth Tailscale capability must use owned-domain/cap/name form"
+        )
+    if (
+        not isinstance(parameters, list)
+        or not 1 <= len(parameters) <= 8
+        or any(not isinstance(parameter, dict) for parameter in parameters)
+    ):
+        raise ConfigError(
+            "reviewer_auth Tailscale capability must contain from one through eight object parameters"
+        )
+    _validate_ascii_json(capabilities, field_name="reviewer_auth.tailscale_app_capabilities")
+    serialized = _canonical_json(capabilities)
+    if len(serialized.encode("ascii")) > MAX_TAILSCALE_CAPABILITIES_JSON_BYTES:
+        raise ConfigError("reviewer_auth Tailscale capability JSON exceeds 4096 bytes")
+    return ReviewerAuthConfig(
+        mode=mode,
+        tailscale_app_capabilities=json.loads(serialized),
+    )
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -424,6 +555,7 @@ def _config_from_document(raw: dict[str, Any]) -> PilotConfig:
         "derived_retention_days",
         "tombstone_retention_days",
         "retention_sweep_interval_seconds",
+        "reviewer_auth",
     }
     if sorted(set(raw) - allowed_keys):
         raise ConfigError("config file contains unknown keys")
@@ -506,6 +638,9 @@ def _config_from_document(raw: dict[str, Any]) -> PilotConfig:
         retention_sweep_interval_seconds=_bounded_int(raw, "retention_sweep_interval_seconds", 300, 30, 3600),
         transport_policy_version=policy,
         launch_scheme=launch_scheme,
+        reviewer_auth=validate_reviewer_auth_config(
+            raw.get("reviewer_auth", {"mode": REVIEWER_AUTH_LEGACY_ADMIN})
+        ),
     )
     validate_approved_handoff_config(config)
     return config

@@ -37,6 +37,7 @@ def load_script():
 PILOT = load_script()
 DNS_NAME = "mini-pc.example-tail.ts.net"
 ORIGIN = f"https://{DNS_NAME}"
+REVIEWER_CAPABILITY = "auth.example.invalid/cap/tacua-reviewer"
 
 
 def config(**overrides):
@@ -64,19 +65,20 @@ def tailscale_status():
             "Online": True,
             "TailscaleIPs": ["100.64.0.1"],
         },
-        "Version": "synthetic",
+        "Version": "1.102.2-test",
     }
 
 
-def serve_status():
+def serve_status(*, reviewer_app_capability=None):
+    handler = {"Proxy": PILOT.EXPECTED_PROXY}
+    if reviewer_app_capability is not None:
+        handler["AcceptAppCaps"] = [reviewer_app_capability]
     return {
         "TCP": {"443": {"HTTPS": True}},
         "Web": {
             f"{DNS_NAME}:443": {
                 "Handlers": {
-                    "/": {
-                        "Proxy": PILOT.EXPECTED_PROXY,
-                    }
+                    "/": handler
                 }
             }
         },
@@ -145,6 +147,133 @@ class TailnetPrivatePilotTests(unittest.TestCase):
                 "status": "ok",
             },
             self.validate(),
+        )
+
+    def test_ingress_preserves_reviewer_auth_headers_only_for_api_requests(self):
+        ingress = (
+            ROOT / "services" / "backend" / "ingress" / "haproxy.cfg"
+        ).read_text(encoding="utf-8")
+        backend_section, reviewer_section = ingress.split(
+            "backend tacua_reviewer\n",
+            maxsplit=1,
+        )
+        for header in ("Tailscale-App-Capabilities", "Tacua-CSRF-Token"):
+            deletion = f"http-request del-header {header}"
+            with self.subTest(header=header):
+                self.assertNotIn(deletion, backend_section)
+                self.assertEqual(1, reviewer_section.count(deletion))
+
+    def test_accepts_only_the_configured_reviewer_app_capability(self):
+        reviewer_auth = SimpleNamespace(
+            mode="tailscale_capability_or_pairing",
+            tailscale_app_capabilities={REVIEWER_CAPABILITY: [{}]},
+        )
+        pilot_config = config(reviewer_auth=reviewer_auth)
+        self.assertEqual(
+            "ok",
+            self.validate(
+                pilot_config=pilot_config,
+                serve=serve_status(
+                    reviewer_app_capability=REVIEWER_CAPABILITY,
+                ),
+            )["status"],
+        )
+
+        for candidate in (
+            serve_status(),
+            serve_status(reviewer_app_capability="other.invalid/cap/reviewer"),
+            serve_status(reviewer_app_capability=REVIEWER_CAPABILITY),
+        ):
+            if "AcceptAppCaps" in candidate["Web"][f"{DNS_NAME}:443"]["Handlers"]["/"]:
+                candidate["Web"][f"{DNS_NAME}:443"]["Handlers"]["/"][
+                    "AcceptAppCaps"
+                ].append("other.invalid/cap/reviewer")
+            with self.subTest(candidate=candidate):
+                with self.assertRaises(PILOT.TailnetPilotError):
+                    self.validate(
+                        pilot_config=pilot_config,
+                        serve=candidate,
+                    )
+
+    def test_reviewer_auth_profile_requires_one_normalized_capability(self):
+        for reviewer_auth in (
+            SimpleNamespace(
+                mode="tailscale_capability_or_pairing",
+                tailscale_app_capabilities={},
+            ),
+            SimpleNamespace(
+                mode="tailscale_capability_or_pairing",
+                tailscale_app_capabilities={"-invalid": [{}]},
+            ),
+            SimpleNamespace(
+                mode="tailscale_capability_or_pairing",
+                tailscale_app_capabilities={REVIEWER_CAPABILITY: []},
+            ),
+            SimpleNamespace(
+                mode="legacy_admin",
+                tailscale_app_capabilities={REVIEWER_CAPABILITY: [{}]},
+            ),
+        ):
+            with self.subTest(reviewer_auth=reviewer_auth):
+                with self.assertRaises(PILOT.TailnetPilotError):
+                    PILOT._reviewer_app_capability(
+                        config(reviewer_auth=reviewer_auth)
+                    )
+
+        self.assertIsNone(PILOT._reviewer_app_capability(config()))
+        self.assertIsNone(
+            PILOT._reviewer_app_capability(
+                config(
+                    reviewer_auth=SimpleNamespace(
+                        mode="legacy_admin",
+                        tailscale_app_capabilities=None,
+                    )
+                )
+            )
+        )
+
+    def test_reviewer_app_capability_requires_tailscale_1_92_or_newer(self):
+        reviewer_auth = SimpleNamespace(
+            mode="tailscale_capability_or_pairing",
+            tailscale_app_capabilities={REVIEWER_CAPABILITY: [{}]},
+        )
+        pilot_config = config(reviewer_auth=reviewer_auth)
+        for version in ("1.91.1", "1.92", "synthetic", 192):
+            status = tailscale_status()
+            status["Version"] = version
+            with self.subTest(version=version):
+                with self.assertRaises(PILOT.TailnetPilotError):
+                    self.validate(
+                        pilot_config=pilot_config,
+                        status=status,
+                        serve=serve_status(
+                            reviewer_app_capability=REVIEWER_CAPABILITY,
+                        ),
+                    )
+
+        for version in ("1.92.0", "1.102.2-t34c5306", "2.0.0"):
+            status = tailscale_status()
+            status["Version"] = version
+            with self.subTest(version=version):
+                self.assertEqual(
+                    "ok",
+                    self.validate(
+                        pilot_config=pilot_config,
+                        status=status,
+                        serve=serve_status(
+                            reviewer_app_capability=REVIEWER_CAPABILITY,
+                        ),
+                    )["status"],
+                )
+        self.assertIsNone(
+            PILOT._reviewer_app_capability(
+                config(
+                    reviewer_auth=SimpleNamespace(
+                        mode="pairing",
+                        tailscale_app_capabilities=None,
+                    )
+                )
+            )
         )
 
     def test_rejects_offline_or_uncovered_tailnet_identity(self):

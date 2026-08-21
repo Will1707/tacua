@@ -58,6 +58,7 @@ BACKUP_ADMIN_SECRET = "admin-secret"
 BACKUP_STATE = "state"
 MAX_BACKUP_MANIFEST_BYTES = 16_777_216
 MAX_SMOKE_RESPONSE_BYTES = 2_097_152
+MAX_PAIRING_APPROVAL_RESPONSE_BYTES = 4_096
 # The Compose verifier copies the stopped SQLite database and WAL into an
 # ephemeral container tmpfs before opening either file. Keep the accepted V1
 # state comfortably below that tmpfs ceiling so SQLite has bounded scratch
@@ -71,6 +72,11 @@ _SEMANTIC_VERSION = re.compile(
 _TIMESTAMP = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
 )
+_PAIRING_HUMAN_CODE = re.compile(
+    r"^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}-"
+    r"[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}$"
+)
+_PAIRING_ID = re.compile(r"^rpair_[a-f0-9]{32}$")
 _IMMUTABLE_IMAGE = re.compile(r"^\S+@sha256:[a-f0-9]{64}$")
 _COMPOSE_PROJECT = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
@@ -79,7 +85,7 @@ _INGRESS_IMAGE = (
     "sha256:66e25cc9a8332635f4e897f7f4b1e5622c25f09f0ee23cddc6ce9bdb3a24772a"
 )
 _INGRESS_CONFIG_DIGEST = (
-    "sha256:b56aaeaf6c579de3bbe1398dfc3c8f585014b2f26b0899baff6556ba44a89691"
+    "sha256:8a27c572d3a90b4adf8b2d45a8418ed15e25d13d631765003ce64dd52cb49a44"
 )
 _INGRESS_CONFIG_TARGET = "/usr/local/etc/haproxy/haproxy.cfg"
 _COMPOSE_HEALTHCHECK = [
@@ -1920,6 +1926,137 @@ class _RejectRedirects(urllib.request.HTTPRedirectHandler):
         raise OperatorError("configured origin returned a forbidden redirect")
 
 
+def approve_reviewer_pairing(
+    config_file: Path,
+    admin_secret_file: Path,
+    human_code: str,
+    *,
+    opener_factory: Callable[[ssl.SSLContext], urllib.request.OpenerDirector]
+    | None = None,
+) -> dict[str, Any]:
+    """Approve one bounded pairing code without exposing approval metadata."""
+
+    if (
+        not isinstance(human_code, str)
+        or _PAIRING_HUMAN_CODE.fullmatch(human_code) is None
+    ):
+        raise OperatorError("reviewer pairing approval code is invalid")
+
+    _inspect_host_file(config_file, "public config", secret=False)
+    _inspect_host_file(admin_secret_file, "admin secret", secret=True)
+    try:
+        same_input_directory = config_file.parent.samefile(admin_secret_file.parent)
+    except OSError as exc:
+        raise OperatorError(
+            "administrator input directory identity cannot be verified"
+        ) from exc
+    if not same_input_directory:
+        raise OperatorError(
+            "public config and admin secret must share one private input directory"
+        )
+
+    config, secret = load_config(config_file, admin_secret_file)
+    if config.reviewer_auth.mode == "legacy_admin":
+        raise OperatorError("configured reviewer authentication does not enable pairing")
+    if not config.backend_origin.startswith("https://"):
+        raise OperatorError("reviewer pairing approval requires configured HTTPS")
+
+    endpoint = config.backend_origin + "/v1/admin/reviewer-pairing-approvals"
+    context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    factory = opener_factory or (
+        lambda tls_context: urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            _RejectRedirects(),
+            urllib.request.HTTPSHandler(context=tls_context),
+        )
+    )
+    opener = factory(context)
+    payload = _canonical_json({"human_code": human_code}).encode("utf-8")
+    request = urllib.request.Request(
+        endpoint,
+        data=payload,
+        method="POST",
+        headers={
+            "Accept": "application/json",
+            "Authorization": "Bearer " + secret.decode("ascii"),
+            "Cache-Control": "no-store",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        response = opener.open(request, timeout=10)
+        with response:
+            if response.status != 200 or response.geturl() != endpoint:
+                raise OperatorError(
+                    "reviewer pairing approval returned an unexpected status or URL"
+                )
+            if response.headers.get("Content-Type", "").lower() != "application/json":
+                raise OperatorError(
+                    "reviewer pairing approval returned an unexpected content type"
+                )
+            declared = response.headers.get("Content-Length")
+            if (
+                declared is None
+                or re.fullmatch(r"[1-9][0-9]{0,4}", declared) is None
+                or int(declared) > MAX_PAIRING_APPROVAL_RESPONSE_BYTES
+            ):
+                raise OperatorError(
+                    "reviewer pairing approval returned an invalid byte declaration"
+                )
+            response_payload = response.read(MAX_PAIRING_APPROVAL_RESPONSE_BYTES + 1)
+    except OperatorError:
+        raise
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        exc.close()
+        raise OperatorError(
+            f"reviewer pairing approval failed with HTTP {status}"
+        ) from None
+    except (OSError, urllib.error.URLError) as exc:
+        raise OperatorError(
+            "reviewer pairing approval endpoint could not be reached securely"
+        ) from exc
+
+    if len(response_payload) != int(declared):
+        raise OperatorError(
+            "reviewer pairing approval bytes differ from Content-Length"
+        )
+    approved = _parse_strict_json_object(
+        response_payload,
+        maximum_bytes=MAX_PAIRING_APPROVAL_RESPONSE_BYTES,
+        label="reviewer pairing approval response",
+    )
+    if (
+        set(approved)
+        != {
+            "pairing_id",
+            "device_label",
+            "client_kind",
+            "scopes",
+            "created_at",
+            "approved_at",
+            "expires_at",
+        }
+        or not isinstance(approved.get("pairing_id"), str)
+        or _PAIRING_ID.fullmatch(approved["pairing_id"]) is None
+        or not isinstance(approved.get("device_label"), str)
+        or not 1 <= len(approved["device_label"]) <= 64
+        or len(approved["device_label"].encode("utf-8")) > 128
+        or approved.get("client_kind") not in {"web", "native"}
+        or approved.get("scopes")
+        != ["reviewer.launch", "reviewer.read", "reviewer.write"]
+    ):
+        raise OperatorError("reviewer pairing approval response is invalid")
+    created_at = _parse_timestamp(approved.get("created_at"), "pairing creation time")
+    approved_at = _parse_timestamp(approved.get("approved_at"), "pairing approval time")
+    expires_at = _parse_timestamp(approved.get("expires_at"), "pairing expiry time")
+    if not created_at <= approved_at < expires_at:
+        raise OperatorError("reviewer pairing approval response is invalid")
+
+    return {"operation": "reviewer_pairing_approved", "status": "ok"}
+
+
 def _read_smoke_json(
     opener: urllib.request.OpenerDirector,
     endpoint: str,
@@ -2145,6 +2282,11 @@ def _parser() -> argparse.ArgumentParser:
     create_secret = subparsers.add_parser("create-admin-secret")
     create_secret.add_argument("--destination", required=True, type=Path)
 
+    approve_pairing = subparsers.add_parser("approve-reviewer-pairing")
+    approve_pairing.add_argument("--config-file", required=True, type=Path)
+    approve_pairing.add_argument("--admin-secret-file", required=True, type=Path)
+    approve_pairing.add_argument("--code", required=True)
+
     compose = subparsers.add_parser("validate-compose")
     compose.add_argument("--config-file", required=True, type=Path)
     compose.add_argument("--compose-json", required=True, type=Path)
@@ -2197,6 +2339,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif args.command == "create-admin-secret":
             result = create_admin_secret(args.destination)
+        elif args.command == "approve-reviewer-pairing":
+            result = approve_reviewer_pairing(
+                args.config_file,
+                args.admin_secret_file,
+                args.code,
+            )
         elif args.command == "validate-compose":
             config = load_public_config(args.config_file)
             result = validate_compose_document(
