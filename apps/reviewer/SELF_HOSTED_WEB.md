@@ -47,7 +47,10 @@ Native builds keep the atomic endpoint-and-credential document in device-only,
 when-unlocked secure storage. Browsers cannot provide that guarantee. The web
 build uses `sessionStorage`, never `localStorage`, so configuration is scoped
 to one browser tab session. The administrator bearer is still readable by
-JavaScript in that origin while the tab is open.
+JavaScript in that origin while the tab is open. Saving configuration and
+activating a stored client each require the backend's authenticated,
+non-mutating reviewer-binding status check; stale reviewer IDs are not exposed
+to transition code, and the check returns no configured identity.
 
 For the single-owner private pilot:
 

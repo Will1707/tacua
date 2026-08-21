@@ -396,6 +396,7 @@ validated constants but are never used without the complete machine binding.
 | `GET` | `/healthz` | public | Storage/protocol health |
 | `GET` | `/version` | public | Service and protocol version |
 | `GET` | `/v1/admin/builds` | admin bearer | List the registered reviewer build projection |
+| `GET` | `/v1/admin/reviewer-binding` | admin bearer plus `Tacua-Reviewer-ID` | Verify the claimed reviewer identity and return status only |
 | `POST` | `/v1/admin/launch-codes` | admin bearer | Create a start or resume grant |
 | `POST` | `/v1/sdk/launch-exchanges` | launch code in body | Start/resume and issue the client-owned credential |
 | `PUT` | `/v1/sdk/sessions/{session}/segments/{sequence}/{segment}` | SDK bearer | Upload/recover media |
@@ -427,6 +428,14 @@ exclude superseded sources, while their detail, evidence, previews, and
 supersession history remain readable. Attempts to transition, replace, approve,
 reject, or export a superseded source fail with the stable
 `409 CANDIDATE_SUPERSEDED` conflict and replacement references.
+
+The reviewer-binding route authenticates the administrator bearer before it
+validates the claimed identity. A correct claim returns exactly
+`{"status":"verified"}` and performs no write. Missing, malformed, incorrect,
+or stale claims fail without returning either the configured or supplied
+identity. This setup check does not replace transition authorization:
+transition and replacement bodies still have to name the configured reviewer
+and remain fail-closed with `REVIEWER_MISMATCH`.
 
 The four admin list routes return exactly one of
 `{"sessions":[...],"next_cursor":...}`,

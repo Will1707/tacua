@@ -278,6 +278,22 @@ async function createFixtureServer(temporaryDirectory) {
           sendCanonicalJson(response, 200, { builds: [] });
           return;
         }
+        if (pathname === "/v1/admin/reviewer-binding") {
+          if (request.headers["tacua-reviewer-id"] !== reviewerId) {
+            protocolErrors.push(
+              `${request.method} ${request.url} did not bind the configured reviewer`,
+            );
+            sendCanonicalJson(response, 403, {
+              error: {
+                code: "REVIEWER_MISMATCH",
+                message: "The reviewer identity does not match this deployment.",
+              },
+            });
+            return;
+          }
+          sendCanonicalJson(response, 200, { status: "verified" });
+          return;
+        }
         if (pathname === "/v1/admin/sessions") {
           sendCanonicalJson(response, 200, {
             next_cursor: null,
@@ -880,6 +896,10 @@ async function runBrowserSmoke(browser, fixture, temporaryDirectory) {
       fixture.protocolErrors,
       [],
       "the reviewer escaped the bounded same-origin administrator protocol",
+    );
+    assert.ok(
+      fixture.requests.includes("GET /v1/admin/reviewer-binding"),
+      "the real reviewer did not verify its configured reviewer identity",
     );
     assert.ok(
       fixture.requests.includes(

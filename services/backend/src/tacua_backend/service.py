@@ -1786,6 +1786,26 @@ class PilotBackend:
         ):
             raise ApiError(401, "ADMIN_AUTHENTICATION_FAILED", "administrator authentication failed")
 
+    def verify_reviewer_identity(self, reviewer_id: str) -> dict[str, str]:
+        """Verify one claimed reviewer identity without exposing or persisting it."""
+
+        if (
+            not isinstance(reviewer_id, str)
+            or ID_PATTERN.fullmatch(reviewer_id) is None
+        ):
+            raise ApiError(
+                400,
+                "REVIEWER_ID_INVALID",
+                "reviewer identity is invalid",
+            )
+        if not hmac.compare_digest(reviewer_id, self.config.reviewer_id):
+            raise ApiError(
+                403,
+                "REVIEWER_MISMATCH",
+                "reviewer identity does not match this deployment",
+            )
+        return {"status": "verified"}
+
     @staticmethod
     def _require_credential_rotation_capacity(
         connection: sqlite3.Connection,
