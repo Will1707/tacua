@@ -23,6 +23,7 @@ const originalTSXLoader = Module._extensions[".tsx"];
 
 let storedConfig;
 let api;
+let saveConfigHook;
 const mockPlatform = { OS: "web" };
 const appStateListeners = new Set();
 const mockAppState = {
@@ -54,6 +55,7 @@ class TacuaApiClient {
   getReviewerBootstrap() { return api.getReviewerBootstrap(this.config); }
   createPairingRequest(label) { return api.createPairingRequest(this.config, label); }
   exchangePairing(token) { return api.exchangePairing(this.config, token); }
+  cancelPairing(token) { return api.cancelPairing(this.config, token); }
   revokeReviewerSession() { return api.revokeReviewerSession(this.config); }
 }
 
@@ -91,6 +93,7 @@ Module._load = function load(request, parent, isMain) {
       async loadBackendConfig() { return storedConfig; },
       async saveBackendConfig(config) {
         savedConfigs.push(config);
+        if (saveConfigHook) await saveConfigHook(config);
         storedConfig = config;
       },
       validateBackendConfig(config) { return config; },
@@ -134,6 +137,7 @@ function bootstrap(reviewerId = "reviewer_owner") {
 function reset(overrides = {}) {
   mockAppState.currentState = "active";
   storedConfig = endpointConfig;
+  saveConfigHook = null;
   constructedConfigs.length = 0;
   savedConfigs.length = 0;
   api = {
@@ -142,6 +146,7 @@ function reset(overrides = {}) {
     async getReviewerBootstrap() { return bootstrap(); },
     async createPairingRequest() { throw new Error("unexpected pairing request"); },
     async exchangePairing() { throw new Error("unexpected pairing exchange"); },
+    async cancelPairing() { throw new Error("unexpected pairing cancellation"); },
     async revokeReviewerSession() { throw new Error("unexpected revocation"); },
     ...overrides,
   };
@@ -574,246 +579,24 @@ test("pairing starts only on an explicit action and keeps its bearer out of publ
   await TestRenderer.act(async () => rendered.renderer.unmount());
 });
 
-test("a pairing exchange that succeeds after cancellation is revoked", async () => {
-  let resolveExchange;
-  let resolveRevoked;
-  let revocationConfig;
-  const exchange = new Promise((resolve) => { resolveExchange = resolve; });
-  const revoked = new Promise((resolve) => { resolveRevoked = resolve; });
-  reset({
-    async getReviewerSession() {
-      throw new TacuaApiError(401, "REVIEWER_AUTHENTICATION_FAILED", "reviewer authentication failed");
-    },
-    async createPairingRequest(_config, label) {
-      return {
-        pairing_id: "rpair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        pairing_token: `rpair_${"a".repeat(32)}.${"B".repeat(43)}`,
-        human_code: "ABCD-EFGH",
-        device_label: label,
-        client_kind: "web",
-        created_at: "2026-08-21T12:00:00Z",
-        expires_at: "2026-08-21T12:10:00Z",
-      };
-    },
-    async exchangePairing() { return exchange; },
-    async revokeReviewerSession(config) {
-      revocationConfig = config;
-      resolveRevoked();
-      return {};
-    },
-  });
-  const rendered = await renderProvider();
-  await TestRenderer.act(async () => {
-    await rendered.observed.beginPairing();
-    await settle();
-  });
-  assert.equal(rendered.observed.status, "pairing_pending");
-
-  await TestRenderer.act(async () => {
-    rendered.observed.cancelPairing();
-    resolveExchange(principal());
-    await revoked;
-    await settle();
-  });
-
-  assert.equal(rendered.observed.status, "pairing_required");
-  assert.equal(rendered.observed.client, null);
-  assert.deepEqual(revocationConfig, {
-    baseUrl: "https://tacua.example",
-    clientKind: "web",
-    csrfToken: "csrf-token",
-  });
-  assert.deepEqual(savedConfigs, []);
-  await TestRenderer.act(async () => rendered.renderer.unmount());
-});
-
-test("a canceled exchange fails closed when its issued session cannot be revoked", async () => {
-  let resolveExchange;
-  let revocationAttempts = 0;
-  const exchange = new Promise((resolve) => { resolveExchange = resolve; });
-  reset({
-    async getReviewerSession() {
-      throw new TacuaApiError(401, "REVIEWER_AUTHENTICATION_FAILED", "reviewer authentication failed");
-    },
-    async createPairingRequest(_config, label) {
-      return {
-        pairing_id: "rpair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        pairing_token: `rpair_${"a".repeat(32)}.${"B".repeat(43)}`,
-        human_code: "ABCD-EFGH",
-        device_label: label,
-        client_kind: "web",
-        created_at: "2026-08-21T12:00:00Z",
-        expires_at: "2026-08-21T12:10:00Z",
-      };
-    },
-    async exchangePairing() { return exchange; },
-    async revokeReviewerSession() {
-      revocationAttempts += 1;
-      throw new Error("network details must not be exposed");
-    },
-  });
-  const rendered = await renderProvider();
-  await TestRenderer.act(async () => {
-    await rendered.observed.beginPairing();
-    await settle();
-  });
-
-  await TestRenderer.act(async () => {
-    rendered.observed.cancelPairing();
-    resolveExchange(principal());
-    await exchange;
-    await settle();
-  });
-
-  assert.equal(rendered.observed.status, "error");
-  assert.equal(rendered.observed.client, null);
-  assert.ok(revocationAttempts >= 1);
-  assert.match(rendered.observed.error, /could not safely revoke/u);
-  assert.doesNotMatch(rendered.observed.error, /network details/u);
-  await TestRenderer.act(async () => rendered.renderer.unmount());
-});
-
-test("a canceled web exchange reconciles a cookie installed before an invalid body", async () => {
-  let sessionCalls = 0;
-  let rejectExchange;
-  let revocationConfig;
-  const exchange = new Promise((_resolve, reject) => { rejectExchange = reject; });
-  reset({
-    async getReviewerSession() {
-      sessionCalls += 1;
-      if (sessionCalls === 1) {
-        throw new TacuaApiError(401, "REVIEWER_AUTHENTICATION_FAILED", "reviewer authentication failed");
-      }
-      // The browser accepted the 201 Set-Cookie header before response-body
-      // validation failed, so the reconciliation probe now sees that session.
-      return principal();
-    },
-    async createPairingRequest(_config, label) {
-      return {
-        pairing_id: "rpair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        pairing_token: `rpair_${"a".repeat(32)}.${"B".repeat(43)}`,
-        human_code: "ABCD-EFGH",
-        device_label: label,
-        client_kind: "web",
-        created_at: "2026-08-21T12:00:00Z",
-        expires_at: "2026-08-21T12:10:00Z",
-      };
-    },
-    async exchangePairing() { return exchange; },
-    async revokeReviewerSession(config) {
-      revocationConfig = config;
-      return {
-        session_id: principal().session_id,
-        reviewer_id: principal().reviewer_id,
-        client_kind: "web",
-      };
-    },
-  });
-  const rendered = await renderProvider();
-  await TestRenderer.act(async () => {
-    await rendered.observed.beginPairing();
-    await settle();
-  });
-  assert.equal(rendered.observed.status, "pairing_pending");
-
-  await TestRenderer.act(async () => {
-    rendered.observed.cancelPairing();
-    rejectExchange(new TacuaApiError(
-      502,
-      "INVALID_PAIRING_EXCHANGE",
-      "The pairing exchange body was invalid.",
-    ));
-    await exchange.catch(() => undefined);
-    await settle();
-  });
-
-  assert.equal(rendered.observed.status, "pairing_required");
-  assert.equal(rendered.observed.client, null);
-  assert.equal(rendered.observed.error, null);
-  assert.equal(sessionCalls, 2);
-  assert.deepEqual(revocationConfig, {
-    baseUrl: "https://tacua.example",
-    clientKind: "web",
-    csrfToken: "csrf-token",
-  });
-  await TestRenderer.act(async () => rendered.renderer.unmount());
-});
-
-test("an ordinary truncated web exchange revokes its installed cookie before reporting the error", async () => {
-  let sessionCalls = 0;
-  let revocationConfig;
-  reset({
-    async getReviewerSession() {
-      sessionCalls += 1;
-      if (sessionCalls === 1) {
-        throw new TacuaApiError(401, "REVIEWER_AUTHENTICATION_FAILED", "reviewer authentication failed");
-      }
-      return principal();
-    },
-    async createPairingRequest(_config, label) {
-      return {
-        pairing_id: "rpair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        pairing_token: `rpair_${"a".repeat(32)}.${"B".repeat(43)}`,
-        human_code: "ABCD-EFGH",
-        device_label: label,
-        client_kind: "web",
-        created_at: "2026-08-21T12:00:00Z",
-        expires_at: "2026-08-21T12:10:00Z",
-      };
-    },
-    async exchangePairing() {
-      throw new TacuaApiError(
-        408,
-        "REQUEST_TIMEOUT",
-        "The pairing exchange response was truncated.",
-      );
-    },
-    async revokeReviewerSession(config) {
-      revocationConfig = config;
-      return {
-        session_id: principal().session_id,
-        reviewer_id: principal().reviewer_id,
-        client_kind: "web",
-      };
-    },
-  });
-  const rendered = await renderProvider();
-  await TestRenderer.act(async () => {
-    await rendered.observed.beginPairing();
-    await settle();
-  });
-
-  assert.equal(rendered.observed.status, "error");
-  assert.equal(rendered.observed.client, null);
-  assert.match(rendered.observed.error, /response was truncated/u);
-  assert.equal(sessionCalls, 2);
-  assert.deepEqual(revocationConfig, {
-    baseUrl: "https://tacua.example",
-    clientKind: "web",
-    csrfToken: "csrf-token",
-  });
-  await TestRenderer.act(async () => rendered.renderer.unmount());
-});
-
-test("a stale cleanup failure invalidates a newer pairing exchange", async () => {
+test("web cancellation is the barrier before a new request and stale exchange cleanup", async () => {
   const firstPairingToken = `rpair_${"a".repeat(32)}.${"B".repeat(43)}`;
   const secondPairingToken = `rpair_${"b".repeat(32)}.${"C".repeat(43)}`;
   let requestCalls = 0;
+  let cancellationCalls = 0;
+  let resolveCancellation;
   let resolveFirstExchange;
-  let resolveSecondExchange;
-  let revocationAttempts = 0;
+  const events = [];
+  const cancellation = new Promise((resolve) => { resolveCancellation = resolve; });
   const firstExchange = new Promise((resolve) => { resolveFirstExchange = resolve; });
-  const secondExchange = new Promise((resolve) => { resolveSecondExchange = resolve; });
   reset({
     async getReviewerSession() {
-      if (requestCalls === 0) {
-        throw new TacuaApiError(401, "REVIEWER_AUTHENTICATION_FAILED", "reviewer authentication failed");
-      }
-      return principal();
+      throw new TacuaApiError(401, "REVIEWER_AUTHENTICATION_FAILED", "reviewer authentication failed");
     },
     async createPairingRequest(_config, label) {
       requestCalls += 1;
       const first = requestCalls === 1;
+      events.push(`request:${requestCalls}`);
       return {
         pairing_id: first
           ? "rpair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -827,12 +610,17 @@ test("a stale cleanup failure invalidates a newer pairing exchange", async () =>
       };
     },
     async exchangePairing(_config, token) {
-      return token === firstPairingToken ? firstExchange : secondExchange;
+      events.push(token === firstPairingToken ? "exchange:1" : "exchange:2");
+      return token === firstPairingToken ? firstExchange : new Promise(() => {});
     },
-    async revokeReviewerSession() {
-      revocationAttempts += 1;
-      if (revocationAttempts === 1) throw new Error("cleanup failed");
-      return {};
+    async cancelPairing(config, token) {
+      assert.deepEqual(config, { baseUrl: "https://tacua.example", clientKind: "web" });
+      assert.equal(token, firstPairingToken);
+      cancellationCalls += 1;
+      events.push(`cancel:start:${cancellationCalls}`);
+      if (cancellationCalls === 1) await cancellation;
+      events.push(`cancel:done:${cancellationCalls}`);
+      return { status: "canceled" };
     },
   });
   const rendered = await renderProvider();
@@ -840,34 +628,185 @@ test("a stale cleanup failure invalidates a newer pairing exchange", async () =>
     await rendered.observed.beginPairing();
     await settle();
   });
+  let canceled;
   await TestRenderer.act(async () => {
-    rendered.observed.cancelPairing();
+    canceled = rendered.observed.cancelPairing();
+    await rendered.observed.beginPairing();
     await settle();
   });
+  assert.equal(requestCalls, 1, "a second request cannot start while cancellation is unresolved");
+  assert.equal(rendered.observed.status, "pairing_pending");
+
+  await TestRenderer.act(async () => {
+    resolveCancellation();
+    await settle();
+  });
+  assert.equal(
+    rendered.observed.status,
+    "pairing_pending",
+    "the delayed exchange response remains inside the cancellation barrier",
+  );
   await TestRenderer.act(async () => {
     await rendered.observed.beginPairing();
     await settle();
   });
-  assert.equal(rendered.observed.status, "pairing_pending");
-  assert.equal(requestCalls, 2);
+  assert.equal(requestCalls, 1);
 
+  // Model the exchange transaction winning while its web 201/Set-Cookie is
+  // delayed until after the first cancellation tombstone. A second token-bound
+  // cancellation must complete after this response before pairing 2 can start.
   await TestRenderer.act(async () => {
     resolveFirstExchange(principal());
     await firstExchange;
+    await canceled;
     await settle();
   });
-  assert.equal(rendered.observed.status, "error");
-  assert.match(rendered.observed.error, /could not safely revoke/u);
+  assert.equal(rendered.observed.status, "pairing_required");
 
   await TestRenderer.act(async () => {
-    resolveSecondExchange(principal());
-    await secondExchange;
+    await rendered.observed.beginPairing();
     await settle();
   });
-  assert.equal(rendered.observed.status, "error");
+  assert.equal(requestCalls, 2);
+  assert.deepEqual(events.slice(0, 6), [
+    "request:1",
+    "exchange:1",
+    "cancel:start:1",
+    "cancel:done:1",
+    "cancel:start:2",
+    "cancel:done:2",
+  ]);
+  assert.deepEqual(events.slice(6), ["request:2", "exchange:2"]);
+  assert.equal(rendered.observed.status, "pairing_pending");
   assert.equal(rendered.observed.client, null);
-  assert.ok(revocationAttempts >= 2, "the invalidated newer exchange was also revoked");
+  assert.equal(events.filter((event) => event.startsWith("cancel:")).length, 4);
   assert.deepEqual(savedConfigs, []);
+  await TestRenderer.act(async () => rendered.renderer.unmount());
+});
+
+test("failed cancellation retains the exact token and requires a successful retry", async () => {
+  const firstPairingToken = `rpair_${"a".repeat(32)}.${"B".repeat(43)}`;
+  let requestCalls = 0;
+  let cancellationCalls = 0;
+  let resolveExchange;
+  const exchange = new Promise((resolve) => { resolveExchange = resolve; });
+  reset({
+    async getReviewerSession() {
+      throw new TacuaApiError(401, "REVIEWER_AUTHENTICATION_FAILED", "reviewer authentication failed");
+    },
+    async createPairingRequest(_config, label) {
+      requestCalls += 1;
+      return {
+        pairing_id: requestCalls === 1
+          ? "rpair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          : "rpair_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        pairing_token: requestCalls === 1
+          ? firstPairingToken
+          : `rpair_${"b".repeat(32)}.${"C".repeat(43)}`,
+        human_code: requestCalls === 1 ? "ABCD-EFGH" : "JKLM-NPQR",
+        device_label: label,
+        client_kind: "web",
+        created_at: "2026-08-21T12:00:00Z",
+        expires_at: "2026-08-21T12:10:00Z",
+      };
+    },
+    async exchangePairing(_config, token) {
+      return token === firstPairingToken ? exchange : new Promise(() => {});
+    },
+    async cancelPairing(_config, token) {
+      cancellationCalls += 1;
+      assert.equal(token, firstPairingToken);
+      if (cancellationCalls === 2) throw new Error("network details must not be exposed");
+      return { status: "canceled" };
+    },
+  });
+  const rendered = await renderProvider();
+  await TestRenderer.act(async () => {
+    await rendered.observed.beginPairing();
+    await settle();
+  });
+
+  let canceled;
+  await TestRenderer.act(async () => {
+    canceled = rendered.observed.cancelPairing();
+    await settle();
+  });
+  assert.equal(rendered.observed.status, "pairing_pending");
+  await TestRenderer.act(async () => {
+    resolveExchange(principal());
+    await exchange;
+    await canceled;
+    await settle();
+  });
+  assert.equal(rendered.observed.status, "pairing_pending");
+  assert.equal(rendered.observed.pairing.human_code, "ABCD-EFGH");
+  assert.match(rendered.observed.error, /Try Cancel pairing again/u);
+  assert.doesNotMatch(rendered.observed.error, /network details/u);
+
+  await TestRenderer.act(async () => {
+    await rendered.observed.beginPairing();
+    await settle();
+  });
+  assert.equal(requestCalls, 1);
+
+  await TestRenderer.act(async () => {
+    await rendered.observed.cancelPairing();
+    await settle();
+  });
+  assert.equal(rendered.observed.status, "pairing_required");
+  assert.equal(cancellationCalls, 3);
+
+  await TestRenderer.act(async () => {
+    await rendered.observed.beginPairing();
+    await settle();
+  });
+  assert.equal(requestCalls, 2);
+  await TestRenderer.act(async () => rendered.renderer.unmount());
+});
+
+test("an invalid web exchange is cleaned by its pairing token without probing cookie identity", async () => {
+  const token = `rpair_${"a".repeat(32)}.${"B".repeat(43)}`;
+  let sessionCalls = 0;
+  let canceledToken;
+  reset({
+    async getReviewerSession() {
+      sessionCalls += 1;
+      throw new TacuaApiError(401, "REVIEWER_AUTHENTICATION_FAILED", "reviewer authentication failed");
+    },
+    async createPairingRequest(_config, label) {
+      return {
+        pairing_id: "rpair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        pairing_token: token,
+        human_code: "ABCD-EFGH",
+        device_label: label,
+        client_kind: "web",
+        created_at: "2026-08-21T12:00:00Z",
+        expires_at: "2026-08-21T12:10:00Z",
+      };
+    },
+    async exchangePairing() {
+      throw new TacuaApiError(
+        502,
+        "INVALID_PAIRING_EXCHANGE",
+        "The pairing exchange body was invalid.",
+      );
+    },
+    async cancelPairing(config, pairingToken) {
+      assert.deepEqual(config, { baseUrl: "https://tacua.example", clientKind: "web" });
+      canceledToken = pairingToken;
+      return { status: "canceled" };
+    },
+  });
+  const rendered = await renderProvider();
+  await TestRenderer.act(async () => {
+    await rendered.observed.beginPairing();
+    await settle();
+  });
+
+  assert.equal(rendered.observed.status, "error");
+  assert.match(rendered.observed.error, /exchange body was invalid/u);
+  assert.equal(canceledToken, token);
+  assert.equal(sessionCalls, 1, "cleanup must not infer the issued session from ambient cookies");
   await TestRenderer.act(async () => rendered.renderer.unmount());
 });
 
@@ -875,10 +814,12 @@ test("native pairing verifies the session and bootstrap before persisting its be
   mockPlatform.OS = "native";
   const sessionId = "rsess_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
   const sessionToken = `${sessionId}.${"B".repeat(43)}`;
+  const pairingToken = `rpair_${"a".repeat(32)}.${"B".repeat(43)}`;
   let sessionCalls = 0;
-  let resolveRevoked;
-  let revocationConfig;
-  const revoked = new Promise((resolve) => { resolveRevoked = resolve; });
+  let resolveCanceled;
+  let cancellationConfig;
+  let canceledToken;
+  const canceled = new Promise((resolve) => { resolveCanceled = resolve; });
   reset({
     async getReviewerSession() {
       sessionCalls += 1;
@@ -894,7 +835,7 @@ test("native pairing verifies the session and bootstrap before persisting its be
     async createPairingRequest(_config, label) {
       return {
         pairing_id: "rpair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        pairing_token: `rpair_${"a".repeat(32)}.${"B".repeat(43)}`,
+        pairing_token: pairingToken,
         human_code: "ABCD-EFGH",
         device_label: label,
         client_kind: "native",
@@ -913,17 +854,18 @@ test("native pairing verifies the session and bootstrap before persisting its be
       };
     },
     async getReviewerBootstrap() { return bootstrap("reviewer_other"); },
-    async revokeReviewerSession(config) {
-      revocationConfig = config;
-      resolveRevoked();
-      return {};
+    async cancelPairing(config, token) {
+      cancellationConfig = config;
+      canceledToken = token;
+      resolveCanceled();
+      return { status: "canceled" };
     },
   });
   const rendered = await renderProvider();
   try {
     await TestRenderer.act(async () => {
       await rendered.observed.beginPairing();
-      await revoked;
+      await canceled;
       await settle();
     });
 
@@ -935,17 +877,176 @@ test("native pairing verifies the session and bootstrap before persisting its be
       false,
       "an unverified native bearer must never reach durable storage",
     );
-    assert.deepEqual(revocationConfig, {
+    assert.equal(canceledToken, pairingToken);
+    assert.deepEqual(cancellationConfig, {
       baseUrl: "https://tacua.example",
       clientKind: "native",
-      sessionToken,
-      csrfToken: "csrf-token",
     });
   } finally {
     await TestRenderer.act(async () => rendered.renderer.unmount());
     mockPlatform.OS = "web";
   }
 });
+
+test("native cancellation waits for an older bearer write before durably clearing it", async () => {
+  mockPlatform.OS = "native";
+  const sessionId = "rsess_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const sessionToken = `${sessionId}.${"B".repeat(43)}`;
+  const pairingToken = `rpair_${"a".repeat(32)}.${"B".repeat(43)}`;
+  let sessionCalls = 0;
+  let releaseBearerWrite;
+  let reportBearerWriteStarted;
+  const bearerWriteRelease = new Promise((resolve) => { releaseBearerWrite = resolve; });
+  const bearerWriteStarted = new Promise((resolve) => { reportBearerWriteStarted = resolve; });
+  const persistenceEvents = [];
+  reset({
+    async getReviewerSession() {
+      sessionCalls += 1;
+      if (sessionCalls === 1) {
+        throw new TacuaApiError(401, "REVIEWER_AUTHENTICATION_FAILED", "reviewer authentication failed");
+      }
+      return principal({
+        session_id: sessionId,
+        device_label: "Tacua native reviewer",
+        client_kind: "native",
+      });
+    },
+    async createPairingRequest(_config, label) {
+      return {
+        pairing_id: "rpair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        pairing_token: pairingToken,
+        human_code: "ABCD-EFGH",
+        device_label: label,
+        client_kind: "native",
+        created_at: "2026-08-21T12:00:00Z",
+        expires_at: "2026-08-21T12:10:00Z",
+      };
+    },
+    async exchangePairing() {
+      return {
+        ...principal({
+          session_id: sessionId,
+          device_label: "Tacua native reviewer",
+          client_kind: "native",
+        }),
+        session_token: sessionToken,
+      };
+    },
+    async cancelPairing(_config, token) {
+      assert.equal(token, pairingToken);
+      return { status: "canceled" };
+    },
+  });
+  saveConfigHook = async (config) => {
+    if (config.sessionToken === sessionToken) {
+      persistenceEvents.push("bearer:start");
+      reportBearerWriteStarted();
+      await bearerWriteRelease;
+      persistenceEvents.push("bearer:done");
+    } else if (config.sessionToken === null) {
+      persistenceEvents.push("clear:done");
+    }
+  };
+
+  const rendered = await renderProvider();
+  try {
+    await TestRenderer.act(async () => {
+      await rendered.observed.beginPairing();
+      await bearerWriteStarted;
+      await settle();
+    });
+    assert.equal(rendered.observed.status, "pairing_pending");
+    assert.equal(storedConfig.sessionToken, null);
+
+    let cancellationSettled = false;
+    let cancellation;
+    await TestRenderer.act(async () => {
+      cancellation = rendered.observed.cancelPairing().then(() => {
+        cancellationSettled = true;
+      });
+      await settle();
+    });
+    assert.equal(cancellationSettled, false);
+    assert.equal(rendered.observed.status, "pairing_pending");
+    assert.deepEqual(persistenceEvents, ["bearer:start"]);
+
+    await TestRenderer.act(async () => {
+      releaseBearerWrite();
+      await cancellation;
+      await settle();
+    });
+    assert.equal(rendered.observed.status, "pairing_required");
+    assert.deepEqual(persistenceEvents, ["bearer:start", "bearer:done", "clear:done"]);
+    assert.deepEqual(storedConfig, { baseUrl: "https://tacua.example", sessionToken: null });
+    assert.deepEqual(savedConfigs, [
+      { baseUrl: "https://tacua.example", sessionToken },
+      { baseUrl: "https://tacua.example", sessionToken: null },
+    ]);
+  } finally {
+    await TestRenderer.act(async () => rendered.renderer.unmount());
+    saveConfigHook = null;
+    mockPlatform.OS = "web";
+  }
+});
+
+for (const [name, exchangeError] of [
+  [
+    "invalid 201 body",
+    new TacuaApiError(502, "INVALID_PAIRING_EXCHANGE", "The 201 pairing body was invalid."),
+  ],
+  [
+    "timed-out response",
+    new TacuaApiError(408, "REQUEST_TIMEOUT", "The pairing exchange response timed out."),
+  ],
+]) {
+  test(`native ${name} is canceled by pairing token before another pairing`, async () => {
+    mockPlatform.OS = "native";
+    const pairingToken = `rpair_${"a".repeat(32)}.${"B".repeat(43)}`;
+    let canceledToken;
+    let cancellationConfig;
+    reset({
+      async getReviewerSession() {
+        throw new TacuaApiError(401, "REVIEWER_AUTHENTICATION_FAILED", "reviewer authentication failed");
+      },
+      async createPairingRequest(_config, label) {
+        return {
+          pairing_id: "rpair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          pairing_token: pairingToken,
+          human_code: "ABCD-EFGH",
+          device_label: label,
+          client_kind: "native",
+          created_at: "2026-08-21T12:00:00Z",
+          expires_at: "2026-08-21T12:10:00Z",
+        };
+      },
+      async exchangePairing() { throw exchangeError; },
+      async cancelPairing(config, token) {
+        cancellationConfig = config;
+        canceledToken = token;
+        return { status: "canceled" };
+      },
+    });
+    const rendered = await renderProvider();
+    try {
+      await TestRenderer.act(async () => {
+        await rendered.observed.beginPairing();
+        await settle();
+      });
+
+      assert.equal(rendered.observed.status, "error");
+      assert.equal(rendered.observed.client, null);
+      assert.equal(canceledToken, pairingToken);
+      assert.deepEqual(cancellationConfig, {
+        baseUrl: "https://tacua.example",
+        clientKind: "native",
+      });
+      assert.deepEqual(savedConfigs, []);
+    } finally {
+      await TestRenderer.act(async () => rendered.renderer.unmount());
+      mockPlatform.OS = "web";
+    }
+  });
+}
 
 test("rapid pairing actions create only one pending request", async () => {
   let requestCalls = 0;
@@ -1016,6 +1117,46 @@ test("an unapproved exchange remains pending instead of becoming a connection er
   });
   assert.equal(rendered.observed.status, "pairing_pending");
   assert.equal(rendered.observed.error, null);
+  await TestRenderer.act(async () => rendered.renderer.unmount());
+});
+
+test("a 401 exchange is token-canceled before offering a replacement code", async () => {
+  const pairingToken = `rpair_${"a".repeat(32)}.${"B".repeat(43)}`;
+  let canceledToken;
+  reset({
+    async getReviewerSession() {
+      throw new TacuaApiError(401, "REVIEWER_AUTHENTICATION_FAILED", "reviewer authentication failed");
+    },
+    async createPairingRequest() {
+      return {
+        pairing_id: "rpair_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        pairing_token: pairingToken,
+        human_code: "ABCD-EFGH",
+        device_label: "Tacua web reviewer",
+        client_kind: "web",
+        created_at: "2026-08-21T12:00:00Z",
+        expires_at: "2026-08-21T12:10:00Z",
+      };
+    },
+    async exchangePairing() {
+      // A retry can receive 401 after an earlier transaction consumed this
+      // token and issued a session, so 401 is not itself cleanup proof.
+      throw new TacuaApiError(401, "PAIRING_EXCHANGE_INVALID", "pairing token is invalid");
+    },
+    async cancelPairing(_config, token) {
+      canceledToken = token;
+      return { status: "canceled" };
+    },
+  });
+  const rendered = await renderProvider();
+  await TestRenderer.act(async () => {
+    await rendered.observed.beginPairing();
+    await settle();
+  });
+
+  assert.equal(canceledToken, pairingToken);
+  assert.equal(rendered.observed.status, "pairing_required");
+  assert.match(rendered.observed.error, /expired/u);
   await TestRenderer.act(async () => rendered.renderer.unmount());
 });
 

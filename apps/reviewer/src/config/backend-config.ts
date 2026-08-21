@@ -48,8 +48,8 @@ function parsePersistedConfig(value: string): BackendConfig | null {
   }
 }
 
-async function removeSupersededConfiguration(): Promise<void> {
-  await Promise.all([
+async function removeSupersededConfigurationBestEffort(): Promise<void> {
+  await Promise.allSettled([
     ...supersededConfigurationKeys.map((key) => SecureStore.deleteItemAsync(key)),
     ...legacyKeys.map((key) => SecureStore.deleteItemAsync(key)),
   ]);
@@ -57,7 +57,7 @@ async function removeSupersededConfiguration(): Promise<void> {
 
 export async function loadBackendConfig(): Promise<BackendConfig | null> {
   const persisted = await SecureStore.getItemAsync(configurationKey);
-  await removeSupersededConfiguration();
+  await removeSupersededConfigurationBestEffort();
   if (persisted === null) return null;
   const parsed = parsePersistedConfig(persisted);
   if (parsed === null) await SecureStore.deleteItemAsync(configurationKey);
@@ -70,13 +70,10 @@ export async function saveBackendConfig(config: BackendConfig): Promise<void> {
   await SecureStore.setItemAsync(configurationKey, JSON.stringify(persisted), {
     keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
   });
-  await removeSupersededConfiguration();
+  await removeSupersededConfigurationBestEffort();
 }
 
 export async function clearBackendConfig(): Promise<void> {
-  await Promise.all([
-    SecureStore.deleteItemAsync(configurationKey),
-    ...supersededConfigurationKeys.map((key) => SecureStore.deleteItemAsync(key)),
-    ...legacyKeys.map((key) => SecureStore.deleteItemAsync(key)),
-  ]);
+  await SecureStore.deleteItemAsync(configurationKey);
+  await removeSupersededConfigurationBestEffort();
 }

@@ -16,6 +16,7 @@ import type {
   ProcessingJob,
   RegisteredBuild,
   ReviewerBootstrap,
+  ReviewerPairingCancellation,
   ReviewerPairingExchange,
   ReviewerPairingRequest,
   ReviewerPrincipal,
@@ -89,10 +90,13 @@ import {
   validateReviewerBootstrap,
 } from "@/api/reviewer-bootstrap-validation";
 import {
+  maximumReviewerPairingCancellationResponseBytes,
   maximumReviewerPairingResponseBytes,
   maximumReviewerSessionResponseBytes,
   ReviewerAuthValidationError,
   validateReviewerDeviceLabel,
+  validateReviewerPairingCancellation,
+  validateReviewerPairingCancellationToken,
   validateReviewerPairingExchange,
   validateReviewerPairingRequest,
   validateReviewerPairingToken,
@@ -516,6 +520,36 @@ class BaseTacuaApiClient {
     } catch (error) {
       if (error instanceof ReviewerAuthValidationError) {
         throw new TacuaApiError(502, error.code, "The backend returned an invalid pairing exchange.");
+      }
+      throw error;
+    }
+  }
+
+  async cancelPairing(pairingToken: string): Promise<ReviewerPairingCancellation> {
+    const clientKind = this.reviewerClientKind();
+    let validatedToken: string;
+    try {
+      validatedToken = validateReviewerPairingCancellationToken(pairingToken);
+    } catch (error) {
+      if (!(error instanceof ReviewerAuthValidationError)) throw error;
+      throw new TacuaApiError(0, error.code, "The reviewer pairing token is invalid.");
+    }
+    const response = await this.request<unknown>("/v1/reviewer/pairing-cancellations", {
+      method: "POST",
+      body: JSON.stringify({ pairing_token: validatedToken, client_kind: clientKind }),
+    }, {
+      expectedStatuses: [200],
+      maximumBytes: maximumReviewerPairingCancellationResponseBytes,
+    });
+    try {
+      return validateReviewerPairingCancellation(response);
+    } catch (error) {
+      if (error instanceof ReviewerAuthValidationError) {
+        throw new TacuaApiError(
+          502,
+          error.code,
+          "The backend returned an invalid pairing cancellation.",
+        );
       }
       throw error;
     }

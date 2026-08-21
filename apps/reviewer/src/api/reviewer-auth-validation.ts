@@ -3,6 +3,7 @@
 import type {
   ReviewerClientKind,
   ReviewerNativePairingExchange,
+  ReviewerPairingCancellation,
   ReviewerPairingExchange,
   ReviewerPairingRequest,
   ReviewerPrincipal,
@@ -18,12 +19,15 @@ const reviewerScopes = Object.freeze([
 ] as const satisfies readonly ReviewerScope[]);
 
 const maximumPairingResponseBytes = 4 * 1_024;
+const maximumPairingCancellationResponseBytes = 256;
 const maximumSessionResponseBytes = 4 * 1_024;
 
 export const maximumReviewerPairingResponseBytes = maximumPairingResponseBytes;
+export const maximumReviewerPairingCancellationResponseBytes = maximumPairingCancellationResponseBytes;
 export const maximumReviewerSessionResponseBytes = maximumSessionResponseBytes;
 
 export type ReviewerAuthValidationCode =
+  | "INVALID_PAIRING_CANCELLATION"
   | "INVALID_PAIRING_REQUEST"
   | "INVALID_PAIRING_EXCHANGE"
   | "INVALID_REVIEWER_PRINCIPAL"
@@ -90,6 +94,10 @@ function pairingToken(value: unknown, code: ReviewerAuthValidationCode): string 
 
 export function validateReviewerPairingToken(value: unknown): string {
   return pairingToken(value, "INVALID_PAIRING_EXCHANGE");
+}
+
+export function validateReviewerPairingCancellationToken(value: unknown): string {
+  return pairingToken(value, "INVALID_PAIRING_CANCELLATION");
 }
 
 function timestamp(value: unknown, code: ReviewerAuthValidationCode): string {
@@ -274,6 +282,15 @@ export function validateReviewerPairingExchange(
   const validated = principal(principalRecord, code, "native");
   if (!sessionToken.startsWith(`${validated.session_id}.`)) fail(code);
   return { ...validated, session_token: sessionToken } as ReviewerNativePairingExchange;
+}
+
+export function validateReviewerPairingCancellation(
+  value: unknown,
+): ReviewerPairingCancellation {
+  const code = "INVALID_PAIRING_CANCELLATION";
+  const record = exact(value, ["status"], code);
+  if (record.status !== "canceled") fail(code);
+  return { status: "canceled" };
 }
 
 function reviewerSession(value: unknown): ReviewerSession {

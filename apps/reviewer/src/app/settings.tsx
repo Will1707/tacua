@@ -148,7 +148,7 @@ export default function SettingsRoute() {
           <Text selectable style={{ color: colors.tertiaryLabel, fontSize: 13 }}>
             Expires {formatDate(pairing.expires_at)}
           </Text>
-          <ActionButton destructive label="Cancel pairing" onPress={cancelPairing} />
+          <ActionButton destructive label="Cancel pairing" onPress={() => void cancelPairing()} />
         </View>
       ) : null}
 

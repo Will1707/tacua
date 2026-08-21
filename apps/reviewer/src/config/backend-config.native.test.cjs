@@ -12,9 +12,14 @@ const transformTypeScript = require("@babel/plugin-transform-typescript");
 
 const values = new Map();
 const reads = [];
+const deleteFailures = new Map();
 const secureStore = {
   WHEN_UNLOCKED_THIS_DEVICE_ONLY: "when-unlocked-this-device-only",
-  async deleteItemAsync(key) { values.delete(key); },
+  async deleteItemAsync(key) {
+    const failure = deleteFailures.get(key);
+    if (failure) throw failure;
+    values.delete(key);
+  },
   async getItemAsync(key) {
     reads.push(key);
     return values.get(key) ?? null;
@@ -61,6 +66,7 @@ const sessionToken = `rsess_${"a".repeat(32)}.${"B".repeat(43)}`;
 test("native V4 stores only the endpoint and scoped reviewer bearer", async () => {
   values.clear();
   reads.length = 0;
+  deleteFailures.clear();
   const config = {
     baseUrl: "https://reviewer.example",
     sessionToken,
@@ -98,6 +104,30 @@ test("native V4 stores only the endpoint and scoped reviewer bearer", async () =
   assert.equal(values.size, 0);
 });
 
+test("native V4 save succeeds when retired-key cleanup fails and reloads the committed value", async () => {
+  const currentKey = "tacua.backend.configuration.v4";
+  const retiredKey = "tacua.backend.admin-token.v1";
+  const config = {
+    baseUrl: "https://replacement-reviewer.example",
+    sessionToken,
+  };
+  values.clear();
+  reads.length = 0;
+  deleteFailures.clear();
+  values.set(retiredKey, "legacy-administrator-secret");
+  deleteFailures.set(retiredKey, new Error("simulated legacy cleanup failure"));
+
+  await saveBackendConfig(config);
+
+  assert.deepEqual(JSON.parse(values.get(currentKey)), {
+    storageVersion: 4,
+    ...config,
+  });
+  assert.equal(values.get(retiredKey), "legacy-administrator-secret");
+  assert.deepEqual(await loadBackendConfig(), config);
+  assert.deepEqual(reads, [currentKey]);
+});
+
 test("native rejects an administrator token or malformed scoped bearer", async () => {
   await assert.rejects(
     saveBackendConfig({
@@ -119,6 +149,7 @@ test("native rejects an administrator token or malformed scoped bearer", async (
 test("native removes an invalid current document instead of retaining a secret", async () => {
   const currentKey = "tacua.backend.configuration.v4";
   values.clear();
+  deleteFailures.clear();
   values.set(currentKey, JSON.stringify({
     storageVersion: 4,
     baseUrl: "https://reviewer.example",
@@ -126,6 +157,23 @@ test("native removes an invalid current document instead of retaining a secret",
   }));
   assert.equal(await loadBackendConfig(), null);
   assert.equal(values.has(currentKey), false);
+});
+
+test("native does not suppress current V4 deletion failures", async () => {
+  const currentKey = "tacua.backend.configuration.v4";
+  const currentDeletionFailure = new Error("simulated current V4 deletion failure");
+  values.clear();
+  deleteFailures.clear();
+  values.set(currentKey, JSON.stringify({
+    storageVersion: 4,
+    baseUrl: "https://reviewer.example",
+    sessionToken: "legacy-administrator-secret",
+  }));
+  deleteFailures.set(currentKey, currentDeletionFailure);
+
+  await assert.rejects(loadBackendConfig(), currentDeletionFailure);
+  await assert.rejects(clearBackendConfig(), currentDeletionFailure);
+  assert.equal(values.has(currentKey), true);
 });
 
 test.after(() => {

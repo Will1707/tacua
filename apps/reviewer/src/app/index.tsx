@@ -172,7 +172,7 @@ export default function ReviewsRoute() {
           <ActionButton label="Request pairing code" onPress={() => void beginPairing()} />
         ) : null}
         {status === "pairing_pending" ? (
-          <ActionButton destructive label="Cancel pairing" onPress={cancelPairing} />
+          <ActionButton destructive label="Cancel pairing" onPress={() => void cancelPairing()} />
         ) : null}
         {status === "error" ? <ActionButton label="Try again" onPress={() => void reloadBackend()} /> : null}
         <Link href="/settings" asChild>

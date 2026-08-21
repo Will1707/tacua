@@ -4,9 +4,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  maximumReviewerPairingCancellationResponseBytes,
   maximumReviewerPairingResponseBytes,
   maximumReviewerSessionResponseBytes,
   ReviewerAuthValidationError,
+  validateReviewerPairingCancellation,
+  validateReviewerPairingCancellationToken,
   validateReviewerPairingExchange,
   validateReviewerPairingRequest,
   validateReviewerPrincipal,
@@ -64,7 +67,28 @@ test("accepts the exact bounded pairing request and both exchange representation
   });
   assert.deepEqual(validateReviewerPairingExchange(native, "native"), native);
   assert.ok(maximumReviewerPairingResponseBytes <= 4 * 1_024);
+  assert.ok(maximumReviewerPairingCancellationResponseBytes <= 256);
   assert.ok(maximumReviewerSessionResponseBytes <= 4 * 1_024);
+});
+
+test("accepts only the exact content-free pairing cancellation result", () => {
+  const token = `${pairingId}.${pairingSecret}`;
+  assert.equal(validateReviewerPairingCancellationToken(token), token);
+  assert.deepEqual(validateReviewerPairingCancellation({ status: "canceled" }), {
+    status: "canceled",
+  });
+  rejects(
+    () => validateReviewerPairingCancellationToken("not-a-pairing-token"),
+    "INVALID_PAIRING_CANCELLATION",
+  );
+  rejects(
+    () => validateReviewerPairingCancellation({ status: "canceled", session_id: sessionId }),
+    "INVALID_PAIRING_CANCELLATION",
+  );
+  rejects(
+    () => validateReviewerPairingCancellation({ status: "already_canceled" }),
+    "INVALID_PAIRING_CANCELLATION",
+  );
 });
 
 test("rejects pairing substitution, drift, invalid labels, and non-canonical lifetimes", () => {

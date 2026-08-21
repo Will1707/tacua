@@ -57,6 +57,16 @@ exposing any operational client. The bootstrap field must match the principal,
 is otherwise rejected, and is used only as a consistency assertion rather than
 as browser configuration.
 
+Canceling does not merely hide the code. The app keeps the opaque pairing token
+in memory and blocks a replacement pairing until any exchange already in flight
+has settled and a final `/v1/reviewer/pairing-cancellations` response is
+validated. This ordering ensures that a delayed exchange `Set-Cookie` cannot
+arrive after the cancellation tombstone and overwrite a newer pairing cookie.
+The token-bound endpoint is idempotent: it removes an unconsumed request or
+revokes the session issued from it and expires the cookie. A network or
+protocol failure leaves the same code in a fail-closed, retryable cancellation
+state.
+
 For the single-owner private pilot:
 
 - admit only the owner's test devices through the tailnet policy;

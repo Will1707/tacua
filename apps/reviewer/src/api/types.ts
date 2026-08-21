@@ -208,6 +208,10 @@ export type ReviewerPairingExchange =
   | ReviewerWebPairingExchange
   | ReviewerNativePairingExchange;
 
+export type ReviewerPairingCancellation = {
+  readonly status: "canceled";
+};
+
 export type ReviewerSession = {
   readonly session_id: string;
   readonly reviewer_id: string;

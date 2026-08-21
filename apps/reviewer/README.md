@@ -56,6 +56,16 @@ CSRF token; web requests rely on the browser's exact same-origin `Origin` and
 cookie behavior. Never commit a real endpoint, credential, recording, or
 private pilot identifier.
 
+Canceling a pending pairing is a server-confirmed operation, not a local UI
+reset. The provider retains the opaque token in memory, waits for any exchange
+request already in flight, and confirms a final token-bound cancellation before
+another pairing can start. That endpoint deletes an unconsumed request or
+revokes the session issued from the exact token; on web it also expires the
+pairing cookie. If confirmation fails, the same pairing remains visible only by
+its human code and can be canceled again. Native never persists an issued
+bearer before principal/bootstrap binding, and cancellation serializes its
+final clearing write after any older Secure Store write.
+
 The reviewer also has a browser export for a private, same-origin self-hosted
 deployment:
 

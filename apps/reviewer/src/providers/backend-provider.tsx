@@ -55,7 +55,7 @@ export type BackendContextValue = BackendState & {
   readonly reload: () => Promise<void>;
   readonly configureEndpoint: (baseUrl: string) => Promise<void>;
   readonly beginPairing: () => Promise<void>;
-  readonly cancelPairing: () => void;
+  readonly cancelPairing: () => Promise<void>;
   readonly disconnect: () => Promise<void>;
 };
 
@@ -117,10 +117,10 @@ function principalsMatch(
     && session.scopes.every((scope, index) => scope === exchanged.scopes[index]);
 }
 
-class IssuedSessionCleanupError extends Error {
+class PairingCleanupError extends Error {
   constructor() {
-    super("Tacua could not safely revoke the reviewer session issued during pairing.");
-    this.name = "IssuedSessionCleanupError";
+    super("Tacua could not confirm that this pairing and any issued session were canceled. Try Cancel pairing again before requesting another code.");
+    this.name = "PairingCleanupError";
   }
 }
 
@@ -167,34 +167,6 @@ async function revokeNativeSessionBeforeEndpointReplacement(
   }
 }
 
-async function reconcileAmbiguousWebPairingExchange(
-  config: BackendConfig,
-): Promise<void> {
-  try {
-    const principal = await clientFor(config).getReviewerSession();
-    // The backend authenticates a supplied reviewer cookie before falling back
-    // to the Serve capability. A capability principal therefore proves that
-    // the browser sent no currently valid pairing-session cookie; a valid
-    // ambiguous 201 cookie would have produced a session principal here.
-    if (principal.auth_kind === "tailscale_capability") return;
-    if (
-      principal.auth_kind !== "session"
-      || principal.client_kind !== "web"
-      || principal.session_id === null
-    ) throw new IssuedSessionCleanupError();
-    const revoked = await clientFor(config, principal.csrf_token).revokeReviewerSession();
-    if (
-      revoked.session_id !== principal.session_id
-      || revoked.reviewer_id !== principal.reviewer_id
-      || revoked.client_kind !== "web"
-    ) throw new IssuedSessionCleanupError();
-  } catch (caught) {
-    if (isApiError(caught, 401)) return;
-    if (caught instanceof IssuedSessionCleanupError) throw caught;
-    throw new IssuedSessionCleanupError();
-  }
-}
-
 function publicPairing(pairing: ReviewerPairingRequest): PendingReviewerPairing {
   return {
     pairing_id: pairing.pairing_id,
@@ -220,14 +192,137 @@ export function BackendProvider({ children }: PropsWithChildren) {
   const generation = useRef(0);
   const pendingPairingToken = useRef<string | null>(null);
   const pairingRequestInFlight = useRef(false);
+  const pairingCancellationInFlight = useRef<{
+    readonly token: string;
+    readonly promise: Promise<void>;
+  } | null>(null);
+  const pairingCancellationRequestInFlight = useRef<{
+    readonly token: string;
+    readonly promise: Promise<void>;
+  } | null>(null);
+  const pairingExchangeInFlight = useRef<{
+    readonly token: string;
+    readonly settled: Promise<void>;
+  } | null>(null);
+  const explicitPairingCancellationInFlight = useRef<{
+    readonly token: string;
+    readonly promise: Promise<void>;
+  } | null>(null);
+  const canceledPairingTokens = useRef(new Set<string>());
+  const pendingNativePairingPersistence = useRef<{
+    readonly token: string;
+    readonly settled: Promise<void>;
+  } | null>(null);
   const appState = useRef(AppState.currentState);
   const expiryRevalidatedSession = useRef<string | null>(null);
   stateRef.current = state;
 
+  const cancelPairingToken = useCallback((
+    config: BackendConfig,
+    token: string,
+  ): Promise<void> => {
+    const active = pairingCancellationRequestInFlight.current;
+    if (active !== null) {
+      if (active.token === token) return active.promise;
+      return Promise.reject(new PairingCleanupError());
+    }
+
+    let operation: { readonly token: string; readonly promise: Promise<void> };
+    const promise = clientFor({ baseUrl: config.baseUrl, sessionToken: null })
+      .cancelPairing(token)
+      .then(() => undefined)
+      .catch(() => {
+        throw new PairingCleanupError();
+      })
+      .finally(() => {
+        if (pairingCancellationRequestInFlight.current === operation) {
+          pairingCancellationRequestInFlight.current = null;
+        }
+      });
+    operation = { token, promise };
+    pairingCancellationRequestInFlight.current = operation;
+    return promise;
+  }, []);
+
+  const cleanPairing = useCallback((
+    config: BackendConfig,
+    token: string,
+  ): Promise<void> => {
+    if (canceledPairingTokens.current.has(token)) return Promise.resolve();
+    const active = pairingCancellationInFlight.current;
+    if (active !== null) {
+      if (active.token === token) return active.promise;
+      return Promise.reject(new PairingCleanupError());
+    }
+
+    // Capture the raw exchange attempt before sending cancellation. If that
+    // request has already crossed the server transaction boundary, its delayed
+    // web 201 can install Set-Cookie after the first tombstone response. The
+    // exchange must therefore settle inside this barrier, followed by one
+    // final idempotent token cancellation, before another pairing is allowed.
+    const exchange = pairingExchangeInFlight.current?.token === token
+      ? pairingExchangeInFlight.current.settled
+      : null;
+    let operation: { readonly token: string; readonly promise: Promise<void> };
+    const promise = (async () => {
+      let cancellationSucceeded = false;
+      try {
+        await cancelPairingToken(config, token);
+        cancellationSucceeded = true;
+      } catch {
+        cancellationSucceeded = false;
+      }
+      if (exchange !== null) {
+        await exchange;
+        try {
+          await cancelPairingToken(config, token);
+          cancellationSucceeded = true;
+        } catch {
+          cancellationSucceeded = false;
+        }
+      }
+      if (!cancellationSucceeded) throw new PairingCleanupError();
+      const nativePersistence = pendingNativePairingPersistence.current?.token === token
+        ? pendingNativePairingPersistence.current
+        : null;
+      if (nativePersistence !== null) {
+        // Serialize the clearing write after the original bearer write. A
+        // cancellation must never resolve while an older Secure Store write
+        // can still complete later and resurrect the revoked bearer.
+        await nativePersistence.settled;
+        try {
+          await saveBackendConfig({ baseUrl: config.baseUrl, sessionToken: null });
+          if (pendingNativePairingPersistence.current === nativePersistence) {
+            pendingNativePairingPersistence.current = null;
+          }
+        } catch {
+          throw new PairingCleanupError();
+        }
+      }
+      canceledPairingTokens.current.add(token);
+    })().finally(() => {
+      if (pairingCancellationInFlight.current === operation) {
+        pairingCancellationInFlight.current = null;
+      }
+    });
+    operation = { token, promise };
+    pairingCancellationInFlight.current = operation;
+    return promise;
+  }, [cancelPairingToken]);
+
   const activate = useCallback(async () => {
     if (!mounted.current) return;
+    if (pendingPairingToken.current !== null) {
+      setState((current) => ({
+        ...initialState,
+        status: "pairing_pending",
+        config: current.config,
+        pairing: current.pairing,
+        error: current.error ?? "Cancel the current pairing before reconnecting.",
+      }));
+      return;
+    }
     const activation = ++generation.current;
-    pendingPairingToken.current = null;
     setState((current) => ({
       ...initialState,
       status: "loading",
@@ -318,6 +413,7 @@ export function BackendProvider({ children }: PropsWithChildren) {
   const finishPairing = useCallback(async (
     activation: number,
     config: BackendConfig,
+    pairingToken: string,
     exchanged: ReviewerPairingExchange,
   ) => {
     const clientKind = reviewerClientKind();
@@ -331,29 +427,13 @@ export function BackendProvider({ children }: PropsWithChildren) {
       baseUrl: config.baseUrl,
       sessionToken: "session_token" in exchanged ? exchanged.session_token : null,
     };
-    const issuedClient = clientFor(authenticatedConfig, exchanged.csrf_token);
-    let nativePersistenceStarted = false;
-    let issuedSessionRevoked = false;
 
     const isCurrent = () => mounted.current && activation === generation.current;
     const abandonIssuedSession = async () => {
-      let cleanupFailed = false;
-      if (clientKind === "native" && nativePersistenceStarted) {
-        try {
-          await saveBackendConfig({ baseUrl: config.baseUrl, sessionToken: null });
-        } catch {
-          cleanupFailed = true;
-        }
+      await cleanPairing(config, pairingToken);
+      if (pendingPairingToken.current === pairingToken) {
+        pendingPairingToken.current = null;
       }
-      if (!issuedSessionRevoked) {
-        try {
-          await issuedClient.revokeReviewerSession();
-          issuedSessionRevoked = true;
-        } catch {
-          cleanupFailed = true;
-        }
-      }
-      if (cleanupFailed) throw new IssuedSessionCleanupError();
     };
 
     try {
@@ -378,11 +458,23 @@ export function BackendProvider({ children }: PropsWithChildren) {
         return;
       }
       if (clientKind === "native") {
-        nativePersistenceStarted = true;
-        await saveBackendConfig(authenticatedConfig);
+        // The bearer remains memory-only until the returned principal and
+        // authoritative bootstrap have both been bound. Mark the write so a
+        // concurrent cancellation can also clear an ambiguously completed
+        // Secure Store update before another pairing is allowed.
+        const persistenceRequest = saveBackendConfig(authenticatedConfig);
+        const persistence = {
+          token: pairingToken,
+          settled: persistenceRequest.then(() => undefined, () => undefined),
+        };
+        pendingNativePairingPersistence.current = persistence;
+        await persistenceRequest;
         if (!isCurrent()) {
           await abandonIssuedSession();
           return;
+        }
+        if (pendingNativePairingPersistence.current === persistence) {
+          pendingNativePairingPersistence.current = null;
         }
       }
       pendingPairingToken.current = null;
@@ -395,7 +487,7 @@ export function BackendProvider({ children }: PropsWithChildren) {
         bootstrap,
       });
     } catch (caught) {
-      if (caught instanceof IssuedSessionCleanupError) throw caught;
+      if (caught instanceof PairingCleanupError) throw caught;
       try {
         await abandonIssuedSession();
       } catch (cleanupCaught) {
@@ -403,7 +495,7 @@ export function BackendProvider({ children }: PropsWithChildren) {
       }
       throw caught;
     }
-  }, []);
+  }, [cleanPairing]);
 
   const pollPairing = useCallback(async (
     activation: number,
@@ -417,105 +509,97 @@ export function BackendProvider({ children }: PropsWithChildren) {
       && pendingPairingToken.current === token
     ) {
       try {
-        const exchanged = await client.exchangePairing(token);
-        await finishPairing(activation, config, exchanged);
+        const exchangeRequest = client.exchangePairing(token);
+        const exchangeOperation = {
+          token,
+          settled: exchangeRequest.then(() => undefined, () => undefined),
+        };
+        pairingExchangeInFlight.current = exchangeOperation;
+        let exchanged: ReviewerPairingExchange;
+        try {
+          exchanged = await exchangeRequest;
+        } finally {
+          if (pairingExchangeInFlight.current === exchangeOperation) {
+            pairingExchangeInFlight.current = null;
+          }
+        }
+        await finishPairing(activation, config, token, exchanged);
         return;
       } catch (caught) {
         if (isApiError(caught, 409, "PAIRING_NOT_APPROVED")) {
           await waitForPairingPoll();
           continue;
         }
-        if (caught instanceof IssuedSessionCleanupError) {
-          if (!mounted.current) return;
-          // Cleanup failure means an issued session may still be live. Invalidate
-          // every newer activation too, so none can overwrite this fail-closed
-          // state with a client while that uncertainty remains.
+        if (caught instanceof PairingCleanupError) {
+          if (!mounted.current || activation !== generation.current) return;
           generation.current += 1;
-          pendingPairingToken.current = null;
+          setState((current) => ({
+            ...initialState,
+            status: "pairing_pending",
+            config,
+            pairing: current.pairing,
+            error: caught.message,
+          }));
+          return;
+        }
+
+        // Once an exchange request has been sent, its response can be
+        // ambiguous on both native and web: the backend may have issued a
+        // session before the client times out or rejects the 201 body. The
+        // pairing-token cancellation endpoint is the sole cleanup authority;
+        // it atomically deletes an unconsumed request or revokes the session
+        // issued from that exact token (and expires the web cookie).
+        const wasCurrent = mounted.current && activation === generation.current;
+        const pairing = stateRef.current.pairing;
+        const cleanupActivation = wasCurrent ? ++generation.current : generation.current;
+        if (wasCurrent) {
           setState({
             ...initialState,
-            status: "error",
+            status: "pairing_pending",
             config,
-            error: caught.message,
+            pairing,
           });
+        }
+        try {
+          await cleanPairing(config, token);
+        } catch {
+          if (
+            wasCurrent
+            && mounted.current
+            && cleanupActivation === generation.current
+            && pendingPairingToken.current === token
+          ) {
+            setState({
+              ...initialState,
+              status: "pairing_pending",
+              config,
+              pairing,
+              error: new PairingCleanupError().message,
+            });
+          }
           return;
         }
-        if (
-          reviewerClientKind() === "web"
-          && !isApiError(caught, 401)
-          && (
-            !(caught instanceof TacuaApiError)
-            || caught.status === 0
-            || caught.status === 408
-            || caught.status === 502
-          )
-        ) {
-          // A browser installs Set-Cookie from the response headers before the
-          // exchange body is read and validated. A timeout, truncated 201, or
-          // invalid success body can therefore have issued a live HttpOnly
-          // session even though exchangePairing threw. Quarantine all newer
-          // activations before inspecting the cookie so no connection can race
-          // the cleanup and retain a revoked client.
-          const wasCurrent = mounted.current && activation === generation.current;
-          const cleanupActivation = ++generation.current;
+        if (pendingPairingToken.current === token) {
           pendingPairingToken.current = null;
-          if (mounted.current) {
-            setState({
-              ...initialState,
-              status: "loading",
-              config,
-            });
-          }
-          try {
-            await reconcileAmbiguousWebPairingExchange(config);
-          } catch (cleanupCaught) {
-            if (!mounted.current || cleanupActivation !== generation.current) return;
-            setState({
-              ...initialState,
-              status: "error",
-              config,
-              error: cleanupCaught instanceof IssuedSessionCleanupError
-                ? cleanupCaught.message
-                : "Tacua could not safely reconcile the reviewer session issued during pairing.",
-            });
-            return;
-          }
-          if (!mounted.current || cleanupActivation !== generation.current) return;
-          setState(wasCurrent
-            ? {
-              ...initialState,
-              status: "error",
-              config,
-              error: message(caught, "Tacua could not finish reviewer pairing."),
-            }
-            : {
-              ...initialState,
-              status: "pairing_required",
-              config,
-            });
-          return;
         }
-        if (!mounted.current || activation !== generation.current) return;
-        pendingPairingToken.current = null;
-        if (isApiError(caught, 401)) {
-          setState({
+        if (!wasCurrent || !mounted.current || cleanupActivation !== generation.current) return;
+        setState(isApiError(caught, 401)
+          ? {
             ...initialState,
             status: "pairing_required",
             config,
             error: "The pairing request expired. Request a new code to continue.",
+          }
+          : {
+            ...initialState,
+            status: "error",
+            config,
+            error: message(caught, "Tacua could not finish reviewer pairing."),
           });
-          return;
-        }
-        setState({
-          ...initialState,
-          status: "error",
-          config,
-          error: message(caught, "Tacua could not finish reviewer pairing."),
-        });
         return;
       }
     }
-  }, [finishPairing]);
+  }, [cleanPairing, finishPairing]);
 
   const reload = useCallback(async () => {
     await activate();
@@ -524,6 +608,12 @@ export function BackendProvider({ children }: PropsWithChildren) {
   const configureEndpoint = useCallback(async (baseUrl: string) => {
     if (reviewerClientKind() === "web") {
       throw new Error("The web reviewer always uses its own origin.");
+    }
+    if (
+      pendingPairingToken.current !== null
+      || pairingCancellationInFlight.current !== null
+    ) {
+      throw new Error("Cancel the current pairing before changing the backend endpoint.");
     }
     const config = validateBackendConfig({ baseUrl, sessionToken: null });
     generation.current += 1;
@@ -564,6 +654,8 @@ export function BackendProvider({ children }: PropsWithChildren) {
       current.status !== "pairing_required"
       || current.config === null
       || pairingRequestInFlight.current
+      || pairingCancellationInFlight.current !== null
+      || pendingPairingToken.current !== null
     ) return;
     pairingRequestInFlight.current = true;
     const pairingClient = clientFor(current.config);
@@ -604,17 +696,63 @@ export function BackendProvider({ children }: PropsWithChildren) {
     }
   }, [pollPairing]);
 
-  const cancelPairing = useCallback(() => {
+  const cancelPairing = useCallback((): Promise<void> => {
     const current = stateRef.current;
-    if (current.status !== "pairing_pending") return;
-    generation.current += 1;
-    pendingPairingToken.current = null;
+    const token = pendingPairingToken.current;
+    if (
+      current.status !== "pairing_pending"
+      || current.config === null
+      || current.pairing === null
+      || token === null
+    ) return Promise.resolve();
+    const active = explicitPairingCancellationInFlight.current;
+    if (active !== null && active.token === token) return active.promise;
+
+    const activation = ++generation.current;
+    const pairing = current.pairing;
     setState({
       ...initialState,
-      status: "pairing_required",
+      status: "pairing_pending",
       config: current.config,
+      pairing,
     });
-  }, []);
+
+    let operation: { readonly token: string; readonly promise: Promise<void> };
+    const promise = cleanPairing(current.config, token)
+      .then(() => {
+        if (pendingPairingToken.current === token) {
+          pendingPairingToken.current = null;
+        }
+        if (!mounted.current || activation !== generation.current) return;
+        setState({
+          ...initialState,
+          status: "pairing_required",
+          config: current.config,
+        });
+      })
+      .catch(() => {
+        if (
+          !mounted.current
+          || activation !== generation.current
+          || pendingPairingToken.current !== token
+        ) return;
+        setState({
+          ...initialState,
+          status: "pairing_pending",
+          config: current.config,
+          pairing,
+          error: new PairingCleanupError().message,
+        });
+      })
+      .finally(() => {
+        if (explicitPairingCancellationInFlight.current === operation) {
+          explicitPairingCancellationInFlight.current = null;
+        }
+      });
+    operation = { token, promise };
+    explicitPairingCancellationInFlight.current = operation;
+    return promise;
+  }, [cleanPairing]);
 
   const disconnect = useCallback(async () => {
     const current = stateRef.current;
@@ -659,6 +797,12 @@ export function BackendProvider({ children }: PropsWithChildren) {
       generation.current += 1;
       pendingPairingToken.current = null;
       pairingRequestInFlight.current = false;
+      pairingCancellationInFlight.current = null;
+      pairingCancellationRequestInFlight.current = null;
+      pairingExchangeInFlight.current = null;
+      explicitPairingCancellationInFlight.current = null;
+      canceledPairingTokens.current.clear();
+      pendingNativePairingPersistence.current = null;
     };
   }, [activate]);
 
