@@ -241,6 +241,8 @@ export function createBackendManagedHostLifecycleAdapter(
     controller,
     {
       getInitialURL: () => Linking.getInitialURL(),
+      isBackendLaunchURL: (url) =>
+        TacuaCaptureSpikeModule.isBackendLaunchURL(url),
       drainPendingLaunchURLs: () =>
         TacuaCaptureSpikeModule.drainPendingBackendLaunchURLs(),
       subscribePendingLaunchURL: (listener) => {

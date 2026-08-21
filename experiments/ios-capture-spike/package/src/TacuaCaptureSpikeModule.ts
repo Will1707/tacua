@@ -713,6 +713,8 @@ type CaptureEventMap = {
 type NativeTacuaCaptureSpikeModule = {
   getCapabilities: () => CaptureCapabilities;
   getBackendTransportConfiguration: () => BackendTransportConfiguration;
+  /** Exact build-pinned native parser; false leaves ordinary host-app URLs untouched. */
+  isBackendLaunchURL: (launchURL: string) => boolean;
   /** Atomically removes URLs from the process-local native inbox. Never log the result. */
   drainPendingBackendLaunchURLs: () => readonly string[];
   getBackendQueueStatus: (localSessionId: string) => Promise<BackendQueueStatus>;

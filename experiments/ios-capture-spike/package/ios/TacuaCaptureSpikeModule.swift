@@ -110,6 +110,17 @@ public final class TacuaCaptureSpikeModule: Module {
       TacuaLaunchURLInbox.shared.drain()
     }
 
+    Function("isBackendLaunchURL") { (launchURL: String) -> Bool in
+      guard
+        let launchConfiguration = try? TacuaLaunchLinkConfiguration.fromBuildConfiguration(),
+        (try? TacuaLaunchLinkParser.parse(
+          launchURL,
+          configuration: launchConfiguration
+        )) != nil
+      else { return false }
+      return true
+    }
+
     Function("prepareBackendLaunch") { (launchURL: String) throws -> [String: Any] in
       // Parsing never accepts an origin: the network origin is independently build-pinned.
       _ = try TacuaBackendConfiguration.fromBuildConfiguration()

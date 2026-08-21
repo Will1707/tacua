@@ -43,6 +43,11 @@ export type BackendManagedHostLifecycleAdapterOptions =
  */
 export type BackendManagedHostLifecyclePrimitives = Readonly<{
   getInitialURL: () => Promise<string | null>;
+  /**
+   * Applies the exact build-pinned native launch parser. Unrelated app URLs return false and must
+   * never be logged, retained, or forwarded to the backend-managed controller.
+   */
+  isBackendLaunchURL: (url: string) => boolean;
   /** Atomically removes URLs from the process-local native inbox. Values must never be logged. */
   drainPendingLaunchURLs: () => readonly string[];
   /** Content-free native signal; the callback drains the inbox synchronously. */
@@ -235,6 +240,22 @@ export function createBackendManagedHostLifecycleAdapterForPrimitives(
   const enqueueIncomingURL = (launchURL: string): Promise<void> | null => {
     if (disposed) return null;
     if (typeof launchURL !== "string" || launchURL.length === 0) {
+      report(
+        new BackendManagedHostLifecycleAdapterError("deliver_launch_url"),
+      );
+      return null;
+    }
+    let isBackendLaunchURL: boolean;
+    try {
+      isBackendLaunchURL = primitives.isBackendLaunchURL(launchURL);
+    } catch {
+      report(
+        new BackendManagedHostLifecycleAdapterError("deliver_launch_url"),
+      );
+      return null;
+    }
+    if (isBackendLaunchURL === false) return null;
+    if (isBackendLaunchURL !== true) {
       report(
         new BackendManagedHostLifecycleAdapterError("deliver_launch_url"),
       );
