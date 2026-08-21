@@ -33,12 +33,25 @@ transport configuration through `transport_configuration_digest`.
 build identity, explicit app-only capture consent, and retention policy into
 `scope_digest`. That scope is immutable for the session.
 
-The transport configuration digest is the Tacua canonical-JSON digest of
-exactly this closed subject (with the deployment's normalized origin):
+The transport configuration digest is the Tacua canonical-JSON digest of one
+versioned, closed subject with the deployment's normalized origin. The legacy
+V1.1 subject is:
 
 ```json
 {"backend_origin":"https://qa.tacua.example","max_completion_bytes":4194304,"max_diagnostic_bytes":3145728,"max_segment_bytes":268435456,"transport_policy_version":"tacua.sdk-transport@1.1.0"}
 ```
+
+V1.2 additionally seals the dedicated QA custom-URL scheme into the same
+subject:
+
+```json
+{"backend_origin":"https://qa.tacua.example","launch_scheme":"example-tacua-qa","max_completion_bytes":4194304,"max_diagnostic_bytes":3145728,"max_segment_bytes":268435456,"transport_policy_version":"tacua.sdk-transport@1.2.0"}
+```
+
+V1.1 forbids `launch_scheme` and remains byte-for-byte compatible with existing
+profiles. V1.2 requires a normalized lowercase 2–64 character scheme. Changing
+that scheme changes the transport digest and therefore transitively reseals the
+SDK profile, build identity, and approved-handoff build binding.
 
 `backend_origin` is an origin, not a base URL: lowercase the scheme and host,
 remove the default port, accept only an empty or root path, normalize the root
