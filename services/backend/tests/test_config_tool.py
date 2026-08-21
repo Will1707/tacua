@@ -260,6 +260,11 @@ class ConfigToolTests(unittest.TestCase):
         )
 
         invalid_policies = (
+            {"mode": []},
+            {"mode": {}},
+            {"mode": None},
+            {"mode": True},
+            {"mode": 1},
             {"mode": "pairing", "tailscale_app_capabilities": capability},
             {
                 "mode": "tailscale_capability_or_pairing",

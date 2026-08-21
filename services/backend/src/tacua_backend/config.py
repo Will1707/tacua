@@ -338,7 +338,7 @@ def validate_reviewer_auth_config(value: Any) -> ReviewerAuthConfig:
         raise ConfigError("reviewer_auth must be an object")
 
     mode = raw.get("mode")
-    if mode not in REVIEWER_AUTH_MODES:
+    if not isinstance(mode, str) or mode not in REVIEWER_AUTH_MODES:
         raise ConfigError("reviewer_auth.mode is unsupported")
     expected_keys = (
         {"mode", "tailscale_app_capabilities"}
