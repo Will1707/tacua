@@ -245,13 +245,70 @@ class OfflineProcessorTests(unittest.TestCase):
             processor.digest_bytes(keyframe),
         )
         self.assertEqual(bundle["candidate"]["state"], "draft")
+        self.assertTrue(
+            bundle["candidate"]["content"]["title"].startswith(
+                "Marked QA finding (narration hypothesis): "
+            )
+        )
+        claims_by_kind = {
+            claim["kind"]: claim
+            for claim in bundle["candidate"]["content"]["claims"]
+        }
+        observed = claims_by_kind["observed"]
+        hypothesis = claims_by_kind["hypothesis"]
+        self.assertEqual(observed["support"], "direct")
+        self.assertEqual(observed["confidence"], "high")
+        self.assertEqual(len(observed["evidence_refs"]), 1)
+        self.assertEqual(
+            observed["statement"],
+            "The attached keyframe shows the captured application screen.",
+        )
+        self.assertNotIn("mark", observed["statement"].lower())
+        self.assertNotIn("save button", observed["statement"].lower())
+        self.assertEqual(hypothesis["support"], "inferred")
+        self.assertEqual(hypothesis["confidence"], "low")
+        self.assertTrue(hypothesis["evidence_refs"])
+        self.assertIn("save button", hypothesis["statement"].lower())
+        self.assertNotEqual(observed["evidence_refs"], hypothesis["evidence_refs"])
+        self.assertEqual(
+            bundle["candidate"]["content"]["actual_behavior"]["claim_refs"],
+            [observed["claim_id"]],
+        )
+        self.assertEqual(
+            bundle["candidate"]["content"]["summary"]["claim_refs"],
+            [observed["claim_id"], hypothesis["claim_id"]],
+        )
         clarification = bundle["candidate"]["content"]["clarifications"][0]
         self.assertEqual(clarification["impact"], "blocking")
         self.assertEqual(clarification["status"], "unresolved")
-        evidence_types = {
-            item["evidence_type"] for item in bundle["evidence_manifest"]["items"]
+        evidence_by_id = {
+            item["evidence_id"]: item
+            for item in bundle["evidence_manifest"]["items"]
         }
+        evidence_types = {item["evidence_type"] for item in evidence_by_id.values()}
         self.assertEqual(evidence_types, {"media.keyframe", "media.clip"})
+        self.assertEqual(
+            {
+                evidence_by_id[reference]["evidence_type"]
+                for reference in observed["evidence_refs"]
+            },
+            {"media.keyframe"},
+        )
+        frame = evidence_by_id[observed["evidence_refs"][0]]
+        self.assertIn("issue mark", frame["description"].lower())
+        self.assertEqual(
+            {
+                evidence_by_id[reference]["evidence_type"]
+                for reference in hypothesis["evidence_refs"]
+            },
+            {"media.clip"},
+        )
+        self.assertTrue(
+            all(
+                item["availability"] == "available"
+                for item in evidence_by_id.values()
+            )
+        )
         self.assertNotIn(
             "media.transcript_excerpt",
             evidence_types,
