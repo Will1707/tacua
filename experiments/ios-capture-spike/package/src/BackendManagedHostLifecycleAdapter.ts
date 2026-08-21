@@ -23,6 +23,7 @@ export type BackendManagedHostLifecycleOperation =
   | "drain_native_launch_urls"
   | "get_initial_url"
   | "deliver_launch_url"
+  | "prepare_launch"
   | "foreground_retry";
 
 /** Privacy-safe lifecycle failure projection. The source error and launch URL never cross here. */
@@ -71,8 +72,13 @@ export type BackendManagedHostLifecycleAdapter = Readonly<{
    * deduplicated queue used by React Native Linking. The value is never returned or projected.
    */
   deliverLaunchURL: (launchURL: string) => void;
-  /** Removes host/native listeners and disposes the owned controller. Idempotent and non-throwing. */
+  /** Compatibility teardown for hosts that do not install a replacement owner. */
   dispose: () => void;
+  /**
+   * Attempts every owned teardown and returns one sticky confirmation result. Retained callbacks
+   * are inert after disposal even when exclusive listener/native-authority cleanup is uncertain.
+   */
+  disposeWithConfirmation: () => boolean;
 }>;
 
 export class BackendManagedHostLifecycleAdapterError extends Error {
@@ -187,7 +193,7 @@ export function createBackendManagedHostLifecycleAdapterForPrimitives(
       await runStep("initial_refresh", () => controller.refresh());
       initialRefreshCompleted = true;
     }
-    await runStep("deliver_launch_url", () =>
+    await runStep("prepare_launch", () =>
       controller.prepareLaunch(launchURL),
     );
   };
@@ -428,8 +434,13 @@ export function createBackendManagedHostLifecycleAdapterForPrimitives(
 
   beginStartup();
 
-  const dispose = (): void => {
-    if (disposed) return;
+  let disposalConfirmed: boolean | null = null;
+  let disposalReentered = false;
+  const disposeWithConfirmation = (): boolean => {
+    if (disposed) {
+      if (disposalConfirmed === null) disposalReentered = true;
+      return disposalConfirmed ?? false;
+    }
     disposed = true;
     const pendingLaunchURLRemoval = removePendingLaunchURL;
     const incomingURLRemoval = removeIncomingURL;
@@ -437,13 +448,23 @@ export function createBackendManagedHostLifecycleAdapterForPrimitives(
     removePendingLaunchURL = null;
     removeIncomingURL = null;
     removeAppState = null;
-    safelyRemove(pendingLaunchURLRemoval);
-    safelyRemove(incomingURLRemoval);
-    safelyRemove(appStateRemoval);
+    const pendingLaunchURLRemoved = safelyRemove(pendingLaunchURLRemoval);
+    const incomingURLRemoved = safelyRemove(incomingURLRemoval);
+    const appStateRemoved = safelyRemove(appStateRemoval);
     pendingLaunches.clear();
     attemptedLaunches.clear();
     attemptedLaunchOrder.length = 0;
-    safelyDispose(controller);
+    const controllerDisposed = safelyDispose(controller);
+    disposalConfirmed =
+      pendingLaunchURLRemoved &&
+      incomingURLRemoved &&
+      appStateRemoved &&
+      controllerDisposed &&
+      !disposalReentered;
+    return disposalConfirmed;
+  };
+  const dispose = (): void => {
+    void disposeWithConfirmation();
   };
 
   return Object.freeze({
@@ -451,6 +472,7 @@ export function createBackendManagedHostLifecycleAdapterForPrimitives(
     ready,
     deliverLaunchURL: queueIncomingURL,
     dispose,
+    disposeWithConfirmation,
   });
 }
 
@@ -494,20 +516,23 @@ function getInitialURLWithTimeout(
   });
 }
 
-function safelyRemove(remover: (() => void) | null): void {
-  if (!remover) return;
+function safelyRemove(remover: (() => void) | null): boolean {
+  if (!remover) return true;
   try {
     remover();
+    return true;
   } catch {
-    // Removal is best-effort; the disposed gate also makes already-queued callbacks inert.
+    // The disposed gate makes retained callbacks inert; false prevents a replacement owner.
+    return false;
   }
 }
 
-function safelyDispose(controller: BackendManagedHostController): void {
+function safelyDispose(controller: BackendManagedHostController): boolean {
   try {
-    controller.dispose();
+    return controller.disposeWithConfirmation() === true;
   } catch {
-    // The public adapter owns teardown and keeps it idempotent/non-throwing for host callbacks.
+    // Teardown remains non-throwing while its caller receives an exact failure confirmation.
+    return false;
   }
 }
 

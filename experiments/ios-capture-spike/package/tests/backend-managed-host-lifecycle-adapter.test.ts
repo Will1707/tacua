@@ -23,7 +23,7 @@ type ControllerHarnessOptions = Readonly<{
   refresh?: () => Promise<void>;
   prepareLaunch?: (url: string) => Promise<void>;
   notifyForeground?: () => Promise<void>;
-  dispose?: () => void;
+  dispose?: () => boolean;
 }>;
 
 function createControllerHarness(options: ControllerHarnessOptions = {}) {
@@ -32,6 +32,11 @@ function createControllerHarness(options: ControllerHarnessOptions = {}) {
   let disposeCount = 0;
   const emptySnapshot = Object.freeze({}) as BackendManagedHostSnapshot;
   const noOp = async () => undefined;
+  const disposeWithConfirmation = (): boolean => {
+    calls.push("dispose-controller");
+    disposeCount += 1;
+    return options.dispose?.() ?? true;
+  };
 
   const controller: BackendManagedHostController = {
     getSnapshot: () => emptySnapshot,
@@ -64,10 +69,9 @@ function createControllerHarness(options: ControllerHarnessOptions = {}) {
     cancelAuthenticatedReset: noOp,
     confirmAuthenticatedReset: noOp,
     dispose: () => {
-      calls.push("dispose-controller");
-      disposeCount += 1;
-      options.dispose?.();
+      void disposeWithConfirmation();
     },
+    disposeWithConfirmation,
   };
 
   return {
@@ -91,6 +95,10 @@ type LifecycleHarnessOptions = Readonly<{
   subscribeAppState?: (
     listener: (state: BackendManagedHostAppState) => void,
   ) => () => void;
+  onPendingNativeLaunchRemoval?: () => void;
+  failPendingNativeLaunchRemoval?: boolean;
+  failIncomingURLRemoval?: boolean;
+  failAppStateRemoval?: boolean;
 }>;
 
 function createLifecycleHarness(options: LifecycleHarnessOptions = {}) {
@@ -130,6 +138,10 @@ function createLifecycleHarness(options: LifecycleHarnessOptions = {}) {
         calls.push("remove-native-launch");
         pendingNativeLaunchRemovalCount += 1;
         pendingNativeLaunchListeners.delete(listener);
+        options.onPendingNativeLaunchRemoval?.();
+        if (options.failPendingNativeLaunchRemoval) {
+          throw new Error(`private native-launch removal ${LAUNCH_URL}`);
+        }
       };
     },
     ...(options.initialURLTimeoutMilliseconds === undefined
@@ -152,6 +164,9 @@ function createLifecycleHarness(options: LifecycleHarnessOptions = {}) {
         calls.push("remove-url");
         incomingURLRemovalCount += 1;
         incomingURLListeners.delete(listener);
+        if (options.failIncomingURLRemoval) {
+          throw new Error(`private incoming-URL removal ${LAUNCH_URL}`);
+        }
       };
     },
     subscribeAppState: (listener) => {
@@ -164,6 +179,9 @@ function createLifecycleHarness(options: LifecycleHarnessOptions = {}) {
         calls.push("remove-app-state");
         appStateRemovalCount += 1;
         appStateListeners.delete(listener);
+        if (options.failAppStateRemoval) {
+          throw new Error(`private app-state removal ${LAUNCH_URL}`);
+        }
       };
     },
   };
@@ -519,8 +537,8 @@ test("dispose is idempotent and prevents startup, queued, and later callback wor
   );
 
   lifecycleHarness.emitURL(LAUNCH_URL);
-  adapter.dispose();
-  adapter.dispose();
+  assert.equal(adapter.disposeWithConfirmation(), true);
+  assert.equal(adapter.disposeWithConfirmation(), true);
   await adapter.ready;
   lifecycleHarness.emitURL(`${LAUNCH_URL}-after-dispose`);
   lifecycleHarness.emitAppState("background");
@@ -536,6 +554,73 @@ test("dispose is idempotent and prevents startup, queued, and later callback wor
   assert.equal(lifecycleHarness.incomingURLListenerCount(), 0);
   assert.equal(lifecycleHarness.appStateListenerCount(), 0);
 });
+
+test("reentrant disposal makes the outer confirmation sticky false", async () => {
+  const controllerHarness = createControllerHarness();
+  let adapter:
+    | ReturnType<typeof createBackendManagedHostLifecycleAdapterForPrimitives>
+    | null = null;
+  let reentrantResult: boolean | null = null;
+  const lifecycleHarness = createLifecycleHarness({
+    onPendingNativeLaunchRemoval: () => {
+      reentrantResult = adapter?.disposeWithConfirmation() ?? null;
+    },
+  });
+  adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controllerHarness.controller,
+    lifecycleHarness.primitives,
+  );
+  await adapter.ready;
+
+  assert.equal(adapter.disposeWithConfirmation(), false);
+  assert.equal(reentrantResult, false);
+  assert.equal(adapter.disposeWithConfirmation(), false);
+  assert.equal(lifecycleHarness.pendingNativeLaunchRemovalCount(), 1);
+  assert.equal(lifecycleHarness.incomingURLRemovalCount(), 1);
+  assert.equal(lifecycleHarness.appStateRemovalCount(), 1);
+  assert.equal(controllerHarness.disposeCount(), 1);
+});
+
+for (const failure of [
+  "pending native launch removal",
+  "incoming URL removal",
+  "app state removal",
+  "controller rejection",
+  "controller throw",
+] as const) {
+  test(`dispose returns one sticky false result after ${failure} while attempting every teardown`, async () => {
+    const controllerHarness = createControllerHarness({
+      ...(failure === "controller rejection"
+        ? { dispose: () => false }
+        : failure === "controller throw"
+          ? {
+              dispose: () => {
+                throw new Error(`private controller teardown ${LAUNCH_URL}`);
+              },
+            }
+          : {}),
+    });
+    const lifecycleHarness = createLifecycleHarness({
+      failPendingNativeLaunchRemoval:
+        failure === "pending native launch removal",
+      failIncomingURLRemoval: failure === "incoming URL removal",
+      failAppStateRemoval: failure === "app state removal",
+    });
+    const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+      controllerHarness.controller,
+      lifecycleHarness.primitives,
+    );
+    await adapter.ready;
+
+    assert.equal(adapter.disposeWithConfirmation(), false);
+    assert.equal(adapter.disposeWithConfirmation(), false);
+    assert.equal(lifecycleHarness.pendingNativeLaunchRemovalCount(), 1);
+    assert.equal(lifecycleHarness.incomingURLRemovalCount(), 1);
+    assert.equal(lifecycleHarness.appStateRemovalCount(), 1);
+    assert.equal(controllerHarness.disposeCount(), 1);
+    assert.equal(JSON.stringify(adapter).includes(LAUNCH_CODE), false);
+  });
+}
 
 test("dispose during initial refresh fences initial URL lookup and delivery", async () => {
   const releaseRefresh = deferred();
@@ -584,8 +669,8 @@ for (const failure of [
     },
   },
   {
-    name: "launch delivery",
-    operation: "deliver_launch_url",
+    name: "launch preparation",
+    operation: "prepare_launch",
     lifecycle: { initialURL: LAUNCH_URL },
     controller: {
       prepareLaunch: async () => {
@@ -625,7 +710,7 @@ for (const failure of [
     assert.equal(Object.isFrozen(errors[0]), true);
     assert.equal(JSON.stringify(errors).includes(LAUNCH_CODE), false);
 
-    if (failure.operation === "deliver_launch_url") {
+    if (failure.operation === "prepare_launch") {
       lifecycleHarness.emitURL(LAUNCH_URL);
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
       assert.equal(controllerHarness.preparedURLs.length, 1);

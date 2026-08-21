@@ -316,7 +316,13 @@ export type BackendManagedHostController = Readonly<{
   requestAuthenticatedReset: (localSessionId: string) => Promise<void>;
   cancelAuthenticatedReset: () => Promise<void>;
   confirmAuthenticatedReset: () => Promise<void>;
+  /** Compatibility teardown for hosts that do not install a replacement owner. */
   dispose: () => void;
+  /**
+   * Clears all JS-held authority, attempts every owned native teardown, and returns the same
+   * sticky confirmation result on every call.
+   */
+  disposeWithConfirmation: () => boolean;
 }>;
 
 type PendingConsent = Readonly<{
@@ -374,6 +380,10 @@ class Controller implements BackendManagedHostController {
   private lifecycleReconciliationScheduled = false;
   private lifecycleSubscriptionReady = false;
   private disposed = false;
+  private disposalConfirmed: boolean | null = null;
+  private disposalReentered = false;
+  private synchronousLaunchTransitionDepth = 0;
+  private readonly ownedLaunchHandleIds = new Set<string>();
   private pendingConsent: PendingConsent | null = null;
   private approvedLaunch: ApprovedLaunch | null = null;
   private installedPlan: InstalledPlan | null = null;
@@ -469,7 +479,11 @@ class Controller implements BackendManagedHostController {
       if (typeof launchURL !== "string" || launchURL.length === 0) {
         throw controllerError("invalid_input", "A launch URL is required");
       }
-      if (this.pendingConsent || this.approvedLaunch) {
+      if (
+        this.pendingConsent ||
+        this.approvedLaunch ||
+        this.ownedLaunchHandleIds.size > 0
+      ) {
         throw controllerError(
           "invalid_state",
           "A launch is already awaiting a decision",
@@ -488,7 +502,22 @@ class Controller implements BackendManagedHostController {
         );
       }
 
-      const prepared = this.primitives.prepareBackendLaunch(launchURL);
+      const prepared = this.runSynchronousLaunchTransition(() =>
+        this.primitives.prepareBackendLaunch(launchURL),
+      );
+      this.ownedLaunchHandleIds.add(prepared.consentRequestId);
+      const launchKind: BackendManagedLaunchKind =
+        prepared.expectedSessionId === null ? "start" : "resume";
+      const preparedConsent: PendingConsent = {
+        consentRequestId: prepared.consentRequestId,
+        launchKind,
+        expectedRemoteSessionId: prepared.expectedSessionId,
+        matchedLocalSessionId: null,
+      };
+      // Native launch authority exists as soon as prepareBackendLaunch returns. Record it before
+      // RESUME matching or any other await so synchronous disposal can take and cancel every
+      // handle the controller owns.
+      this.pendingConsent = preparedConsent;
       let matchedLocalSessionId: string | null = null;
       try {
         if (
@@ -508,13 +537,23 @@ class Controller implements BackendManagedHostController {
           );
         }
         this.assertNotDisposed();
+        if (this.pendingConsent !== preparedConsent) {
+          throw controllerError(
+            "invalid_state",
+            "Prepared launch ownership changed before consent",
+          );
+        }
       } catch (error) {
-        this.primitives.cancelBackendLaunch(prepared.consentRequestId);
+        // Disposal atomically takes this slot before cancellation. A resumed async task must only
+        // cancel authority it still owns, otherwise a failed remover could be invoked twice and
+        // replace the privacy-safe disposed error with native detail.
+        if (this.pendingConsent === preparedConsent) {
+          this.cancelOwnedLaunchHandle(prepared.consentRequestId);
+          this.pendingConsent = null;
+        }
         throw error;
       }
 
-      const launchKind: BackendManagedLaunchKind =
-        prepared.expectedSessionId === null ? "start" : "resume";
       this.pendingConsent = {
         consentRequestId: prepared.consentRequestId,
         launchKind,
@@ -539,35 +578,64 @@ class Controller implements BackendManagedHostController {
           "No launch is awaiting consent",
         );
       }
-      this.pendingConsent = null;
       if (granted !== true) {
-        this.primitives.cancelBackendLaunch(pending.consentRequestId);
+        const cancellationConfirmed = this.cancelOwnedLaunchHandle(
+          pending.consentRequestId,
+        );
+        this.pendingConsent = null;
+        if (!cancellationConfirmed) {
+          this.setPhase({
+            kind: "blocked",
+            reason: "operator_reconciliation_required",
+            localSessionId: pending.matchedLocalSessionId,
+          });
+          throw controllerError(
+            "native_rejected",
+            "Launch cancellation could not be confirmed",
+          );
+        }
         this.setPhase({ kind: "idle" });
         return;
       }
 
       let approved: ApprovedBackendLaunch | null = null;
       try {
-        approved = this.primitives.confirmBackendLaunchConsent(
-          pending.consentRequestId,
-          true,
+        approved = this.runSynchronousLaunchTransition(() =>
+          this.primitives.confirmBackendLaunchConsent(
+            pending.consentRequestId,
+            true,
+          ),
         );
+        // Native confirmation atomically consumes the consent request and returns the only
+        // approved handle. Mirror that transition in the same synchronous turn.
+        this.ownedLaunchHandleIds.delete(pending.consentRequestId);
+        this.ownedLaunchHandleIds.add(approved.approvedLaunchId);
+        this.pendingConsent = null;
+        this.approvedLaunch = {
+          approvedLaunchId: approved.approvedLaunchId,
+          launchKind: pending.launchKind,
+          expectedRemoteSessionId: pending.expectedRemoteSessionId,
+          matchedLocalSessionId: pending.matchedLocalSessionId,
+        };
         this.assertNotDisposed();
       } catch (error) {
-        // The native gate is volatile. Preparing another link replaces any orphaned approved
-        // handle, but cancel the known request first and return the host to a retryable state.
-        this.primitives.cancelBackendLaunch(
-          approved?.approvedLaunchId ?? pending.consentRequestId,
-        );
-        this.setPhase({ kind: "idle" });
+        const cleanupId =
+          approved?.approvedLaunchId ?? pending.consentRequestId;
+        const cancellationConfirmed =
+          this.cancelOwnedLaunchHandle(cleanupId);
+        this.pendingConsent = null;
+        this.approvedLaunch = null;
+        if (cancellationConfirmed) {
+          this.setPhase({ kind: "idle" });
+        } else {
+          this.setPhase({
+            kind: "blocked",
+            reason: "operator_reconciliation_required",
+            localSessionId: pending.matchedLocalSessionId,
+          });
+        }
         throw error;
       }
-      this.approvedLaunch = {
-        approvedLaunchId: approved.approvedLaunchId,
-        launchKind: pending.launchKind,
-        expectedRemoteSessionId: pending.expectedRemoteSessionId,
-        matchedLocalSessionId: pending.matchedLocalSessionId,
-      };
       this.setPhase({
         kind: "launch_approved",
         launchKind: pending.launchKind,
@@ -588,6 +656,12 @@ class Controller implements BackendManagedHostController {
           "No approved launch is available",
         );
       }
+      if (!this.ownedLaunchHandleIds.has(approved.approvedLaunchId)) {
+        throw controllerError(
+          "invalid_state",
+          "Approved launch ownership is unavailable",
+        );
+      }
       if (this.primitives.getStatus().recorderRecording) {
         throw controllerError(
           "invalid_state",
@@ -595,9 +669,10 @@ class Controller implements BackendManagedHostController {
         );
       }
 
-      // One-shot native handles are never reused after an attempted exchange. Native code decides
-      // whether the underlying launch code was consumed; JS always requires a fresh link on error.
+      // Public exchange is one-shot, but native ownership remains explicit until the plan promise
+      // resolves and therefore proves that native request construction consumed the handle.
       this.approvedLaunch = null;
+      let launchConsumed = false;
       try {
         if (approved.launchKind === "start") {
           const plan = await this.awaitActive(
@@ -606,6 +681,8 @@ class Controller implements BackendManagedHostController {
               segmentDurationSeconds: duration,
             }),
           );
+          this.ownedLaunchHandleIds.delete(approved.approvedLaunchId);
+          launchConsumed = true;
           await this.awaitActive(this.installStartedPlan(plan, "start"));
           return;
         }
@@ -646,9 +723,13 @@ class Controller implements BackendManagedHostController {
             segmentDurationSeconds: duration,
           }),
         );
+        this.ownedLaunchHandleIds.delete(approved.approvedLaunchId);
+        launchConsumed = true;
         await this.awaitActive(this.installResumedPlan(plan, "resume"));
       } catch (error) {
-        this.primitives.cancelBackendLaunch(approved.approvedLaunchId);
+        if (!launchConsumed) {
+          this.cancelOwnedLaunchHandle(approved.approvedLaunchId);
+        }
         this.setPhase({
           kind: "blocked",
           reason: "operator_reconciliation_required",
@@ -1062,8 +1143,27 @@ class Controller implements BackendManagedHostController {
     });
 
   dispose = (): void => {
-    if (this.disposed) return;
+    void this.disposeWithConfirmation();
+  };
+
+  disposeWithConfirmation = (): boolean => {
+    if (this.disposed) {
+      if (this.disposalConfirmed === null) {
+        this.disposalReentered = true;
+        return false;
+      }
+      return this.disposalConfirmed;
+    }
     this.disposed = true;
+    const ownedLaunchHandleIds = [...this.ownedLaunchHandleIds];
+    // Take all JS ownership before invoking native cleanup. Async continuations can then observe
+    // that disposal already owns cancellation and cannot retry or project native failure detail.
+    this.pendingConsent = null;
+    this.approvedLaunch = null;
+    this.ownedLaunchHandleIds.clear();
+    // A reentrant primitive can create a handle before it returns the identifier to JS. The host
+    // cannot prove teardown across that synchronous transition, even if every known handle cancels.
+    let disposalConfirmed = this.synchronousLaunchTransitionDepth === 0;
     const removeCaptureLifecycleListeners =
       this.removeCaptureLifecycleListeners;
     this.removeCaptureLifecycleListeners = null;
@@ -1071,36 +1171,63 @@ class Controller implements BackendManagedHostController {
       try {
         removeCaptureLifecycleListeners();
       } catch {
-        // Listener removal is best-effort during teardown. The disposed gate also ignores any
-        // callback already queued by the native event emitter.
+        // The disposed gate makes retained callbacks inert, but the owner still needs an exact
+        // signal that exclusive native-listener teardown was not confirmed.
+        disposalConfirmed = false;
       }
     }
-    if (this.pendingConsent) {
+    for (const requestId of ownedLaunchHandleIds) {
       try {
-        this.primitives.cancelBackendLaunch(
-          this.pendingConsent.consentRequestId,
-        );
+        this.primitives.cancelBackendLaunch(requestId);
       } catch {
-        // Teardown remains non-throwing; native launch handles are volatile and process-scoped.
+        // Native launch handles are volatile and process-scoped, but a replacement owner must
+        // not be installed after their cancellation becomes uncertain.
+        disposalConfirmed = false;
       }
     }
-    if (this.approvedLaunch) {
-      try {
-        this.primitives.cancelBackendLaunch(
-          this.approvedLaunch.approvedLaunchId,
-        );
-      } catch {
-        // Continue clearing all JS-held authority even if native teardown rejects cancellation.
-      }
-    }
-    this.pendingConsent = null;
-    this.approvedLaunch = null;
     this.installedPlan = null;
     this.activeCaptureSessionId = null;
     this.pendingDrainSessionId = null;
     this.resetRequest = null;
     this.listeners.clear();
+    if (this.disposalReentered) disposalConfirmed = false;
+    this.disposalConfirmed = disposalConfirmed;
+    return disposalConfirmed;
   };
+
+  private runSynchronousLaunchTransition<Result>(
+    operation: () => Result,
+  ): Result {
+    this.synchronousLaunchTransitionDepth += 1;
+    try {
+      return operation();
+    } finally {
+      this.synchronousLaunchTransitionDepth -= 1;
+    }
+  }
+
+  private cancelOwnedLaunchHandle(requestId: string): boolean {
+    if (!this.ownedLaunchHandleIds.has(requestId)) return true;
+    // Take ownership before entering the primitive so a reentrant disposal cannot invoke the same
+    // cancellation twice. The transition depth also makes that disposal conservatively false.
+    this.ownedLaunchHandleIds.delete(requestId);
+    this.synchronousLaunchTransitionDepth += 1;
+    try {
+      this.primitives.cancelBackendLaunch(requestId);
+      return true;
+    } catch {
+      if (!this.disposed) {
+        this.ownedLaunchHandleIds.add(requestId);
+      } else {
+        // Disposal has already returned a conservative terminal result. Do not retain authority
+        // that a late synchronous transition surfaced after the disposal snapshot was taken.
+        this.disposalConfirmed = false;
+      }
+      return false;
+    } finally {
+      this.synchronousLaunchTransitionDepth -= 1;
+    }
+  }
 
   private readonly handleCaptureLifecycleSignal = (): void => {
     if (this.disposed) return;
