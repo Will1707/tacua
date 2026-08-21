@@ -1644,6 +1644,68 @@ class OperatorToolTests(unittest.TestCase):
                     code,
                 )
 
+    def test_approve_reviewer_pairing_default_opener_disables_environment_proxies(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_file, secret_file, _state = self.deployment(root)
+            self.enable_reviewer_pairing(config_file)
+            config, secret = load_config(config_file, secret_file)
+            endpoint = (
+                config.backend_origin + "/v1/admin/reviewer-pairing-approvals"
+            )
+            opener = FakeOpener(
+                {
+                    "/v1/admin/reviewer-pairing-approvals": {
+                        "pairing_id": "rpair_" + "a" * 32,
+                        "device_label": "Will's reviewer",
+                        "client_kind": "web",
+                        "scopes": [
+                            "reviewer.launch",
+                            "reviewer.read",
+                            "reviewer.write",
+                        ],
+                        "created_at": "2026-08-21T09:00:00Z",
+                        "approved_at": "2026-08-21T09:00:01Z",
+                        "expires_at": "2026-08-21T09:10:00Z",
+                    }
+                }
+            )
+            built: list[tuple[object, ...]] = []
+
+            def fake_build_opener(*handlers: object) -> FakeOpener:
+                built.append(handlers)
+                return opener
+
+            with patch.object(
+                operator_tool.urllib.request,
+                "build_opener",
+                side_effect=fake_build_opener,
+            ):
+                result = approve_reviewer_pairing(
+                    config_file,
+                    secret_file,
+                    "ABCD-EFGH",
+                )
+
+            self.assertEqual(
+                {"operation": "reviewer_pairing_approved", "status": "ok"},
+                result,
+            )
+            self.assertEqual(
+                [(endpoint, "Bearer " + secret.decode("ascii"))],
+                opener.requests,
+            )
+            self.assertEqual(1, len(built))
+            proxy_handlers = [
+                handler
+                for handler in built[0]
+                if isinstance(handler, operator_tool.urllib.request.ProxyHandler)
+            ]
+            self.assertEqual(1, len(proxy_handlers))
+            self.assertEqual({}, proxy_handlers[0].proxies)
+
     def test_approve_reviewer_pairing_rejects_legacy_mode_and_untrusted_response(
         self,
     ) -> None:

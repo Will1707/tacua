@@ -1966,6 +1966,7 @@ def approve_reviewer_pairing(
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     factory = opener_factory or (
         lambda tls_context: urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
             _RejectRedirects(),
             urllib.request.HTTPSHandler(context=tls_context),
         )
