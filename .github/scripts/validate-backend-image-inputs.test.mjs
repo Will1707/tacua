@@ -1,10 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import {
+  chmodSync,
+  cpSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
+  collectInputRecords,
   MAX_BACKEND_IMAGE_INPUT_FILE_BYTES,
   validateDockerDefinition,
   validateInputRecords,
@@ -20,6 +33,22 @@ const validDockerignore = readFileSync(
   new URL("../../services/backend/Dockerfile.dockerignore", import.meta.url),
   "utf8",
 );
+const repositoryRoot = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "../..",
+);
+
+function privateBackendInputTree(context) {
+  const temporary = mkdtempSync(path.join(tmpdir(), "tacua-private-backend-"));
+  context.after(() => rmSync(temporary, { force: true, recursive: true }));
+  for (const record of collectInputRecords(repositoryRoot)) {
+    const destination = path.join(temporary, record.path);
+    mkdirSync(path.dirname(destination), { mode: 0o700, recursive: true });
+    cpSync(path.join(repositoryRoot, record.path), destination);
+    chmodSync(destination, 0o600);
+  }
+  return temporary;
+}
 
 test("a floating base and broad source copy are rejected", () => {
   assert.throws(
@@ -69,12 +98,64 @@ test("case and whitespace cannot hide added or changed Docker instructions", () 
   }
 });
 
+test("every backend image input has an explicit immutable image mode", () => {
+  assert.throws(
+    () => validateDockerDefinition(
+      validDockerfile.replace(
+        "COPY --chown=root:root --chmod=0444 LICENSE NOTICE /app/",
+        "COPY --chown=root:root LICENSE NOTICE /app/",
+      ),
+      validDockerignore,
+    ),
+    /COPY boundary differs|closed instruction policy/u,
+  );
+});
+
+test("a real owner-private backend input tree remains valid", (context) => {
+  const privateRoot = privateBackendInputTree(context);
+  const privateRecords = collectInputRecords(privateRoot);
+
+  assert.doesNotThrow(() => validateInputRecords(privateRecords));
+  assert.ok(privateRecords.every((record) => record.mode === 0o600));
+});
+
+test("unsafe and symlinked backend directory ancestry is rejected", (context) => {
+  const privateRoot = privateBackendInputTree(context);
+  const target = path.join(privateRoot, "services/backend/src");
+
+  const linkedRoot = `${privateRoot}-link`;
+  context.after(() => rmSync(linkedRoot, { force: true }));
+  symlinkSync(privateRoot, linkedRoot, "dir");
+  assert.throws(
+    () => collectInputRecords(linkedRoot),
+    /root is not a safe real directory/u,
+  );
+
+  for (const mode of [0o777, 0o1700]) {
+    chmodSync(target, mode);
+    assert.throws(
+      () => collectInputRecords(privateRoot),
+      /directory ancestry is unsafe/u,
+    );
+    chmodSync(target, 0o700);
+  }
+
+  const realTarget = `${target}-real`;
+  renameSync(target, realTarget);
+  symlinkSync(realTarget, target, "dir");
+  assert.throws(
+    () => collectInputRecords(privateRoot),
+    /directory ancestry is unsafe/u,
+  );
+});
+
 test("an oversized source-shaped image input is rejected", () => {
   assert.throws(
     () =>
       validateInputRecords([
         {
           links: 1,
+          mode: 0o644,
           path: "services/backend/src/tacua_backend/recording.py",
           regular: true,
           size: MAX_BACKEND_IMAGE_INPUT_FILE_BYTES + 1,
@@ -88,6 +169,7 @@ test("an oversized source-shaped image input is rejected", () => {
       validateInputRecords([
         {
           links: 1,
+          mode: 0o644,
           path: "services/backend/src/tacua_backend/private_recording.py",
           regular: true,
           size: 1,
@@ -96,4 +178,17 @@ test("an oversized source-shaped image input is rejected", () => {
       ]),
     /unsafe or oversized input file/,
   );
+});
+
+test("backend inputs with executable or special source modes are rejected", () => {
+  const records = collectInputRecords();
+  for (const mode of [0o555, 0o1644]) {
+    assert.throws(
+      () => validateInputRecords([
+        { ...records[0], mode },
+        ...records.slice(1),
+      ]),
+      /unsafe or oversized input file/u,
+    );
+  }
 });

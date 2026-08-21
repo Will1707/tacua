@@ -286,6 +286,20 @@ The reviewer preparation commands are required on a clean clone: its hardened
 image consumes the generated web export and audited third-party notice rather
 than installing or compiling dependencies in the image build.
 
+Both application Dockerfiles assign image modes explicitly instead of
+inheriting a checkout's umask. Backend source, public examples, schemas, and
+license files are root-owned mode `0444`; its two operator-invoked helpers are
+mode `0555`. Reviewer static files are root-owned mode `0444`, while only the
+fixed static directory spine and server entry point are mode `0555`. The
+reviewer export validator accepts the exact ordinary `0755`/`0644` tree or an
+owner-private `0700`/`0600` tree, then the image build normalizes either form.
+Both image validators reject symlinked ancestry, linked or special input
+files, unsafe source modes, and input replacement observed during validation;
+the reviewer validator's final recheck covers its complete export tree after
+the bundle, metadata, notice, Dockerfile, and non-export inputs have been read.
+This does not change the protected host modes or bind-mount behavior of the
+runtime config, administrator secret, state, or upgrade evidence.
+
 The backend runs as UID/GID `10001`, drops Linux capabilities, uses a read-only
 root filesystem, writes only to `/var/lib/tacua`, publishes no host port, and
 joins exactly one `internal: true` network. The browser reviewer runs as

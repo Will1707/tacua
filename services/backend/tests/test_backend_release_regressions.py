@@ -328,7 +328,10 @@ class BackendContainerRegressionTests(unittest.TestCase):
             repository / "services/backend/Dockerfile.dockerignore"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("COPY --chown=root:root LICENSE NOTICE /app/", dockerfile)
+        self.assertIn(
+            "COPY --chown=root:root --chmod=0444 LICENSE NOTICE /app/",
+            dockerfile,
+        )
         self.assertIn("!LICENSE", dockerignore.splitlines())
         self.assertIn("!NOTICE", dockerignore.splitlines())
 
@@ -344,7 +347,10 @@ class BackendContainerRegressionTests(unittest.TestCase):
         for contract in ("ticket-candidate", "approved-handoff"):
             for suffix in ("src/", "schemas/"):
                 contract_path = f"contracts/{contract}/{suffix}"
-                self.assertIn(f"COPY --chown=root:root {contract_path}", dockerfile)
+                self.assertIn(
+                    f"COPY --chown=root:root --chmod=0444 {contract_path}",
+                    dockerfile,
+                )
                 self.assertIn(f"!{contract_path}", dockerignore)
 
 

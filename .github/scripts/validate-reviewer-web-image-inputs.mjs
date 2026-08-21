@@ -32,7 +32,7 @@ const expectedInstructions = [
   ["ENV", "PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1"],
   [
     "RUN",
-    "groupadd --gid 10002 tacua-reviewer && useradd --uid 10002 --gid 10002 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin tacua-reviewer && install -d -o root -g root -m 0555 /srv/tacua-reviewer /licenses /licenses/tacua /licenses/reviewer",
+    "groupadd --gid 10002 tacua-reviewer && useradd --uid 10002 --gid 10002 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin tacua-reviewer && install -d -o root -g root -m 0555 /srv/tacua-reviewer /srv/tacua-reviewer/_expo /srv/tacua-reviewer/_expo/static /srv/tacua-reviewer/_expo/static/js /srv/tacua-reviewer/_expo/static/js/web /srv/tacua-reviewer/assets /srv/tacua-reviewer/assets/node_modules /srv/tacua-reviewer/assets/node_modules/expo-router /srv/tacua-reviewer/assets/node_modules/expo-router/assets /srv/tacua-reviewer/assets/node_modules/expo-router/assets/react-navigation /srv/tacua-reviewer/assets/node_modules/expo-router/assets/react-navigation/elements /licenses /licenses/tacua /licenses/reviewer",
   ],
   [
     "COPY",
@@ -40,7 +40,19 @@ const expectedInstructions = [
   ],
   [
     "COPY",
-    "--chown=root:root apps/reviewer/dist/ /srv/tacua-reviewer/",
+    "--chown=root:root --chmod=0444 apps/reviewer/dist/index.html apps/reviewer/dist/metadata.json /srv/tacua-reviewer/",
+  ],
+  [
+    "COPY",
+    "--chown=root:root --chmod=0444 apps/reviewer/dist/_expo/static/js/web/*.js /srv/tacua-reviewer/_expo/static/js/web/",
+  ],
+  [
+    "COPY",
+    "--chown=root:root --chmod=0444 apps/reviewer/dist/assets/node_modules/expo-router/assets/*.png /srv/tacua-reviewer/assets/node_modules/expo-router/assets/",
+  ],
+  [
+    "COPY",
+    "--chown=root:root --chmod=0444 apps/reviewer/dist/assets/node_modules/expo-router/assets/react-navigation/elements/*.png /srv/tacua-reviewer/assets/node_modules/expo-router/assets/react-navigation/elements/",
   ],
   [
     "COPY",
@@ -77,18 +89,36 @@ const expectedIgnoreRules = new Set([
   "!services/reviewer-web/",
   "!services/reviewer-web/server.py",
 ]);
-const safePart = /^[A-Za-z0-9@._-]{1,255}$/u;
-const entryBundle = /^_expo\/static\/js\/web\/entry-([a-f0-9]{32})\.js$/u;
-const allowedAssetExtension = new Set([
-  ".css",
-  ".jpeg",
-  ".jpg",
-  ".png",
-  ".svg",
-  ".ttf",
-  ".webp",
-  ".woff2",
+export const reviewerImageInputPaths = Object.freeze([
+  "LICENSE",
+  "NOTICE",
+  "apps/reviewer/NOTICE",
+  "apps/reviewer/generated/THIRD_PARTY_NOTICES.txt",
+  "services/reviewer-web/server.py",
 ]);
+const reviewerImageInputDirectories = new Set([""]);
+for (const inputPath of reviewerImageInputPaths) {
+  let directory = path.posix.dirname(inputPath);
+  while (directory !== ".") {
+    reviewerImageInputDirectories.add(directory);
+    directory = path.posix.dirname(directory);
+  }
+}
+const safePart = /^[A-Za-z0-9@._-]{1,255}$/u;
+const allowedDirectories = new Set([
+  "_expo",
+  "_expo/static",
+  "_expo/static/js",
+  "_expo/static/js/web",
+  "assets",
+  "assets/node_modules",
+  "assets/node_modules/expo-router",
+  "assets/node_modules/expo-router/assets",
+  "assets/node_modules/expo-router/assets/react-navigation",
+  "assets/node_modules/expo-router/assets/react-navigation/elements",
+]);
+const entryBundle = /^_expo\/static\/js\/web\/entry-([a-f0-9]{32})\.js$/u;
+const allowedAsset = /^(?:assets\/node_modules\/expo-router\/assets\/(?:[^/]+\.png|react-navigation\/elements\/[^/]+\.png))$/u;
 const forbiddenBundleText = [
   "localStorage",
   "expo-file-system",
@@ -99,6 +129,120 @@ const forbiddenBundleText = [
 
 function fail(message) {
   throw new Error(message);
+}
+
+function metadataIdentity(metadata) {
+  return [
+    metadata.dev,
+    metadata.ino,
+    metadata.mode,
+    metadata.nlink,
+    metadata.size,
+    metadata.mtimeMs,
+    metadata.ctimeMs,
+  ];
+}
+
+function sameMetadata(left, right) {
+  const before = metadataIdentity(left);
+  const after = metadataIdentity(right);
+  return before.every((value, index) => value === after[index]);
+}
+
+function snapshotReviewerImageInputs(root) {
+  const absoluteRoot = path.resolve(root);
+  const rootMetadata = lstatSync(absoluteRoot);
+  if (
+    !rootMetadata.isDirectory()
+    || rootMetadata.isSymbolicLink()
+    || ![0o555, 0o700, 0o755].includes(rootMetadata.mode & 0o7777)
+  ) {
+    fail("reviewer image input root is not a safe real directory");
+  }
+  const resolvedRoot = realpathSync(absoluteRoot);
+  const directorySnapshots = new Map();
+  for (const relativePath of [...reviewerImageInputDirectories].sort()) {
+    const absolutePath = relativePath
+      ? path.join(absoluteRoot, relativePath)
+      : absoluteRoot;
+    const metadata = lstatSync(absolutePath);
+    const expectedResolved = relativePath
+      ? path.join(resolvedRoot, ...relativePath.split("/"))
+      : resolvedRoot;
+    if (
+      !metadata.isDirectory()
+      || metadata.isSymbolicLink()
+      || ![0o555, 0o700, 0o755].includes(metadata.mode & 0o7777)
+      || realpathSync(absolutePath) !== expectedResolved
+    ) {
+      fail(`reviewer image input directory is unsafe: ${relativePath || "."}`);
+    }
+    directorySnapshots.set(absolutePath, { expectedResolved, metadata });
+  }
+
+  let totalBytes = 0;
+  const fileSnapshots = new Map();
+  for (const relativePath of reviewerImageInputPaths) {
+    const absolutePath = path.join(absoluteRoot, relativePath);
+    const metadata = lstatSync(absolutePath);
+    const resolved = realpathSync(absolutePath);
+    const after = lstatSync(absolutePath);
+    if (
+      !metadata.isFile()
+      || metadata.isSymbolicLink()
+      || metadata.nlink !== 1
+      || ![0o444, 0o600, 0o644].includes(metadata.mode & 0o7777)
+      || metadata.size < 1
+      || metadata.size > maximumReviewerFileBytes
+      || resolved !== path.join(resolvedRoot, ...relativePath.split("/"))
+      || !sameMetadata(metadata, after)
+    ) {
+      fail(`reviewer image contains an unsafe copied input: ${relativePath}`);
+    }
+    fileSnapshots.set(absolutePath, {
+      expectedResolved: resolved,
+      metadata,
+      relativePath,
+    });
+    totalBytes += metadata.size;
+  }
+  if (totalBytes > maximumReviewerBytes) {
+    fail("reviewer non-export image inputs exceed their aggregate bound");
+  }
+  return {
+    result: { files: reviewerImageInputPaths.length, totalBytes },
+    revalidate() {
+      for (const [absolutePath, before] of fileSnapshots) {
+        const after = lstatSync(absolutePath);
+        if (
+          !after.isFile()
+          || after.isSymbolicLink()
+          || !sameMetadata(before.metadata, after)
+          || realpathSync(absolutePath) !== before.expectedResolved
+        ) {
+          fail(`reviewer image input changed during validation: ${before.relativePath}`);
+        }
+      }
+      for (const [absolutePath, before] of directorySnapshots) {
+        const after = lstatSync(absolutePath);
+        if (
+          !after.isDirectory()
+          || after.isSymbolicLink()
+          || !sameMetadata(before.metadata, after)
+          || realpathSync(absolutePath) !== before.expectedResolved
+        ) {
+          fail("reviewer image input directory changed during validation");
+        }
+      }
+    },
+  };
+}
+
+export function validateReviewerImageInputs(root = repositoryRoot, hooks = {}) {
+  const validation = snapshotReviewerImageInputs(root);
+  hooks.beforeFinalRevalidation?.();
+  validation.revalidate();
+  return validation.result;
 }
 
 function parseDockerInstructions(dockerfile) {
@@ -151,13 +295,12 @@ export function validateDockerDefinition(dockerfile, dockerignore) {
   }
 }
 
-function safeFile(relative, absolute) {
-  const metadata = lstatSync(absolute);
+function safeFile(relative, metadata) {
   if (
     !metadata.isFile()
     || metadata.isSymbolicLink()
     || metadata.nlink !== 1
-    || (metadata.mode & 0o7777) !== 0o0644
+    || ![0o600, 0o644].includes(metadata.mode & 0o7777)
     || metadata.size < 1
     || metadata.size > maximumReviewerFileBytes
   ) {
@@ -171,35 +314,70 @@ function collectFiles(root) {
   if (
     !rootMetadata.isDirectory()
     || rootMetadata.isSymbolicLink()
-    || (rootMetadata.mode & 0o7777) !== 0o0755
+    || ![0o700, 0o755].includes(rootMetadata.mode & 0o7777)
   ) {
     fail("reviewer export root must be one real directory");
   }
   const resolvedRoot = realpathSync(root);
+  const rootAfter = lstatSync(root);
+  if (!sameMetadata(rootMetadata, rootAfter)) {
+    fail("reviewer export root changed during inspection");
+  }
   const pending = [root];
+  const directories = new Set();
   const files = new Map();
+  const snapshots = new Map([
+    [root, {
+      expectedResolved: resolvedRoot,
+      kind: "directory",
+      metadata: rootMetadata,
+      relativePath: ".",
+    }],
+  ]);
   let total = 0;
   while (pending.length) {
     const current = pending.pop();
     for (const entry of readdirSync(current, { withFileTypes: true })) {
       const absolute = path.join(current, entry.name);
       const relative = path.relative(root, absolute).split(path.sep).join("/");
+      const metadata = lstatSync(absolute);
+      const resolved = realpathSync(absolute);
+      const after = lstatSync(absolute);
       if (
         relative.startsWith("../")
         || relative.split("/").some((part) => !safePart.test(part))
-        || realpathSync(absolute) !== path.resolve(resolvedRoot, relative)
+        || resolved !== path.resolve(resolvedRoot, relative)
+        || !sameMetadata(metadata, after)
       ) {
         fail("reviewer export path is unsafe");
       }
-      if (entry.isSymbolicLink()) fail("reviewer export must not contain links");
-      if (entry.isDirectory()) {
-        if ((lstatSync(absolute).mode & 0o7777) !== 0o0755) {
+      if (metadata.isSymbolicLink() || entry.isSymbolicLink()) {
+        fail("reviewer export must not contain links");
+      }
+      if (metadata.isDirectory()) {
+        if (
+          !allowedDirectories.has(relative)
+          || ![0o700, 0o755].includes(metadata.mode & 0o7777)
+        ) {
           fail("reviewer export contains a non-container-readable directory");
         }
+        directories.add(relative);
         pending.push(absolute);
-      } else if (entry.isFile()) {
-        total += safeFile(relative, absolute);
+        snapshots.set(absolute, {
+          expectedResolved: resolved,
+          kind: "directory",
+          metadata,
+          relativePath: relative,
+        });
+      } else if (metadata.isFile()) {
+        total += safeFile(relative, metadata);
         files.set(relative, absolute);
+        snapshots.set(absolute, {
+          expectedResolved: resolved,
+          kind: "file",
+          metadata,
+          relativePath: relative,
+        });
       } else {
         fail("reviewer export contains a non-file entry");
       }
@@ -208,7 +386,30 @@ function collectFiles(root) {
       }
     }
   }
-  return files;
+  if (
+    directories.size !== allowedDirectories.size
+    || [...allowedDirectories].some((directory) => !directories.has(directory))
+  ) {
+    fail("reviewer export directory shape differs from the closed policy");
+  }
+  return { files, snapshots };
+}
+
+function revalidateExportSnapshots(snapshots) {
+  for (const [absolutePath, before] of snapshots) {
+    const after = lstatSync(absolutePath);
+    const expectedKind = before.kind === "file"
+      ? after.isFile()
+      : after.isDirectory();
+    if (
+      !expectedKind
+      || after.isSymbolicLink()
+      || !sameMetadata(before.metadata, after)
+      || realpathSync(absolutePath) !== before.expectedResolved
+    ) {
+      fail(`reviewer export changed during validation: ${before.relativePath}`);
+    }
+  }
 }
 
 function validateIndex(indexBytes, bundleName) {
@@ -226,8 +427,8 @@ function validateIndex(indexBytes, bundleName) {
   }
 }
 
-export function validateReviewerExport(root) {
-  const files = collectFiles(root);
+function snapshotReviewerExport(root) {
+  const { files, snapshots } = collectFiles(root);
   const names = [...files.keys()].sort();
   const bundles = names.filter((name) => entryBundle.test(name));
   if (
@@ -241,10 +442,7 @@ export function validateReviewerExport(root) {
     const permitted = name === "index.html"
       || name === "metadata.json"
       || entryBundle.test(name)
-      || (
-        name.startsWith("assets/")
-        && allowedAssetExtension.has(path.posix.extname(name).toLowerCase())
-      );
+      || allowedAsset.test(name);
     if (!permitted || name.endsWith(".map")) {
       fail(`reviewer export contains an unexpected artifact: ${name}`);
     }
@@ -273,13 +471,26 @@ export function validateReviewerExport(root) {
     fail("reviewer bundle contains a forbidden storage, native, or source-map path");
   }
   return {
-    bundle: bundles[0],
-    files: files.size,
-    status: "ok",
+    result: {
+      bundle: bundles[0],
+      files: files.size,
+      status: "ok",
+    },
+    revalidate() {
+      revalidateExportSnapshots(snapshots);
+    },
   };
 }
 
-export function validateRepository(root = repositoryRoot) {
+export function validateReviewerExport(root, hooks = {}) {
+  const validation = snapshotReviewerExport(root);
+  hooks.beforeFinalRevalidation?.();
+  validation.revalidate();
+  return validation.result;
+}
+
+export function validateRepository(root = repositoryRoot, hooks = {}) {
+  const inputValidation = snapshotReviewerImageInputs(root);
   checkReviewerThirdPartyNotices(root);
   validateDockerDefinition(
     readFileSync(path.join(root, "services/reviewer-web/Dockerfile"), "utf8"),
@@ -288,7 +499,13 @@ export function validateRepository(root = repositoryRoot) {
       "utf8",
     ),
   );
-  return validateReviewerExport(path.join(root, "apps/reviewer/dist"));
+  const exportValidation = snapshotReviewerExport(
+    path.join(root, "apps/reviewer/dist"),
+  );
+  hooks.beforeFinalRevalidation?.();
+  exportValidation.revalidate();
+  inputValidation.revalidate();
+  return exportValidation.result;
 }
 
 if (

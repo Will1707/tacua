@@ -11,10 +11,27 @@ ENV PYTHONUNBUFFERED=1 \
 
 RUN groupadd --gid 10002 tacua-reviewer \
     && useradd --uid 10002 --gid 10002 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin tacua-reviewer \
-    && install -d -o root -g root -m 0555 /srv/tacua-reviewer /licenses /licenses/tacua /licenses/reviewer
+    && install -d -o root -g root -m 0555 \
+      /srv/tacua-reviewer \
+      /srv/tacua-reviewer/_expo \
+      /srv/tacua-reviewer/_expo/static \
+      /srv/tacua-reviewer/_expo/static/js \
+      /srv/tacua-reviewer/_expo/static/js/web \
+      /srv/tacua-reviewer/assets \
+      /srv/tacua-reviewer/assets/node_modules \
+      /srv/tacua-reviewer/assets/node_modules/expo-router \
+      /srv/tacua-reviewer/assets/node_modules/expo-router/assets \
+      /srv/tacua-reviewer/assets/node_modules/expo-router/assets/react-navigation \
+      /srv/tacua-reviewer/assets/node_modules/expo-router/assets/react-navigation/elements \
+      /licenses \
+      /licenses/tacua \
+      /licenses/reviewer
 
 COPY --chown=root:root --chmod=0555 services/reviewer-web/server.py /usr/local/bin/tacua-reviewer-web
-COPY --chown=root:root apps/reviewer/dist/ /srv/tacua-reviewer/
+COPY --chown=root:root --chmod=0444 apps/reviewer/dist/index.html apps/reviewer/dist/metadata.json /srv/tacua-reviewer/
+COPY --chown=root:root --chmod=0444 apps/reviewer/dist/_expo/static/js/web/*.js /srv/tacua-reviewer/_expo/static/js/web/
+COPY --chown=root:root --chmod=0444 apps/reviewer/dist/assets/node_modules/expo-router/assets/*.png /srv/tacua-reviewer/assets/node_modules/expo-router/assets/
+COPY --chown=root:root --chmod=0444 apps/reviewer/dist/assets/node_modules/expo-router/assets/react-navigation/elements/*.png /srv/tacua-reviewer/assets/node_modules/expo-router/assets/react-navigation/elements/
 COPY --chown=root:root --chmod=0444 LICENSE NOTICE /licenses/tacua/
 COPY --chown=root:root --chmod=0444 apps/reviewer/NOTICE /licenses/reviewer/NOTICE
 COPY --chown=root:root --chmod=0444 apps/reviewer/generated/THIRD_PARTY_NOTICES.txt /licenses/reviewer/THIRD_PARTY_NOTICES.txt

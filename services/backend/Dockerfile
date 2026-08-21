@@ -16,18 +16,18 @@ RUN groupadd --gid 10001 tacua \
     && install -d -o tacua -g tacua -m 0700 /var/lib/tacua /var/lib/tacua/tmp
 
 WORKDIR /app
-COPY --chown=root:root LICENSE NOTICE /app/
-COPY --chown=root:root services/backend/src/tacua_backend/*.py /app/services/backend/src/tacua_backend/
+COPY --chown=root:root --chmod=0444 LICENSE NOTICE /app/
+COPY --chown=root:root --chmod=0444 services/backend/src/tacua_backend/*.py /app/services/backend/src/tacua_backend/
 COPY --chown=root:root --chmod=0555 services/backend/scripts/run_compose_isolated_processing.py services/backend/scripts/run_isolated_processor.py /app/services/backend/scripts/
-COPY --chown=root:root services/backend/config.example.json services/backend/config.template.example.json /app/services/backend/
-COPY --chown=root:root contracts/sdk-backend-protocol/src/*.py /app/contracts/sdk-backend-protocol/src/
-COPY --chown=root:root contracts/sdk-backend-protocol/schemas/*.schema.json /app/contracts/sdk-backend-protocol/schemas/
-COPY --chown=root:root contracts/runtime/src/*.py /app/contracts/runtime/src/
-COPY --chown=root:root contracts/runtime/schemas/*.schema.json /app/contracts/runtime/schemas/
-COPY --chown=root:root contracts/ticket-candidate/src/*.py /app/contracts/ticket-candidate/src/
-COPY --chown=root:root contracts/ticket-candidate/schemas/*.schema.json /app/contracts/ticket-candidate/schemas/
-COPY --chown=root:root contracts/approved-handoff/src/*.py /app/contracts/approved-handoff/src/
-COPY --chown=root:root contracts/approved-handoff/schemas/*.schema.json /app/contracts/approved-handoff/schemas/
+COPY --chown=root:root --chmod=0444 services/backend/config.example.json services/backend/config.template.example.json /app/services/backend/
+COPY --chown=root:root --chmod=0444 contracts/sdk-backend-protocol/src/*.py /app/contracts/sdk-backend-protocol/src/
+COPY --chown=root:root --chmod=0444 contracts/sdk-backend-protocol/schemas/*.schema.json /app/contracts/sdk-backend-protocol/schemas/
+COPY --chown=root:root --chmod=0444 contracts/runtime/src/*.py /app/contracts/runtime/src/
+COPY --chown=root:root --chmod=0444 contracts/runtime/schemas/*.schema.json /app/contracts/runtime/schemas/
+COPY --chown=root:root --chmod=0444 contracts/ticket-candidate/src/*.py /app/contracts/ticket-candidate/src/
+COPY --chown=root:root --chmod=0444 contracts/ticket-candidate/schemas/*.schema.json /app/contracts/ticket-candidate/schemas/
+COPY --chown=root:root --chmod=0444 contracts/approved-handoff/src/*.py /app/contracts/approved-handoff/src/
+COPY --chown=root:root --chmod=0444 contracts/approved-handoff/schemas/*.schema.json /app/contracts/approved-handoff/schemas/
 
 USER 10001:10001
 VOLUME ["/var/lib/tacua"]
