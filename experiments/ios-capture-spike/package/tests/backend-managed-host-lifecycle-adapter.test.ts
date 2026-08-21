@@ -220,6 +220,14 @@ function deferred() {
   return { promise, resolve };
 }
 
+function deferredValue<Value>() {
+  let resolve: (value: Value) => void = () => undefined;
+  const promise = new Promise<Value>((fulfill) => {
+    resolve = fulfill;
+  });
+  return { promise, resolve };
+}
+
 async function waitFor(predicate: () => boolean): Promise<void> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     if (predicate()) return;
@@ -260,6 +268,976 @@ test("startup installs listeners, refreshes, and privately delivers the initial 
   assert.deepEqual(controllerHarness.preparedURLs, [LAUNCH_URL]);
   assert.equal(JSON.stringify(adapter).includes(LAUNCH_CODE), false);
 
+  adapter.dispose();
+});
+
+test("startup retry recovers a native-only cold-launch inbox after refresh rejection", async () => {
+  const errors: BackendManagedHostLifecycleError[] = [];
+  let refreshCount = 0;
+  const controllerHarness = createControllerHarness({
+    refresh: async () => {
+      refreshCount += 1;
+      if (refreshCount === 1) {
+        throw new Error(`private initial discovery ${LAUNCH_URL}`);
+      }
+    },
+  });
+  const lifecycleHarness = createLifecycleHarness({
+    currentState: "active",
+    initialNativeURLs: [LAUNCH_URL],
+    initialURL: null,
+  });
+  const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controllerHarness.controller,
+    lifecycleHarness.primitives,
+    { onError: (error) => errors.push(error) },
+  );
+
+  await assert.rejects(
+    adapter.ready,
+    (error: unknown) =>
+      error instanceof BackendManagedHostLifecycleAdapterError &&
+      error.operation === "initial_refresh",
+  );
+  assert.equal(
+    lifecycleHarness.calls.includes("drain-native-launch-urls"),
+    false,
+  );
+  assert.deepEqual(controllerHarness.preparedURLs, []);
+
+  await adapter.retryStartup();
+
+  assert.equal(refreshCount, 2);
+  assert.equal(
+    lifecycleHarness.calls.filter(
+      (call) => call === "drain-native-launch-urls",
+    ).length,
+    1,
+  );
+  assert.equal(
+    lifecycleHarness.calls.filter((call) => call === "get-initial-url")
+      .length,
+    1,
+  );
+  assert.deepEqual(controllerHarness.preparedURLs, [LAUNCH_URL]);
+  assert.equal(
+    controllerHarness.calls.filter((call) => call === "prepare-launch")
+      .length,
+    1,
+  );
+  assert.deepEqual(errors, [
+    {
+      operation: "initial_refresh",
+      category: "host_lifecycle_rejected",
+    },
+  ]);
+  assert.equal(lifecycleHarness.pendingNativeLaunchListenerCount(), 1);
+  assert.equal(lifecycleHarness.incomingURLListenerCount(), 1);
+  assert.equal(lifecycleHarness.appStateListenerCount(), 1);
+  adapter.dispose();
+});
+
+test("a failed initial refresh has one coalesced startup retry across duplicate active sources", async () => {
+  const releaseRecoveryRefresh = deferred();
+  const errors: BackendManagedHostLifecycleError[] = [];
+  let refreshCount = 0;
+  const controllerHarness = createControllerHarness({
+    refresh: async () => {
+      refreshCount += 1;
+      if (refreshCount === 1) {
+        throw new Error(`private initial discovery ${LAUNCH_URL}`);
+      }
+      await releaseRecoveryRefresh.promise;
+    },
+  });
+  const lifecycleHarness = createLifecycleHarness({
+    currentState: "active",
+    initialNativeURLs: [LAUNCH_URL],
+    initialURL: LAUNCH_URL,
+  });
+  const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controllerHarness.controller,
+    lifecycleHarness.primitives,
+    { onError: (error) => errors.push(error) },
+  );
+
+  await assert.rejects(
+    adapter.ready,
+    (error: unknown) =>
+      error instanceof BackendManagedHostLifecycleAdapterError &&
+      error.operation === "initial_refresh",
+  );
+  assert.equal(
+    lifecycleHarness.calls.includes("drain-native-launch-urls"),
+    false,
+  );
+
+  const recovery = adapter.retryStartup();
+  assert.equal(adapter.retryStartup(), recovery);
+  await waitFor(() => refreshCount === 2);
+
+  // Router and React Native event duplicates race the retained native cold-launch inbox.
+  adapter.deliverLaunchURL(LAUNCH_URL);
+  lifecycleHarness.emitURL(LAUNCH_URL);
+  assert.deepEqual(controllerHarness.preparedURLs, []);
+
+  releaseRecoveryRefresh.resolve();
+  await recovery;
+  assert.equal(adapter.retryStartup(), recovery);
+  await adapter.retryStartup();
+
+  assert.equal(refreshCount, 2);
+  assert.equal(
+    lifecycleHarness.calls.filter(
+      (call) => call === "drain-native-launch-urls",
+    ).length,
+    1,
+  );
+  assert.equal(
+    lifecycleHarness.calls.filter((call) => call === "get-initial-url")
+      .length,
+    1,
+  );
+  assert.deepEqual(controllerHarness.preparedURLs, [LAUNCH_URL]);
+  assert.equal(lifecycleHarness.pendingNativeLaunchListenerCount(), 1);
+  assert.equal(lifecycleHarness.incomingURLListenerCount(), 1);
+  assert.equal(lifecycleHarness.appStateListenerCount(), 1);
+  assert.deepEqual(errors, [
+    {
+      operation: "initial_refresh",
+      category: "host_lifecycle_rejected",
+    },
+  ]);
+  assert.equal(JSON.stringify(adapter).includes(LAUNCH_CODE), false);
+  adapter.dispose();
+});
+
+test("sequential duplicate callbacks share the one failed refresh retry", async () => {
+  const errors: BackendManagedHostLifecycleError[] = [];
+  let refreshCount = 0;
+  const controllerHarness = createControllerHarness({
+    refresh: async () => {
+      refreshCount += 1;
+      throw new Error(`private refresh ${LAUNCH_URL}`);
+    },
+  });
+  const lifecycleHarness = createLifecycleHarness({ initialURL: null });
+  const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controllerHarness.controller,
+    lifecycleHarness.primitives,
+    { onError: (error) => errors.push(error) },
+  );
+
+  await assert.rejects(adapter.ready);
+  lifecycleHarness.emitURL(LAUNCH_URL);
+  await waitFor(() => errors.length === 2);
+
+  // Let the first rejected delivery leave the pending map before replaying the exact source.
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  lifecycleHarness.emitURL(LAUNCH_URL);
+  adapter.deliverLaunchURL(LAUNCH_URL);
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+  const recovery = adapter.retryStartup();
+  assert.equal(adapter.retryStartup(), recovery);
+  await assert.rejects(
+    recovery,
+    (error: unknown) =>
+      error instanceof BackendManagedHostLifecycleAdapterError &&
+      error.operation === "initial_refresh" &&
+      !String(error).includes(LAUNCH_CODE),
+  );
+  assert.equal(adapter.retryStartup(), recovery);
+
+  assert.equal(refreshCount, 2);
+  assert.deepEqual(controllerHarness.preparedURLs, []);
+  assert.deepEqual(errors, [
+    {
+      operation: "initial_refresh",
+      category: "host_lifecycle_rejected",
+    },
+    {
+      operation: "initial_refresh",
+      category: "host_lifecycle_rejected",
+    },
+  ]);
+  assert.equal(JSON.stringify(errors).includes(LAUNCH_CODE), false);
+  assert.equal(JSON.stringify(adapter).includes(LAUNCH_CODE), false);
+  adapter.dispose();
+});
+
+test("startup retry fences a callback accepted during its scheduled refresh", async () => {
+  const releaseRetryRefresh = deferred();
+  const releasePreparation = deferred();
+  const errors: BackendManagedHostLifecycleError[] = [];
+  let refreshCount = 0;
+  const controllerHarness = createControllerHarness({
+    refresh: async () => {
+      refreshCount += 1;
+      if (refreshCount === 1) {
+        throw new Error(`private initial refresh ${LAUNCH_URL}`);
+      }
+      await releaseRetryRefresh.promise;
+    },
+    prepareLaunch: async () => {
+      await releasePreparation.promise;
+      throw new Error(`private preparation ${LAUNCH_URL}`);
+    },
+  });
+  const lifecycleHarness = createLifecycleHarness({ initialURL: null });
+  const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controllerHarness.controller,
+    lifecycleHarness.primitives,
+    { onError: (error) => errors.push(error) },
+  );
+
+  await assert.rejects(adapter.ready);
+  const recovery = adapter.retryStartup();
+  await waitFor(() => refreshCount === 2);
+
+  // This callback is accepted after recovery starts but cannot run until its refresh task exits.
+  lifecycleHarness.emitURL(LAUNCH_URL);
+  assert.deepEqual(controllerHarness.preparedURLs, []);
+  releaseRetryRefresh.resolve();
+  await waitFor(() => controllerHarness.preparedURLs.length === 1);
+
+  let recoverySettled = false;
+  void recovery
+    .finally(() => {
+      recoverySettled = true;
+    })
+    .catch(() => undefined);
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  assert.equal(recoverySettled, false);
+
+  releasePreparation.resolve();
+  await assert.rejects(
+    recovery,
+    (error: unknown) =>
+      error instanceof BackendManagedHostLifecycleAdapterError &&
+      error.operation === "prepare_launch" &&
+      !String(error).includes(LAUNCH_CODE),
+  );
+  assert.equal(recoverySettled, true);
+  assert.equal(refreshCount, 2);
+  assert.deepEqual(controllerHarness.preparedURLs, [LAUNCH_URL]);
+  assert.equal(
+    lifecycleHarness.calls.filter(
+      (call) => call === "drain-native-launch-urls",
+    ).length,
+    1,
+  );
+  assert.equal(
+    lifecycleHarness.calls.filter((call) => call === "get-initial-url")
+      .length,
+    1,
+  );
+  assert.deepEqual(errors, [
+    {
+      operation: "initial_refresh",
+      category: "host_lifecycle_rejected",
+    },
+    {
+      operation: "prepare_launch",
+      category: "host_lifecycle_rejected",
+    },
+  ]);
+  assert.equal(JSON.stringify(errors).includes(LAUNCH_CODE), false);
+  assert.equal(JSON.stringify(adapter).includes(LAUNCH_CODE), false);
+  adapter.dispose();
+});
+
+test("startup retry adopts a callback already driving the shared refresh", async () => {
+  const releaseRetryRefresh = deferred();
+  const releasePreparation = deferred();
+  const errors: BackendManagedHostLifecycleError[] = [];
+  let refreshCount = 0;
+  const controllerHarness = createControllerHarness({
+    refresh: async () => {
+      refreshCount += 1;
+      if (refreshCount === 1) {
+        throw new Error(`private initial refresh ${LAUNCH_URL}`);
+      }
+      await releaseRetryRefresh.promise;
+    },
+    prepareLaunch: async () => {
+      await releasePreparation.promise;
+      throw new Error(`private preparation ${LAUNCH_URL}`);
+    },
+  });
+  const lifecycleHarness = createLifecycleHarness({ initialURL: null });
+  const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controllerHarness.controller,
+    lifecycleHarness.primitives,
+    { onError: (error) => errors.push(error) },
+  );
+
+  await assert.rejects(adapter.ready);
+  lifecycleHarness.emitURL(LAUNCH_URL);
+  await waitFor(() => refreshCount === 2);
+
+  // The callback owns the shared retry before the public boundary opens its collector.
+  const recovery = adapter.retryStartup();
+  assert.equal(adapter.retryStartup(), recovery);
+  let recoverySettled = false;
+  void recovery
+    .finally(() => {
+      recoverySettled = true;
+    })
+    .catch(() => undefined);
+
+  releaseRetryRefresh.resolve();
+  await waitFor(() => controllerHarness.preparedURLs.length === 1);
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  assert.equal(recoverySettled, false);
+
+  releasePreparation.resolve();
+  await assert.rejects(
+    recovery,
+    (error: unknown) =>
+      error instanceof BackendManagedHostLifecycleAdapterError &&
+      error.operation === "prepare_launch" &&
+      !String(error).includes(LAUNCH_CODE),
+  );
+  assert.equal(recoverySettled, true);
+  assert.equal(refreshCount, 2);
+  assert.deepEqual(controllerHarness.preparedURLs, [LAUNCH_URL]);
+  assert.equal(
+    lifecycleHarness.calls.filter(
+      (call) => call === "drain-native-launch-urls",
+    ).length,
+    1,
+  );
+  assert.equal(
+    lifecycleHarness.calls.filter((call) => call === "get-initial-url")
+      .length,
+    1,
+  );
+  assert.deepEqual(errors, [
+    {
+      operation: "initial_refresh",
+      category: "host_lifecycle_rejected",
+    },
+    {
+      operation: "prepare_launch",
+      category: "host_lifecycle_rejected",
+    },
+  ]);
+  assert.equal(JSON.stringify(errors).includes(LAUNCH_CODE), false);
+  assert.equal(JSON.stringify(adapter).includes(LAUNCH_CODE), false);
+  adapter.dispose();
+});
+
+test("ready adopts a callback accepted during its initial refresh", async () => {
+  const releaseInitialRefresh = deferred();
+  const releasePreparation = deferred();
+  const errors: BackendManagedHostLifecycleError[] = [];
+  let refreshCount = 0;
+  const controllerHarness = createControllerHarness({
+    refresh: async () => {
+      refreshCount += 1;
+      await releaseInitialRefresh.promise;
+    },
+    prepareLaunch: async () => {
+      await releasePreparation.promise;
+      throw new Error(`private preparation ${LAUNCH_URL}`);
+    },
+  });
+  const lifecycleHarness = createLifecycleHarness({ initialURL: null });
+  const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controllerHarness.controller,
+    lifecycleHarness.primitives,
+    { onError: (error) => errors.push(error) },
+  );
+
+  await waitFor(() => refreshCount === 1);
+  lifecycleHarness.emitURL(LAUNCH_URL);
+  assert.deepEqual(controllerHarness.preparedURLs, []);
+
+  let readySettled = false;
+  void adapter.ready
+    .finally(() => {
+      readySettled = true;
+    })
+    .catch(() => undefined);
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  assert.equal(readySettled, false);
+
+  releaseInitialRefresh.resolve();
+  await waitFor(() => controllerHarness.preparedURLs.length === 1);
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  assert.equal(readySettled, false);
+
+  releasePreparation.resolve();
+  let readyError: unknown;
+  await assert.rejects(adapter.ready, (error: unknown) => {
+    readyError = error;
+    return (
+      error instanceof BackendManagedHostLifecycleAdapterError &&
+      error.operation === "prepare_launch" &&
+      !String(error).includes(LAUNCH_CODE)
+    );
+  });
+  assert.equal(readySettled, true);
+
+  // A non-refresh startup failure is sticky and never replays discovery or launch preparation.
+  const recovery = adapter.retryStartup();
+  assert.equal(adapter.retryStartup(), recovery);
+  await assert.rejects(recovery, (error: unknown) => error === readyError);
+  assert.equal(refreshCount, 1);
+  assert.deepEqual(controllerHarness.calls, ["refresh", "prepare-launch"]);
+  assert.deepEqual(controllerHarness.preparedURLs, [LAUNCH_URL]);
+  assert.equal(
+    lifecycleHarness.calls.filter(
+      (call) => call === "drain-native-launch-urls",
+    ).length,
+    1,
+  );
+  assert.equal(
+    lifecycleHarness.calls.filter((call) => call === "get-initial-url")
+      .length,
+    1,
+  );
+  assert.deepEqual(errors, [
+    {
+      operation: "prepare_launch",
+      category: "host_lifecycle_rejected",
+    },
+  ]);
+  assert.equal(JSON.stringify(errors).includes(LAUNCH_CODE), false);
+  assert.equal(JSON.stringify(adapter).includes(LAUNCH_CODE), false);
+  adapter.dispose();
+});
+
+test("ready fences a native signal that races the bounded initial URL lookup", async () => {
+  const initialURL = deferredValue<string | null>();
+  const releasePreparation = deferred();
+  const errors: BackendManagedHostLifecycleError[] = [];
+  const controllerHarness = createControllerHarness({
+    prepareLaunch: async () => {
+      await releasePreparation.promise;
+      throw new Error(`private preparation ${LAUNCH_URL}`);
+    },
+  });
+  const lifecycleHarness = createLifecycleHarness({
+    getInitialURL: () => initialURL.promise,
+  });
+  const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controllerHarness.controller,
+    lifecycleHarness.primitives,
+    { onError: (error) => errors.push(error) },
+  );
+
+  await waitFor(() => lifecycleHarness.calls.includes("get-initial-url"));
+  lifecycleHarness.enqueueNativeURL(LAUNCH_URL);
+  await waitFor(() => controllerHarness.preparedURLs.length === 1);
+  initialURL.resolve(null);
+
+  let readySettled = false;
+  void adapter.ready
+    .finally(() => {
+      readySettled = true;
+    })
+    .catch(() => undefined);
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  assert.equal(readySettled, false);
+
+  releasePreparation.resolve();
+  await assert.rejects(
+    adapter.ready,
+    (error: unknown) =>
+      error instanceof BackendManagedHostLifecycleAdapterError &&
+      error.operation === "prepare_launch" &&
+      !String(error).includes(LAUNCH_CODE),
+  );
+  assert.equal(readySettled, true);
+  assert.deepEqual(controllerHarness.preparedURLs, [LAUNCH_URL]);
+  assert.deepEqual(errors, [
+    {
+      operation: "prepare_launch",
+      category: "host_lifecycle_rejected",
+    },
+  ]);
+  assert.equal(JSON.stringify(errors).includes(LAUNCH_CODE), false);
+  adapter.dispose();
+});
+
+test("startup discovery bounds concurrent work without capping sequential native delivery", async () => {
+  const initialURL = deferredValue<string | null>();
+  const errors: BackendManagedHostLifecycleError[] = [];
+  const controllerHarness = createControllerHarness();
+  const lifecycleHarness = createLifecycleHarness({
+    getInitialURL: () => initialURL.promise,
+  });
+  const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controllerHarness.controller,
+    lifecycleHarness.primitives,
+    { onError: (error) => errors.push(error) },
+  );
+
+  await waitFor(() => lifecycleHarness.calls.includes("get-initial-url"));
+  const launchURLs = Array.from(
+    { length: 33 },
+    (_, index) => `${LAUNCH_URL}&sequence=${index}`,
+  );
+  for (const [index, launchURL] of launchURLs.entries()) {
+    lifecycleHarness.enqueueNativeURL(launchURL);
+    await waitFor(() => controllerHarness.preparedURLs.length === index + 1);
+  }
+
+  initialURL.resolve(null);
+  await adapter.ready;
+
+  assert.deepEqual(controllerHarness.preparedURLs, launchURLs);
+  assert.deepEqual(errors, []);
+  assert.equal(
+    lifecycleHarness.calls.filter(
+      (call) => call === "drain-native-launch-urls",
+    ).length,
+    34,
+  );
+  adapter.dispose();
+});
+
+test("disposal fences a native delivery collected during initial URL lookup", async () => {
+  const initialURL = deferredValue<string | null>();
+  const errors: BackendManagedHostLifecycleError[] = [];
+  const controllerHarness = createControllerHarness();
+  const lifecycleHarness = createLifecycleHarness({
+    getInitialURL: () => initialURL.promise,
+  });
+  const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controllerHarness.controller,
+    lifecycleHarness.primitives,
+    { onError: (error) => errors.push(error) },
+  );
+
+  await waitFor(() => lifecycleHarness.calls.includes("get-initial-url"));
+  lifecycleHarness.enqueueNativeURL(LAUNCH_URL);
+  assert.equal(adapter.disposeWithConfirmation(), true);
+  initialURL.resolve(null);
+  await adapter.ready;
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+  assert.deepEqual(controllerHarness.preparedURLs, []);
+  assert.deepEqual(errors, []);
+  assert.equal(
+    lifecycleHarness.calls.filter(
+      (call) => call === "drain-native-launch-urls",
+    ).length,
+    2,
+  );
+  assert.equal(lifecycleHarness.pendingNativeLaunchListenerCount(), 0);
+  assert.equal(lifecycleHarness.incomingURLListenerCount(), 0);
+  assert.equal(lifecycleHarness.appStateListenerCount(), 0);
+});
+
+test("startup recovery fences a native signal that races its initial URL lookup", async () => {
+  const initialURL = deferredValue<string | null>();
+  const releasePreparation = deferred();
+  let refreshCount = 0;
+  const controllerHarness = createControllerHarness({
+    refresh: async () => {
+      refreshCount += 1;
+      if (refreshCount === 1) throw new Error("private initial refresh");
+    },
+    prepareLaunch: () => releasePreparation.promise,
+  });
+  const lifecycleHarness = createLifecycleHarness({
+    getInitialURL: () => initialURL.promise,
+  });
+  const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controllerHarness.controller,
+    lifecycleHarness.primitives,
+  );
+
+  await assert.rejects(adapter.ready);
+  const recovery = adapter.retryStartup();
+  await waitFor(() => lifecycleHarness.calls.includes("get-initial-url"));
+  lifecycleHarness.enqueueNativeURL(LAUNCH_URL);
+  await waitFor(() => controllerHarness.preparedURLs.length === 1);
+  initialURL.resolve(null);
+
+  let recoverySettled = false;
+  void recovery.then(() => {
+    recoverySettled = true;
+  });
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  assert.equal(recoverySettled, false);
+
+  releasePreparation.resolve();
+  await recovery;
+  assert.equal(recoverySettled, true);
+  assert.equal(refreshCount, 2);
+  assert.deepEqual(controllerHarness.preparedURLs, [LAUNCH_URL]);
+  adapter.dispose();
+});
+
+test("an early native signal retains its cold launch until startup recovery", async () => {
+  const errors: BackendManagedHostLifecycleError[] = [];
+  let refreshCount = 0;
+  const controllerHarness = createControllerHarness({
+    refresh: async () => {
+      refreshCount += 1;
+      if (refreshCount === 1) {
+        throw new Error(`private discovery failure ${LAUNCH_URL}`);
+      }
+    },
+  });
+  const lifecycleHarness = createLifecycleHarness({
+    currentState: "active",
+    initialNativeURLs: [LAUNCH_URL],
+    initialURL: null,
+    emitNativeSignalWhileSubscribing: true,
+  });
+  const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controllerHarness.controller,
+    lifecycleHarness.primitives,
+    { onError: (error) => errors.push(error) },
+  );
+
+  await assert.rejects(adapter.ready);
+  assert.equal(
+    lifecycleHarness.calls.includes("drain-native-launch-urls"),
+    false,
+  );
+  const recovery = adapter.retryStartup();
+  await recovery;
+
+  assert.equal(refreshCount, 2);
+  assert.equal(
+    lifecycleHarness.calls.filter(
+      (call) => call === "drain-native-launch-urls",
+    ).length,
+    1,
+  );
+  assert.deepEqual(controllerHarness.preparedURLs, [LAUNCH_URL]);
+  assert.deepEqual(errors, [
+    {
+      operation: "initial_refresh",
+      category: "host_lifecycle_rejected",
+    },
+  ]);
+  assert.equal(JSON.stringify(errors).includes(LAUNCH_CODE), false);
+  assert.equal(lifecycleHarness.pendingNativeLaunchListenerCount(), 1);
+  adapter.dispose();
+});
+
+test("startup retry failure is sticky, bounded, and contains no launch authority", async () => {
+  const errors: BackendManagedHostLifecycleError[] = [];
+  let refreshCount = 0;
+  const controllerHarness = createControllerHarness({
+    refresh: async () => {
+      refreshCount += 1;
+      throw new Error(`private refresh ${LAUNCH_URL}`);
+    },
+  });
+  const lifecycleHarness = createLifecycleHarness({
+    initialNativeURLs: [LAUNCH_URL],
+    initialURL: LAUNCH_URL,
+  });
+  const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controllerHarness.controller,
+    lifecycleHarness.primitives,
+    { onError: (error) => errors.push(error) },
+  );
+
+  await assert.rejects(adapter.ready);
+  const recovery = adapter.retryStartup();
+  await assert.rejects(
+    recovery,
+    (error: unknown) =>
+      error instanceof BackendManagedHostLifecycleAdapterError &&
+      error.operation === "initial_refresh" &&
+      !String(error).includes(LAUNCH_CODE),
+  );
+  assert.equal(adapter.retryStartup(), recovery);
+  await assert.rejects(adapter.retryStartup());
+
+  assert.equal(refreshCount, 2);
+  assert.deepEqual(errors, [
+    {
+      operation: "initial_refresh",
+      category: "host_lifecycle_rejected",
+    },
+    {
+      operation: "initial_refresh",
+      category: "host_lifecycle_rejected",
+    },
+  ]);
+  assert.equal(errors.every(Object.isFrozen), true);
+  assert.equal(JSON.stringify(errors).includes(LAUNCH_CODE), false);
+  assert.equal(JSON.stringify(adapter).includes(LAUNCH_CODE), false);
+  adapter.dispose();
+});
+
+test("disposal during startup retry fences discovery and launch delivery", async () => {
+  const releaseRecoveryRefresh = deferred();
+  const errors: BackendManagedHostLifecycleError[] = [];
+  let refreshCount = 0;
+  const controllerHarness = createControllerHarness({
+    refresh: async () => {
+      refreshCount += 1;
+      if (refreshCount === 1) throw new Error(`private ${LAUNCH_URL}`);
+      await releaseRecoveryRefresh.promise;
+    },
+  });
+  const lifecycleHarness = createLifecycleHarness({
+    initialNativeURLs: [LAUNCH_URL],
+    initialURL: LAUNCH_URL,
+  });
+  const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controllerHarness.controller,
+    lifecycleHarness.primitives,
+    { onError: (error) => errors.push(error) },
+  );
+
+  await assert.rejects(adapter.ready);
+  const recovery = adapter.retryStartup();
+  await waitFor(() => refreshCount === 2);
+  assert.equal(adapter.disposeWithConfirmation(), true);
+  releaseRecoveryRefresh.resolve();
+  await recovery;
+
+  assert.equal(adapter.retryStartup(), recovery);
+  assert.equal(
+    lifecycleHarness.calls.includes("drain-native-launch-urls"),
+    false,
+  );
+  assert.equal(lifecycleHarness.calls.includes("get-initial-url"), false);
+  assert.deepEqual(controllerHarness.preparedURLs, []);
+  assert.deepEqual(controllerHarness.calls, [
+    "refresh",
+    "refresh",
+    "dispose-controller",
+  ]);
+  assert.deepEqual(errors, [
+    {
+      operation: "initial_refresh",
+      category: "host_lifecycle_rejected",
+    },
+  ]);
+});
+
+test("queued disposal fences a callback-owned retry before launch preparation", async () => {
+  const releaseRetryRefresh = deferred();
+  const errors: BackendManagedHostLifecycleError[] = [];
+  const events: string[] = [];
+  let refreshCount = 0;
+  let controllerDisposed = false;
+  const controllerHarness = createControllerHarness();
+  const disposeController = (): boolean => {
+    controllerDisposed = true;
+    events.push("dispose-controller");
+    return true;
+  };
+  const controller: BackendManagedHostController = {
+    ...controllerHarness.controller,
+    refresh: () => {
+      refreshCount += 1;
+      events.push(`refresh-${refreshCount}`);
+      return refreshCount === 1
+        ? Promise.reject(new Error(`private refresh ${LAUNCH_URL}`))
+        : releaseRetryRefresh.promise;
+    },
+    prepareLaunch: async () => {
+      events.push(
+        controllerDisposed ? "prepare-after-dispose" : "prepare-launch",
+      );
+    },
+    dispose: () => {
+      void disposeController();
+    },
+    disposeWithConfirmation: disposeController,
+  };
+  const lifecycleHarness = createLifecycleHarness({ initialURL: null });
+  const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controller,
+    lifecycleHarness.primitives,
+    { onError: (error) => errors.push(error) },
+  );
+
+  await assert.rejects(adapter.ready);
+  lifecycleHarness.emitURL(LAUNCH_URL);
+  await waitFor(() => refreshCount === 2);
+
+  // Resolving queues runStep's continuation first; disposal then runs before the retry projection
+  // and launch-delivery continuation can mark discovery complete or retain launch authority.
+  releaseRetryRefresh.resolve();
+  queueMicrotask(() => adapter.dispose());
+  for (let turn = 0; turn < 3; turn += 1) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+
+  const recovery = adapter.retryStartup();
+  assert.equal(adapter.retryStartup(), recovery);
+  await recovery;
+  assert.equal(adapter.disposeWithConfirmation(), true);
+  assert.deepEqual(events, ["refresh-1", "refresh-2", "dispose-controller"]);
+  assert.deepEqual(errors, [
+    {
+      operation: "initial_refresh",
+      category: "host_lifecycle_rejected",
+    },
+  ]);
+  assert.equal(JSON.stringify(errors).includes(LAUNCH_CODE), false);
+});
+
+test("queued disposal suppresses a classified initial refresh failure", async () => {
+  let rejectInitialRefresh: (error: unknown) => void = () => undefined;
+  const initialRefresh = new Promise<void>((_resolve, reject) => {
+    rejectInitialRefresh = reject;
+  });
+  const errors: BackendManagedHostLifecycleError[] = [];
+  const events: string[] = [];
+  const controllerHarness = createControllerHarness();
+  const disposeController = (): boolean => {
+    events.push("dispose-controller");
+    return true;
+  };
+  const controller: BackendManagedHostController = {
+    ...controllerHarness.controller,
+    refresh: () => {
+      events.push("refresh");
+      return initialRefresh;
+    },
+    dispose: () => {
+      void disposeController();
+    },
+    disposeWithConfirmation: disposeController,
+  };
+  const lifecycleHarness = createLifecycleHarness({ initialURL: null });
+  const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controller,
+    lifecycleHarness.primitives,
+    { onError: (error) => errors.push(error) },
+  );
+  await waitFor(() => events.includes("refresh"));
+
+  // runStep classifies this rejection before the next microtask disposes the adapter. Public
+  // observation must still honor the current disposal fence instead of reporting a late failure.
+  rejectInitialRefresh(new Error(`private refresh ${LAUNCH_URL}`));
+  queueMicrotask(() => adapter.dispose());
+  await adapter.ready;
+
+  const recovery = adapter.retryStartup();
+  assert.equal(adapter.retryStartup(), recovery);
+  await recovery;
+  assert.equal(adapter.disposeWithConfirmation(), true);
+  assert.deepEqual(events, ["refresh", "dispose-controller"]);
+  assert.deepEqual(errors, []);
+  assert.equal(JSON.stringify(adapter).includes(LAUNCH_CODE), false);
+});
+
+test("queued disposal fences initial URL validation and reporting", async () => {
+  const initialURL = deferredValue<string | null>();
+  const errors: BackendManagedHostLifecycleError[] = [];
+  const controllerHarness = createControllerHarness();
+  const lifecycleHarness = createLifecycleHarness({
+    getInitialURL: () => initialURL.promise,
+  });
+  const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controllerHarness.controller,
+    lifecycleHarness.primitives,
+    { onError: (error) => errors.push(error) },
+  );
+  await waitFor(() => lifecycleHarness.calls.includes("get-initial-url"));
+
+  // The runtime-invalid fallback result reaches runStep first. Nested microtasks then dispose before
+  // discovery resumes to validate it, so no post-teardown error or delivery may be published.
+  initialURL.resolve(42 as unknown as string | null);
+  queueMicrotask(() => queueMicrotask(() => adapter.dispose()));
+  await adapter.ready;
+
+  const recovery = adapter.retryStartup();
+  assert.equal(adapter.retryStartup(), recovery);
+  await recovery;
+  assert.equal(adapter.disposeWithConfirmation(), true);
+  assert.deepEqual(controllerHarness.calls, ["refresh", "dispose-controller"]);
+  assert.deepEqual(controllerHarness.preparedURLs, []);
+  assert.deepEqual(errors, []);
+  assert.equal(
+    lifecycleHarness.calls.filter((call) => call === "get-initial-url")
+      .length,
+    1,
+  );
+});
+
+test("a native drain cannot defer initial URL invocation past disposal", async () => {
+  const events: string[] = [];
+  const errors: BackendManagedHostLifecycleError[] = [];
+  let controllerDisposed = false;
+  let adapter:
+    | ReturnType<typeof createBackendManagedHostLifecycleAdapterForPrimitives>
+    | null = null;
+  const controllerHarness = createControllerHarness({
+    dispose: () => {
+      controllerDisposed = true;
+      events.push("dispose-controller");
+      return true;
+    },
+  });
+  const lifecycleHarness = createLifecycleHarness({
+    drainPendingLaunchURLs: () => {
+      events.push("drain-native-launch-urls");
+      queueMicrotask(() => {
+        events.push("dispose-adapter");
+        adapter?.dispose();
+      });
+      return [];
+    },
+    getInitialURL: async () => {
+      events.push(
+        controllerDisposed
+          ? "get-initial-url-after-dispose"
+          : "get-initial-url",
+      );
+      return null;
+    },
+  });
+  adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controllerHarness.controller,
+    lifecycleHarness.primitives,
+    { onError: (error) => errors.push(error) },
+  );
+
+  await adapter.ready;
+
+  assert.equal(adapter.disposeWithConfirmation(), true);
+  assert.deepEqual(events, [
+    "drain-native-launch-urls",
+    "get-initial-url",
+    "dispose-adapter",
+    "dispose-controller",
+  ]);
+  assert.deepEqual(controllerHarness.preparedURLs, []);
+  assert.deepEqual(errors, []);
+});
+
+test("startup retry preserves non-refresh ready failures without replay", async () => {
+  const controllerHarness = createControllerHarness({
+    prepareLaunch: async () => {
+      throw new Error(`private preparation ${LAUNCH_URL}`);
+    },
+  });
+  const lifecycleHarness = createLifecycleHarness({ initialURL: LAUNCH_URL });
+  const adapter = createBackendManagedHostLifecycleAdapterForPrimitives(
+    controllerHarness.controller,
+    lifecycleHarness.primitives,
+  );
+
+  let readyError: unknown;
+  await assert.rejects(adapter.ready, (error: unknown) => {
+    readyError = error;
+    return (
+      error instanceof BackendManagedHostLifecycleAdapterError &&
+      error.operation === "prepare_launch"
+    );
+  });
+  const recovery = adapter.retryStartup();
+  await assert.rejects(recovery, (error: unknown) => error === readyError);
+  assert.equal(adapter.retryStartup(), recovery);
+  assert.deepEqual(controllerHarness.calls, ["refresh", "prepare-launch"]);
   adapter.dispose();
 });
 

@@ -273,7 +273,20 @@ const removeRouterLaunchListener = subscribeRouterLaunchURLs(
 
 // Resolves after initial discovery and any initial launch URL have been delivered.
 // A rejection is BackendManagedHostLifecycleAdapterError and contains no source error.
-await host.ready;
+try {
+  await host.ready;
+} catch (error) {
+  if (
+    error instanceof TacuaCapture.BackendManagedHostLifecycleAdapterError &&
+    error.operation === 'initial_refresh'
+  ) {
+    // Join the adapter's one shared refresh retry without accepting or returning a URL.
+    // Queued delivery and concurrent/repeated calls share this same sticky result.
+    await host.retryStartup();
+  } else {
+    throw error;
+  }
+}
 const controller = host.controller;
 
 // Present the exact consent contract named by the awaiting_launch_consent phase.
@@ -311,17 +324,28 @@ URL, code, or user content. The adapter ignores an exact duplicate launch URL
 after its first delivery attempt, without retaining the URL itself. Only an
 `inactive`/`background`-to-`active` transition invokes `notifyForeground()`;
 bursts are coalesced while preserving a transition that arrives during native
-work. `dispose()` remains an idempotent, non-throwing compatibility teardown.
+work. If `ready` rejects at `initial_refresh`, the adapter permits at most one
+additional refresh shared by queued launch delivery and every `retryStartup()`
+caller. The sticky method waits for existing lifecycle work, then re-drains the
+native inbox and repeats the bounded initial `Linking` lookup through the same
+filtered, serialized, fingerprint-deduplicated delivery queue. Accepted launch
+deliveries already pending when initial discovery or recovery begins, or
+accepted while its refresh or bounded linking lookup is in flight, together
+with native inbox values retained across a failed refresh, are included in the
+corresponding startup result. The method accepts and returns no launch data;
+every caller receives the same bounded safe result. A successful `ready` or a
+non-refresh rejection is not replayed. `dispose()` remains an idempotent,
+non-throwing compatibility teardown.
 `disposeWithConfirmation()` attempts all three host-listener removals and
 owned-controller teardown and returns one sticky boolean result.
 `true` proves every removal and volatile launch-handle cancellation completed;
 `false` requires the host to remain terminal and avoid installing a replacement
 owner until process relaunch. Disposed callbacks are inert in either case.
 Results that arrive after teardown cannot trigger initial-URL reads, URL
-delivery, discovery, or state publication; an in-flight RESUME match also
-cancels its newly prepared native consent handle before rejecting. Lifecycle
-errors distinguish source/filter delivery (`deliver_launch_url`) from a launch
-that reached and was rejected by controller preparation (`prepare_launch`),
+delivery, discovery, error reporting, or state publication; an in-flight RESUME
+match also cancels its newly prepared native consent handle before rejecting.
+Lifecycle errors distinguish source/filter delivery (`deliver_launch_url`) from
+a launch that reached and was rejected by controller preparation (`prepare_launch`),
 without projecting the URL, code, or underlying error.
 
 `createBackendManagedHostController()` remains the dependency-light lower-level
