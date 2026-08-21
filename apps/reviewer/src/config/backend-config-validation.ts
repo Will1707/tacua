@@ -53,11 +53,19 @@ export function validateBackendConnectionConfig(config: BackendConfig): BackendC
   };
 }
 
-export function validateBackendConfig(config: BackendConfig): BackendConfig {
+/** Validate the connection and operator-declared reviewer identity before authentication. */
+export function validateBackendIdentityConfig(config: BackendConfig): BackendConfig {
   const connection = validateBackendConnectionConfig(config);
   return {
     ...connection,
     reviewerId: requireIdentifier(connection.reviewerId, "Reviewer ID"),
+  };
+}
+
+export function validateBackendConfig(config: BackendConfig): BackendConfig {
+  const connection = validateBackendIdentityConfig(config);
+  return {
+    ...connection,
     targetScheme: normalizeTargetScheme(connection.targetScheme),
   };
 }

@@ -2489,7 +2489,12 @@ def _reviewer_smoke(origin: str) -> None:
         raise ReconcileError("RECONCILE_SMOKE_FAILED") from error
 
 
-def _smoke(manifest: Mapping[str, Any], *, public: bool) -> None:
+def _smoke(
+    manifest: Mapping[str, Any],
+    *,
+    public: bool,
+    allow_prebootstrap_reviewer_routes: bool = False,
+) -> None:
     config_file = Path(manifest["config"]["path"])
     secret_file = Path(manifest["secret"]["path"])
     try:
@@ -2503,6 +2508,9 @@ def _smoke(manifest: Mapping[str, Any], *, public: bool) -> None:
                 secret_file,
                 origin_override=None,
                 allow_loopback_http=False,
+                allow_prebootstrap_reviewer_routes=(
+                    allow_prebootstrap_reviewer_routes
+                ),
                 opener_factory=direct_opener,
             )
             _reviewer_smoke(load_public_config(config_file).backend_origin)
@@ -2513,6 +2521,9 @@ def _smoke(manifest: Mapping[str, Any], *, public: bool) -> None:
                 secret_file,
                 origin_override=origin,
                 allow_loopback_http=True,
+                allow_prebootstrap_reviewer_routes=(
+                    allow_prebootstrap_reviewer_routes
+                ),
                 opener_factory=direct_opener,
             )
             _reviewer_smoke(origin)
@@ -3246,7 +3257,11 @@ def seal(
         if not healthy:
             raise ReconcileError("RECONCILE_HEALTH_FAILED")
         draft.update(deployment)
-        _smoke(draft, public=False)
+        _smoke(
+            draft,
+            public=False,
+            allow_prebootstrap_reviewer_routes=True,
+        )
         if initial_state != "maintenance":
             _status, active = _tailnet_state(
                 draft,
@@ -3255,7 +3270,11 @@ def seal(
             )
             if not active:
                 raise ReconcileError("RECONCILE_TAILNET_FAILED")
-            _smoke(draft, public=True)
+            _smoke(
+                draft,
+                public=True,
+                allow_prebootstrap_reviewer_routes=True,
+            )
         draft["manifest_digest"] = _document_digest(
             draft,
             "manifest_digest",

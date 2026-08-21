@@ -45,13 +45,22 @@ accessibility, preventing a partial settings write from pairing an old token
 with a new origin. Before “Save and connect” persists anything, the reviewer
 checks the public protocol, authenticates the administrator bearer, verifies
 the entered reviewer ID against the deployment through a non-mutating
-status-only route, and validates the bounded build registry. Provider startup
-repeats the identity-binding check before exposing a persisted client, so a
-missing, incorrect, or stale ID fails closed. Neither the success response nor
-the bounded errors disclose the configured or supplied identity. Authenticated
-requests use the native Expo fetch boundary, omit cookies, reject redirects,
-and verify the response origin before parsing bounded JSON. Never commit a real
-endpoint, credential, recording, or private pilot identifier.
+status-only route, and only then reads bounded build launch metadata. Provider
+startup repeats that order before exposing a persisted client, so a missing,
+incorrect, or stale ID fails closed. The entered identity is never replaced by
+backend metadata: the bootstrap 1.0 compatibility field must equal the already
+verified declaration and is discarded rather than used as configuration.
+Neither the status response nor bounded errors disclose the configured or
+supplied identity, and reviewer logs do not interpolate it or the administrator
+secret. Authenticated requests use the native Expo fetch boundary, omit
+cookies, reject redirects, and verify the response origin before parsing
+bounded JSON. Never commit a real endpoint, credential, recording, or private
+pilot identifier.
+
+The reviewer accepts only the exact bootstrap 1.0 shape after the entered
+identity has passed the status-only check. Its compatibility identity field
+must agree exactly, is otherwise rejected, and is never used to replace or
+derive the entered reviewer ID.
 
 The reviewer also has a browser export for a private, same-origin self-hosted
 deployment:

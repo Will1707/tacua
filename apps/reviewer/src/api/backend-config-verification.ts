@@ -3,7 +3,7 @@
 import {
   type BackendConfig,
   validateBackendConfig,
-  validateBackendConnectionConfig,
+  validateBackendIdentityConfig,
 } from "../config/backend-config-validation.ts";
 import type { ReviewerBootstrap } from "./types.ts";
 
@@ -40,12 +40,12 @@ async function authenticateBackendConfig<Client extends BackendConfigurationClie
   candidate: BackendConfig,
   createClient: (config: BackendConfig) => Client,
 ): Promise<ActiveBackendConfig<Client>> {
-  // Only origin and administrator credential are trusted before bootstrap.
-  // The provisional client uses the supplied identity/scheme solely to call
-  // the admin-authenticated additive endpoint; no identity-bound operation is
-  // performed through it.
-  const provisional = validateBackendConnectionConfig(candidate);
-  const bootstrapClient = createClient(provisional);
+  // The reviewer identity is always operator-declared. Prove that claim before
+  // reading build launch metadata so a wrong or stale identity never reaches
+  // persistence, bootstrap-derived configuration, or reviewer operations.
+  const identityConfig = validateBackendIdentityConfig(candidate);
+  const bootstrapClient = createClient(identityConfig);
+  await bootstrapClient.verifyReviewerIdentity();
   let bootstrap: ReviewerBootstrap;
   try {
     bootstrap = await bootstrapClient.getReviewerBootstrap();
@@ -56,11 +56,10 @@ async function authenticateBackendConfig<Client extends BackendConfigurationClie
       || !("status" in error)
       || error.status !== 404
     ) throw error;
-    // A pre-bootstrap backend cannot prove either manual field. Validate both
-    // only now, then bind them before any legacy registry read.
-    const legacyConfig = validateBackendConfig(provisional);
+    // The additive build-metadata endpoint may be absent during an upgrade.
+    // Validate the legacy manual scheme before exposing a final client.
+    const legacyConfig = validateBackendConfig(identityConfig);
     const legacyClient = createClient(legacyConfig);
-    await legacyClient.verifyReviewerIdentity();
     await legacyClient.listBuilds();
     return { config: legacyConfig, client: legacyClient };
   }
@@ -68,13 +67,17 @@ async function authenticateBackendConfig<Client extends BackendConfigurationClie
   if (!build || bootstrap.builds.length !== 1) {
     throw new Error("The Tacua deployment must register exactly one reviewer build.");
   }
+  if (bootstrap.reviewer_id !== identityConfig.reviewerId) {
+    // The status-only binding already succeeded. Treat disagreement from the
+    // bootstrap projection as a bounded consistency failure, never as an
+    // alternate source of reviewer identity.
+    throw new Error("The reviewer identity does not match this deployment.");
+  }
   const verifiedConfig = validateBackendConfig({
-    ...provisional,
-    reviewerId: bootstrap.reviewer_id,
-    targetScheme: build.launch_scheme ?? provisional.targetScheme,
+    ...identityConfig,
+    targetScheme: build.launch_scheme ?? identityConfig.targetScheme,
   });
   const verifiedClient = createClient(verifiedConfig);
-  await verifiedClient.verifyReviewerIdentity();
   return { config: verifiedConfig, client: verifiedClient };
 }
 
@@ -82,7 +85,7 @@ export async function verifyBackendConfig(
   candidate: BackendConfig,
   dependencies: BackendConfigVerificationDependencies,
 ): Promise<BackendConfig> {
-  const connection = validateBackendConnectionConfig(candidate);
+  const connection = validateBackendIdentityConfig(candidate);
   await dependencies.probeBackend(connection.baseUrl);
   return (await authenticateBackendConfig(connection, dependencies.createClient)).config;
 }

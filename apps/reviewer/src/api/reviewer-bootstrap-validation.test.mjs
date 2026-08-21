@@ -40,10 +40,10 @@ function rejects(value) {
   );
 }
 
-test("accepts exact current and legacy reviewer bootstrap projections", () => {
+test("accepts exact current and transport 1.1 build projections", () => {
   assert.deepEqual(validateReviewerBootstrap(bootstrap()), bootstrap());
-  const legacy = bootstrap({ builds: [registeredBuild({ launch_scheme: null })] });
-  assert.deepEqual(validateReviewerBootstrap(legacy), legacy);
+  const legacyTransport = bootstrap({ builds: [registeredBuild({ launch_scheme: null })] });
+  assert.deepEqual(validateReviewerBootstrap(legacyTransport), legacyTransport);
   assert.ok(maximumReviewerBootstrapResponseBytes <= 128 * 1_024);
 });
 
@@ -57,7 +57,7 @@ test("rejects contract drift and non-exact envelope or build shapes", () => {
   rejects(bootstrap({ builds: [missingScheme] }));
 });
 
-test("rejects invalid reviewer identities and unsafe launch schemes", () => {
+test("rejects invalid legacy identities and unsafe launch schemes", () => {
   for (const reviewer_id of ["Reviewer_owner", "ab", "reviewer.owner", "reviewer_e\u0301"]) {
     rejects(bootstrap({ reviewer_id }));
   }

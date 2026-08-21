@@ -49,8 +49,13 @@ build uses `sessionStorage`, never `localStorage`, so configuration is scoped
 to one browser tab session. The administrator bearer is still readable by
 JavaScript in that origin while the tab is open. Saving configuration and
 activating a stored client each require the backend's authenticated,
-non-mutating reviewer-binding status check; stale reviewer IDs are not exposed
-to transition code, and the check returns no configured identity.
+non-mutating reviewer-binding status check before any build-metadata bootstrap;
+stale reviewer IDs are not exposed to transition code. The status response
+does not return the configured identity.
+
+The reader accepts the exact bootstrap 1.0 shape after that status check, but
+treats its matching identity field only as a consistency assertion. It never
+derives browser configuration from that field.
 
 For the single-owner private pilot:
 
