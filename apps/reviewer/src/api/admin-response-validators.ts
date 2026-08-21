@@ -819,10 +819,7 @@ export type CandidateTransitionBody = CandidateTransitionCommon & (
     readonly content: TicketCandidate["content"];
   }
   | { readonly action: "mark_ready" }
-  | {
-    readonly action: "approve";
-    readonly approval_id: string;
-  }
+  | { readonly action: "approve" }
   | { readonly action: "reject" }
   | {
     readonly action: "resolve_clarification";
@@ -850,7 +847,7 @@ export function validateTransitionRequestBinding(
     const actionKeys: Record<CandidateTransitionBody["action"], readonly string[]> = {
       edit_content: ["content"],
       mark_ready: [],
-      approve: ["approval_id"],
+      approve: [],
       reject: [],
       resolve_clarification: ["clarification_id", "choice_id", "resolution_note"],
     };
@@ -865,8 +862,6 @@ export function validateTransitionRequestBinding(
     text(body.reason, 1, 256);
     if (body.action === "edit_content") {
       record(body.content);
-    } else if (body.action === "approve") {
-      identifier(body.approval_id);
     } else if (body.action === "resolve_clarification") {
       identifier(body.clarification_id);
       identifier(body.choice_id);
@@ -951,9 +946,5 @@ export function validateTransitionBinding(
   if (
     body.action === "edit_content"
     && candidate.candidate_content_digest === parent.candidate_content_digest
-  ) fail("TRANSITION_RESPONSE_BINDING_MISMATCH");
-  if (
-    body.action === "approve"
-    && candidate.approval?.approval_id !== body.approval_id
   ) fail("TRANSITION_RESPONSE_BINDING_MISMATCH");
 }
