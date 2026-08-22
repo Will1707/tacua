@@ -61,8 +61,18 @@ accepted source joins the same serialized, fingerprint-deduplicated queue.
 Unrelated application URLs are ignored and remain owned by the host app. URLs and
 launch codes remain volatile: they are neither logged nor persisted nor
 projected into public state, and inbox wakeups and lifecycle errors contain no
-URL, code, or underlying platform error. Preservation alone grants no authority;
-the SDK must still enforce the consent and one-shot exchange steps above.
+URL, code, or underlying platform error. If the initial native discovery refresh
+fails, the host lifecycle adapter permits at most one additional refresh shared
+by queued launch delivery and every call to its sticky, coalesced startup-retry
+boundary. The retry has no URL input or output; after refresh recovery it
+re-drains the volatile native inbox and bounded initial linking source through
+the same filtered, fingerprint-deduplicated queue. Accepted launch deliveries
+already pending when initial discovery or recovery begins, or accepted while
+its refresh or bounded linking lookup is in flight, together with native inbox
+values retained across a failed refresh, are fenced before `ready` or startup
+recovery completes, and teardown fences every step.
+Preservation alone grants no authority; the SDK must still enforce the consent
+and one-shot exchange steps above.
 
 Raw upload credentials must not be persisted in capture manifests, emitted to
 logs, or embedded in exported tickets. Offline retries may retain only the

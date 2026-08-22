@@ -68,6 +68,12 @@ export type BackendManagedHostLifecycleAdapter = Readonly<{
   /** Resolves after initial discovery and launch-inbox delivery, or rejects with a safe error. */
   ready: Promise<void>;
   /**
+   * After `ready` rejects during initial refresh, joins at most one additional refresh shared with
+   * blocked launch delivery, then repeats startup discovery. The method has no launch input or
+   * output and returns one sticky safe result to every caller.
+   */
+  retryStartup: () => Promise<void>;
+  /**
    * Delivers a URL obtained from a host-owned linking seam into the same private, serialized,
    * deduplicated queue used by React Native Linking. The value is never returned or projected.
    */
@@ -106,6 +112,11 @@ class InternalLifecycleFailure {
 
 class InternalLifecycleDisposed {}
 
+type StartupDiscoveryCollector = {
+  firstFailure: BackendManagedHostLifecycleAdapterError | null;
+  readonly pending: Set<Promise<void>>;
+};
+
 /** Pure seam used by the public React Native factory and Node tests. */
 export function createBackendManagedHostLifecycleAdapterForPrimitives(
   controller: BackendManagedHostController,
@@ -125,8 +136,16 @@ export function createBackendManagedHostLifecycleAdapterForPrimitives(
   const attemptedLaunches = new Set<string>();
   const attemptedLaunchOrder: string[] = [];
   const pendingLaunches = new Map<string, Promise<void>>();
+  let startupDiscoveryCollector: StartupDiscoveryCollector | null = null;
+
+  const throwIfDisposed = (): void => {
+    if (disposed) throw new InternalLifecycleDisposed();
+  };
 
   const report = (error: BackendManagedHostLifecycleAdapterError): void => {
+    // Listener installation marks the adapter disposed before publishing its constructor failure.
+    // Every later operation is silent once teardown has fenced the lifecycle boundary.
+    if (disposed && error.operation !== "install_listeners") return;
     if (!options.onError) return;
     try {
       options.onError(
@@ -155,8 +174,9 @@ export function createBackendManagedHostLifecycleAdapterForPrimitives(
     task: () => Result | Promise<Result>,
   ): Promise<Result> => {
     try {
+      throwIfDisposed();
       const result = await task();
-      if (disposed) throw new InternalLifecycleDisposed();
+      throwIfDisposed();
       return result;
     } catch (error) {
       if (error instanceof InternalLifecycleDisposed || disposed) {
@@ -185,14 +205,45 @@ export function createBackendManagedHostLifecycleAdapterForPrimitives(
     if (expired !== undefined) attemptedLaunches.delete(expired);
   };
 
+  let initialRefreshRetryExecution: Promise<void> | null = null;
+  const retryInitialRefresh = (): Promise<void> => {
+    if (initialRefreshCompleted) return Promise.resolve();
+    if (initialRefreshRetryExecution) return initialRefreshRetryExecution;
+
+    const execution = runStep("initial_refresh", () =>
+      controller.refresh(),
+    ).then(() => {
+      throwIfDisposed();
+      initialRefreshCompleted = true;
+    });
+    // Unlike general callback observation, a disposed retry must stay rejected so a queued launch
+    // cannot continue into preparation after teardown. Every other failure is projected once here
+    // and the same safe promise is shared by queued delivery and the public startup retry.
+    const projected = execution.catch((error: unknown) => {
+      if (error instanceof InternalLifecycleDisposed) throw error;
+      if (disposed) throw new InternalLifecycleDisposed();
+      if (error instanceof BackendManagedHostLifecycleAdapterError) throw error;
+      const safeError = projectFailure(error, "initial_refresh");
+      report(safeError);
+      throw safeError;
+    });
+    void projected.catch(() => undefined);
+    initialRefreshRetryExecution = projected;
+    return initialRefreshRetryExecution;
+  };
+
   const prepareLaunchOnce = async (launchURL: string): Promise<void> => {
     const fingerprint = fingerprintLaunchURL(launchURL);
     if (attemptedLaunches.has(fingerprint)) return;
-    rememberAttempt(fingerprint);
     if (!initialRefreshCompleted) {
-      await runStep("initial_refresh", () => controller.refresh());
-      initialRefreshCompleted = true;
+      await retryInitialRefresh();
     }
+    // Disposal can run in the microtask between refresh completion and this continuation. Fence it
+    // before retaining the fingerprint or invoking the controller with private launch authority.
+    throwIfDisposed();
+    // A discovery failure is not a launch delivery attempt. Remember only after discovery has
+    // recovered so the retained native inbox or another accepted source can safely retry it.
+    rememberAttempt(fingerprint);
     await runStep("prepare_launch", () =>
       controller.prepareLaunch(launchURL),
     );
@@ -203,7 +254,7 @@ export function createBackendManagedHostLifecycleAdapterForPrimitives(
     fallback: BackendManagedHostLifecycleOperation,
   ): Promise<void> => {
     const projected = execution.catch((error: unknown) => {
-      if (error instanceof InternalLifecycleDisposed) return;
+      if (error instanceof InternalLifecycleDisposed || disposed) return;
       // Nested queue work has already been projected and reported at its originating operation.
       if (error instanceof BackendManagedHostLifecycleAdapterError) throw error;
       const safeError = projectFailure(error, fallback);
@@ -218,6 +269,7 @@ export function createBackendManagedHostLifecycleAdapterForPrimitives(
   const refreshExecution = startupGate.then(async () => {
     if (disposed) return;
     await runStep("initial_refresh", () => controller.refresh());
+    throwIfDisposed();
     initialRefreshCompleted = true;
   });
   // URL delivery waits only for controller discovery. A stuck React Native initial-URL promise
@@ -243,6 +295,41 @@ export function createBackendManagedHostLifecycleAdapterForPrimitives(
     return projected;
   };
 
+  const trackStartupDiscoveryDelivery = (
+    delivery: Promise<void>,
+  ): Promise<void> => {
+    const collector = startupDiscoveryCollector;
+    if (!collector || collector.pending.has(delivery)) return delivery;
+    collector.pending.add(delivery);
+    void delivery.then(
+      () => {
+        collector.pending.delete(delivery);
+      },
+      (error: unknown) => {
+        collector.pending.delete(delivery);
+        const safeError =
+          error instanceof BackendManagedHostLifecycleAdapterError
+            ? error
+            : new BackendManagedHostLifecycleAdapterError(
+                "deliver_launch_url",
+              );
+        if (!(error instanceof BackendManagedHostLifecycleAdapterError)) {
+          report(safeError);
+        }
+        collector.firstFailure ??= safeError;
+      },
+    );
+    return delivery;
+  };
+
+  const seedStartupDiscoveryCollector = (): void => {
+    // Seed only bounded promise values: launch URLs and fingerprints stay outside the collector.
+    // The Set makes repeated seeding harmless when recovery reuses the same collector.
+    for (const delivery of pendingLaunches.values()) {
+      trackStartupDiscoveryDelivery(delivery);
+    }
+  };
+
   const enqueueIncomingURL = (launchURL: string): Promise<void> | null => {
     if (disposed) return null;
     if (typeof launchURL !== "string" || launchURL.length === 0) {
@@ -260,6 +347,9 @@ export function createBackendManagedHostLifecycleAdapterForPrimitives(
       );
       return null;
     }
+    // A native matcher may synchronously trigger host teardown. Do not fingerprint or retain the
+    // launch after that reentrant disposal, regardless of the matcher's return value.
+    if (disposed) return null;
     if (isBackendLaunchURL === false) return null;
     if (isBackendLaunchURL !== true) {
       report(
@@ -270,8 +360,12 @@ export function createBackendManagedHostLifecycleAdapterForPrimitives(
     const fingerprint = fingerprintLaunchURL(launchURL);
     if (attemptedLaunches.has(fingerprint)) return null;
     const existing = pendingLaunches.get(fingerprint);
-    if (existing) return existing;
-    if (pendingLaunches.size >= MAXIMUM_PENDING_LAUNCHES) {
+    if (existing) return trackStartupDiscoveryDelivery(existing);
+    if (
+      pendingLaunches.size >= MAXIMUM_PENDING_LAUNCHES ||
+      (startupDiscoveryCollector?.pending.size ?? 0) >=
+        MAXIMUM_PENDING_LAUNCHES
+    ) {
       report(
         new BackendManagedHostLifecycleAdapterError("deliver_launch_url"),
       );
@@ -288,7 +382,7 @@ export function createBackendManagedHostLifecycleAdapterForPrimitives(
         }
       })
       .catch(() => undefined);
-    return execution;
+    return trackStartupDiscoveryDelivery(execution);
   };
 
   const queueIncomingURL = (launchURL: string): void => {
@@ -296,7 +390,10 @@ export function createBackendManagedHostLifecycleAdapterForPrimitives(
   };
 
   const drainNativeLaunchInbox = (): readonly Promise<void>[] => {
-    if (disposed) return [];
+    // The native inbox is the authoritative cold-launch owner. Keep its value retained until
+    // discovery can accept delivery; an early signal or foreground transition must not consume it
+    // behind a refresh failure.
+    if (disposed || !initialRefreshCompleted) return [];
     let launchURLs: readonly string[];
     try {
       launchURLs = primitives.drainPendingLaunchURLs();
@@ -374,36 +471,117 @@ export function createBackendManagedHostLifecycleAdapterForPrimitives(
     scheduleForeground();
   };
 
-  const startupExecution = refreshExecution.then(async () => {
+  const discoverStartupLaunches = async (
+    existingCollector?: StartupDiscoveryCollector,
+  ): Promise<void> => {
     if (disposed) return;
-    const initialDeliveries = [...drainNativeLaunchInbox()];
+    const discoveryCollector =
+      existingCollector ??
+      ({
+        firstFailure: null,
+        pending: new Set<Promise<void>>(),
+      } satisfies StartupDiscoveryCollector);
+    startupDiscoveryCollector = discoveryCollector;
+    // A callback accepted during initial refresh is already queued when discovery opens. Adopt its
+    // promise so `ready` cannot lose its safe preparation result through the normalized queue tail.
+    seedStartupDiscoveryCollector();
     let initialURL: string | null = null;
     try {
-      initialURL = await runStep("get_initial_url", () =>
-        getInitialURLWithTimeout(primitives),
-      );
-    } catch (error) {
-      if (error instanceof InternalLifecycleDisposed || disposed) throw error;
-      // The validated native inbox is authoritative. React Native Linking is a compatibility
-      // source, so a rejected or timed-out initial lookup is reported but cannot hide an already
-      // prepared native launch behind a rejected `ready` promise.
-      report(projectFailure(error, "get_initial_url"));
-    }
-    if (initialURL !== null) {
-      if (typeof initialURL !== "string" || initialURL.length === 0) {
-        report(
-          new BackendManagedHostLifecycleAdapterError("get_initial_url"),
+      // Native delivery remains immediate while the bounded Linking fallback is pending. Every
+      // accepted delivery in that discovery window is registered in the bounded collector below.
+      drainNativeLaunchInbox();
+      try {
+        initialURL = await runStep("get_initial_url", () =>
+          getInitialURLWithTimeout(primitives),
         );
-        initialURL = null;
+        // `runStep` checks its own await, but disposal can still run before this caller resumes.
+        throwIfDisposed();
+      } catch (error) {
+        if (error instanceof InternalLifecycleDisposed || disposed) throw error;
+        // The validated native inbox is authoritative. React Native Linking is a compatibility
+        // source, so a rejected or timed-out initial lookup is reported but cannot hide an already
+        // prepared native launch behind a rejected `ready` promise.
+        report(projectFailure(error, "get_initial_url"));
       }
+      if (initialURL !== null) {
+        if (typeof initialURL !== "string" || initialURL.length === 0) {
+          report(
+            new BackendManagedHostLifecycleAdapterError("get_initial_url"),
+          );
+          initialURL = null;
+        }
+      }
+      if (initialURL !== null) {
+        enqueueIncomingURL(initialURL);
+      }
+    } finally {
+      // Close the discovery window synchronously after the initial lookup. Later signals are warm
+      // callback work; signals that raced the lookup are fenced by this exact promise snapshot.
+      startupDiscoveryCollector = null;
     }
-    if (initialURL !== null) {
-      const delivery = enqueueIncomingURL(initialURL);
-      if (delivery) initialDeliveries.push(delivery);
+    await Promise.all(
+      [...discoveryCollector.pending].map((delivery) =>
+        delivery.catch(() => undefined),
+      ),
+    );
+    if (discoveryCollector.firstFailure) {
+      throw discoveryCollector.firstFailure;
     }
-    await Promise.all(initialDeliveries);
-  });
+  };
+
+  const startupExecution = refreshExecution.then(() =>
+    discoverStartupLaunches(),
+  );
   const ready = observe(startupExecution, "initial_refresh");
+
+  let retryStartupExecution: Promise<void> | null = null;
+  const retryStartup = (): Promise<void> => {
+    if (retryStartupExecution) return retryStartupExecution;
+
+    const execution = ready.then(
+      () => undefined,
+      async (error: unknown) => {
+        if (disposed) return;
+        // Launch preparation is deliberately one-shot. Only a failed initial discovery refresh
+        // admits the startup retry; every other ready rejection retains its existing safe result.
+        if (
+          !(
+            error instanceof BackendManagedHostLifecycleAdapterError &&
+            error.operation === "initial_refresh"
+          )
+        ) {
+          throw error;
+        }
+
+        const discoveryCollector: StartupDiscoveryCollector = {
+          firstFailure: null,
+          pending: new Set<Promise<void>>(),
+        };
+        // Open the collector before scheduling refresh so a callback accepted while refresh is in
+        // flight is fenced too. Discovery still runs after the serialized task: awaiting a URL
+        // delivery from inside that task would make the lifecycle tail wait on itself.
+        startupDiscoveryCollector = discoveryCollector;
+        // A delivery accepted just before this public retry may already own the one shared refresh.
+        // Seed only its bounded promise so normalized queue ordering cannot erase a safe failure;
+        // launch URLs and fingerprints remain outside the collector.
+        seedStartupDiscoveryCollector();
+        try {
+          await schedule("initial_refresh", async () => {
+            if (initialRefreshCompleted) return;
+            await retryInitialRefresh();
+          });
+          if (disposed) return;
+          await discoverStartupLaunches(discoveryCollector);
+        } finally {
+          if (startupDiscoveryCollector === discoveryCollector) {
+            startupDiscoveryCollector = null;
+          }
+        }
+      },
+    );
+    retryStartupExecution = observe(execution, "initial_refresh");
+    return retryStartupExecution;
+  };
 
   try {
     previousAppState = primitives.getCurrentAppState();
@@ -470,6 +648,7 @@ export function createBackendManagedHostLifecycleAdapterForPrimitives(
   return Object.freeze({
     controller,
     ready,
+    retryStartup,
     deliverLaunchURL: queueIncomingURL,
     dispose,
     disposeWithConfirmation,
@@ -497,22 +676,32 @@ function getInitialURLWithTimeout(
       reject(new InternalLifecycleFailure("get_initial_url"));
     }, timeoutMilliseconds);
 
-    void Promise.resolve()
-      .then(primitives.getInitialURL)
-      .then(
-        (value) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          resolve(value);
-        },
-        () => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          reject(new InternalLifecycleFailure("get_initial_url"));
-        },
-      );
+    let initialURL: Promise<string | null>;
+    try {
+      // Invoke the primitive before yielding. A native drain can queue teardown, and a deferred
+      // invocation must not begin a new initial-URL read after that teardown has run.
+      initialURL = Promise.resolve(primitives.getInitialURL());
+    } catch {
+      settled = true;
+      clearTimeout(timer);
+      reject(new InternalLifecycleFailure("get_initial_url"));
+      return;
+    }
+
+    void initialURL.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(new InternalLifecycleFailure("get_initial_url"));
+      },
+    );
   });
 }
 
