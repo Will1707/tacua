@@ -434,7 +434,7 @@ wait_for_healthy "$compose_ingress_container"
 docker exec "$compose_container" sh -c \
   'test "$(stat -c %a /run/secrets/tacua_admin)" = 444 && ! test -w /run/secrets/tacua_admin'
 docker exec "$compose_container" python -B -c \
-  'from pathlib import Path; import stat; root=Path("/app"); files=[path for path in root.rglob("*") if path.is_file()]; executable={Path("/app/services/backend/scripts/run_compose_isolated_processing.py"),Path("/app/services/backend/scripts/run_isolated_processor.py")}; assert files and executable <= set(files); assert all(path.stat().st_uid == 0 and path.stat().st_gid == 0 and stat.S_IMODE(path.stat().st_mode) == (0o555 if path in executable else 0o444) for path in files)'
+  'import os, stat, tacua_backend; from pathlib import Path; assert os.geteuid() == 10001; root=Path("/app"); paths=list(root.rglob("*")); files=[path for path in paths if path.is_file()]; directories=[root,*[path for path in paths if path.is_dir()]]; executable={Path("/app/services/backend/scripts/run_compose_isolated_processing.py"),Path("/app/services/backend/scripts/run_isolated_processor.py")}; assert files and executable <= set(files); assert all(not path.is_symlink() and path.stat().st_uid == 0 and path.stat().st_gid == 0 and stat.S_IMODE(path.stat().st_mode) == 0o555 for path in directories); assert all(path.stat().st_uid == 0 and path.stat().st_gid == 0 and stat.S_IMODE(path.stat().st_mode) == (0o555 if path in executable else 0o444) for path in files)'
 if docker port "$compose_container" 8080/tcp >/dev/null 2>&1; then
   echo "the backend unexpectedly published its internal listener" >&2
   exit 1
