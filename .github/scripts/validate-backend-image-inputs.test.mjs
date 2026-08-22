@@ -111,6 +111,29 @@ test("every backend image input has an explicit immutable image mode", () => {
   );
 });
 
+test("every backend image directory is explicit, root-owned, and traversable", () => {
+  const directoryInstall =
+    "&& install -d -o root -g root -m 0555 \\\n        /app";
+  assert.ok(validDockerfile.includes(directoryInstall));
+
+  for (const changed of [
+    validDockerfile.replace(
+      directoryInstall,
+      directoryInstall.replace("0555", "0444"),
+    ),
+    validDockerfile.replace(
+      "        /app/services/backend/src/tacua_backend\n",
+      "        /app/services/backend/src/tacua-backend\n",
+    ),
+  ]) {
+    assert.notEqual(changed, validDockerfile);
+    assert.throws(
+      () => validateDockerDefinition(changed, validDockerignore),
+      /closed instruction policy/u,
+    );
+  }
+});
+
 test("a real owner-private backend input tree remains valid", (context) => {
   const privateRoot = privateBackendInputTree(context);
   const privateRecords = collectInputRecords(privateRoot);

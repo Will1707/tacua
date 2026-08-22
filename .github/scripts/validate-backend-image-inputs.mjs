@@ -139,7 +139,7 @@ const expectedInstructions = [
   ],
   [
     "RUN",
-    "groupadd --gid 10001 tacua && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin tacua && install -d -o tacua -g tacua -m 0700 /var/lib/tacua /var/lib/tacua/tmp",
+    "groupadd --gid 10001 tacua && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin tacua && install -d -o tacua -g tacua -m 0700 /var/lib/tacua /var/lib/tacua/tmp && install -d -o root -g root -m 0555 /app /app/contracts /app/contracts/approved-handoff /app/contracts/approved-handoff/schemas /app/contracts/approved-handoff/src /app/contracts/runtime /app/contracts/runtime/schemas /app/contracts/runtime/src /app/contracts/sdk-backend-protocol /app/contracts/sdk-backend-protocol/schemas /app/contracts/sdk-backend-protocol/src /app/contracts/ticket-candidate /app/contracts/ticket-candidate/schemas /app/contracts/ticket-candidate/src /app/services /app/services/backend /app/services/backend/scripts /app/services/backend/src /app/services/backend/src/tacua_backend",
   ],
   ["WORKDIR", "/app"],
   ...expectedCopyBodies.map((body) => ["COPY", body]),
